@@ -1,0 +1,534 @@
+   TITLE 'IGG019DB - BDAM CREATE WRITE, VARIABLE/UNDEFINED FORMAT'
+IGG019DB CSECT
+*MODULE NAME = IGG019DB                                               *
+*                                                                     *
+*DESCRIPTIVE NAME = BDAM CREATE WRITE, VARIABLE & UNDEFINED FORMAT    *
+*                                                                     *
+*COPYRIGHT = NONE                                                     *
+*                                                                     *
+*CHANGE ACTIVITY                                                      *
+*                                                                     *
+*        RELEASE 20 CHANGES/DELETIONS
+*0833000120-000180,000420-000600                                 20201
+*        RELEASE 21 CHANGES/DELETIONS
+*0410                                                            A46868
+*        VS1-1 CHANGES/DELETIONS
+*        VS2-1 CHANGES/DELETIONS
+*        VS1-2 CHANGES/DELETIONS
+*        VS2-2 CHANGES/DELETIONS
+*062820-062960,065600-066000                                     Y02072
+*
+*STATUS CHANGE LEVEL 005
+*
+*FUNCTIONS- THIS ROUTINE OBTAINS AN IOB, INITIALIZES THE CHANNEL
+*    PROGRAM, AND ISSUES THE 'EXCP' FOR A WRITE TYPE SF OR SZ TO A
+*    FORMAT 'V' OR 'U' DATA SET.
+*    IF THIS WRITE IS FOR A RECORD WHICH WILL NOT FIT ON THIS TRACK,
+*    A RETURN CODE OF 4 WILL BE RETURNED AND THE USER SHOULD NEXT ISSUE
+*    A WRITE TYPE 'SZ'. THIS WILL CAUSE THE CAPACITY RECORD TO BE
+*    WRITTEN ON THE CURRENT TRACK.
+*    IF A TYPE 'SZ' IS ISSUED AND THERE HAVE BEEN NO RECORDS WRITTEN
+*    ON THIS TRACK, THE CAPACITY RECORD WILL BE WRITTEN AND AN ERASE
+*    CCW INCLUDED TO CLEAR THE REMAINDER OF THE TRACK.
+*
+*ENTRY POINTS- 'WRTENTRY' IS THE NORMAL ENTRY POINT FROM THE WRITE
+*    MACRO EXPANSION. CALLING SEQUENCE IS     L     15,DCBWRITE
+*                                             BALR  14,15
+*
+*    'EOVENTRY' IS THE ENTRY FROM THE BSAM END-OF-VOLUME EXECUTOR TO
+*    RESTART A WRITE WHICH WAS ISSUED AFTER THE CURRENT SPACE
+*    ALLOCATION WAS FILLED. THE RECORD WILL NOW BE WRITTEN INTO THE
+*    SPACE OBTAINED AS SECONDARY ALLOCATION. CALLING SEQUENCE IS
+*                                              L    15,DCBWRITE
+*                                              BAL  14,4(15)
+*INPUT- TO 'WRTENTRY'- DECB ADDRESS IN REGISTER 1
+*       TO 'EOVENTRY'- IOB ADDRESS IN REGISTER 3
+*                      DCB ADDRESS IN REGISTER 2
+*                      DEB ADDRESS IN REGISTER 5
+*
+*OUTPUT- AN IOB FROM THE POOL OF IOBS WILL BE ASSIGNED TO THIS DECB
+*    AND ITS ADDRESS PLACED IN THE DECB, EXCP WILL BE ISSUED TO
+*    SCHEDULE THIS WRITE.
+*
+*EXTERNAL ROUTINES-
+*
+*EXITS- 'RETURN' IS AN EXIT BACK TO THE USER, REGISTER 15 WILL CONTAIN
+*    A RETURN CODE AS FOLLOWS,
+*        0 = RECORD WAS WRITTEN, THERE IS MORE SPACE ON THE TRACK
+*        4 = RECORD NOT WRITTEN, THE TRACK IS FILLED, TYPE SZ SHOULD BE
+*            ISSUED AND THEN THE TYPE SF MAY BE REISSUED.
+*        8 = RECORD WAS WRITTEN, DATA SET IS FILLED
+*        12= RECORD NOT WRITTEN, NO IOB IS AVAILABLE UNTIL 'CHECK' HAS
+*            BEEN ISSUED.
+*    'EOVEXIT' IS A RETURN TO THE END-OF-VOLUME EXECUTOR.
+*
+*    'ABEXIT' IS AN EXIT WHEN THE RECORD WILL NOT FIT ON AN EMPTY
+*      TRACK. A DMABCOND MACRO IS ISSUED TO TRANSFER CONTROL TO
+*      THE PROBLEM DETERMINATION MODULES WHICH WILL ISSUE A WTP
+*      MESSAGE AND GTRACE PERTINENT CONTROL BLOCKS BEFORE ISSUING
+*      THE ABEND. A RETURN CODE ACCOMPANYING THE ABEND WILL
+*      IDENTIFY THE EXACT CAUSE OF THE ERROR.
+*
+*TABLES  1. DIRECT ACCESS DEVICE TABLE IS USED TO CALCULATE THE BYTES
+*           OF OVERHEAD FOR THIS RECORD AND TO DETERMINE THE NEXT
+*           VALID TRACK ADDRESS AND TRACK LENGTH.
+*
+*ATTRIBUTES- THIS ROUTINE IS REENTRANT AND EXECUTED ENABLED.
+*
+*NOTES- THE REGISTER USAGE IN THIS MODULE AND THE BSAM END-OF-VOLUME
+*    EXECUTOR MUST REMAIN CONSISTENT.
+*
+*
+*  REGISTER USAGE
+*
+         USING IGG019DB,EPREG
+         USING IHADCB,DCBREG
+         USING IOBDEF,IOBREG
+         USING DEB,DEBREG
+         USING DECBDEF,DECBREG
+*
+WKREG    EQU   0         WORK REGISTER
+PARAM1   EQU   1         PARAMETER REGISTER
+DECBREG  EQU   1         DECB ADDRESS
+DCBREG   EQU   2         DCB ADDRESS
+IOBREG   EQU   3         IOB ADDRESS
+EOVRETRN EQU   4         EOV RETURN ADDRESS
+DEBREG   EQU   5         DEB ADDRESS
+WKREG1   EQU   6         WORK REGISTERS
+WKREG2   EQU   7
+WKREG3   EQU   8
+WKREG4   EQU   9
+CCHH     EQU   9
+WKREG5   EQU   10
+WKREG6   EQU   11
+BASE     EQU   12        BASE OF THIS MODULE
+SAVE     EQU   13        USER'S SAVE AREA
+RETREG   EQU   14        RETURN ADDRESS WHEN ENTERED
+EPREG    EQU   15        ENTRY POINT
+*
+*
+*
+*
+*  ENTRY POINTS TO THIS ROUTINE
+*
+WRTENTRY B     BEGIN                   GO TO BEGINNING OF WRITE CODE
+*
+         DROP  EPREG
+         USING IGG019DB,BASE
+*
+EOVENTRY L     DECBREG,IOBECBPT        LOAD DECB BASE ADDRESS
+         L     BASE,DCBWRITE           SET BASE REGISTER
+         LR    EOVRETRN,RETREG         MOVE RETURN TO EOV ADDRESS
+         B     TSTSZ                   GO DETERMINE TYPE OF WRITE
+*
+*
+BEGIN    SAVE  (14,12)                 SAVE THE USER'S REGISTER
+         L     DCBREG,DECDCBAD         LOAD DCB BASE ADDRESS FROM DECB
+         L     DEBREG,DCBDEBAD         LOAD DEB BASE ADDRESS FROM DCB
+         LR    BASE,EPREG              MOVE ENTRY POINT TO BASE REG.
+         L     IOBREG,DCBIOBA          LOAD CURRENT IOB ADDRESS
+         TS    IOBLINK+4               IS CURRENT IOB AVAILABLE
+         BC    8,OKIOB                 BR YES (PREV RCD DIDN'T FIT TRK)
+*
+         L     IOBREG,IOBLINK          LOAD ADDRESS OF NEXT IOB
+         TS    IOBLINK+4               IF NEXT IOB IS AVAILABLE
+         BC    8,OKIOB                  GO INITIALIZE IT
+*                                      ELSE RETURN WITH ERROR CODE 12
+         LA    15,12
+         B     RETURN
+*
+*
+USEBLKS  LH    WKREG4,DCBBLKSI         USE MAXIMUM LENGTH AS DATA LNG
+         B     ADDKEY                   GO ADD KEY LENGTH
+*
+USELL    LA    WKREG4,0(WKREG1,WKREG3) FIND THE FIRST TWO BYTES OF THE
+         MVC   IOBCSW(2),0(WKREG4)      USER'S RECORD, ALIGN THEM,
+         LH    WKREG4,IOBCSW            USE AS DATA LENGTH.
+         B     ADDKEY                  GO ADD KEY LENGTH
+*
+*
+OKIOB    ST    IOBREG,DCBIOBA          STORE CURRENT IOB ADDRESS IN DCB
+         LA    WKREG,8(0,IOBREG)       STORE ADDRESS OF IOS IOB IN
+         ST    WKREG,DECIOBPT            THE DECB
+         ST    DECBREG,IOBECBPT        STORE DECB ADDRESS IN IOB
+         TM    DCBCIND1,VOLFUL          IS THE VOLUME FULL YET   A46868
+         BO    POSTEOV                  YES, SET EOV BIT AND     A46868
+*                                       RETURN                   A46868
+TSTSZ    TM    DECTYPE+1,WZERO         IS THIS A WRITE R0 REQUEST
+         BC    1,WZERORTN               YES, GO TO WZERO ROUTINE
+         LA    WKREG,IOBCCW1           BE SURE IOBSTART IS
+         ST    WKREG,IOBSTART           RESET TO CCW1
+*
+         SR    WKREG1,WKREG1           INSERT KEY LENGTH FROM THE DCB
+         IC    WKREG1,DCBKEYLE          (MAY BE ZERO)
+         L     WKREG3,DECAREA          LOAD ADDRESS OF OUTPUT AREA
+TSTV     TM    DCBRECFM,UNKWN          IF FORMAT IS VARIABLE
+         BC    8,USELL                  GO USE LL FROM RECORD
+         TM    DECTYPE,SOPT     IF THE OPTION TO USE DCBBLOCK SIZE 6991
+         BC    1,USEBLKS                WAS SPECIFIED, GO USE IT
+         LH    WKREG4,DECLNGTH         USE DECB LENGTH AS DATA LENGTH
+*
+ADDKEY   LA    WKREG2,0(WKREG1,WKREG4) ADD KEY LENGTH + DATA LENGTH
+         STH   WKREG4,IOBDNRCF+6       STORE DATA LNG IN NEW COUNT FLD
+         CLI   IOBCCW1,SETSECT          IS THIS RPS              20201
+         BNE   NOTCARN                  IF NOT, TREAT C.P. AS    20201
+*                                       USUAL                    20201
+         LTR   WKREG2,WKREG2            TEST IF ANY BYTES ARE    20201
+*                                       WRITTEN                  20201
+         BNZ   REALRIT                  YES GO ON                20201
+         NI    IOBCCW4+D4,CCHNOFF       TURN OFF CHAIN BIT       20201
+         B     NEXT01                   BRANCH                   20201
+REALRIT  EQU   *                                                 20201
+         OI    IOBCCW4+D4,CCHN                                   20201
+NEXT01   EQU   *                                                 20201
+         MVC   IOBCCW5+D1(THREE),DECAREA+D1  MOVE AREA TO WRT    20201
+*
+         STH   WKREG2,IOBCCW5+D6        ST KL+DL IN WRT CCW CNT  20201
+         B     CALCLGN                  BRANCH AROUND NON RPS    20201
+*                                       RTN                      20201
+NOTCARN  EQU   *                                                 20201
+         LTR   WKREG2,WKREG2           TEST IF ANY BYTES ARE WRITTEN
+         BC    7,REALRITE              YES GO ON
+         NI    IOBCCW3+4,X'BF'          TURN OFF COMMAND CHAIN BIT
+         B     *+8
+REALRITE EQU   *
+         OI    IOBCCW3+4,CCHN          TURN ON COMMAND CHAIN BIT
+         MVC   IOBCCW4+1(3),DECAREA+1  MOVE AREA TO WRITE CCW ADDRESS
+         STH   WKREG2,IOBCCW4+6        STORE KL+DL IN WRITE CCW COUNT
+*
+*
+*  CALCULATE RECORD LENGTH PLUS OVERHEAD
+*
+CALCLGN  L     WKREG3,DCBDVTBL         LOAD ADDR. OF DADT ENTRY
+         SR    WKREG,WKREG             IF NO KEYS ARE BEING WRITTEN,
+         CLI   DCBKEYLE,0               WKREG WILL CONTAIN THE OVERHEAD
+         BC    7,*+8                     TO BE SUBTRACTED
+         IC    WKREG,OVERK(0,WKREG3)     FOR UNKEYED RECORDS
+         SR    WKREG5,WKREG5
+         IC    WKREG5,OVERL(0,WKREG3)  DEVELOP BYTES NEEDED FOR A
+         TM    BYTEDEV(WKREG3),TBOVHD   TWO BYTE OVERHEAD USED   20201
+         BNO   MZ0010                   BRANCH NO                20201
+         LH    WKREG5,OVERI(WKREG3)     GET TWO BYTE OVERHEAD    20201
+MZ0010   EQU   *                                                 20201
+         AR    WKREG5,WKREG2               LAST RECORD BY
+         SR    WKREG5,WKREG                KL+DL+OVERHEAD.
+*
+         SR    WKREG6,WKREG6              DEVELOP BYTES NEEDED FOR AN
+         IC    WKREG6,OVERI(0,WKREG3)      INTERMEDIATE RECORD BY
+         TM    BYTEDEV(WKREG3),TBOVHD   TWO BYTE OVERHEAD USED   20201
+         BNO   MZ0020                   BRANCH NO                20201
+         LH    WKREG6,OVERI(WKREG3)     GET TWO BYTE OVERHEAD    20201
+MZ0020   EQU   *                                                 20201
+         MH    WKREG2,TOLER(0,WKREG3)       (KL+DL)TOLER+OVERHEAD
+         SRL   WKREG2,9
+         AR    WKREG6,WKREG2
+         SR    WKREG6,WKREG
+*                              WKREG5 = SIZE OF A LAST RECORD ON TRACK
+*                              WKREG6 = SIZE OF AN INTERMEDIATE RECORD
+*
+*
+         TM    DCBCIND2,WZEROBIT       WAS PREVIOUS WRITE A WRITE R0
+         BC    1,WZEROFF                YES, GO INCREMENT TO NEXT TRACK
+*
+         CH    WKREG5,DCBTRBAL         DOES RECORD FIT AS LAST ON TRACK
+         BC    2,FULLTRK                NO, USE RETURN CODE OF 4
+*
+*   UPDATE DCB FIELDS
+*
+FITS     LH    WKREG3,DCBTRBAL         DECREMENT TRACK BALANCE BY
+         SR    WKREG3,WKREG6            THE SIZE OF AN
+         STH   WKREG3,DCBTRBAL          INTERMEDIATE RECORD
+         MVC   IOBSEEK(8),DCBFDAD      MOVE PRIOR RECORD AS SEARCH ARG
+         IC    WKREG3,DCBFDAD+7        INCREMENT THE R BYTE
+         LA    WKREG3,1(0,WKREG3)       OF MBBCCHHR
+         STC   WKREG3,DCBFDAD+7         BY ONE
+         MVC   IOBDNRCF(5),DCBFDAD+3   MOVE CURRENT CCHHR TO NEW COUNT
+*
+         BAL   WKREG1,EXCP             GO SCHEDULE THIS WRITE AND
+*                                       TEST FOR ENTRY FROM EOV
+*
+NORMAL   SR    15,15
+*
+RETURN   RETURN (14,12),T,RC=(15)      RETURN TO THE USER
+*
+*
+*
+SETEOV   OI    DCBCIND1,VOLFUL         MARK DCB SO FUTURE REQ.S BYPASS
+         BCTR  WKREG3,0                 RESTORE DCBFDAD           12987
+         STC   WKREG3,DCBFDAD                                     12987
+POSTEOV  OI    IOBLINK,EOVBIT          MARK IOB AS NOT SCHEDULED BY IOS
+         B     NORMAL                  RETURN TO THE USER
+*
+*  WRITE ZERO ROUTINE
+*
+WZERORTN LA    WKREG1,IOBCCW5          RESET START ADDR. TO SEARCH R0
+         CLI   IOBCCW1,SETSECT          IS RPS FEATURED          20201
+         BNE   NONCARN                  IF NOT, SKIP RPS RTN     20201
+         LA    WKREG1,IOBCCW7           RESET START ADDR TO SET  20201
+*                                       SECT                     20201
+         TM    DCBOPTCD,WRTCHK            CCW7 FOR NO WRTCHK     20201
+*                                       WHITH REC                20201
+         BZ    SETCHAIN                   REDY. ELSE START ADDR  20201
+*                                       IS                       20201
+         LA    WKREG1,IOBCCW11            CCW11 FOR WRT CHK WITH 20201
+*                                       REC                      20201
+SETCHAIN OI    D28(WKREG1),CCHN          REDY. ALSO SET COMMAND  20201
+         OI    D60(WKREG1),CCHN          CHAINS FOR VERIFY AND   20201
+*                                         ERASE AND BR AROUND
+         B     SKPUSUAL                   USUAL WRT0 RTN         20201
+NONCARN  EQU   *                                                 20201
+         TM    DCBOPTCD,WRTCHK          CCW. IF WRITE CHECK IS NOT
+         BC    8,SETCCHN                SPECIFIED ADDRESS IS CCW5
+         LA    WKREG1,IOBCCW8           ELSE START ADDRESS IS CCW8
+SETCCHN  OI    20(WKREG1),CCHN          TURN ON VERIFY COMMAND CHAIN
+         OI    44(WKREG1),CCHN           AND ERASE COMMAND CHAIN
+SKPUSUAL EQU   *                                                 20201
+         ST    WKREG1,IOBSTART          STORE STARTING ADDRESS IN IOB
+         TM    DCBCIND2,WZEROBIT       SHOULD THIS WRITE ERASE TRACK
+         BC    1,UPTRACK                YES, GO INCREMENT TRACK NUMBER
+         CLI   DCBFDAD+7,0             FIRST WRITE MAY BE TO WRITE R0
+         BC    8,TURNONR0               IF SO, ERASE TRACK ONE
+         CLI   IOBCCW1,SETSECT          IS RPS FEATURED          20201
+         BNE   NOTRECR                  BRANCH IF NOT            20201
+         NI    D60(WKREG1),SILSKP       TURN OFF ERASE CC        20201
+         TM    DCBOPTCD,WRTCHK          IS WRT CHK SPECIFIED     20201
+         BO    TURNONR0                 YES, GO SET UP WRITE     20201
+         NI    D28(WKREG1),SILSKP       TURN OFF VERIFY C.C.     20201
+         B     TURNONR0                 BRANCH AROUND NON RPS    20201
+*                                       RTN                      20201
+NOTRECR  EQU   *                                                 20201
+         NI    44(WKREG1),X'30'         TURN OFF ERASE COMMAND CHAIN
+         TM    DCBOPTCD,WRTCHK          IS WRITE CHECK SPECIFIED
+         BC    1,TURNONR0                YES, GO SET UP TO WRITE.  NO,
+         NI    20(WKREG1),X'30'         TURN OFF VERIFY COMMAND CHAIN
+*
+TURNONR0 MVC   IOBR0CNT(4),DCBFDAD+3   MOVE CCHH0 TO R0 COUNT
+         MVC   IOBR0DAT(5),DCBFDAD+3   MOVE CCHHR AS HIGHEST ID ON TRK
+         MVC   IOBR0DAT+5(2),DCBTRBAL  MOVE TRBAL AS BYTES REMAINING
+         MVC   IOBSEEK,DCBFDAD         MOVE CURRENT ADDR AS SEEK ADDR
+         OI    DCBCIND2,WZEROBIT       SET- LAST I/O WAS A WRITE R0 BIT
+*
+         BAL   WKREG1,EXCP             GO SCHEDULE THIS WRITE AND
+*                                       TEST FOR ENTRY FROM EOV
+*
+         SR    WKREG2,WKREG2           FIND LAST EXTENT IN THE DEB
+         IC    WKREG2,DEBNMEXT          BY NUMBER OF EXTENTS
+         BCTR  WKREG2,0                  MINUS ONE
+         SLL   WKREG2,4                 TIMES 16
+         AR    WKREG2,DEBREG            PLUS DEB BASE ADDRESS
+         CLC   DCBFDAD+3(4),DEBENDCC-DEB(WKREG2)  IS THIS LAST TRACK
+         BC    7,NORMAL                 NO, USE RETURN CODE OF 0
+*
+EOV      LA    15,8          SET RETURN CODE-LAST TRACK WRITTEN
+         B     RETURN         GO BACK TO THE USER
+*
+*
+FULLTRK  MVI   IOBLINK+4,0             MARK THIS IOB AVAILABLE AGAIN
+         LA    15,4                    SET RETURN CODE-TRACK IS FULL
+         B     RETURN                  GO BACK TO THE USER
+*
+*
+*   INCREMENT TRACK ADDRESS BY 1 AND CHECK VALIDITY
+*
+WZEROFF  XI    DCBCIND2,WZEROBIT       TURN OFF WRITE R0 FLAG
+UPTRACK  L     WKREG1,DCBDVTBL         LOAD ADDRESS OF DADT ENTRY
+         MVC   IOBCSW(4),MAXCC(WKREG1) MOVE NO. OF CYL.S, TRACKS TO IOB
+         MVC   IOBCSW+4(4),DCBFDAD+3   MOVE CURRENT CCHH FOR ALIGNMENT
+         MVC   DCBTRBAL,TRKL(WKREG1)   RESET TRACK BALANCE TO FULL AMT
+         SR    WKREG2,WKREG2
+         IC    WKREG2,DCBFDAD          DEVELOP POINTER TO CURRENT
+         SLL   WKREG2,4                 EXTENT IN THE DEB
+         AR    WKREG2,DEBREG
+         LA    IOBREG,0(0,IOBREG)      BE SURE HI-ORDER BYTE IS ZERO
+         LA    WKREG3,3(0,IOBREG)       SET CCHH VALUE TO HH      12748
+         L     CCHH,IOBCSW+4           LOAD CURRENT CCHH TO AN ACCUM.
+         TM    BYTEDEV(WKREG1),BYTE     ARE BYTES NON-CONTIGUOUS  12748
+         BZ    DOWNONE                  BRANCH IF CONTIGUOUS      12748
+ADDONE   AH    CCHH,ONE                ADD ONE TO THE LO-ORDER BYTE
+         TM    BYTEDEV(WKREG1),BYTE    ARE BYTES NON-CONTIGUOUS
+         BC    1,USEBYTE                YES, TREAT EACH SEPARATELY
+         STH   CCHH,IOBCSW+4-IOBDEF(0,WKREG3)     STORE NEW CC OR HH
+         CLC   IOBCSW+4-IOBDEF(2,WKREG3),IOBCSW-IOBDEF(WKREG3)
+*                                                 CHECK FOR VALID VALUE
+         BC    4,TSTEXT                ADDRESS VALID, CHECK EXTENT
+         SRL   CCHH,16                 SHIFT TO CC VALUE
+         XC    IOBCSW-IOBDEF+4(2,WKREG3),IOBCSW-IOBDEF+4(WKREG3)  12748
+*        ZERO THE BYTES PROCESSED                                 12748
+*                                                OF CCHH
+         BCTR  WKREG3,0                DECREMENT THE CCHH INDEX
+DOWNONE  BCTR  WKREG3,0
+         CR    WKREG3,IOBREG           HAVE ALL BYTES BEEN PROCESSED
+         BC    10,ADDONE                NO, LOOP TO ADD ONE TO NEXT BYT
+*
+NEXTEXT  IC    WKREG3,DCBFDAD          INCREMENT M AND SEE IF THIS WAS
+         LA    WKREG3,1(0,WKREG3)       THE LAST EXTENT.
+         STC   WKREG3,DCBFDAD
+         CLC   DCBFDAD(1),DEBNMEXT
+         BC    8,SETEOV                 YES, GO SET EOV BIT
+*
+         LA    WKREG2,16(0,WKREG2)     INCREMENT TO NEXT EXTENT
+         MVC   DCBFDAD+1(6),DEBBINUM-DEB(WKREG2) MOVE BBCCHH TO DCB
+RESETBAL MVI   DCBFDAD+7,0             MOVE A ZERO TO R BYTE
+         TM    DECTYPE+1,WZERO         THIS A WRITE ZERO REQUEST
+         BC    1,TURNONR0               YES GO TO SET UP FOR WRITE R0
+         CH    WKREG5,DCBTRBAL         WILL THE NEW TRACK HOLD ONE RCD.
+         BC    12,FITS                  YES, GO UPDATE DCB
+ABEXIT   DMABCOND  205,SVC=YES,DCB=(DCBREG) BR PROB DET TO ABEND Y02072
+*
+USEBYTE  STC   CCHH,IOBCSW+4-IOBDEF(0,WKREG3) STORE AND           12748
+         SRL   CCHH,8                   SHIFT TO THE NEXT ONE
+         CLC   IOBCSW+4-IOBDEF(1,WKREG3),IOBCSW-IOBDEF(WKREG3)    12748
+*                                               THIS BYTE VALID
+         BC    4,TSTEXT                YES, GO CHECK EXTENT LIMIT
+         MVI   IOBCSW+4-IOBDEF(WKREG3),0  ZERO INVALID BYTE       12748
+         BC    15,DOWNONE               GO LOOK AT THE NEXT ONE
+*
+TSTEXT   CLC   IOBCSW+4(4),DEBENDCC-DEB(WKREG2) ADDRESS WITHIN EXTENT
+         BC    2,NEXTEXT               NO, SEE IF THERE'S ANOTHER EXT
+         MVC   DCBFDAD+3(4),IOBCSW+4   YES, MOVE NEW CCHH TO DCB
+         BC    15,RESETBAL              AND GO RESET TRACK BALANCE
+*
+*
+EXCP     EQU   *
+         LA    PARAM1,8(0,IOBREG)      SET IOS IOB PARAMETER
+         EXCP  (1)
+*
+*
+EOVTST   TM    IOBLINK,EOVBIT          IF ENTERED BY A WRITE MACRO
+         BCR   8,WKREG1                 RETURN TO THE BAL+4
+*
+         NI    IOBLINK,NOTEOV
+EOVEXIT  EQU   *
+         BR    EOVRETRN                 ELSE RETURN TO EOV
+         EJECT
+*
+ONE      DC    H'1'      CONSTANT ONE
+CCHN     EQU   X'40'     COMMAND CHAIN FLAG
+SILI     EQU   X'20'     SUPPRESS INCORRECT LENGTH FLAG
+WRTCHK   EQU   X'80'     WRITE CHECK OPTION
+UNKWN    EQU   X'80'     UNKNOWN FORMAT
+NOTEOV   EQU   X'7F'     ALL BITS EXCEPT EOV FLAG
+SOPT     EQU   X'80'          LENGTH CODED AS 'S'                  6991
+WZERO    EQU   X'04'     TYPE WRITE R0
+WZEROBIT EQU   X'40'     LAST I/O WAS WRITE R0
+EOVBIT   EQU   X'80'     THIS WRITE NOT SCHEDULED BECAUSE OF EOV
+VOLFUL   EQU   X'20'     VOLUME FULL BIT
+*
+* RPS DEVELOPED CONSTANTS AND EQUATES
+*
+SETSECT  EQU   X'23'     SET SECTOR TEST BYTE                    20201
+SILSKP   EQU   X'30'                    TURNS OFF DC AND CC      20201
+CCHNOFF  EQU   X'BF'                    TURNS OFF C. C.          20201
+*
+TBOVHD   EQU   X'08'                    TWO BYTE OVERHEAD INDIC  20201
+*
+D0       EQU   0                        ZERO DISPLACEMENT        20201
+D1       EQU   1                        ONE BYTE DISPLACEMENT    20201
+THREE    EQU   3                        THREE BYTES              20201
+D4       EQU   4                        4 BYTE DISPLACEMENT      20201
+D6       EQU   6                        6 BYTE DISPLACEMENT      20201
+D8       EQU   8                        8 BYTE DISPLACEMENT      20201
+D28      EQU   28                       28BYTE DISPLACEMENT      20201
+D60      EQU   60                       60BYTE DISPLACEMENT      20201
+*
+*      DIRECT ACCESS DEVICE TABLE DEFINITION
+BYTE     EQU   2         BYTES OF  CCHH ARE NON-CONTIGUOUS
+OVERK    EQU   8         OFFSET TO KEY OVERHEAD
+OVERI    EQU   6                   INTERMEDIATE RECORD OVERHEAD
+OVERL    EQU   7                   LAST RECORD OVERHEAD
+TOLER    EQU   10                  TOLERANCE FACTOR
+TRKL     EQU   4                   BYTES ON TRACK
+MAXCC    EQU   0                   NO. OF CYLINDERS, TRACKS
+BYTEDEV  EQU   9                   FLAG, BYTES ARE NON-CONTIGUOUS
+         DC    C'IGGR'                  THIS IS A ROTATIONAL     20201
+*                                         POSITION SENSING
+*                                         MODULE
+PATCH    DC    XL50'0'                  PATCH AREA               Y02072
+         EJECT
+**********************************************************************
+*    CONTROL BLOCK DEFINITIONS FOLLOW
+**********************************************************************
+         DCBD  DSORG=(PS),DEVD=(DA)
+*
+**********************************************************************
+*
+DECBDEF  DSECT     DATA EVENT CONTROL BLOCK
+DECSDECB DS    F         STANDARD ECB
+DECTYPE  DS    CL2       TYPE AND OPTIONS
+DECLNGTH DS    CL2       DATA LENGTH
+DECDCBAD DS    F         DCB ADDRESS
+DECAREA  DS    F         AREA ADDRESS
+DECIOBPT DS    F         IOB ADDRESS
+DECKYADR DS    F
+DECOFSET DS    CL2
+DECRESPN DS    CL1
+         SPACE 2
+*
+**********************************************************************
+*
+         SPACE 2
+IOBDEF   DSECT      I/O BLOCK DEFINITION
+IOBLINK  DS    F         IOB LINK ADDRESS
+IOBIOBA  DS    F         IOB ADDRESS FOR EOV
+IOBFLAG1 DS    CL1       ERROR FLAG 1
+IOBFLAG2 DS    CL1       ERROR FLAG 2
+IOBSENSE DS    CL2       I/O SENSE BITS
+IOBECBPT DS    F         ECB ADDRESS
+IOBCSW   DS    D         CSW STORED BY IOS
+IOBSIOCC DS    0BL1      SIO CONDITION CODE
+IOBSTART DS    F         CHANNEL PROGRAM STARTING CCW
+IOBDCBPT DS    F         DCB ADDRESS
+IOBRESTR DS    F         CHANNEL PROGRAM RESTART ADDRESS
+IOBINCAM DS    CL2       BLOCK INCREMENT AMOUNT
+IOBERRCT DS    CL2       ERROR COUNTS
+IOBSEEK  DS    D         SEEK ADDRESS
+IOBDNRCF DS    D         NEW RECORD COUNT FIELD
+IOBR0CNT DS    D         COUNT FIELD OF R0
+IOBR0DAT DS    D         DATA FIELD OF R0
+IOBCCW1  DS    D         FIRST CCW OF CHANNEL PROGRAM
+IOBCCW2  DS    D
+IOBCCW3  DS    D
+IOBCCW4  DS    D
+IOBCCW5  DS    D
+IOBCCW6  DS    D
+IOBCCW7  DS    D
+IOBCCW8  DS    D
+IOBCCW9  DS    D
+IOBCCW10 DS    D
+IOBCCW11 DS    D
+IOBCCW12 DS    D
+IOBCCW13 DS    D
+IOBCCW14 DS    D         LAST CCW OF LONGEST CHANNEL PROGRAM
+*
+**********************************************************************
+*
+*
+DEB      DSECT
+         DS    0F
+DEBNMSUB DS    0CL1
+DEBTCBAD DS    CL4
+DEBAMLNG DS    0CL1
+DEBDEBAD DS    CL4
+DEBOGLGS DS    0CL1
+DEBIRBAD DS    CL4
+DEBOPATB DS    0CL1
+DEBSYSPG DS    CL4
+DEBNMEXT DS    0CL1
+DEBUSRPG DS    CL4
+DEBPRIOR DS    0CL1
+DEBECBAD DS    CL4
+DEBPROTG DS    0CL1
+DEBDEBID DS    0CL1
+DEBDCBAD DS    CL4
+DEBEXSCL DS    0CL1
+DEBAPPAD DS    CL4
+DEBDVMOD DS    0CL1
+DEBUCBAD DS    CL4
+DEBBINUM DS    CL2
+DEBSTRCC DS    CL2
+DEBSTRHH DS    CL2
+DEBENDCC DS    CL2
+DEBENDHH DS    CL2
+DEBNMTRK DS    CL2
+DEBSUBID EQU   0         SUBROUTINE ID'S
+         END

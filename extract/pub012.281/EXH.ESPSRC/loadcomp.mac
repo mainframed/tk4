@@ -1,0 +1,1272 @@
+LCOMP    TITLE 'L O A D C O M P  ***  COMPARE TWO LOAD MODULES'  87258
+         MACRO ,
+&NM      LIBDEF &N=,&DSECT=
+         AIF   ('&DSECT' EQ '').NODS
+&DSECT   DSECT ,
+.NODS    ANOP  ,
+          DS    0D             MALIGN                           GP15136
+NAME&N    DS    CL8          MODULE NAME
+LABEL&N   DS    CL8          LABEL IN MODULE
+NUMBER&N  DS    XL4          NUMBER (OFFSET) INTO NAME/LABEL
+LENGTH&N  DS    F            LENGTH OF MODULE
+ADDRESS&N DS    A            ADDRESS OF MODULE
+COMPADR&N DS    A    1/2     ADDRESS OF COMPARE
+COMPLEN&N DS    F    2/2     LENGTH OF COMPARE
+BLDL&N    DS    20F          BLDL LIST                          GP15136
+I&N       DCB   DDNAME=*,DSORG=PO,MACRF=R   PDS DCB
+DDN&N     DS    CL8          DD NAME                            GP15136
+DSN&N     DS    CL44         DATA SET NAME                      GP15136
+VOL&N     DS    CL6          VOLUME SERIAL                      GP15136
+         MEND  ,
+         SPACE 1
+         MACRO
+         RCRD  &A,&B
+         ORG   TRTTABLE+X'&A'
+         DC    X'&B'
+         ORG   ,
+         MEND
+         SPACE 2
+         PUNCH ' ORDER LOADCOMP(P) '   MAKE DUMPS EASIER        GP15136
+         SPACE 1
+         COPY  ASMOPTS                                          \
+         SPACE 1
+         ASMPARM LIST=NO                                        \
+         EJECT ,
+***********************************************************************
+*                                                                     *
+*        PROGRAM: COMPARES TWO LOAD MODULES OR PARTS OF LOAD MODULES. *
+*                    PROGRAM COMPARE FROM CB&T TAPE FILE 149          *
+*        METHOD:  ACTS AS A PSEUDO-LOADER.  BUYS AND CLEARS TWO CORE  *
+*                 AREAS INTO WHICH THE MODULES' TEXT BLOCKS ARE READ. *
+*                 RELOCATABLE REFERENCES ARE RESOLVED USING A COMMON  *
+*                 EXTERNAL SYMBOL TABLE TO SOLVE THE PROBLEMS OF      *
+*                 DIFFERENT CSECT ORDER AND DIFFERENT LOAD POINTS.    *
+*                                                                     *
+*        ATTRIB:  REENTRANT, REUSABLE.                                *
+*                                                                     *
+*        MISSING: CAN'T HANDLE OVERLAY MODULES.                       *
+*                                                                     *
+*        AUTHOR:  LOU P. RIVAS  -  UCLA/CCN.                JUNE 1977 *
+*          CHANGED BY G. POSTPISCHIL                        FEB. 2008 *
+*                                                                     *
+*                                                                     *
+*        PARM='NAME1(OFFSET1),NAME2(OFFSET2),COUNT'                   *
+*  (IF PARM IS OMITTED THEN ALL MODULES ON I1 WILL BE COMPARED        *
+*   WITH CORRESPONDING NAMED MODULES IN I2 AND WTO'S WILL BE DONE     *
+*   TO DDNAME 'SUMPRINT')                                             *
+*                                                                     *
+* --> TTRL XCTL TABLES WILL BE MODIFIED SO DIFFERENT TTRL'S WILL      *
+*     MATCH. (MODULE IS DETERMINED TO HAVE TTRL'S BY MODULE NAME)     *
+*                                                                     *
+*        //I1       DD ...              PDS WITH LOAD MODULE NAME1.   *
+*        //I2       DD ...              PDS WITH LOAD MODULE NAME2.   *
+*        //SUMPRINT DD SYSOUT=A,...     WTO FILE IF NO PARM (ALL)     *
+*        //SNAP     DD SYSOUT=A,...     OUTPUT FILE/MISMATCHES+SNAP.  *
+*        //SYSPRINT DD SYSOUT=A,...     OPTIONAL OUTPUT (NO SNAP).    *
+*                                                                     *
+*        (OFFSET#) IS OPTIONAL AND TAKES THE FORM:                    *
+*               (LABEL) WHERE 'LABEL' IS A CSECT OR ENTRY IN NAME#.   *
+*               (+NUMBER) WHERE 'NUMBER' IS AN OFFSET INTO THE NAME#; *
+*                   'NUMBER' IS ASSUMED HEX AND 'NUMBER.' IS DECIMAL. *
+*               (LABEL+NUMBER) WHICH IS THE OFFSET INTO THE LABEL.    *
+*                                                                     *
+*        COUNT IS OPTIONAL AND TAKES THE FORM 'NUMBER.' OR 'NUMBER'.  *
+*               IF COUNT IS NOT SPECIFIED, THE NUMBER OF BYTES THAT   *
+*               ARE COMPARED IS THE LARGER OF THE TWO MODULE LENGTHS  *
+*               OR THE LARGER OF THE TWO CSECT LENGTHS IF BOTH        *
+*               (OFFSET#) SPECIFY CSECTS, ADJUSTED BY THE LENGTH IN   *
+*               (OFFSET#) AS APPROPRIATE.  COUNT CAN ONLY BE USED TO  *
+*               REDUCE THE COMPARE LENGTH.                            *
+*                                                                     *
+*        IF ANY 'NUMBER' IS INVALID (E.G. OUTSIDE MODULE OR CSECT),   *
+*        IT IS IGNORED.  IF 'LABEL' IS NOT FOUND, IT IS IGNORED.      *
+*                                                                     *
+*        SYNTACTICAL ERRORS WILL CAUSE A 'PARM INVALID' ERROR         *
+*        MESSAGE.  WRONG PARAMETERS WILL CAUSE UNPREDICTABLE RESULTS. *
+*                                                                     *
+* RETURN CODES: 00 - ALL MODULE(S) COMPARED SUCCESSFULLY              *
+*               04 - COMPARE FAILED (AT LEAST 1 IF 'ALL)              *
+*               08 - INITIALIZATION FAILED (LAST MODULE IF 'ALL')     *
+*                                                                     *
+***********************************************************************
+         EJECT
+***********************************************************************
+*                                                                     *
+*        FLOW OF CONTROL:                                             *
+*                                                                     *
+*          1) ENTER, BUY WORK AREA, AND CHAIN SAVE AREAS.             *
+*          2) PARSE PARM STRING.                                      *
+*          3) 'OPEN' FILES.                                           *
+*          4) 'BLDL', GET CORE FOR TEXT BLOCKS, AND 'FIND' MEMBER.    *
+*          5) CLEAR TEXT BUFFER AND 'READ' ALL MEMBER BLOCKS.         *
+*             A) CLEAR TEXT BUFFER; LENGTH IS FROM BLDLSIZE.          *
+*             B) SET FLAG INDICATING "NOTE LIST" PRESENT.             *
+*             C) IF FIRST RECORD IS TEXT, GO READ IT (AT III).        *
+*             D) READ NON-TEXT RECORD.                                *
+*                I) IF EOF THEN CLEAR LABEL IF NOT FOUND AND DONE.    *
+*               II) IF "NOTE LIST" RECORD THEN IGNORE IT.             *
+*              III) IF CONTROL THEN READ NEXT TEXT RECORD.            *
+*               IV) IF CESD THEN RESOLVE LABEL AND BUILD COMMON ESD.  *
+*                V) IF RLD THEN RESOLVE RELOCATABLE REFERENCES.       *
+*          6) USE OFFSET# AND COUNT TO INITIALIZE FOR COMPARE LOOP.   *
+*          7) COMPARE TEXT BUFFERS BYTE BY BYTE; OUTPUT EACH UNEQUAL. *
+*          8) 'SNAP' TEXT BUFFERS IF ANY UNEQUALITIES.                *
+*          9) FREE TEXT BUFFERS, 'CLOSE' FILES, AND EXIT.             *
+*                                                                     *
+***********************************************************************
+         EJECT
+***********************************************************************
+*                                                                     *
+* UPDATES: 001 - 11/22/78 - 1) ALLOW DDNAME=SYSPRINT AS OPTIONAL      *
+*                              OUTPUT FILE (REPLACES DDNAME=SNAP).    *
+*                              IF SYSPRINT USED, THEN DO MISMATCH     *
+*                              LOGGING, BUT DON'T DO PSEUDO-SNAP.     *
+*                           2) IF OUTPUT FILE (SNAP OR SYSPRINT) IS   *
+*                              ALLOCATED TO TSO AS TERMFILE: 1) DON'T *
+*                              OPEN FILE, AND 2) FAKE OUT WRITES TO   *
+*                              GO TO CODE THAT TPUTS THE RECORDS.     *
+*                           3) REMOVE MAIN STORAGE ADDRESSES FROM     *
+*                              MISMATCH LINE SINCE REAL SNAP NO       *
+*                              LONGER USED.                           *
+*          002 - 09/11/79 - 1) FIX 4MEG CONSTANT DEPENDENCY.          *
+*                           2) FIX XCTL TTR RESOLUTION CODE TO        *
+*                              HANDLE SUBLISTS.                       *
+*          003 - 04/23/80 - 1) CONVERT TO MVS.                        *
+*          004 - 12/31/80 - 1) FIX UNPK 0C4 BUG.                      *
+*                           2) ADD TWO NEW RETURN CODES:              *
+*                              04 - COMPARE FAILED.                   *
+*                              08 - INITIALIZATION FAILED.            *
+*          005 - 12/17/81 - 1) FIX UNFINDABLE CSECT BUG - (1 BIT CHG) *
+*                                                                     *
+***********************************************************************
+         EJECT
+         PRINT &PRTSOR                                          GP15136
+LOADCOMP PGMHEAD ZERO31,BASE=(R12,R11),PARM=R9,BNDRY=PAGE,RM=24 GP15136
+         SERVINIT ,          GET @SERVICE ROUTINES              GP15136
+         SERVLOAD @PRINTER      LOAD PRINTER                    GP15136
+         BANDAID INIT                                           GP15136
+         SPACE 1
+STABCESD EQU   1000                     NUMBER OF CESD TABLE ENTRIES
+         SPACE 1
+         PRTOPEN SYSPRINT,DEV=1,OPT=NOWTO  EITHER PRINT AVAIL?  GP15136
+         CH    R15,=H'4'     IS SYSPRINT PRESENT ?              GP15136
+         BL    PRTALL        SNAP IS - PRINT AND SNAP ALL       GP15136
+         BE    PRTSHORT      SYSPRINT - SUPPRESS SNAPS          GP15136
+         OI    FLAGS,FG#SUM   SUPPRESS OUTPUT
+PRTSHORT OI    FLAGS,FG#NSNAP SUPPRESS SNAPS
+PRTALL   MVICC 8,RESULT=RETCODE         SET INIT FAILED RETCODE     004
+         MVC   I1(DCBPOX),DCBPO         INITIALIZE FIRST DCB
+         MVC   I2(DCBPOX),DCBPO         INITIALIZE SECOND DCB
+         MVI   I2+DCBDDNAM+1-IHADCB,C'2'  AND CORRECT THE DD NAME
+         MVC   DDN1,I1+DCBDDNAM-IHADCB  SAVE DD NAME OVER OPEN  GP15136
+         MVC   DDN2,I2+DCBDDNAM-IHADCB  SAVE DD NAME OVER OPEN  GP15136
+         L     R15,=A(DECBRW)  GET DECB PATTERN                  87258
+         MVC   DECB(DECBX),0(R15)       INITIALIZE DECB          87258
+         LA    R1,CESDTAB    GET TABLE START                    GP15136
+         A     R1,=A(COMMNAME-CESDTAB)  END                     GP15136
+         ST    R1,@CESDEND   SAVE END FOR FASTER COMPARE        GP15136
+         LA    R1,I1         INPUT DCB 1                        GP15136
+         LA    R2,I2         INPUT DCB 2                        GP15136
+         STM   R1,R2,DCBOLIST           BUILD OPEN LIST         GP15136
+         MVI   DCBOLIST+4,X'80'         SET TWO DCB INPUT OPEN  GP15136
+         MVI   PRELINE,C' '  SET FOR FAST BLANKING OF OUTLINE   GP15136
+         SPACE 1
+         SERVCALL RJFCB,DDN1 GET JFCB FOR I1                    GP15136
+         MVC   DSN1,JFCBDSNM-INFMJFCB(R1)    DATA SET NAME      GP15136
+         MVC   VOL1,JFCBVOLS-INFMJFCB(R1)    VOLUME SERIAL      GP15136
+         SERVCALL RJFCB,DDN2 GET JFCB FOR I2                    GP15136
+         MVC   DSN2,JFCBDSNM-INFMJFCB(R1)    DATA SET NAME      GP15136
+         MVC   VOL2,JFCBVOLS-INFMJFCB(R1)    VOLUME SERIAL      GP15136
+         SPACE 1
+         N     R9,=XL4'00FFFFFF'        PARM POINTER WORD THERE ?   002
+         BZ    ERR1                     NO, GO TELL USER
+         L     R9,0(,R9)                LOAD PARM ADDRESS
+         N     R9,=XL4'00FFFFFF'        ANY PARM ?                  002
+         BZ    ERR1                     NO, GO TELL USER
+         LH    R8,0(,R9)                LOAD PARM LENGTH
+         LTR   R8,R8                    ANY PARM ?
+         BNZ   HAVEPARM                 YES, GO PROCESS IT
+         OI    FLAGS,FG#ALL  NO PARM - PROCESS ALL MEMBERS      GP15136
+         PRTOPEN SUMPRINT,DEV=2,OPT=NOWTO  SUMMARY FILE         GP15136
+         B     OPEN                     GO OPEN DATA SETS
+         SPACE 1
+HAVEPARM CH    R8,=H'3'                 LONG ENOUGH ?
+         BL    ERR2                     NO, GO TELL USER
+         LA    R9,2(,R9)                POINT TO PARM PROPER
+         STM   R8,R9,DB2                SAVE FOR SINGLE PARM    GP15136
+         LA    R3,NAME1                 WHERE TO PUT FIRST NAME
+         BAL   R14,GETNAME              GO MOVE IT IN
+         LTR   R8,R8                    BACK WITH NOTHING LEFT ?
+*OLD*    BZ    ERR2                     YES, GO TELL USER
+         BP    DONEONCE      OK IF MORE                         GP15136
+         LM    R8,R9,DB2                FAKE FOR SINGLE PARM    GP15136
+DONEONCE LA    R3,NAME2                 WHERE TO PUT SECOND NAME
+         BAL   R14,GETNAME              GO MOVE IT IN
+         LTR   R8,R8                    BACK WITH NOTHING LEFT ?
+         BZ    OPEN                     YES, NO COUNT FIELD
+         BAL   R15,GETNUMB              GO CONVERT THE COUNT
+         ST    R0,COUNT                 SAVE IT
+         SPACE 1
+OPEN     PRTL  '#                      LOAD MODULE COMPARE',TITLE=1,   *
+               DEV=(1,2)     PLACE TITLE ON EACH OUTPUT FILE    GP15136
+ OI    FLAGS,FG#LINE        USE LINE MODE COMPARE  **NEED PARM**
+         OPEN  (I1,,I2,,),MF=(E,DCBOLIST)  OPEN PDSs            GP15136
+         TM    I1+DCBOFLGS-IHADCB,DCBOFOPN OPEN ?
+         BNZ   OPENPDS1                 NO                      GP15136
+         PRTL  ' OPEN FOR I1 DD FAILED',DEV=(1,2)               GP15136
+         B     ALLDONE                                          GP15136
+OPENPDS1 TM    I2+DCBOFLGS-IHADCB,DCBOFOPN OPEN ?
+         BNZ   OPENPDS2                 NO                      GP15136
+         PRTL  ' OPEN FOR I2 DD FAILED',DEV=(1,2)               GP15136
+         B     ALLDONE                                          GP15136
+         SPACE 1
+OPENPDS2 TM    FLAGS,FG#ALL             PROCESSING ALL MEMBERS?     001
+         BZ    NOTALL                   NO - BRANCH                 001
+ALLLOOP  L     R15,=A(GETENT)           @ GETENT ROUTINE
+         BALR  R14,R15                  GO GET MODULE NAME
+         SPACE 2
+NOTALL   XC    BLDL1+12(12),BLDL1+12     CLEAR FLAGS            GP15145
+         XC    BLDL2+12(12),BLDL2+12     CLEAR FLAGS            GP15145
+         LA    R10,NAME1                DO FIRST ONE
+         LA    R3,ERR3                  ERROR EXIT
+         BAL   R4,BLDLFIND              GO GET CORE FOR MODULE
+         LA    R10,NAME2                DO SECOND ONE
+         LA    R3,ERR4                  ERROR EXIT
+         BAL   R4,BLDLFIND              GO GET CORE FOR MODULE
+         LA    R10,NAME1                DO FIRST ONE
+         BAL   R4,CLEAREAD              GO READ IN MODULE
+         LA    R10,NAME2                DO SECOND ONE
+         BAL   R4,CLEAREAD              GO READ IN MODULE
+         LA    R10,NAME1                                        GP15136
+         PRTLIST TITDSN,DEV=(1,2),TITLE=3 SHOW 1ST TITLE        GP15136
+         LA    R10,NAME2                                        GP15136
+         PRTLIST TITDSN,DEV=(1,2),TITLE=4 SHOW 2ND TITLE        GP15136
+         SPACE 1
+         L     R15,=A(SUP)              BASE FOR IOSUP ROUTINE
+         LA    R1,NAME1                 GO FIX TTRL'S MODULE 1
+         BALR  R14,R15
+         LA    R1,NAME2                 AND MODULE 2
+         BALR  R14,R15
+         SPACE 2
+         LM    R6,R7,COMPADR1     FIRST MODULE START/LENGTH     GP15136
+         LM    R8,R9,COMPADR2     SECOND MODULE START/LENGTH    GP15136
+         A     R6,NUMBER1               ADJUST FIRST MODULE
+         A     R8,NUMBER2               ADJUST SECOND MODULE
+         S     R7,NUMBER1               ADJUST FIRST LENGTH
+         S     R9,NUMBER2               ADJUST SECOND LENGTH
+         OC    COUNT,COUNT              COMPARE LENGTH SPECIFIED ?
+         BZ    NOCOUNT                  NO
+         MIN   R7,COUNT                 NEED TO ADJUST AGAIN ?
+         MIN   R9,COUNT                 NEED TO ADJUST AGAIN ?
+         SPACE 2
+NOCOUNT  XR    R2,R2                    INDICATE NO OUTPUT YET
+         ST    R7,LENCLCL1   SAVE DESIRED LENGTH                GP15136
+         ST    R9,LENCLCL2   SAVE DESIRED LENGTH                GP15136
+         MIN   (R7),(R9)     USE SMALLER FOR COMPARES           GP15136
+         LA    R4,1          FLAG; ALSO USEFUL CONSTANT
+         SPACE 1
+COMPLOOP LTR   R7,R7         ANY MORE TO DO ?                   GP15136
+         BNP   DONECOMP      NO                                 GP15136
+COMPLUPE LR    R9,R7         SAME TEST LENGTH                   GP15136
+         CLCL  R6,R8         COMPARE THE MODULES                GP15136
+         BE    DONECOMP      ALL EQUAL                          GP15136
+         BAL   R3,OUTPUT     PRINT DIFFEENCE
+         AR    R2,R4         COUNT DIFFERENCES                  GP15136
+         SPACE 1
+NEXTCOMP AR    R6,R4                    NEXT MODULE1
+         AR    R8,R4                    NEXT MODULE2
+         SR    R7,R4         ADJUST RESIDUAL LENGTH             GP15136
+         BP    COMPLUPE      AND TRY AGAIN                      GP15136
+         SPACE 2
+DONECOMP L     R7,LENCLCL1   LOAD DESIRED LENGTH                GP15136
+         L     R9,LENCLCL2   LOAD DESIRED LENGTH                GP15136
+         CR    R7,R9                    LENGTH MISMATCH ?
+         BE    SNAPDUMP                 NO, ALL DONE
+         SPACE 1
+         XR    R4,R4                    INDICATE LENGTH CALL
+         BAL   R3,OUTPUT                INDICATE WHERE IT FAILED
+         SPACE 1
+SNAPDUMP CLI   RETCODE+3,4              PREVIOUS COMPARE BOMBED?    004
+         BE    *+8                      BIF YES - DON'T RESET CODE  004
+         MVI   RETCODE+3,0              SET COMPARE WORKED RETCODE  004
+         LTR   R2,R2                    ANY OUTPUT ?
+         BNZ   SNAPNCMP                   YES; SHOW MISMATCH    GP15145
+         TM    FLAGS,FG#ALL             PROCESSING ALL MEMBERS? GP15145
+         BNZ   NOWTO                      YES; SHORTEN LISTING  GP15145
+         LA    R1,WTO20                 SET 'COMPARES' MESSAGE  GP15145
+         B     WTOX                     NO, ALL DONE            GP15145
+         SPACE 1
+SNAPNCMP MVICC 4                        SET COMPARE FAILED RETCODE  004
+         BAL   R14,COMPDUMP  DUMP TEXT AND COMPARE              GP15136
+         SPACE 1
+         L     R0,COMPADR1              MODULE1 STARTING ADDRESS
+         LR    R1,R0                    COPY FOR ENDING ADDRESS
+         A     R1,COMPLEN1              ADD LENGTH FOR ENDING ADDRESS
+         BCTR  R1,0                     IT IS INCLUSIVE
+         L     R2,COMPADR2              MODULE2 STARTING ADDRESS
+         LR    R3,R2                    COPY FOR ENDING ADDRESS
+         A     R3,COMPLEN2              ADD LENGTH FOR ENDING ADDRESS
+         BCTR  R3,0                     IT IS INCLUSIVE
+         STM   R0,R3,WRKWRDS            SAVE LIST ADDRESSES
+         LA    R2,2                     LOOP TWO TIMES
+         LA    R1,WRKWRDS               WHERE LISTS START
+         L     R15,=A(SNAPIT)           @ SNAP ROUTINE
+SNAPLOOP BALR  R14,R15                  DUMP IT
+         LA    R1,8(,R1)                NEXT LIST
+         BCT   R2,SNAPLOOP              GO AGAIN
+         SPACE 1
+         LA    R1,WTO21                 'COMPARE FAIL' MESSAGE
+         CLC   LENGTH1,LENGTH2    SAME SIZE ?                   GP15145
+         BE    WTOX                 YES; JUST SHOW NAMES        GP15145
+         LA    R1,WTO22      USE LONGER TEXT                    GP15145
+         MVC   RECORD(256),0(R1)  MOVE THE WTO TO WORK AREA     GP15145
+         MVC   RECORD+12(8),NAME1       FILL IN THE             GP15145
+         MVC   RECORD+45(8),NAME2         MODULE NAMES          GP15145
+         UNPK  WRKWRDS(9),LENGTH1(5)    UNPACK                  GP15145
+         TR    WRKWRDS(8),TRTABLE-C'0'  MAKE PRINTABLE          GP15145
+         MVC   RECORD+22(6),WRKWRDS+2   MOVE TO OUTPUT LINE     GP15145
+         UNPK  WRKWRDS(9),LENGTH2(5)    UNPACK                  GP15145
+         TR    WRKWRDS(8),TRTABLE-C'0'  MAKE PRINTABLE          GP15145
+         MVC   RECORD+55(6),WRKWRDS+2   MOVE TO OUTPUT LINE     GP15145
+         B     WTOY                     JOIN COMMON             GP15145
+WTOX     MVC   RECORD(256),0(R1)        MOVE THE WTO TO WORK AREA
+         MVC   RECORD+12(8),NAME1       FILL IN THE
+         MVC   RECORD+36(8),NAME2         MODULE NAMES
+WTOY     LA    R1,RECORD                FINISHED WTO
+         SPACE 2
+WTO      TM    FLAGS,FG#ALL             PROCESSING ALL MEMBERS?     001
+         BZ    WTO#                     NO - BRANCH                 001
+         PRTV  (R1),DEV=2,CC=NO         PRINT THE MSG           GP15136
+         B     NOWTO                    AND CONTINUE
+         SPACE 1
+WTO#     WTO   MF=(E,(R1))              DONE
+         SPACE 1
+NOWTO    LM    R0,R1,LENGTH1            FIRST MODULE LENGTH AND ADDRESS
+         LM    R2,R3,LENGTH2              AND SAME FOR SECOND MODULE
+         STM   R0,R3,WRKWRDS            SAVE LENGTH AND ADDRESS PAIRS
+         SPACE 1
+         LA    R2,2                     LOOP TWO TIMES
+         LA    R3,WRKWRDS               WHERE PAIRS START
+FREELOOP LM    R0,R1,0(R3)              LOAD LENGTH AND ADDRESS PAIR
+         LTR   R1,R1                    ANYTHING THERE ?
+         BZ    NEXTFREE                 NO, NOTHING BOUGHT
+         SPACE 1
+         FREEMAIN R,LV=(0),A=(1)        FREE BOUGHT CORE
+         SPACE 1
+NEXTFREE LA    R3,8(,R3)                NEXT PAIR
+         BCT   R2,FREELOOP              GO AGAIN
+         SPACE 1
+         XC    FRSTTAB(NEXTTAB-FRSTTAB+L'NEXTTAB),FRSTTAB  CLEAN UP
+         XC    NAME1(BLDL1-NAME1),NAME1 CLEAN UP I1 STUFF
+         XC    NAME2(BLDL2-NAME2),NAME2 AND I2
+         MVI   FLAG2,0       AND ZERO FLAG                      GP15136
+         TM    FLAGS,FG#ALL             PROCESSING ALL MEMBERS?     001
+         BO    ALLLOOP                  YES - GO GET NEXT           001
+         SPACE 1
+ALLDONE  CLOSE MF=(E,DCBOLIST)          CLOSE ALL FILES OPENED
+         SERVTERM ,                                             GP15136
+         L     R9,RETCODE                                       GP15136
+         PGMEXIT RC=(R9)     FREE WORKAREA/SET RC/RETURN 004    GP15136
+         SPACE 2
+*---------------------------------------------------------------------*
+*                                                                     *
+*   COMPDUMP - Dump two Modules/CSECTs side by side, and underline    *
+*   any differences in the hex and text fields.                       *
+*   Address/Length in COMPADR1/COMPLEN1 and COMPADR2/COMPLEN2         *
+*                                                                     *
+*---------------------------------------------------------------------*
+COMPDUMP STM   R0,R15,SAVESUB     SAVE A FEW REGISTERS          GP15136
+         LM    R4,R5,COMPADR1     LOAD LEFT ADDRESS/LENGTH      GP15136
+         LM    R6,R7,COMPADR2     LOAD RIGHT ADDRESS/LENGTH     GP15136
+COMPNLIN MVC   OUTLINE1,PRELINE   BLANK TOP LINE                GP15136
+         MVC   OUTLINE2,OUTLINE1  AND SECOND LINE               GP15136
+         LTR   R5,R5              LEFT RESIDUAL ?               GP15136
+         BNP   COMPRLIN           NONE; TEST RIGHT SIDE         GP15136
+         LA    R3,L'OUTTXT1       SET MAX ON ONE LINE           GP15136
+         MIN   (R3),(R5)          DO ONLY WHAT'S LEFT           GP15136
+         LR    R15,R3             SHORTCUT FOR TEXT             GP15136
+         BCTR  R15,0                FOR EXECUTE                 GP15136
+         EX    R15,EXMVTXT1       MOVE LEFT TEXT                GP15136
+         EX    R15,EXTRTXT1       MAKE PRINTABLE                GP15136
+         MVI   OUTFRM11,C'*'      FRAME TEXT                    GP15136
+         MVI   OUTFRM12,C'*'      TEXT FRAME                    GP15136
+         LA    R3,3(,R3)          ROUND, JUST IN CASE           GP15136
+         SRA   R3,2               CONVERT LENGTH TO WORD COUNT  GP15136
+         LR    R0,R4              ADDRESS                       GP15136
+         S     R0,ADDRESS1        CONVERT TO OFFSET             GP15136
+         STCM  R0,7,DB                                          GP15136
+         UNPK  WRKWRDS(7),DB(4)   UNPACK                        GP15136
+         TR    WRKWRDS(6),TRTABLE-C'0'  MAKE PRINTABLE          GP15136
+         MVC   OUTOFF1,WRKWRDS    MOVE TO OUTPUT LINE           GP15136
+         LA    R15,OUTHEX1        DO HEX WORD 1                 GP15136
+         LR    R14,R4             INPUT ADDRESS                 GP15136
+COMPLWRD MVC   DB(4),0(R14)       MOVE WORD                     GP15136
+         UNPK  WRKWRDS(9),DB(5)   UNPACK                        GP15136
+         TR    WRKWRDS(8),TRTABLE-C'0'  MAKE PRINTABLE          GP15136
+         MVC   0(8,R15),WRKWRDS   MOVE TO OUTPUT LINE           GP15136
+         LA    R15,9(,R15)        ADVANCE OUTPUT                GP15136
+         LA    R14,4(,R14)        ADVANCE INPUT                 GP15136
+         BCT   R3,COMPLWRD        DO ANOTHER WORD               GP15136
+         LA    R4,L'OUTTXT1(,R4)  ADVANCE INPUT                 GP15136
+         SH    R5,=AL2(L'OUTTXT1)   FIX RESIDUAL LENGTH         GP15136
+COMPRLIN LTR   R7,R7              RIGHT RESIDUAL ?              GP15136
+         BNP   COMPBOTH           NONE; COMPARE                 GP15136
+         LA    R3,L'OUTTXT1       SET MAX ON ONE LINE           GP15136
+         MIN   (R3),(R7)          DO ONLY WHAT'S LEFT           GP15136
+         LR    R15,R3             SHORTCUT FOR TEXT             GP15136
+         BCTR  R15,0                FOR EXECUTE                 GP15136
+         EX    R15,EXMVTXT2       MOVE LEFT TEXT                GP15136
+         EX    R15,EXTRTXT2       MAKE PRINTABLE                GP15136
+         MVI   OUTFRM21,C'*'      FRAME TEXT                    GP15136
+         MVI   OUTFRM22,C'*'      TEXT FRAME                    GP15136
+         LA    R3,3(,R3)          ROUND, JUST IN CASE           GP15136
+         SRA   R3,2               CONVERT LENGTH TO WORD COUNT  GP15136
+         LR    R0,R6              ADDRESS                       GP15136
+         S     R0,ADDRESS2        CONVERT TO OFFSET             GP15136
+         STCM  R0,7,DB                                          GP15136
+         UNPK  WRKWRDS(7),DB(4)   UNPACK                        GP15136
+         TR    WRKWRDS(6),TRTABLE-C'0'  MAKE PRINTABLE          GP15136
+         MVC   OUTOFF2,WRKWRDS    MOVE TO OUTPUT LINE           GP15136
+         LA    R15,OUTHEX2        DO HEX WORD 1                 GP15136
+         LR    R14,R6             INPUT ADDRESS                 GP15136
+COMPRWRD MVC   DB(4),0(R14)       MOVE WORD                     GP15136
+         UNPK  WRKWRDS(9),DB(5)   UNPACK                        GP15136
+         TR    WRKWRDS(8),TRTABLE-C'0'  MAKE PRINTABLE          GP15136
+         MVC   0(8,R15),WRKWRDS   MOVE TO OUTPUT LINE           GP15136
+         LA    R15,9(,R15)        ADVANCE OUTPUT                GP15136
+         LA    R14,4(,R14)        ADVANCE INPUT                 GP15136
+         BCT   R3,COMPRWRD        DO ANOTHER WORD               GP15136
+         LA    R6,L'OUTTXT1(,R6)  ADVANCE INPUT                 GP15136
+         SH    R7,=AL2(L'OUTTXT1)   FIX RESIDUAL LENGTH         GP15136
+COMPBOTH LA    R14,OUTHEX1        ANY LEFT TEXT?                GP15136
+         LA    R15,OUTHEX2        ANY RIGHT TEXT ?              GP15136
+         LA    R0,OUTFRM11-OUTHEX1-2  NUMBER OF FIELDS TO CHECK GP15136
+COMPBLUP CLC   0(1,R14),0(R15)    SAME ?                        GP15136
+         BE    COMPBBMP           YES; BUMP                     GP15136
+         CLI   0(R14),C' '        UNILATERAL BLANK ?            GP15136
+         BE    COMPBBMP           YES; IGNORE                   GP15136
+         CLI   0(R15),C' '        UNILATERAL BLANK ?            GP15136
+         BE    COMPBBMP           YES; IGNORE                   GP15136
+         MVI   OUTLINE2-OUTLINE1(R14),C'_'                      GP15136
+         MVI   OUTLINE2-OUTLINE1(R15),C'_'                      GP15136
+         MVI   OUTLINE2,C'+'      SIGNAL OVERPRINT REQUIRED     GP15136
+COMPBBMP LA    R14,1(,R14)        ADVANCE LEFT                  GP15136
+         LA    R15,1(,R15)        ADVANCE RIGHT                 GP15136
+         BCT   R0,COMPBLUP        TRY AGAIN                     GP15136
+         PRTF  OUTLINE1           PRINT FORMATTED LINE          GP15136
+         CLI   OUTLINE2,C'+'      DIFFERENCES?                  GP15136
+         BNE   COMPTEND           CHECK FOR END                 GP15136
+         PRTF  OUTLINE2           OVERPRINT DIFFERENCES         GP15136
+COMPTEND LTR   R5,R5              LEFT EXHAUSTED?               GP15136
+         BP    COMPNLIN           NO; GO FOR MORE               GP15136
+         LTR   R7,R7              RIGHT EXHAUSTED?              GP15136
+         BP    COMPNLIN           NO; GO FOR MORE               GP15136
+         LM    R0,R15,SAVESUB     RESTORE REGISTERS             GP15136
+         BR    R14                AND RETURN                    GP15136
+         SPACE 1
+EXMVTXT1 MVC   OUTTXT1(0),0(R4)   MOVE LEFT TEXT                GP15136
+EXTRTXT1 TR    OUTTXT1(0),PRTAB   MAKE PRINTABLE                GP15136
+EXMVTXT2 MVC   OUTTXT2(0),0(R6)   MOVE RIGHT TEXT               GP15136
+EXTRTXT2 TR    OUTTXT2(0),PRTAB   MAKE PRINTABLE                GP15136
+         SPACE 2
+ERR1     LA    R1,WTO02                 ERROR MESSAGE
+         B     WTO                      DO IT
+         SPACE 1
+ERR2     LA    R1,WTO03                 ERROR MESSAGE
+         B     WTO                      DO IT
+         SPACE 1
+ERR3     LA    R3,C'1'                  INDICATE LIBRARY
+         LA    R14,BLDL2+4   CHECK OTHER PDS                    GP15145
+         B     ERR3N4                   SKIP NEXT               GP15145
+ERR4     LA    R3,C'2'                  ERROR MESSAGE
+         LA    R14,BLDL1+4   CHECK OTHER PDS                    GP15145
+ERR3N4   TM    PDS2INDC-PDS2(R14),PDS2ALIS  ALIAS ENTRY ?       GP15145
+         BNZ   ERR3A4                     YES; LONGER TEXT      GP15145
+         MVC   RECORD(256),WTO24        MOVE THE WTO TO WORK AREA
+         MVC   RECORD+12(8),NAME1-NAME1(R10) GET NAME IN THE    GP15136
+         STC   R3,RECORD+35               NAME AND LIBRARY
+         B     ERR3COM
+ERR3A4   MVC   RECORD(256),WTO25        WTO TO WORK AREA        GP15145
+         MVC   RECORD+18(8),NAME1-NAME1(R10) GET NAME IN THE    GP15145
+         STC   R3,RECORD+41               NAME AND LIBRARY      GP15145
+ERR3COM  MVICC 4                        SET COMPARE FAILED RETCODE  004
+         B     WTOY                     DO IT
+ERR8     LA    R3,C'1'                  INDICATE LIBRARY         87258
+         B     *+8                      SKIP NEXT                87258
+ERR8B    LA    R3,C'2'                  ERROR MESSAGE            87258
+         MVC   RECORD(256),WTO29        MOVE THE WTO TO WORK AREA
+         MVC   RECORD+12(8),0(R2)       FILL IN THE              87258
+         STC   R3,RECORD+39               NAME AND LIBRARY       87258
+         MVICC 4                        SET COMPARE FAILED RETCODE  004
+         B     WTOY                     DO IT                    87258
+         SPACE 1
+ERR5     L     R1,WRKWRDS               GET REQUESTED SIZE
+         LA    R1,1023(,R1)             ROUND UP
+         SRL   R1,10                    AND MAKE IT K
+         CVD   R1,WRKWRDS               TO DECIMAL
+         OI    WRKWRDS+7,X'0F'          FIX SIGN
+         UNPK  WRKWRDS(5),WRKWRDS+5(3)  TO PRINTABLES
+         MVC   RECORD(256),WTO11        MOVE THE WTO TO WORK AREA
+         MVC   RECORD+26(5),WRKWRDS     FILL IN THE AMOUNT
+         MVICC 4                        SET COMPARE FAILED RETCODE  004
+         B     WTOY                     DO IT
+         SPACE 1
+ERR6     LA    R1,WTO12                 ERROR MESSAGE
+         MVICC 4                        SET COMPARE FAILED RETCODE  004
+         B     WTO                      DO IT
+         SPACE 2
+         PUSH  PRINT                                            GP15136
+         PRINT NOGEN
+WTO02    WTO   'COMP02I PARM OMITTED',ROUTCDE=11,MF=L
+WTO03    WTO   'COMP03I PARM INVALID',ROUTCDE=11,MF=L
+WTO11    WTO 'COMP11I NEED AT LEAST XXXXXK MORE MEMORY',ROUTCDE=11,MF=L
+WTO12    WTO   'COMP12I SYMBOL TABLE TOO SMALL',ROUTCDE=11,MF=L
+WTO20    WTO   'COMP20I XXXXXXXX IS THE SAME AS YYYYYYYY',             *
+               ROUTCDE=11,MF=L
+WTO21    WTO   'COMP21I XXXXXXXX DOES NOT MATCH YYYYYYYY',             *
+               ROUTCDE=11,MF=L
+WTO22    WTO   'COMP22I XXXXXXXX (XXXXXX) DOES NOT MATCH YYYYYYYY (XXXX*
+               XX)',ROUTCDE=11,MF=L                             GP15145
+WTO24    WTO   'COMP24I XXXXXXXX NOT FOUND IN IY',ROUTCDE=11,MF=L
+WTO25    WTO   'COMP25I ALIAS XXXXXXXX NOT FOUND IN IY',ROUTCDE=11,MF=L
+WTO29    WTO   'COMP29I XXXXXXXX UNPROCESSABLE IN IY',ROUTCDE=11,MF=L
+         POP   PRINT                                            GP15136
+         EJECT
+GETNAME  MVI   0(R3),C' '               BLANK THE NAME AND
+         MVC   1(7+8,R3),0(R3)            LABEL RECEIVING FIELDS
+         LA    R4,8(,R3)                SAVE LABEL FIELD START
+         SPACE 1
+         CLI   0(R9),C','               NO NAME ?
+         BE    ERR8                     YES, GO TELL USER
+         CLI   0(R9),C'('               OTHER NO NAME ?
+         BE    ERR8                     YES, GO TELL USER
+         BAL   R15,MOVENAME             COPY NAME
+           B   ERR8                     WRONG SEPARATOR, GO TELL USER
+         LA    R9,1(,R9)                STRIP SEPARATOR
+         BCT   R8,GETNAME3              DECREMENT REMAINDER
+         B     ERR8                     NOTHING LEFT, GO TELL USER
+GETNAME3 LR    R5,R14                   SAVE RETURN ADDRESS
+         LA    R14,ERR8                 NEW RETURN ADDRESS
+         CLI   0(R9),C')'               ONLY '()' ?
+         BER   R14                      YES, GO TELL USER
+         CLI   0(R9),C'+'               NO LABEL ?
+         BE    NOCSECT                  YES, SKIP THIS THEN
+         LR    R3,R4                    NEW OUTPUT LOCATION
+         BAL   R15,MOVENAME             COPY LABEL
+*HUH?*     B   *+8                      SKIP ERROR RETURN
+         B     ERR8                     WRONG SEPARATOR, GO TELL USER
+         CLI   0(R9),C'+'               OFFSET ?
+         BNE   ENDNAME                  NO, SKIP THIS THEN
+         SPACE 1
+NOCSECT  LA    R9,1(,R9)                STRIP '+' SEPARATOR
+         BCT   R8,*+6                   DECREMENT REMAINDER
+         BR    R14                      NOTHING LEFT, GO TELL USER
+         BAL   R15,GETNUMB              GO CONVERT NUMBER
+         ST    R0,8(,R4)                SAVE THE NUMBER
+         LTR   R8,R8                    ANYTHING LEFT ?
+         BZR   R14                      NO, ERROR
+         SPACE 1
+ENDNAME  LR    R14,R5                   RESTORE RETURN ADDRESS
+         LA    R9,1(,R9)                STRIP ')' SEPARATOR
+         BCT   R8,*+6                   DECREMENT REMAINDER
+         BR    R14                      NOTHING LEFT, RETURN
+         CLI   0(R9),C','               RIGHT SEPARATOR ?
+         BNE   ERR8                     NO, GO TELL USER
+         SPACE 1
+NAMEEND  LA    R9,1(,R9)                STRIP SEPARATOR
+         BCTR  R8,0                     DECREMENT REMAINDER
+         BR    R14                      RETURN ALL THE WAY
+         EJECT
+MOVENAME LA    R0,9                     LOOP PREVENTION
+         SPACE 1
+NAMELOOP MVC   0(1,R3),0(R9)            MOVE IN A CHARACTER
+         BCT   R8,*+6                   SKIP NEXT IF ANY LEFT
+         BR    R14                      RETURN ALL THE WAY
+         LA    R9,1(,R9)                NEXT INPUT CHARACTER
+         LA    R3,1(,R3)                NEXT OUTPUT LOCATION
+         CLI   0(R9),C','               SEPARATOR ?
+         BE    NAMEEND                  YES, GO STRIP IT OFF
+         CLI   0(R9),C'('               OTHER SEPARATOR ?
+         BE    4(,R15)                  YES, RETURN FOR LABEL
+         CLI   0(R9),C'+'               OFFSET SEPARATOR ?
+         BER   R15                      YES, RETURN FOR OFFSET
+         CLI   0(R9),C')'               OFFSET TERMINATOR ?
+         BER   R15                      YES, RETURN AFTER OFFSET
+         BCT   R0,NAMELOOP              GO AGAIN ?
+         B     ERR8                     TELL USER OF PARM ERROR
+         EJECT
+GETNUMB  CLI   0(R9),C'.'               NO NUMBER ?
+         BE    ERR2                     YES, GO TELL USER
+         CLI   0(R9),C')'               OTHER NO NUMBER ?
+         BE    ERR2                     YES, GO TELL USER
+         LA    R3,WRKWRDS+8             NUMBER OUTPUT LOCATION
+         LA    R0,9                     LOOP PREVENTION
+         SPACE 1
+NUMLOOP  IC    R6,0(,R9)                INSERT CHARACTER
+         CLI   0(R9),C'0'               NUMERIC ?
+         BNL   *+8                      YES, NO CONVERT NEEDED
+         LA    R6,X'39'(,R6)            CONVERT TO HEX
+         STC   R6,0(,R3)                TO OUTPUT LOCATION
+         LA    R9,1(,R9)                NEXT INPUT CHARACTER
+         LA    R3,1(,R3)                NEXT OUTPUT CHARACTER
+         BCT   R8,*+8                   DECREMENT COUNT
+         B     GOTNUM                   HAVE THE NUMBER
+         CLI   0(R9),C')'               END OF NUMBER ?
+         BE    GOTNUM                   YES, HAVE THE NUMBER
+         BCT   R0,NUMLOOP               GO AGAIN ?
+         B     ERR2                     TELL USER OF PARM ERROR
+         SPACE 1
+GOTNUM   LA    R6,WRKWRDS+8+1           START+1 SUBTRACTED FROM
+         SR    R3,R6                      END YIELDS EXECUTE LENGTH
+         LA    R6,WRKWRDS+8(R3)         LAST CHARACTER IN NUMBER
+         CLI   0(R6),C'.'+X'39'         DECIMAL ?
+         BE    DECIMAL                  YES, EASY CONVERT
+         SPACE 1
+         EX    R3,PACK                  PACK THE HEX
+         MVO   WRKWRDS+8(5),WRKWRDS+3(5) ALIGN THIS GARBAGE
+         L     R0,WRKWRDS+8             LOAD IT
+         BR    R15                      RETURN TO CALLER
+         SPACE 1
+DECIMAL  BCTR  R3,0                     DROP THE '.'
+         EX    R3,PACK                  PACK THE HEX
+         CVB   R0,WRKWRDS               TO BINARY AND LOAD
+         BR    R15                      RETURN TO CALLER
+         SPACE 2
+PACK     PACK  WRKWRDS(8),WRKWRDS+8(0)  << EXECUTED >>
+         EJECT
+         PUSH  USING                                            GP15136
+         USING LIBWORK,R10              ADDRESSABILITY
+         SPACE 1
+BLDLFIND MVC   BLDL#(4),=AL2(1,74)  BLDL COUNT/LENGTH           GP15136
+         LA    R5,BLDL#+4    POINT TO OUTPUT                    GP15136
+         USING PDS2,R5                  ADDRESSABILITY          GP15136
+         MVC   PDS2NAME,NAME#           MOVE IN NAME
+         SPACE 1
+         BLDL  I#,BLDL#                 DO THE BLDL             GP15136
+         BXH   R15,R15,0(R3)            ERROR, TAKE EXIT
+         SPACE 1
+         CLI   PDS2LIBF,PDS2LNRM        IN SPECIFIED LIBRARY ?  GP15136
+         BNER  R3                       NO, TAKE EXIT
+         TM    PDS2INDC,B'00011000'     ENTRY LONG ENOUGH ?     GP15136
+         BZ    ERR8-ERR3(,R3)           NO, TAKE EXIT            87258
+         TM    PDS2ATR1,PDS2OVLY        INVALID ATTRIBUTE ?     GP15136
+         BNZ   ERR8-ERR3(,R3)           YES, TAKE EXIT           87258
+         SPACE 1
+         ICM   R15,14,PDS2STOR          LOAD SIZE OF MODULE (OFFSET 8)
+         SRL   R15,8                    SHIFT TO LOW THREE BYTES
+         ST    R15,LENGTH#              SAVE GETMAIN LENGTH
+         ST    R15,COMPLEN#               AND AS COMPARE LENGTH
+         C     R15,NUMBER#              OFFSET OUTSIDE NUMBER ?
+         BH    *+10                     NO, SKIP NEXT
+         XC    NUMBER#,NUMBER#          IGNORE NUMBER
+         SPACE 1
+         GETMAIN EC,A=ADDRESS#,LV=(R15),SP=0,MF=(E,WRKWRDS) BUY IT
+         BXH   R15,R15,ERR5             EXIT IF ERROR
+         SPACE 1
+         MVC   COMPADR#,ADDRESS#        SAVE AS COMPARE ADDRESS
+         SPACE 1
+         FIND  I#,PDS2TTRP,C            PREPARE TO READ MODULE
+         BR    R4                       RETURN
+         POP   USING                                            GP15136
+         EJECT
+         PUSH  USING                                            GP15136
+         USING LIBWORK,R10              ADDRESSABILITY
+CLEAREAD LA    R5,BLDL#+4               BLDL LIST AREA          GP15136
+         USING PDS2,R5                                          GP15136
+         L     R15,LENGTH#              LOAD LENGTH             GP15136
+         L     R14,ADDRESS#             WHERE TO CLEAR CORE     GP15136
+         SR    R1,R1                                            GP15136
+         MVCL  R14,R0                   CLEAR STORAGE           GP15136
+         SPACE 1
+         L     R3,ADDRESS#              START OF TEXT BUFFER
+         LR    R6,R3                    TEXT BUFFER ADDRESS
+         L     R7,LENGTH#                 AND LENGTH FOR 'FIRST' READ
+         OC    PDS2TTRN(3),PDS2TTRN     ANY NOTE LIST ?         GP15136
+         BZ    *+8                      NO, SKIP NEXT
+         OI    BLDL#,X'F0'              MARK NOTE LIST
+         CLC   PDS2TTRP,PDS2TTRT        IS FIRST RECORD TEXT ?  GP15136
+         BE    READTEXT                 YES, NO CONTROL RECORD
+         SPACE 1
+NEXTRCRD READ  DECB,SF,I#,RECORD,256,MF=E READ A RECORD
+         CHECK DECB                     WAIT FOR COMPLETION
+         TM    BLDL#,X'F0'              HAVE NOTE LIST ?
+         BNO   RCRDTYPE                 NO, SKIP NOTE LIST CHECK
+         NOTE  I#                       FIND TTR OF LAST BLOCK
+         ST    R1,WRKWRDS               STORE TTRZ
+         CLC   PDS2TTRN(3),WRKWRDS      THIS THE NOTE LIST ?
+         BE    NEXTRCRD                 YES, SKIP IT
+         SPACE 1
+RCRDTYPE SR    R2,R2                    CLEAR FOR INSERT BY TRT GP15136
+         TRT   RECORD(1),TRTTABLE       INSERT RECORD TYPE      GP15136
+         SR    R1,R1         CLEAR UNWANTED CRUD                GP15136
+         B     *(R2)                    GO TO IT                GP15136
+         B     NEXTRCRD   04            IGNORE THE RECORD
+         B     DOCESD     08            PROCESS CESD
+         B     DOCNTRL    0C            PROCESS CONTROL RECORD
+*        B     DORLD      10            PROCESS RLD OR CRLD
+         SPACE 2
+DORLD    LH    R1,RECORD+6              GET AMOUNT OF DATA
+         LA    R6,RECORD+16             POINT TO R & P
+         SH    R1,=H'4'                 DECREMENT COUNT
+         LA    R7,RECORD+20             POINT TO F & A
+         SPACE 1
+RLDLOOP  TM    0(R7),B'01100000'        DON'T RELOCATE ?
+         BNZ   NEXTRLD                  TRUE, SKIP IT
+         SPACE 1
+         LH    R8,0(,R6)                ESD ID OF EXTERNAL REFERENCE
+         BCTR  R8,0                     ORIGIN ZERO
+         MH    R8,=AL2(LTABCESD)        TIMES ENTRY LENGTH
+         LA    R8,CESDTAB(R8)           THE REFERENCED ENTRY
+         SPACE 1
+         L     R14,TABCOMM-TABCESD(R8)  LOAD COMMON ADDRESS
+         S     R14,TABADDR-TABCESD(R8)  LESS OFFSET IN CESD
+         TM    0(R7),B'00000010'        NEGATIVE RELOCATION ?
+         BNO   *+6                      NO, SKIP NEXT
+         LCR   R14,R14                  ADJUST FOR NEGATIVE RELOCATION
+         SPACE 1
+         L     R15,0(,R7)               OFFSET OF RELOCATABLE REFERENCE
+         LA    R15,0(R3,R15)            NOW HAVE THE ADDRESS
+         SPACE 1
+         IC    R8,0(,R7)                GET FLAGS
+         N     R8,=F'12'                ONLY WANT LENGTH INDICATION
+         B     *(R8)                    GO RELOCATE ACCORDING TO LENGTH
+         B     RLDLEN2                  LENGTH IS TWO
+         B     RLDLEN3                  LENGTH IS THREE
+*        B     RLDLEN4                  LENGTH IS FOUR
+         EJECT
+RLDLEN4  MVC   WRKWRDS(4),0(R15)        ALIGN IT
+         AL    R14,WRKWRDS              RELOCATE
+         ST    R14,WRKWRDS+4            STORE FOR MOVE
+         MVC   0(4,R15),WRKWRDS+4       PUT IT BACK
+         B     NEXTRLD                  GO DO NEXT ENTRY
+         SPACE 1
+RLDLEN3  MVC   WRKWRDS(3),0(R15)        ALIGN IT
+         L     R8,WRKWRDS                 AND LOAD IT
+         SRA   R8,8                         AND SHIFT IT
+         ALR   R14,R8                   RELOCATE
+         ST    R14,WRKWRDS+4            STORE FOR MOVE
+         MVC   0(3,R15),WRKWRDS+5       PUT IT BACK
+         B     NEXTRLD                  GO DO NEXT ENTRY
+         SPACE 1
+RLDLEN2  MVC   WRKWRDS(2),0(R15)        ALIGN IT
+         LH    R8,WRKWRDS                 AND LOAD IT
+         ALR   R14,R8                   RELOCATE
+         STH   R14,WRKWRDS+4            STORE FOR MOVE
+         MVC   0(2,R15),WRKWRDS+4       PUT IT BACK
+         SPACE 1
+NEXTRLD  TM    0(R7),B'00000001'        USE SAME R & P ?
+         BO    *+14                     YES
+         LA    R6,4(,R7)                NEXT R & P
+         SH    R1,=H'4'                 ADJUST LENGTH
+         LR    R7,R6                    PRETEND IT WAS LAST F & A
+         SPACE 1
+         LA    R7,4(,R7)                NEXT F & A
+         SH    R1,=H'4'                 ADJUST LENGTH
+         BP    RLDLOOP                  MORE TO DO
+         SPACE 2
+         TM    RECORD,B'00000001'       RLD ALSO A CONTROL RECORD ?
+         BO    DOCNTRL                  YES, GO READ TEXT
+         TM    RECORD,B'00001000'       LAST RLD RECORD ?
+         BZ    NEXTRCRD                 NO, GO READ NEXT
+         SPACE 2
+EOM      TM    BLDL#,X'0F'              LABEL FOUND ?
+         BOR   R4                       YES, RETURN
+         MVI   LABEL#,C' '              CLEAR THE
+         MVC   LABEL#+1(7),LABEL#         LABEL FIELD
+         BR    R4                       RETURN
+         EJECT
+DOCNTRL  MVI   RECORD+8,0               CLEAR READ COMMAND FROM CCW
+         LR    R6,R3                    COPY ADDRESS START
+         A     R6,RECORD+8              ADD OFFSET TO DATA START
+         LH    R7,RECORD+12+2             AND LOAD RECORD LENGTH
+         SPACE 1
+READTEXT READ  DECB,SF,I#,(R6),(R7),MF=E READ A TEXT RECORD
+         CHECK DECB                     WAIT FOR COMPLETION
+         B     NEXTRCRD                 GO READ NEXT RECORD
+         SPACE 2
+DOCESD   IC    R1,RECORD+7              LOAD LENGTH OF ESD ENTRIES
+         SRL   R1,4                     DIVIDE BY LENGTH TO GET COUNT
+         LH    R6,RECORD+4              LOAD FIRST ESD ID
+         BCTR  R6,0                     ORIGIN ZERO
+         MH    R6,=AL2(LTABCESD)        TIMES ENTRY LENGTH
+         LA    R6,CESDTAB(R6)           NEXT AVAILABLE ENTRY
+         USING TABCESD,R6               ADDRESSABILITY
+         LA    R7,RECORD+8              START OF FIRST ENTRY
+         USING CESDENT,R7               ADDRESSABILITY
+         SPACE 1
+CESDLOOP XC    TABNAME(LTABCESD),TABNAME CLEAR THE ENTRY
+         TM    CESDTYPE,B'01011100'     UNWANTED TYPE ?             005
+         BNZ   CESDBCT                  YES, ON TO NEXT ENTRY
+         TM    CESDTYPE,B'00000011'     IS IT EXTERNAL REFERENCE ?
+         BNM   CESDLRSD                 NO, SKIP SETTING FLAG
+         OI    FLAG2,FG2EXT             MARK EXTERNAL REFERENCE FOUND
+         SPACE 1
+CESDLRSD MVC   TABNAME(TABCOMM-TABNAME),CESDNAME COPY NAME AND OFFSET
+         MVI   TABADDR,0                CLEAR FIRST OFFSET BYTE
+         L     R8,FRSTTAB               FIND FIRST ENTRY
+         LTR   R8,R8                    VERY FIRST CALL ?
+         BNZ   NOTFIRST                 NO, CONTINUE
+         SPACE 1
+         L     R8,=A(STABCESD*LTABCESD) LENGTH OF CESD TABLE
+         LA    R8,CESDTAB(R8)           END OF TABLE
+         ST    R8,FRSTTAB               FIRST ENTRY OF COMMON TABLE
+         B     ADDCOMM                  GO ADD FIRST COMMON ENTRY
+         EJECT
+NOTFIRST LA    R14,8                    BXLE INCREMENT
+         L     R15,NEXTTAB              LAST USED ENTRY
+         SPACE 1
+COMMLOOP CLC   TABNAME,0(R8)            ALREADY IN TABLE ?
+         BE    CESDCHCK                 YES, NO NEED TO ADD AGAIN
+         BXLE  R8,R14,COMMLOOP          KEEP LOOKING
+         SPACE 1
+ADDCOMM  MVC   0(8,R8),TABNAME          ADD THE NEW ENTRY
+         ST    R8,NEXTTAB                 AND AS LAST USED
+         SPACE 2
+CESDCHCK ST    R8,TABCOMM               SAVE ADDRESS FOR RELOCATION
+         CLC   LABEL#,CESDNAME          HAVE A CANDIDATE ?
+         BNE   CESDBCT                  NO, ON TO NEXT ENTRY
+         L     R8,TABADDR               SAVE OFFSET
+         TM    CESDTYPE,B'00000011'     CSECT, ENTRY, OR EXTERNAL ?
+         BM    CESDBCT                  SKIP IF EXTERNAL REFERENCE
+         BO    ENTRY                    IT'S AN 'ENTRY' (LR) ENTRY
+         SPACE 1
+         A     R8,COMPADR#              ADD ADDRESS OF COMPARE
+         ST    R8,COMPADR#              SAVE NEW COMPARE START
+         MVC   COMPLEN#+1(3),CESDLEN+1    AND SAVE NEW COMPARE LENGTH
+         CLC   COMPLEN#,NUMBER#         OFFSET OUTSIDE CSECT ?
+         BH    CESDOI                   NO, GO INDICATE LABEL FOUND
+         XC    NUMBER#,NUMBER#          IGNORE NUMBER
+         B     CESDOI                   GO INDICATE LABEL FOUND
+         SPACE 1
+ENTRY    L     R14,NUMBER#              LOAD NUMBER OFFSET
+         AR    R14,R8                   COMBINED OFFSET
+         C     R14,COMPLEN#             OUTSIDE MODULE ?
+         BNH   *+6                      NO, SKIP NEXT
+         LR    R14,R8                   IGNORE NUMBER, USE ENTRY
+         ST    R14,NUMBER#              STORE OFFSET
+         SPACE 1
+CESDOI   OI    BLDL#,X'0F'              MARK LABEL FOUND
+         SPACE 1
+CESDBCT  LA    R6,LTABCESD(R6)          NEXT ENTRY
+         C     R6,@CESDEND              OVERRUN ?               GP15136
+         BNL   ERR6                     YES, CAN'T CONTINUE
+         LA    R7,LCESDENT(R7)          NEXT ENTRY
+         BCT   R1,CESDLOOP              GO CHECK IT
+         B     NEXTRCRD                 GO READ NEXT RECORD
+         SPACE 1
+TITDSN   FD    DDN#,PAD,LEN=8     DDNAME                        GP15136
+         FD    NAME#,PAD,LEN=8    MEMBER                        GP15136
+         FD    VOL#,PAD,LEN=6     VOLUME SERIAL                 GP15136
+         FD    DSN#,PAD,LEN=44    DSNAME                        GP15136
+         FD    *END
+         POP   USING                                            GP15136
+         EJECT
+OUTPUT   LTR   R2,R2                    FIRST CALL ?
+         BNZ   OUTCONT                  YES, CONTINUE
+         SPACE 1
+         PRTLIST MSGNAME
+*DEFER*  TM    BLDL1,X'0F'              LABEL FOUND ?
+*        BNO   *+14                     NO, CLEAR THE (C)
+*        CLC   LENGTH1,COMPLEN1         WAS IT A CSECT ?
+*        BNE   *+10                     YES, SKIP THE CLEAR
+*        MVC   REC3T+D1I1+8(3),=C'   '  CLEAR THE 'C'
+*        TM    BLDL2,X'0F'              LABEL FOUND ?
+*        BNO   *+14                     NO, CLEAR THE (C)
+*        CLC   LENGTH2,COMPLEN2         WAS IT A CSECT ?
+*        BNE   *+10                     YES, SKIP THE CLEAR
+*        MVC   REC3T+D1I2+8(3),=C'   '  CLEAR THE 'C'
+*        PRTV  RECORD,CC=NO
+         SPACE 1
+OUTCONT  LTR   R4,R4                    WHAT IS WANTED ?
+         BP    OUTUNEQ                  ADD 'UNLIKE' OUTPUT LINE
+         BZ    OUTDIFF                  ADD 'LONGER' OUTPUT LINE
+*        BM    OUTBUFF                  DUMP THE BUFFER
+         SPACE 1
+OUTBUFF  CLC   =H'4',RECORD             NULL BUFFER ?
+         BER   R3                       YES RETURN
+         TM    FLAGS,FG#SUM  SUPPRESS DETAIL LISTING ?           87258
+         BNZ   OUTBUFFI      YES                                 87258
+         SPACE 1
+         PRTV  RECORD,CC=NO                                     GP15136
+         SPACE 1
+OUTBUFFI MVC   RECORD(2),=H'4'          RESET BLOCK LENGTH
+         B     OUTCONT                  TRY AGAIN
+         SPACE 2
+OUTDIFF  ST    R3,WRKWRDS                                       GP15136
+         LA    R3,NAME1                                         GP15136
+         CR    R7,R9                    IS FIRST MODULE EXHAUSTED ?
+         BL    OUTDIFF2                 YES                     GP15136
+         LA    R3,NAME2                 CHANGE 'I1' TO 'I2'     GP15136
+OUTDIFF2 SR    R7,R9                    COPY EXCESS LENGTH
+         LPR   R7,R7                                            GP15136
+         ST    R7,DB                    STORE IT                GP15136
+         PRTLIST MSGLONG                                        GP15136
+         L     R3,WRKWRDS                                       GP15136
+         BR    R3                       RETURN
+         SPACE 2
+OUTUNEQ  ST    R3,WRKWRDS                                       GP15136
+         TM    FLAGS,FG#LINE      LINE MODE ?                   GP15136
+         BNZR  R3                 YES; SKIP BYTE AT A TIME      GP15136
+         LR    R0,R6         GET FIRST ADDRESS                  GP15136
+         S     R0,COMPADR1   LESS BASE                          GP15136
+         ST    R0,DB         SAVE FIRST ADDRESS                 GP15136
+         LR    R0,R8         GET SECOND                         GP15136
+         S     R0,COMPADR2   LESS BASE                          GP15136
+         ST    R0,DB+4         AND SECOND                       GP15136
+         LA    R3,1          SET STRING LENGTH                  GP15136
+         PRTLIST MSGDIFF     PRINT                              GP15136
+         L     R3,WRKWRDS                                       GP15136
+         BR    R3                       RETURN TO CALLER
+         SPACE 4
+         LTORG ,             DON'T WANT THIS AFTER CONSTANTS     87258
+         SPACE 1                                                 87258
+MSGNAME  FD    'MODULES:',NL,PADR,RADJ,LEN=10
+         FD    NAME1,PAD
+         FD    NAME2,PAD
+         FD    'LENGTH:',NL,PADR,RADJ,LEN=10
+         FD    LENGTH1,HEX,PAD
+         FD    LENGTH2,HEX,PAD
+         FD    'LABEL:',NL,PADR,RADJ,LEN=10
+         FD    LABEL1,PAD
+         FD    LABEL2,PAD
+         FD    'COMPARE:',NL,PADR,RADJ,LEN=10
+         FD    COMPLEN1,HEX,PAD
+         FD    COMPLEN2,HEX,PAD
+         FD    '  (BASIC COMPARE LENGTH)'
+         FD    'OFFSET:',NL,PADR,RADJ,LEN=10
+         FD    NUMBER1,HEX,PAD
+         FD    NUMBER2,HEX,PAD
+         FD    '  (IN MODULE OR CSECT)'
+         FD    'COUNT:',NL,PADR,RADJ,LEN=10
+         FD    COUNT,HEX,PAD
+         FD    '  (FORCED COMPARE LENGTH)'
+         FDTM  FLAG2,FG2EXT,BNO=MSGNAMEX   ANY UNRESOLVED REFERENCES ?
+         FDOPT NL,CC=C'0'
+         FD    'NOTE: SOME UNRESOLVED EXTERNAL REFERENCES RESOLVED'
+MSGNAMEX FDOPT NL,CC=C'0'
+         FD    *END
+         SPACE 1
+MSGDIFF  FD    DB+1,3,HEX,NL,PAD
+         FD    0(R6),(R3),HEX,PAD
+         FD    0(R8),(R3),HEX,PAD
+         FD    DB+5,3,HEX,PAD
+         FD    *END
+         SPACE 1
+MSGLONG  FD    0(R3),L'NAME1,NL,PAD
+         FD    'IS LONGER BY'
+         FD    DB+1,3,HEX,PAD
+         FD    'BYTES.'
+         FD    *END
+         PRINT NOGEN
+TRTTABLE DC    256X'04'                 IGNORE EVERYTHING
+         SPACE 1
+         RCRD  80,04                    IDR      - IGNORE
+         RCRD  40,04                    SYM      - IGNORE
+         RCRD  20,08                    CESD     - PROCESS
+         RCRD  10,04                    SC/TR    - IGNORE
+         RCRD  01,0C                    CNTRL    - PROCESS
+         RCRD  05,04                    CNT-EOS  - IGNORE
+         RCRD  0D,0C                    CNT-EOM  - PROCESS
+         RCRD  02,10                    RLD      - PROCESS
+         RCRD  06,04                    RLD-EOS  - IGNORE
+         RCRD  0E,10                    RLD-EOM  - PROCESS
+         RCRD  03,10                    CRLD     - PROCESS
+         RCRD  07,04                    CRLD-EOS - IGNORE
+         RCRD  0F,10                    CRLD-EOM - PROCESS
+         SPACE 1
+TRTABLE  DC    C'0123456789ABCDEF'      GUESS WHAT THIS IS FOR
+         SPACE 1
+REC3     DC    Y(LREC3,0),C' '                                   87258
+REC3T    DC    C'LABEL:   11111111(C) 22222222(C)'
+LREC3    EQU   *-REC3
+         SPACE 1
+DCBPO    DCB   DDNAME=I1,DSORG=PO,EODAD=EOM,MACRF=R
+DCBPOX   EQU   *-DCBPO                  LENGTH OF DCB
+         SPACE 1
+         READ  DECBRW,SF,MF=L
+DECBX    EQU   *-DECBRW                 LENGTH OF DECB
+         EJECT ,
+         PUSH  USING                                            GP15136
+*   SUP - CHECK IF MODULE CONTAINS TTRLs OF OTHER MODULES,
+*         IF SO, SET THEM ALL TO C'TTRL'
+*     AT ENTRY R1 = @ NAME IN WORK OF MODULE TO TEST
+*
+         SPACE 1
+SUP      STM   R0,R15,SAVESUB           SAVE REGS
+         LR    R10,R15                  GET BASE REG            GP15136
+         USING SUP,R10                                          GP15136
+         LR    R8,R1                    SAVE @ MODULE NAME ETC
+         LA    R7,SUP#TB8               SEE IF 1ST LOAD WITH TTRL'S
+         BAL   R14,SUP$SCN              GO SCAN TABLE
+         B     SUP$FND1                 BRANCH IF FOUND IN TABLE
+         LA    R7,SUP#TB6               SEE IF LATER LOAD
+         BAL   R14,SUP$SCN              GO SCAN TABLE
+         B     SUP$FND2
+SUP$EXIT LM    R0,R15,SAVESUB           RESTORE REGS
+         BR    R14                      AND RETURN
+         SPACE 1
+SUP$FND2 TM    NAME1-NAME1+6(R8),X'F0'  NUMERIC 7TH CHAR?
+         BNO   SUP$EXIT                 NO TTRL'S IF NOT
+SUP$FND1 L     R1,ADDRESS1-NAME1(,R8)   GET BEGIN ADDR
+         L     R2,LENGTH1-NAME1(,R8)    GET LENGTH
+         CL    R2,=F'1024'              > 1024 LONG?
+         BH    SUP$EXIT                 YES, NO TTRL'S
+         LA    R3,0(R2,R1)              @ PAST END OF MODULE
+         SH    R3,=H'4'                 BACK UP 4 BYTES
+         SR    R4,R4                    CLEAR FOR IC
+         IC    R4,3(,R3)                GET OFFSET/8 OF TTRL TABLE
+         SLA   R4,3                     GET REAL OFFSET
+         BZ    SUP$EXIT                 I WON'T BUY OFFSET 0
+         ALR   R1,R4                    POINT TO TTRL TABLE
+         SPACE 1
+SUP$LOOP CR    R1,R3                    PAST END OF MODULE?
+         BNL   SUP$EXIT                 BRANCH IF PAST
+         OC    0(2,R1),0(R1)            END OF TABLE?
+         BZ    SUP$EXIT                 DONE IF SO
+         CLC   0(2,R1),=X'FFFF'         SUBLIST DELIMITER?          002
+         BE    SUP$FF                   YES - SKIP PAST IT          002
+         MVC   2(4,R1),=C'TTRL'         FIX UP TTRL
+         LA    R1,6(,R1)                TO NEXT ENTRY
+         B     SUP$LOOP
+         SPACE 1
+SUP$FF   LA    R1,2(,R1)                SKIP PAST SUBLIST DELIMITER 002
+         B     SUP$LOOP                 AND GO CHECK FOR END        002
+         SPACE 1
+SUP$SCN  LH    R0,0(,R7)                GET NUMBER OF ENTRIES IN TABLE
+         LH    R15,2(,R7)               GET LEN-1 OF EACH ENTRY
+SUP$SCNL EX    R15,SUP$SCNC             CLC 4(0,R7),NAME1-NAME1(R8)
+         BER   R14                      RETURN IF FOUND
+         LA    R7,1(R15,R7)             TO NEXT ENTRY
+         BCT   R0,SUP$SCNL              SCAN ALL ENTRIES
+         B     4(,R14)                  RETURN NOT FOUND
+SUP$SCNC CLC   4(0,R7),NAME1-NAME1(R8)  * EXECUTED *
+         SPACE 1
+SUP#TB8  DC    Y((SUP#TB8L-4)/8)        NUMBER OF ENTRIES
+         DC    Y(7)                     LENGTH -1 OF EACH ENTRY
+         DC    CL8'IGC0001I'            OPEN
+         DC    CL7'IGC0002',X'C0'       CLOSE
+         DC    CL8'IGC0002A'            STOW
+         DC    CL8'IGC0002B'            OPENJ
+         DC    CL8'IGC0002C'            TCLOSE
+         DC    CL8'IGC0002I'            SCRATCH
+         DC    CL8'IGC0003A'            FEOV
+         DC    CL8'IGC0003B'            ALLOCATE
+         DC    CL8'IGC0005E'            EOV
+         DC    CL8'IGC0008A'            SETPRT
+         DC    CL8'IGC0008F'            ATLAS
+         DC    CL8'IGC0009C'            TSO
+         DC    CL8'IGC0009D'            TSO
+SUP#TB8L EQU   *-SUP#TB8                LENGTH OF TABLE
+         SPACE 1
+SUP#TB6  DC    Y((SUP#TB6L-4)/6)        NUMBER OF ENTRIES
+         DC    Y(5)                     LENGTH OF ENTRY -1
+         DC    CL6'IFG019'              OPEN
+         DC    CL6'IFG020'              CLOSE
+         DC    CL6'IFG023'              TCLOSE
+         DC    CL6'IFG055'              EOV
+         DC    CL6'IFGASR'              ASR MODULE NAMES
+         DC    CL6'IGG019'              OPEN
+         DC    CL6'IGG020'              CLOSE
+         DC    CL6'IGG021'              STOW
+         DC    CL6'IGG023'              TCLOSE
+         DC    CL6'IGG029'              SCRATCH
+         DC    CL6'IGG032'              ALLOCATE
+         DC    CL6'IGG055'              EOV
+         DC    CL6'IGG081'              SETPRT
+         DC    CL6'IGG086'              ATLAS
+         DC    CL6'IGG093'              TSO
+         DC    CL6'IGG094'              TSO
+SUP#TB6L EQU   *-SUP#TB6                LENGTH OF TABLE
+         SPACE 1
+         POP   USING                                            GP15136
+         EJECT ,
+         PUSH  USING                                            GP15136
+*   SNAPIT: SNAP ROUTINE
+*     R1 = @ (@ BEGIN, @ END)
+*
+         SPACE 1
+SNAPIT   TM    FLAGS,FG#NSNAP           DON'T DO SNAP?              001
+         BOR   R14                      YES - RETURN TO CALLER      001
+         TM    FLAGS,FG#LINE      LINE MODE ?                   GP15136
+         BNZR  R14                YES; SKIP BYTE AT A TIME      GP15136
+         SPACE 2
+         STM   R0,R15,SAVESUB           SAVE REGS
+         LR    R10,R15                  LOCAL BASE              GP15136
+         USING SNAPIT,R10                                       GP15136
+         LM    R2,R3,0(R1)              GET @ BEGIN, @ END
+         LA    R4,4                     CONSTANT
+         SR    R5,R5                    START AT OFFSET 0
+         SPACE 1
+SN$LOOP1 MVC   LINERDW(5),SN#RDW        INIT RDW, CTL CHAR (' ')
+         MVC   LINE+1(L'LINE-1),LINE    BLANK REST OF LINE
+         LTR   R5,R5                    1ST LINE?
+         BNZ   *+8                      BRANCH IF NOT
+         MVI   LINE,C'1'                NEW PAGE ON FIRST
+         ST    R5,SN#WRK                OFFSET TO HEX
+         UNPK  LINE+1(7),SN#WRK+1(4)
+         TR    LINE+1(6),TRTABLE-C'0'
+         MVI   LINE+1+6,C' '
+         LA    R0,2                     DO TWO SETS OF 16 BYTES
+         LA    R7,LINE+1+6+1            @ OF FIRST WORD OF HEX
+         LA    R8,LINE+L'LINE-32-1      @ OF FIRST WORD OF CHAR
+         SPACE 1
+SN$LOOP2 MVC   0(3,R7),=CL3' '          ADD SOME BLANKS
+         LA    R7,3(,R7)
+         LR    R6,R4                    AND 4 SETS OF 4 IN EACH 16
+         SPACE 1
+SN$LOOP3 MVC   DB(4),0(R2)   GET 4 BYTES WITHOUT 0C4             87258
+         UNPK  0(9,R7),DB(5)    AND UNPACK                       87258
+         TR    0(8,R7),TRTABLE-C'0'
+         MVI   8(R7),C' '               FIX GARBAGE BYTE
+         MVC   0(4,R8),0(R2)            MOVE IN CHAR STUFF
+         AR    R2,R4                    BUMP INPUT PTR
+         LA    R7,9(,R7)                BUMP HEX OUTPUT PTR
+         AR    R8,R4                    BUMP CHAR OUTPUT PTR
+         AR    R5,R4                    BUMP OFFSET TOO
+         CR    R2,R3                    NEXT WORD TO BE DUMPED?
+         BNL   SN$DONE                  NO, PRINT, DONE
+         BCT   R6,SN$LOOP3              DO 16 BYTES
+         BCT   R0,SN$LOOP2              DO ABOVE TWICE
+         SPACE 1
+         BAL   R8,SN$PUT                PRINT LINE
+         B     SN$LOOP1
+         SPACE 1
+SN$DONE  BAL   R8,SN$PUT                PRINT LAST LINE
+         LM    R0,R15,SAVESUB           RESTORE REGS
+         BR    R14                      AND RETURN
+         SPACE 1
+SN$PUT   MVI   LINE+L'LINE-1,C'*'       STARS AROUND CHAR PART
+         MVI   LINE+L'LINE-1-32-1,C'*'
+         TR    LINE+L'LINE-1-32(32),PRTAB  CHANGE GARBAGE TO '.'
+         PRTV  LINERDW       WRITE LINE                         GP15136
+         BR    R8                       AND RETURN
+         SPACE 1
+SN#RDW   DC    Y(L'LINE+4,0),C' '
+PRTAB    TRTAB CODE=TN,FILL=C'.'                                GP15136
+         POP   USING                                            GP15136
+         EJECT ,
+         PUSH  USING                                            GP15136
+GETENT   STM   R0,R15,SAVESUB           SAVE CALLERS REGS
+         LR    R9,R15                   SET LOCAL BASE
+         USING GETENT,R9
+         L     R6,DIRLST                @ LAST DIR ENTRY
+         LTR   R6,R6                    FIRST TIME?
+         BZ    GE$FIRST                 YES, GO READ
+         SR    R5,R5                    CLEAR FOR IC
+         IC    R5,11(,R6)               GET LENGTH OF LAST ENTRY
+         N     R5,=X'0000001F'          GET LENGTH IN H-WORDS
+         LA    R5,12(R5,R5)             LENGTH IN BYTES
+         AR    R6,R5                    @ NEXT ENTRY IF ANY
+         LH    R1,DIRBUF                GET LENGTH OF DATA IN BLOCK
+         LA    R1,DIRBUF(R1)            @ PAST LAST ENTRY
+         CR    R6,R1                    IS THIS ENTRY OK?
+         BL    GE$OK                    BRANCH IF OK
+GE$FIRST MVI   DIRTTR+3,1               SET GET NEXT BLOCK
+         POINT I1,DIRTTR                POINT THERE
+         READ  DECB,SF,I1,DIRBUF,256,MF=E  READ NEXT DIR BLOCK
+         CHECK DECB                     WAIT FOR IT
+         NOTE  I1                       GET IT'S TTR
+         ST    R1,DIRTTR                SAVE FOR NEXT TIME
+         LA    R6,DIRBUF+2              GET @ 1ST ENTRY
+GE$OK    CLC   0(8,R6),=8X'FF'          LAST ENTRY?
+         BE    ALLDONE                  YES, JUST LEAVE
+         ST    R6,DIRLST                ELSE SAVE ENTRY ADDR
+         MVC   NAME1,0(R6)              SET 1ST NAME
+         MVC   NAME2,0(R6)              AND 2ND NAME
+         LM    R0,R15,SAVESUB           RESTORE REGS
+         BR    R14                      AND RETURN
+         POP   USING                                            GP15136
+         SPACE 2
+         LTORG
+         SPACE 1
+SYSPRINT PRTWORK SNAP,SYSPRINT,TITLE=5      OUTPUT FILE         GP15136
+SUMPRINT PRTWORK SUMPRINT,*USER,TITLE=0     SUMMARY FILE        GP15136
+         EJECT ,
+         PRINT NOGEN                                                001
+CESDENT  DSECT
+CESDNAME DS    CL8                      IDENTIFIER
+CESDTYPE DS    X                        TYPE OF ESD ENTRY
+CESDADR  DS    AL3                      OFFSET INTO MODULE
+CESDLEN  DS    F                        CSECT LENGTH
+LCESDENT EQU   *-CESDENT                LENGTH OF ENTRY
+         SPACE 2
+TABCESD  DSECT
+TABNAME  DS    CL8                      CESD IDENTIFIER
+TABADDR  DS    F                        OFFSET INTO MODULE
+TABCOMM  DS    A                        ADDRESS OF COMMON LABEL
+LTABCESD EQU   *-TABCESD                LENGTH OF ENTRY
+         SPACE 2
+         DCBD  DEVD=DA,DSORG=(PO,PS)
+         IHAPSA ,                                                   003
+         IHAASCB ,                                                  003
+         EJECT
+SAVE     DSECT               DYNAMIC SAVE AND STORAGE AREA      GP15136
+DB       DS    D             REAL DOUBLE-WORD AREA               87258
+DB2      DS    D             REAL DOUBLE-WORD AREA              GP15136
+WRKWRDS  DS    4F                       DOUBLEWORD ALIGNED WORK AREA
+         SERVDEFS ,          ASSORTED @SERVICE DATA             GP15136
+DCBOLIST OPEN  (I1,,I2,),MF=L           OPEN/CLOSE PARM LIST    GP15136
+SAVESUB  DS    16F                      SUBROUTINE SAVE AREA
+@CESDEND DS    A             FIRST BYTE AFTER CESDTAB           GP15136
+SN#WRK   DS    F                        SNAP WORK AREA
+LENCLCL1 DS    F             LOGICAL COMPARE LENGTH 1           GP15136
+LENCLCL2 DS    F             LOGICAL COMPARE LENGTH 2           GP15136
+COUNT    DS    F                        NUMBER OF BYTES TO COMPARE
+FRSTTAB  DS    F                        FIRST COMMON SYMBOL IN TABLE
+NEXTTAB  DS    F                        NEXT COMMON SYMBOL IN TABLE
+FLAGS    DS    X                        FLAG AREA                   001
+FG#NSNAP EQU   X'80'                    DON'T DO A PSEUDO-SNAP DUMP 001
+FG#ALL   EQU   X'40'                    PROCESS ALL PDS MEMBERS     001
+FG#LINE  EQU   X'20'         USE LINE COMPARE MODE              GP15136
+FG#SUM   EQU   X'01'         SUPPRESS SNAP AND MISMATCHES        87258
+FLAG2    DS    X             FLAG FOR EXTERNAL REFERENCE
+FG2EXT   EQU   X'C0'                                            GP15136
+         SPACE 1
+LINERDW  DS    2H                       RDW FOR LINE
+LINE     DS    CL121                    PRINT LINE
+         SPACE 1
+PRELINE  DC    C' '          BLANK FOR CLEARING LINE            GP15136
+OUTLINE1 DC    CL133' '      CC PLUS PRINT DATA                 GP15136
+OUTLINE2 DC    CL133' '      CC PLUS OVERPRINT                  GP15136
+         ORG   OUTLINE1+1    DEFINE PRINT STUFF                 GP15136
+OUTOFF1  DS    CL6' ',CL2    MODULE/CSECT OFFSET                GP15136
+OUTHEX1  DS    4CL(8+1)' ',CL2   4 HEX WORDS                    GP15136
+OUTFRM11 DS    C'*'          LEFT FRAME                         GP15136
+OUTTXT1  DS    CL16' '       PRINTABLE TEXT                     GP15136
+OUTFRM12 DS    C'*',CL2      RIGHT FRAME                        GP15136
+OUTHEX2  DS    4CL(8+1)' ',CL2   4 HEX WORDS                    GP15136
+OUTFRM21 DS    C'*'          LEFT FRAME                         GP15136
+OUTTXT2  DS    CL16' '       PRINTABLE TEXT                     GP15136
+OUTFRM22 DS    C'*',CL2      RIGHT FRAME                        GP15136
+OUTOFF2  DS    CL6' '        MODULE/CSECT OFFSET                GP15136
+         ORG   ,
+         SPACE 2
+         PRINT GEN
+         LIBDEF N=1          DEFINE FIRST LIBRARY
+         SPACE 2
+         LIBDEF N=2          DEFINE SECOND LIBRARY
+         SPACE 2
+         READ  DECB,SF,MF=L             DECB FOR PDS INPUT
+         SPACE 1
+DIRLST   DS    A
+DIRTTR   DS    F                        TTR OF LAST DIRECTORY  BLOCK
+DIRBUF   DS    256X                     DIRECTORY BUFFER FOR 'ALL' OPT
+         SPACE 1
+RECORD   DS    CL256         INPUT RECORD
+         SPACE 1
+         DS    0F                       ALIGNMENT
+CESDTAB  DS    (STABCESD)XL(LTABCESD)   CESD ENTRY TABLE
+         SPACE 1
+COMMNAME DS    (2*STABCESD)CL8
+         SPACE 1
+SAVEEND  EQU   *                                                GP15136
+         EJECT
+         PRINT GEN
+         IHAPDS PDSBLDL=YES,DSECT=YES                           GP15136
+         SPACE 2
+         LIBDEF N=#,DSECT=LIBWORK
+         SPACE 2
+         PRINT NOGEN                                            GP15136
+MYJFCB   DSECT ,                                                GP15136
+         IEFJFCBN ,                                             GP15136
+         END   ,                                                 87258

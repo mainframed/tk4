@@ -1,0 +1,407 @@
+TSOCMD   TITLE 'TSOCMD - TSO CP TO EXECUTE ANOTHER COMMAND'
+         PUNCH ' ALIAS TC'         MAIN NAME IS 'TSOCMD'
+         PUNCH ' SETCODE AC(0)'    DO NOT LINK AUTHORIZED
+*
+* SYNTAX:  TSOCMD TARGET-COMMAND
+*    WHERE "TARGET-COMMAND" IS ANY TSO COMMAND, AND ITS PARMS.
+*    THE "TARGET-COMMAND" CANNOT BE A CLIST (OR AN "EXEC").
+* FUNCTION: TSOCMD (TC) WILL EXECUTE ANY TSO COMMAND.  TSOCMD
+*    AUTHORIZES ITSELF BEFORE ATTACHING THE DESIRED COMMAND, THUS
+*    ALLOWING AUTHORIZED CMDS TO BE ISSUED IN SPF.
+*
+* - THIS PROGRAM MIGHT BE RENT, BUT WHO CARES.
+* - THIS CODE COULD DEFINITELY USE SOME CLEANUP.
+*
+         SPACE 2
+TSOCMD   TSOENTER REGS=YES,PL=(CPPL,,IO,CSCAN),WORK=WORKLEN
+TSODSECT DSECT ,                        RE-ESTABLIST DSECT
+DOUBLE   DC    D'0'                     FOR CONVERSIONS
+ATTLIST  ATTACH DE=0,SF=L               PHONEY ATTACH LIST
+ATTLISTL EQU   *-ATTLIST                LENGTH
+PTPB     PUTLINE MF=L                   PHONEY PUTLINE LIST
+ATTTCB   DC    A(0)                     TCB ADDRESS
+ATTECB   DC    F'0'                     ECB ADDRESS
+STAECMP  DC    F'0'                     CMP FOR STAI
+BLDL     DC    2H'0',CL58' '            BLDL LIST
+BLDLNAME EQU   BLDL+4,8                 LMOD NAME FOR BLDL & ATTACH
+PARM     DC    H'0',CL100' '            PARM FIELD (USED AS WORK NOW)
+*
+NEWCPPL  DS    4F             CPPL FOR TARGET COMMAND
+NEWCBUF  DS    CL256          BUFFER FOR TARGET COMMAND
+CSSYNFLG DS    F              CMD SCAN SYNTAX CHECK FLAG
+CSOUTPUT DS    D              CMD SCAN OUTPUT AREA
+*
+OLD      DS    F                INFORMATIONAL MESSAGE OLD
+OLDA     DS    A                MESSAGE AREA ADDRESS
+MSGAREA  DS    A                MESSAGE HEADER
+MSGID    DS    CL8              MESSAGE IDENTIFICATOR
+MSGTEXT  DS    CL72             MESSAGE TEXT
+WORKUNPK DS    CL5              UNPACK AREA
+LPDESAVE DS    18F              SAVE AREA FOR REGISTERS
+LPDESV1  DS    18F              SAVE AREA FOR LPDE ROUTINE
+AUTHFLAG DS    X                AUTHFLAG
+WORKLEN  EQU   *-TSOWORK        LENGTH OF WORK AREA
+TSOCMD   CSECT                  CONTINUE CSECT
+         TITLE 'TSOCMD - INITIALIZATION CODE'
+         MVC   BLDL(4),=AL2(1,58)       NUMBER/LEN
+         XC    MSGAREA,MSGAREA          CLEAR MESSAGE AREA
+         MVI   AUTHFLAG,0               CLEAR AUTH FLAG
+         MVC   MSGAREA(2),=AL2(84)      MOVE IN LENGTH
+         MVC   OLD,=F'1'
+         LA    R1,MSGAREA
+         ST    R1,OLDA
+         MVC   MSGID(8),=C'GDC000I '    MOVE IN ID
+         MVC   MSGTEXT,BLANKS           CLEAR MESSAGE TEXT
+         MVC   STAECMP(4),TSOECB        CLEAR IT THIS WAY
+         EJECT
+*
+*  CREATE NEW COMMAND BUFFER FOR TARGET COMMAND
+*
+         L     R1,CPPLCBUF         POINT TO CMD BUFFER
+         LUSE  CMDBUF,R1           MAP IT
+         LA    R2,CMDTEXT          POINT TO TEXT OF INPUT CMD
+         AH    R2,CMDOFF           POINT TO TEXT OF TARGET CMD
+         LH    R3,CMDLEN           LEN OF INPUT CMD
+         SH    R3,CMDOFF           LEN OF TARGET CMD
+         LA    R1,NEWCBUF          POINT TO CBUF FOR TARGET CMD
+         STH   R3,CMDLEN           STORE LENGTH
+         XC    CMDOFF,CMDOFF       ZERO THE OFFSET
+         SH    R3,=H'5'            SUB 4 (LEN+OFF), SUB 1 FOR MVC
+         C     R3,=F'0'            IF LEN LT 0,
+         BL    ERRMISS1               THEN TARGET CMD IS MISSING
+         C     R3,=F'255'          IF LEN GT 255
+         BH    ERRLEN1                THEN TARGET CMD TOO LONG
+         EX    R3,MVCCMD           MOVE INTO TARGET CMDBUF
+         B     CSPLBLD             AND PROCEED
+*
+MVCCMD   MVC   CMDTEXT(0),0(R2)         <<EXECUTED>>
+         LDROP R1                  DROP MAP OF CMDBUF
+         EJECT
+*
+* COMMAND BUFFER FOR REQUESTED TSO COMMAND IS NOW BUILT
+* NOW BUILD THE IKJSCAN PARM LIST (CSPL)
+*
+CSPLBLD  DS    0H
+         MVC   CSPLUPT,CPPLUPT     POINT TO UPT
+         MVC   CSPLECT,CPPLECT     POINT TO ECT
+*
+         XC    TSOECB(4),TSOECB    CLEAR ECB
+         LA    R2,TSOECB           POINT TO ECB
+         ST    R2,CSPLECB          STORE IT IN CSPL
+*
+         XC    CSSYNFLG,CSSYNFLG   CLEAR FLGS (RQST CMD SYN CHECK)
+         LA    R2,CSSYNFLG         POINT TO SYNTAX CHECK FLAG
+         ST    R2,CSPLFLG          STORE IT IN CSPL
+*
+         XC    CSOUTPUT,CSOUTPUT   CLEAR OUTPUT AREA
+         LA    R2,CSOUTPUT         POINT OUTPUT AREA
+         ST    R2,CSPLOA           STORE IT IN CSPL
+*
+         LA    R2,NEWCBUF          POINT TO CMD BUFFER
+         ST    R2,CSPLCBUF         STORE IT IN CSPL
+*
+         LA    R1,CSPL             POINT TO CSPL FOR CMD SCAN
+         CALLTSSR EP=IKJSCAN       SCAN THE REQUESTED COMMAND
+         LTR   R15,R15             RETURN SHOULD BE ZERO
+         BNZ   ERRSCAN1            IF NOT, ERROR IN PARM LIST
+         LA    R1,CSOUTPUT         POINT TO OUTPUT AREA
+         USING CSOA,R1             MAP IT WITH IKJCSOA
+         TM    CSOAFLG,CSOAVWP+CSOAVNP   CHECK FOR VALID CMDS
+         BNZ   GETNAME             BRANCH IF VALID (NOT ZEROS)
+*
+*                                  ELSE INVALID, ANALYZE IT
+         TM    CSOAFLG,CSOANOC     WAS THERE A CMD?
+         BO    ERRMISS1
+         TM    CSOAFLG,CSOAEXEC    IMPLICIT EXEC?
+         BO    ERREXEC1
+         B     ERRBADC1            ELSE JUST PLAIN BAD
+*
+*
+GETNAME  MVC   BLDLNAME(8),=8C' '  BLANK MODULE NAME
+         L     R3,CSOACNM          ADDR OF REQUESTED CMD NAME
+         LH    R2,CSOALNM          LENGTH OF CMD NAME
+         BCTR  R2,0                SUB 1 FOR MVC LENGTH
+         EX    R2,MVCCMDNM         MOVE IT TO BLDLNAME
+         CLC   BLDLNAME(8),=CL8'EX'    NO CLIST ALLOWED
+         BE    ERREXEC1
+         CLC   BLDLNAME(8),=CL8'EXEC'  NO CLIST ALLOWED
+         BE    ERREXEC1
+         CLC   BLDLNAME(8),=CL8'TC'      NO RECURSIVE TSOCMD
+         BE    ERRECUR1
+         CLC   BLDLNAME(8),=CL8'TSOCMD'  NO RECURSIVE TSOCMD
+         BE    ERRECUR1
+*
+* NOW CONSTRUCT THE NEW CPPL FOR TARGET CMD
+*
+         LA    R1,NEWCBUF               LOAD PTR TO NEW CMD BUFF
+         ST    R1,NEWCPPL               SAVE IT IN NEW CPPL
+         MVC   NEWCPPL+4(12),CPPLUPT    COPY REST OF CPPL
+         B     LPDESRCH                 PROCEED TO MODULE SEARCH
+*
+MVCCMDNM MVC   BLDLNAME(0),0(R3)        <<EXECUTED>>
+*
+         EJECT
+ERRMISS1 DS    0H                       MISSING TARGET CMD
+         LA    R1,MSG01                 POINT TO MESSAGE
+         LA    R0,L'MSG01               LOAD LENGTH
+         B     PRELEAVX                 PUT MSG AND TERMINATE
+ERRLEN1  DS    0H                       TARGET CMD TOO LONG
+         LA    R1,MSG02                 POINT TO MESSAGE
+         LA    R0,L'MSG02               LOAD LENGTH
+         B     PRELEAVX                 PUT MSG AND TERMINATE
+ERRSCAN1 DS    0H                       IKJSCAN FAIL
+         LA    R1,MSG03                 POINT TO MESSAGE
+         LA    R0,L'MSG03               LOAD LENGTH
+         B     PRELEAVX                 PUT MSG AND TERMINATE
+ERREXEC1 DS    0H                       EXEC OR % NOT ALLOWED
+         LA    R1,MSG04                 POINT TO MESSAGE
+         LA    R0,L'MSG04               LOAD LENGTH
+         B     PRELEAVX                 PUT MSG AND TERMINATE
+ERRECUR1 DS    0H                       RECURSIVE NOT ALLOWED
+         LA    R1,MSG07                 POINT TO MESSAGE
+         LA    R0,L'MSG07               LOAD LENGTH
+         B     PRELEAVX                 PUT MSG AND TERMINATE
+ERRBADC1 DS    0H                       INVALID TARGET CMD NAME
+         LA    R1,MSG05                 POINT TO MESSAGE
+         LA    R0,L'MSG05               LOAD LENGTH
+         B     PRELEAVX                 PUT MSG AND TERMINATE
+         EJECT
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+LPDESRCH DS    0H                       IF MODULE IS IN LPA *HMD 06/80*
+*                                       THEN FORGET BLDL    *HMD 06/80*
+         STM   R0,R15,LPDESAVE          SAVE REGISTERS      *HMD 06/80*
+         L     R3,CVTPTR                GET CVT ADDRESS
+         LUSE  CVT,R3                   ADDRESS THE CVT     *HMD 06/80*
+         L     R15,CVTQLPAQ             POINT TO ALPAQ      *HMD 06/80*
+         L     R15,0(R15)               1ST CDE ON QUEUE    *HMD 06/80*
+         LA    R15,0(R15)               CLEAR FOR ICM       *HMD 06/80*
+         LTR   R15,R15                  ANYTHING THERE?     *HMD 06/80*
+CDELOOP  BZ    DIRSRCH                  NO, SEARCH DIRECT   *HMD 06/80*
+         CLC   BLDL+4(8),8(R15)         NAMES MATCH?        *HMD 06/80*
+         BE    LPDEEXIT                 YES, RELOAD REGS    *HMD 06/80*
+         ICM   R15,7,1(R15)             GET NEXT POINTER    *HMD 06/80*
+         B     CDELOOP                  LOOP AGAIN          *HMD 06/80*
+DIRSRCH  LM    R0,R1,BLDL+4             PICK UP THE NAME    *HMD 06/80*
+         L     R15,CVTLPDSR             GET LPA SEARCH ROUTINE
+         XC    LPDESV1(18*4),LPDESV1    CLEAR PHONY SAVEAREA
+         LR    R2,R13                   SAVE R13 ADDRESS    *HMD 06/80*
+         LA    R13,LPDESV1              POINT TO PHONY      *HMD 06/80*
+         BALR  R14,R15                  SEARCH THE LPA DIRECTORY
+         B     LPDEEXIT                 EUREKA, WE FOUND IT *HMD 06/80*
+         B     NOTLPA                   SHUCKS, NOT THERE   *HMD 06/80*
+         LDROP R3                       GET RID OF BASE     *HMD 06/80*
+LPDEEXIT LR    R13,R2                   RESTORE R13         *HMD 06/80*
+         LM    R0,R15,LPDESAVE          RESTORE REGS        *HMD 06/80*
+         B     DOATTACH                 DO THE ATTACH       *HMD 06/80*
+NOTLPA   DS    0H                       NOT IN LPA LIB      *HMD 06/80*
+         LR    R13,R2                   RESTORE REG 13      *HMD 06/80*
+         LM    R0,R15,LPDESAVE          RESTORE REGISTERS   *HMD 06/80*
+         XR    R1,R1                    CLEAR DCB ADDRESS
+         BLDL  (1),BLDL                 DO IT
+         CH    R15,=H'8'                CHECK JUST IN CASE
+         BNH   *+8                      OK
+         LA    R15,12                   LOAD ERROR CODE
+         B     *+4(R15)                 DO BRANCH
+         B     DOATTACH                 RETURN CODE=0
+         B     NONESUCH                 NO SUCH MODULE
+         B     IOERR                    I/O ERROR IN SEARCH
+         LA    R1,MSG06                 BAD RETURN CODE FROM BLDL
+         LA    R0,L'MSG06               AND LEN
+         B     PRELEAVX                 DIE RIGHT NOW
+         TITLE 'TSOCMD - ERROR AND RETURN CODE'
+NONESUCH MVC   PARM(L'NOMOD),NOMOD      MOVE IN MESSAGE
+         MVC   PARM+MODOFF(8),BLDL+4    MOVE IN MODULE NAME
+         LA    R1,PARM                  LOAD PLACE
+         LA    R0,L'NOMOD               LEN
+         B     PRELEAVX                 DO IT
+         SPACE 2
+IOERR    LA    R1,IOERRMSG              LOAD MESSAGE
+         LA    R0,L'IOERRMSG            LENGTH
+         SPACE 2
+PRELEAVX MVI   STAECMP+3,20             ERROR CODE
+PRELEAVE MVC   MSGTEXT,BLANKS           CLEAR MSG TEXT      *HMD 06/80*
+         LR    R2,R0                    SAVE LENGTH         *HMD 06/80*
+PREMVC   MVC   MSGTEXT(0),0(R1)         << EXECUTED >>      *HMD 06/80*
+         BCTR  R2,0                     DOWN 1 FOR MVC      *HMD 06/80*
+         EX    R2,PREMVC                MOVE IN TEXT        *HMD 06/80*
+         PUTLINE PARM=PTPB,OUTPUT=(OLD,TERM,SINGLE,INFOR),  *HMD 06/80*X
+               MF=(E,IOPL)                                  *HMD 06/80*
+*
+LEAVE    DS    0H
+         L     R2,STAECMP               TEST CMP CODE
+         LTR   R2,R2                    TEST IT
+         BP    *+6                      AROUND CLEAR
+         XR    R2,R2                    CLEAR IT
+         TSOLEAVE RETCODE=(R2)          LEAVE NOW
+         TITLE 'TSOCMD - SOME CONSTANTS'
+MSG01    DC    C'ERROR: TARGET COMMAND TO BE EXECUTED IS MISSING'
+MSG02    DC    C'ERROR: TARGET COMMAND TO BE EXECUTED EXCEEDS 255 CHARA+
+               CTERS'
+MSG03    DC    C'** ERROR IN COMMAND SCAN ** CONTACT SYSTEMS PERSONNEL'
+MSG04    DC    C'ERROR: TARGET COMMAND CANNOT BE "EXEC" OR "%"'
+MSG05    DC    C'ERROR: TARGET COMMAND IS INVALID'
+MSG06    DC    C'** ERROR IN BLDL ** CONTACT SYSTEMS PERSONNEL'
+MSG07    DC    C'ERROR: TARGET COMMAND CANNOT BE "TSOCMD" OR "TC"'
+MSG10    DC    C'** ATTACH ERROR ** CONTACT SYSTEMS PERSONNEL'
+STAXMSG  DC    C'** TSOCMD TERMINATED BY ATTENTION **'
+IOERRMSG DC    C'** I/O ERROR DURING BLDL ** CONTACT SYSTEMS PERSONNEL'
+NOMOD    DC    C'COMMAND 12345678 NOT FOUND'
+ABCODE   DC    C'COMMAND 12345678 ABENDED, SYS=000, USER=0000'
+NONZERO  DC    C'COMMAND 12345678 ENDED, COND. CODE=0000     '
+*  NOTE THAT NONZERO ABOVE MUST BE SAME LENGTH AS ABCODE    *HMD 06/80*
+BLANKS   DC    CL80' '                                      *HMD 06/80*
+MODOFF   EQU   8
+ABSYS    EQU   30
+ABUSER   EQU   40
+NONCODE  EQU   35
+TRT      EQU   *-C'0'
+         DC    C'0123456789ABCDEF'
+         TITLE 'TSOCMD - SET UP AND ATTACH TARGET COMMAND'
+DOATTACH DS    0H
+         L     R6,CPPLECT               LOAD ECT ADDR
+         LUSE  ECT,R6                   ADDRESS DSECT
+         SETAUTH ON                     GESCO AUTHORIZATION ON
+         MVI   AUTHFLAG,X'FF'           TURN ON FLAG
+         MVC   ECTPCMD,BLDL+4           MOVE IN COMMAND NAME
+         LDROP R6
+         LA    R6,ATTTCB                ADDR OF ATTACHED TCB FOR STAX
+         STAX  STAXEXIT,USADDR=(R6),OBUF=(STAXMSG,L'STAXMSG)
+         LA    R1,NEWCPPL               LOAD PARM POINTER
+         SPACE 3
+         XC    ATTLIST(ATTLISTL),ATTLIST  CLEAR ATTACH LIST
+         XC    ATTECB(4),ATTECB         CLEAR THE ECB
+ATTACH   ATTACH EPLOC=BLDL+4,DCB=0,ECB=ATTECB,SZERO=NO,                +
+               STAI=(STAI,(R13)),PURGE=NONE,ASYNCH=YES,                +
+               MF=(E,(1)),SF=(E,ATTLIST),SHSPV=78
+         LTR   R15,R15                  TEST RETURN CODE
+         BNZ   ERRATCH1                 ERROR IF NOT ZERO
+         ST    R1,ATTTCB                SAVE TCB ADDRESS
+         WAIT  1,ECB=ATTECB             WAIT FOR SUBTASK
+         CLI   AUTHFLAG,X'FF'           IS AUTH FLAG ON
+         BNE   OFFSTAX                  BRANCH IF NOT
+         SETAUTH OFF                    ELSE TURN OFF AUTH
+         MVI   AUTHFLAG,X'00'           INDICATE SO
+OFFSTAX  STAX  ,                        TURN OFF ATTN EXIT
+         OC    STAECMP(4),STAECMP       GET CMP FROM TASK
+         BZ    GETRC                    OK, GET RETURN CODE
+         MVI   STAECMP,X'00'            CLEAR HIGH BYTE
+         L     R1,STAECMP               GET IT
+         SLL   R1,4                     NOW HAVE 0SSSUUU0
+         ST    R1,ATTECB                SAVE IT
+         MVC   PARM(L'ABCODE),ABCODE
+         MVC   PARM+MODOFF(8),BLDL+4    MOVE IN MOD NAME
+         UNPK  DOUBLE(4),ATTECB(3)      GET FOR HEX
+         MVC   PARM+ABSYS(3),DOUBLE     DO THAT
+         TR    PARM+ABSYS(3),TRT        GET IN PRINTABLE
+         MVC   ATTECB(2),STAECMP+2      GET LOW 2 BYTES
+         NI    ATTECB,X'0F'             OFF LOW SYSTEM BYTE
+         LH    R15,ATTECB               LOAD CMP CODE
+         CVD   R15,DOUBLE               CONVERT IT
+         UNPK  PARM+ABUSER(4),DOUBLE+5(3)
+         OI    PARM+ABUSER+3,C'0'       PRINTABLE
+         B     DETACH                   DO DETACH
+         SPACE 3
+GETRC    L     R15,ATTECB               GET ECB
+         LA    R15,0(,R15)              OFF POST FLAGS
+         LTR   R15,R15                  TEST RETURN CODE
+         ST    R15,STAECMP              SAVE IT IN RIGHT FIELD
+         MVI   STAECMP,X'FF'            SET FLAG FOR NO RC MSG
+         BZ    DETACH                   IF RC=0, READY TO DETACH
+*                                       ELSE TGT CMD RC NOT ZERO
+         OC    ATTTCB(4),ATTTCB         DID STAX DETACH IT?
+         BZ    DETDONE                  IF YES, IGNORE RC
+         MVI   STAECMP,X'00'            ELSE RC MSG REQUIRED
+         CVD   R15,DOUBLE               CONVERT IT
+         MVC   PARM(L'NONZERO),NONZERO  MOVE IN CODE
+         MVC   PARM+MODOFF(8),BLDL+4    MOVE IN NAME
+         UNPK  WORKUNPK(5),DOUBLE+5(3)  UNPACK CODE
+         OI    WORKUNPK+4,C'0'          FIX SIGN
+         MVC   PARM+NONCODE(4),WORKUNPK+1  MOVE IN CODE
+         EJECT
+DETACH   DS    0H
+         OC    ATTTCB(4),ATTTCB         DETACHED BY STAX?
+         BZ    DETDONE                  IF YES, SKIP DETACH
+         DETACH ATTTCB,STAE=NO          DETACH TARGET COMMAND
+DETDONE  LA    R1,PARM                  LOAD ADDRESS OF ROUTINE
+         LA    R0,L'NONZERO             BOTH SAME LEN
+         CLI   STAECMP,X'FF'            CMP ZERO?
+         BE    LEAVE                    YES, NO RC MSG REQUIRED
+         B     PRELEAVE                 ELSE PUT MSG, THEN LEAVE
+         SPACE 5
+ERRATCH1 DS    0H                       ATTACH FAILED
+         CLI   AUTHFLAG,X'FF'           IS AUTH FLAG ON
+         BNE   ERSTXOFF                 BRANCH IF NOT
+         SETAUTH OFF                    ELSE TURN OFF AUTH
+         MVI   AUTHFLAG,X'00'           INDICATE SO
+ERSTXOFF STAX  ,                        TURN OFF ATTN EXIT
+         LA    R1,MSG10                 MESSAGE ADDRESS
+         LA    R0,L'MSG10               AND LEN
+         B     PRELEAVX                 DONE FOR
+         TITLE 'TSOCMD - STAX EXIT ROUTINE'
+STAXEXIT DS    0H                  STAX ATTN EXIT
+         USING STAXEXIT,R15        TEMP ADDRESSABILITY
+         B     STAXSTM             BRANCH AROUNG DC
+STAXBASE DC    A(TSOCMD)           ADDR FOR BASE REG
+STAXSTM  STM   R14,R12,12(R13)     SAVE ATTN PROCESSOR'S REGS
+         LR    R12,R15             NOW WE HAVE SAME ADDRESSABILITY
+         DROP  R15                   AS IN MAIN ROUTINE
+*
+* - SINCE WE CALL NO ROUTINES, AND DO ONLY A DETACH SVC,
+*   NO SAVE AREA IS PROVIDED.  NOTE, AS "ATTACH" CURRENTLY WRITTEN,
+*   STAI WOULD NOT GAIN CONTROL AFTER THIS ROUTINE DETACHES COMMAND,
+*   AND ECB WOUD CONTAIN THE S13E ABEND CODE. THUS WE CLEAR THE
+*   'ATTTCB' TO SIGNAL ITS DETACHED AND RC IN ECB CAN BE IGNORED.
+*
+         L     R2,8(,R1)           LOAD USADDR (ADDR OF ATTTCB)
+         LTR   R2,R2               TCB MUST BE NONZERO
+         BZ    STAXABND
+         DETACH (R2),STAE=NO       TERMINATE ATTACHED COMMAND
+         XC    0(4,R2),0(R2)       CLEAR ATTTCB TO INDIC DETACHED
+*
+         LM    R14,R12,12(R13)     RESTORE REGS
+         SR    R15,R15             SET RETURN CODE
+         BR    R14                 RETURN TO ATTN PROCESSOR
+*
+STAXABND ABEND 016                 ATTACH NOT COMPLETED, NO DUMP
+         TITLE 'TSOCMD - STAI EXIT ROUTINE'
+         LDROP *
+         LUSE  STAI,R15                 TELL ASSEMBLER
+STAI     CH    R0,=H'12'                CODE FOR NO CORE?
+         BE    STAINCOR                 NO CORE, OK
+         L     R2,0(,R1)                GET ADDR OF PARM
+         LUSE  TSODSECT,R2              TELL ASSEMBLER
+         OC    STAECMP(4),STAECMP       SET CONDITION CODE
+         BNZ   STAIDIE                  RECURSION-DIE
+         MVC   STAECMP(4),4(R1)         COPY STAE ABCODE
+         B     STAIDO                   GO TO RETRY ROUTINE
+         SPACE 3
+STAINCOR OC    STAECMP(4),STAECMP       SET CONDITION CODE
+         BNZ   STAIDIE                  STAI-RECURSION DIE
+         ST    R1,STAECMP               SAVE CMP AS PUT THERE
+STAIDO   LA    R0,STAITRY               LOAD STAE RETRY ROUTINE
+         LA    R15,4                    LOAD RETRY CODE
+         SVC   3                        RETURN TO ASIR
+         SPACE 1
+STAIDIE  LR    R3,R1                    SAVE POINTER
+         POST  ATTECB,0                 POST MY MOTHER
+         XC    DOUBLE(4),DOUBLE         CLEAR IT
+         WAIT  1,ECB=DOUBLE             STOP HERE
+         LDROP *
+STAITRY  STAE  0,CT                     CLEAR ANY STAE CB'S
+         SVC   3                        RETURN UP ANOTHER LEVEL
+         EJECT * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+         LUSE  TSODSECT,R13             RE-ESTABLIST FOR THESE ISNS
+MVCMOD   MVC   BLDL+4(0),0(R1)          <<EXECUTED>>
+MVCPARM  MVC   PARM+2(0),0(R3)          <<EXECUTED>>
+         SPACE 2
+         LTORG
+         EJECT
+         IKJECT
+         IKJCSOA  ,
+CMDBUF   DSECT                CMD BUFFER (<-CSPLCBUF)
+CMDLEN   DC    H'0'           LENGTH, INCLUDES HEADER (4 BYTES)
+CMDOFF   DC    H'0'           OFFSET TO NONBLANK PAST COMMAND.
+CMDTEXT  DC    CL256' '       FIRST TEXT BYTE.  MAX LENGTH??
+         EJECT
+         CVT  DSECT=YES,LIST=YES
+         END

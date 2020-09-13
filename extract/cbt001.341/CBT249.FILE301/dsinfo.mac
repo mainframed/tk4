@@ -1,0 +1,1420 @@
+          TITLE 'DSINFO COMMAND - DISPLAY DATASET ATTRIBUTES'
+*********************************************************************
+*  NAME        -  DSINFO                                            *
+*                                                                   *
+*  FUNCTION    -  DISPLAY DATASET ATTRIBUTES                        *
+*                                                                   *
+*  RESTRICTION -  WORKS WITH OS CVOLS ONLY!!!                       *
+*                                                                   *
+*  AUTHOR      -  ORIGINAL FROM OS/MVT SHARE MODS TAPE              *
+*                                                                   *
+*  REVISIONS   -  CODE MARKED 'FRBNY' - 5/80                        *
+*                                                                   *
+*                 1. SUPPORT MVS LOCATE RESTRICTIONS                *
+*                                                                   *
+*                 CODE MARKED 'CTL'   - 1/81                        *
+*                                                                   *
+*                 1. SUPPORT MVS LAST ACCESS DATE                   *
+*                                                                   *
+*  SYNTAX      -  DSINFO DSN(X) LEVEL(X) TOTALS SOME DCB HISTORY    *
+*                        ALL MEMBERS                                *
+*                                                                   *
+*  SYSTEM      -  MVS 3.8 OR MVS/SE2                                *
+*                                                                   *
+*  ATTRIB      -  NON-REUS                                          *
+*                                                                   *
+*  MACROS      -  SAVE,GETMAIN,FREEMAIN,STAX,LINK,GTSIZE,LOCATE,    *
+*                 RDJFCB,OPEN,READ,DCB,CAMLST,IKJPARM,IKJKEYWD,     *
+*                 IKJNAME,IKJSUBF,IKJPOSIT,IKJENDP                  *
+*                                                                   *
+*  DSECTS      -  IKJCPPL,IKJDAPL,IKJPPL,IKJDAP08,IKJDAP18,         *
+*                 IKJPARMD,WKAREA,VOLBLK,DSPTR,LNKIND               *
+*                                                                   *
+*  INPUT       -  R1->CPPL                                          *
+*                                                                   *
+*  OUTPUT      -  VARIOUS FORMATS DEPENDING ON OPTIONS              *
+*                                                                   *
+*  LOGIC       -  1.  ENTRANCE CONVENTIONS                          *
+*                 2.  PARSE OPERANDS                                *
+*                 3.  SEARCH OS CVOL FOR APPROPRIATE DATASETS       *
+*                 4.  SORT DATASET NAMES FOUND                      *
+*                 5.  GET FMT1 DSCB INFORMATION:                    *
+*                     A. ALLOCATE DUMMYDSN                          *
+*                     B. RDJFCB                                     *
+*                     C. OPEN VTOC INPUT                            *
+*                     D. READ FMT1 AND FMT3 WITH BDAM               *
+*                 6.  IF MEMBERS DESIRED, READ DIRECTORY            *
+*                                                                   *
+*  INSTALL    -   ASSEMBLE DSINFO                                   *
+*                 LINK DSINFO                                       *
+*                 PLACE DSINFO IN LINKLIST LIBRARY                  *
+*********************************************************************
+DSINFO   CSECT                         ENTRANCE CONVENTIONS
+         SAVE  (14,12)
+         BALR  11,0
+         USING *,11,12                 R11 & R12 BASE REGISTERS
+         LA    12,4095(11)
+         LA    12,1(12)
+         LR    7,1                     SAVE CPPL ADDRESS
+         USING CPPL,7
+         GETMAIN R,LV=ENDAREA-WKAREA   GET WORK AREA
+         ST    13,4(1)
+         ST    1,8(13)                 CHAIN SAVE AREAS
+         LR    13,1
+         USING WKAREA,13
+         LA    2,4095
+         SLL   2,1
+         GETMAIN R,LV=(2)              SAVE 8K FOR SYSTEM USE
+         LR    3,1
+         GETMAIN VC,LA=TABSIZE,A=SORTTAB
+         LTR   15,15
+         BNZ   NOCORE
+         L     1,SORTTAB
+         A     1,SORTLEN               SAVE END ADDRESS OF WORKAREA
+         ST    1,ENDTAB
+         FREEMAIN R,LV=(2),A=(3)       RETURN 8K (FOR MVT SYSTEM)
+         ST    7,CPPLADR
+         STAX  ATTEXIT,REPLACE=YES
+         MVI   ALOCFLG,X'00'           ALLOCATED DD FLAGE
+         MVI   ATTFLAG,X'00'           ATTENTION INTERRUPT FLAG
+         MVI   OPTFLG,X'00'            PRINT OPTION FLAG
+         MVI   BUF,C' '
+         MVC   BUF+1(132),BUF          CLEAR BUFFERS
+         MVC   CARD+4(44),BUF
+         LA    1,CARD+4
+         ST    1,CATNAME+4
+         L     4,SORTTAB
+         LA    10,STACK
+         LA    1,CATBLK
+         ST    1,CATNAME+12
+         ST    1,0(10)
+         SR    1,1                     ZERO COUNTERS
+         ST    1,TOTUSED
+         ST    1,TOTALOC
+         ST    1,TOTDS
+         L     3,CPPLCBUF
+         CLC   4(5,3),=C'SPACE'        SPACE REQUEST?
+         BNE   GOPARSE                 NO, GO TO PARSE
+         OI    OPTFLG,X'10'            GET TOTALS FOR SPACE COMMAND
+         B     GETINDQ
+*
+*        BUILD PARSE PARM LIST
+*
+GOPARSE  LA    9,PPLWK
+         USING PPL,9
+         MVC   PPLUPT(4),CPPLUPT       UPT
+         MVC   PPLECT(4),CPPLECT       ECT
+         XC    DUMECB(4),DUMECB        ECB
+         LA    1,DUMECB
+         ST    1,PPLECB
+         L     1,PCLPTR                PCL
+         ST    1,PPLPCL
+         LA    1,PDLPTR                PDL
+         ST    1,PPLANS
+         MVC   PPLCBUF(4),CPPLCBUF     CIB
+         XC    PPLUWA(4),PPLUWA        UWA
+         LR    1,9
+         LINK  EP=IKJPARS              INVOKE PARSE
+         LTR   15,15
+         BP    PARSEERR                CHECK IF PARSE OK
+         L     8,PDLPTR
+*
+*        PROCESS OPERANDS
+*
+         USING IKJPARMD,8
+KDSN     LH    1,DSN                   DSN OPERAND PRESENT?
+         LTR   1,1
+         BZ    KIND
+         L     2,DSN#P
+         OI    OPTFLG,X'01'
+         TM    DSN#P+6,X'40'           IS DSN QUOTED?
+         BZ    QUALDSN                 GET HIGH INDEX
+         LH    1,DSN#P+4
+         BCTR  1,0
+         ST    1,CARD
+         LA    3,CARD+4
+         EX    1,MVIND                 SAVE DSN FOR LOCATE
+         B     KPDS                    CHECK PRINT OPTIONS
+QUALDSN  BAL   14,GETBTLQ
+         AR    3,1
+         LH    1,DSN#P+4               LENGTH OF REMAINDER OF DSN
+         L     2,DSN#P                 PTR TO REMAINDER OF DSN
+         BAL   14,GETREST              MOVE REMAINDER OF DSN
+         B     KPDS
+KIND     LH    1,IND                   LEVEL SPECIFIED?
+         LTR   1,1
+         BZ    GETINDQ                 GET INDEX QUALIFIER
+         L     2,IND#P
+         LH    1,IND#P+4
+         LA    3,CARD+4
+         BCTR  1,0
+         ST    1,CARD
+         EX    1,MVIND                 SAVE FOR LOCATE
+         EX    1,SAVEIND               SAVE HIGH LEVEL INDEX
+CKSPACE  TM    OPTFLG,X'10'            SPACE REQUEST
+         BO    GETCAT                  YES
+         B     KTOT                    CHECK PRINT OPTIONS
+GETINDQ  BAL   14,GETBTLQ
+         B     CKSPACE
+QUALIND  BAL   14,GETBTLQ
+         AR    3,1
+         LH    1,IND#P+4               L'REMAINDER OF IND
+         L     2,IND#P                 ->REMAINDER OF IND
+         BAL   14,GETREST
+         B     CKSPACE
+         SPACE 2
+GETREST  MVI   1(3),C'.'               MOVE DOT
+         LA    3,2(3)
+         BCTR  1,0
+         EX    1,MVIND                 MOVE REMAINDER
+         A     1,CARD
+         LA    1,2(1)
+         ST    1,CARD
+         BR    14
+GETBTLQ  L     9,CPPLPSCB
+GETUID   LR    2,9                     UID FROM PSCB
+         SR    1,1
+         IC    1,7(9)                  UID LENGTH
+MVID     LA    3,CARD+4
+         BCTR  1,0
+         ST    1,CARD
+         EX    1,MVIND
+         EX    1,SAVEIND               SAVE FOR 2ND LOCATE      FRBNY
+         BR    14
+KTOT     LH    1,TOT                   TOTALS REQUESTED?
+         LTR   1,1
+         BZ    KPDS
+         OI    OPTFLG,X'10'            YES, SET FLAG
+         B     GETCAT
+KPDS     LH    1,PDS                   MEMBERS SPECIFIED?
+         LTR   1,1
+         BZ    KALL
+         OI    OPTFLG,X'08'            YES, SET FLAG
+KALL     LH    1,ALL                   ALL SPECIFIED?
+         LTR   1,1
+         BZ    KORG
+*                                      GET TERMINAL SCREEN SIZE
+         GTSIZE
+         CH    1,=H'120'
+         BL    SMALL
+         MVI   INST1+3,X'0C'
+         MVI   INST2+3,X'0C'
+         MVI   INST3+1,X'00'
+SMALL    EQU   *
+         OI    OPTFLG,X'E0'            LIST EVERYTHING
+         B     GETCAT
+KORG     LH    1,ORG                   DCB SPECIFIED?
+         LTR   1,1
+         BZ    KDTE
+         OI    OPTFLG,X'40'            YES, SET FLAG
+         B     GETCAT
+KDTE     LH    1,DTE                   HISTORY SPECIFIED?
+         LTR   1,1
+         BZ    KTRK
+         OI    OPTFLG,X'20'            YES, SET FLAG
+         B     GETCAT
+KTRK     OI    OPTFLG,X'80'            SET DEFAULT
+         B     GETCAT
+MVIND    MVC   0(0,3),0(2)
+SAVEIND  MVC   INDIMAGE(*-*),0(2)      SAVE HIGH LEVEL INDEX
+         DROP  7
+*
+*        PROCESS ERROR CONDITIONS
+*
+NOCVOL   MVC   BUF+1(26),=C'CONTROL VOLUME NOT MOUNTED'
+         SR    3,3
+         B     PRTERR
+PARSEERR MVC   BUF+1(11),=C'PARSE ERROR'
+         SR    3,3
+         B     PRTERR
+EMPTY    MVC   BUF+1(17),=C'INDEX LEVEL EMPTY'
+         L     3,CARD
+         LA    1,BUF+20
+         B     PRTERR
+BADIND   MVC   BUF+1(26),=C'INDEX LEVEL NOT IN CATALOG'
+         L     3,CARD
+         LA    1,BUF+29
+         B     PRTERR
+TOOMANY  MVC   BUF+1(38),=C'DATA SET NAME FOUND IN INDEX STRUCTURE'
+         L     3,CARD
+         LA    1,BUF+41
+         B     PRTERR
+CATIO    EQU   *
+BADTTR   MVC   BUF+1(20),=C'I/O ERROR IN CATALOG'
+         SR    3,3
+         B     PRTERR
+SYNTAX   MVC   BUF+1(23),=C'INVALID DSNAME OR INDEX'
+         L     3,CARD
+         LA    1,BUF+26
+PRTERR   LTR   3,3
+         BZ    PRINTBAD
+         LA    2,CARD+4
+         EX    3,MVIT
+PRINTBAD BAL   14,P2
+         B     FINI
+*
+*        SEARCH THE OS CVOL FOR DATASETS WITHIN INDEX
+*
+GETCAT   EQU   *
+         LA    7,LVSTACK               INITIALIZE LEVEL STACK
+         MVI   0(7),X'00'
+         LOCATE CATNAME                LOCATE
+         MVI   CATNAME,X'44'           NO CVOL SUPPLIED (DEFAULT)
+         B     CKRTN(15)          RC
+CKRTN    B     PROCESS            0    OK
+         B     NOCVOL             4    CVOL NOT MOUNTED
+         B     BADIND             8    INDEX LEVEL NOT IN CATALOG
+         B     PROCESS            12   OK
+         B     TOOMANY            16   DSN FOUND BEFORE INDICES DONE
+         B     SYNTAX             20   SYNTAX ERROR
+         B     CATIO              24   I/O ERROR
+         B     BADTTR             28   BAD TTR IN CATALOG
+         B     FINI
+         SPACE 2
+*
+*        SPECIAL CHECK FOR MVS LOCATES
+*
+PROCESS  CLC   CARD+4(9),=C'SYSCTLG.V'  REQUEST BY HIGH INDEX?  FRBNY
+         BNE   PROCESS2                 NO, CONTINUE            FRBNY
+         MVI   CATNAME,X'C4'            YES, SAY CVOL PRESENT   FRBNY
+         MVC   CARD+4(8),INDIMAGE       MOVE INDEX FOR LOCATE   FRBNY
+         MVC   INDCVOL(6),CARD+13       MOVE CVOL FOR LOCATE    FRBNY
+         MVC   CARD+12(7),=CL7' '       CLEAR OUT REST OF DSN   FRBNY
+         LA    1,INDCVOL                --> CVOL SUPPLIED       FRBNY
+         ST    1,CATNAME+8              SAVE --> FOR LOCATE     FRBNY
+         B     GETCAT                   GO ISSUE SECOND LOCATE  FRBNY
+         SPACE 2
+*
+*        ASSEMBLE DATASET INDEXES
+*
+PROCESS2 L     9,0(10)                  TOP OF STACK
+         TM    OPTFLG,X'01'             DSN SPECIFIED?
+         BO    BYDSN
+         MVC   CVOL(6),259(9)           GET CVOL NAME
+         LA    9,2(9)                   SKIP COUNT FIELD
+         CLI   0(9),X'00'
+         BNE   TESTTYPE
+         CLI   11(9),X'03'              SKIP ICE
+         BE    BY18
+         LA    9,22(9)                  SKIP VICE
+         B     TESTTYPE
+BY18     LA    9,18(9)
+TESTTYPE CLI   0(9),X'FF'               PROCESS ILE
+         BE    LINKENT
+         CLI   11(9),X'00'              PROCESS IPE
+         BE    PTRENT
+*
+*        DSPE IS THE LOWEST LEVEL
+*
+         USING DSPTR,9
+         LR    1,4                      NEXT TABLE ENTRY
+         MVI   0(4),C' '                CLEAR ENTRY
+         MVC   1(53,4),0(4)
+         LA    2,CARD+4
+         L     3,CARD
+         EX    3,MVIT                   MOVE HIGH LEVEL INDEX
+         AR    1,3
+         LA    1,1(1)
+         MVI   0(1),C'.'
+         LA    1,1(1)
+         LA    6,LVSTACK                MOVE INTERMEDIATE LEVELS
+GETLEVEL CLI   0(6),X'00'               ANY MORE?
+         BE    MVLOW                    NO, MOVE LOW LEVEL INDEX
+         LH    3,8(6)
+         LR    2,6
+         EX    3,MVIT
+         AR    1,3
+         LA    1,1(1)
+         MVI   0(1),C'.'
+         LA    1,1(1)
+         LA    6,10(6)
+         B     GETLEVEL
+MVIT     MVC   0(0,1),0(2)
+MVLOW    MVC   0(8,1),DSNAME
+         MVC   44(6,4),DSSER           SAVE VOLSER
+         MVC   50(4,4),DSDEV           SAVE DEVICE CODE
+         LA    4,54(4)                 INCREMENT FOR NEXT ENTRY
+         C     4,ENDTAB
+         BNL   USEDUP
+NEXTENT  SR    8,8
+         IC    8,DSCNT
+         SLL   8,1                     # BYTES REMAINING IN ENTRY
+         LA    9,12(9)
+         AR    9,8
+         B     TESTTYPE
+         USING VOLBLK,9
+BYDSN    MVI   0(4),C' '               BLANK OUT TABLE ENTRY
+         MVC   1(49,4),0(4)
+         LR    1,4
+         LA    2,CARD+4
+         L     3,CARD
+         EX    3,MVIT                  MOVE DSN
+         MVC   44(6,4),VOLSER#         MOVE VOLSER
+         MVC   50(4,4),VOLDEV          MOVE DEVICE CODE
+         LA    4,54(4)
+         ST    4,ENDLIST
+         B     SORTEND
+         SPACE 2
+*
+*        PROCESS ILE (INDEX LINK ENTRY)
+*
+         USING LNKIND,9
+LINKENT  XC    WK(4),WK
+         CLC   LNKTTR(3),WK            GOOD TTR?
+         BE    POPUP                   NO
+         MVC   WK(3),LNKTTR            MOVE TO H.W. BOUNDARY
+         LA    1,WK
+         ST    1,CATTTR+4              SETUP CAMLST
+         L     8,0(10)
+         ST    8,CATTTR+12
+         LOCATE CATTTR                 READ CATALOG BLOCK
+         B     CKRTN(15)
+*
+*        PROCESS IPE (INDEX POINTER ENTRY)
+*
+         USING INDPTR,9
+PTRENT   XC    WK(4),WK
+         CLC   INDTTR(3),WK            GOOD TTR?
+         BE    POPUP                   NO
+         MVC   0(8,7),INDNAME          SAVE INDEX NAME
+         LA    1,8                     FIND LENGTH
+         LA    15,INDNAME
+         SR    2,2
+SCAN     CLI   1(15),X'40'
+         BE    GOTIT
+         LA    15,1(15)
+         LA    2,1(2)
+         BCT   1,SCAN
+         BCTR  2,0
+GOTIT    STH   2,8(7)
+         LA    7,10(7)
+         MVI   0(7),X'00'
+         LA    8,12(9)
+         ST    8,4(10)                 SAVE PTR IN CURRENT BLOCK
+         L     8,0(10)
+         LA    8,272(8)                PTR TO NEW BLOCK
+         LA    10,8(10)
+         ST    8,0(10)                 NEW BLOCK TO TOP OF STACK
+         MVC   WK(3),INDTTR
+         LA    1,WK                    SAVE ADDR FOR CAMLST
+         ST    1,CATTTR+4
+         ST    8,CATTTR+12
+         LOCATE CATTTR                 READ LOWER LEVEL BLOCK
+         B     CKRTN(15)
+POPUP    S     10,=F'8'
+         LA    1,STACK
+         CR    1,10
+         BH    SORT
+         SH    7,=H'10'                POP UP LEVEL STACK
+         MVI   0(7),X'00'
+         L     9,4(10)
+         B     TESTTYPE
+*
+*        NOW SORT THE ENTRIES IN THE TABLE
+*
+SORT     ST    4,ENDLIST               TABLE END
+         LR    2,4
+         L     3,SORTTAB               TABLE START
+         CR    3,4
+         BE    EMPTY                   INDEX LEVEL EMPTY?
+NEXTPASS LA    4,54(3)                 NEXT ENTRY
+         CR    4,2                     END OF TABLE?
+         BNL   SORTEND
+COMP     CLC   44(6,3),44(4)           COMPARE VOLSERS
+         BH    SWITCH
+INCR     LA    4,54(4)
+         CR    4,2                     END OF TABLE?
+         BL    COMP
+         LA    3,54(3)
+         CR    3,2
+         BNL   SORTEND
+         B     NEXTPASS
+SWITCH   MVC   BUF(54),0(3)            SWITCH ITEMS IN LIST
+         MVC   0(54,3),0(4)
+         MVC   0(54,4),BUF
+         B     INCR
+SORTEND  L     2,SORTTAB
+         ST    2,PTRLIST               SAVE PTR TO 1ST FMT1
+         MVI   BUF,C' '
+         MVC   BUF+1(132),BUF
+         LA    8,8                     ISOLATE HIGH LEVEL INDEX
+         LR    1,8
+FINDDOT  CLI   0(2),C'.'
+         BE    GOTDOT
+         LA    2,1(2)
+         BCT   1,FINDDOT
+GOTDOT   SR    8,1
+         LA    8,1(8)
+         ST    8,INDSIZE
+         B     READJFCB                GO, ALLOCATE DATASET
+FINI     L     2,SAVE+4
+         FREEMAIN V,A=SORTTAB
+TERM     EQU   *
+         FREEMAIN R,LV=ENDAREA-WKAREA,A=(13)
+         LR    13,2
+         SR    15,15
+         RETURN (14,12),RC=(15)
+*
+*        ATTENTION EXIT ROUTINE
+*
+         USING *,15
+ATTEXIT  MVI   ATTFLAG,X'FF'           SET ATTENTION FLAG
+         BR    14
+ATTFLAG  DS    XL2
+         DROP  15
+*
+*        PROCESS ERROR CONDITIONS
+*
+NOOPEN   MVC   BUF+1(42),MSG15
+         MVC   BUF+37(6),VOLSER
+         B     PUTDSN
+NODASD   MVC   BUF+1(40),MSG20
+         MVC   BUF+25(6),VOLSER
+         B     PUTDSN
+NOSYSUT1 MVC   BUF+1(55),MSG21         NO DD FOR VOLUME
+         MVC   BUF+9(6),VOLSER
+         MVI   ALOCFLG,X'00'
+PUTDSN   EQU   *
+         L     2,PTRLIST
+         BAL   14,P2
+         L     7,INDSIZE               STRIP HIGH LEVEL INDEX
+         LA    7,0(2,7)
+         MVC   BUF+1(35),0(7)          MOVE DSNAME FOR PRINT
+         BAL   14,P2
+NEXTVOL  LA    2,54(2)                 INCREMENT FOR NEXT VOL
+         ST    2,PTRLIST
+         C     2,ENDLIST               END OF LIST?
+         BE    CLEANUP
+         CLC   VOLSER(6),44(2)
+         BNE   ALLDONE
+         L     7,INDSIZE               STRIP HIGH LEVEL INDEX
+         LA    7,0(2,7)
+         MVC   BUF+1(35),0(7)          MOVE DSNAME
+         BAL   14,P2
+         B     NEXTVOL
+VTOCIO   MVC   BUF+1(26),MSG11         ERROR IN VTOC
+         MVC   BUF+28(6),VOLSER
+         BAL   14,P2
+         B     NEXTVOL
+USEDUP   MVC   BUF+1(41),MSG23
+         BAL   14,P2
+         B     FINI
+NOCORE   MVC   BUF+1(41),MSG23
+         BAL   14,P2
+         FREEMAIN R,LV=(2),A=(3)
+         L     2,SAVE+4
+         B     TERM
+TESTDYN  LH    1,4(5)                  DYNAMIC ALLOC ERROR
+         CH    1,C214
+         BE    NOSYSUT1
+         CH    1,C218
+         BE    NOSYSUT1
+         MVC   BUF+1(24),=C'DYNAMIC ALLOCATION ERROR'
+DAIRERR1 LR    0,2
+         BAL   14,HEX
+         MVC   BUF+30(4),DBWK+4
+         BAL   14,P2
+         B     NOSYSUT1
+DAIRERR  LR    1,15
+         MVC   BUF+1(15),=C'DAIR ERROR CODE'
+         B     DAIRERR1
+NOTIOT   MVC   BUF+1(36),=C'TOO MANY DATA SETS ALREADY ALLOCATED'
+         BAL   14,P2
+         B     FINI
+*
+*        START PROCESSING THIS VOLUME
+*
+READJFCB L     2,PTRLIST
+         CLI   ATTFLAG,X'FF'           WAS ATTENTION HIT?
+         BE    CLEANUP
+         TM    VTOCDCB+48,X'10'
+         BO    ALLDONE
+ALLOCDD  BAL   14,GETDAPL              BUILD DAPB
+         LA    5,DAIRBLK
+         USING DAPB08,5
+         MVC   DA08CD(2),=X'0008'
+         XC    DA08FLG(6),DA08FLG
+         LA    3,44
+         LR    4,2
+GETDSNL  CLI   0(4),C' '
+         BE    GOTDSNL
+         LA    4,1(4)
+         BCT   3,GETDSNL
+GOTDSNL  SR    4,2                     LENGTH OF DSN
+         STH   4,DUMMYDSN
+         MVC   DUMMYDSN+2(44),0(2)
+         LA    1,DUMMYDSN
+         ST    1,DA08PDSN
+         MVC   VOLSER(6),44(2)
+         MVC   DA08DDN(24),BUF
+         MVC   DEVTYP(4),50(2)
+         CLI   DEVTYP+2,X'20'          DASD DEVICE?
+         BNE   NODASD
+         SR    4,4
+         IC    4,DEVTYP+3
+         SLL   4,3
+         XC    DA08BLK(16),DA08BLK
+         MVC   DA08MNM(16),BUF
+         MVC   DA08DSP1(8),DAIRFLG
+         LA    1,DAIRLIST
+         LINK  EP=IKJDAIR              ALLOC DUMMYDSN
+         B     TESTALOC(15)    RC
+TESTALOC B     GETJFCB
+         B     FINI            4
+         B     FINI            8
+         B     TESTDYN         12      DAIR RETURN CODES
+         B     NOTIOT          16
+         B     DAIRERR         20
+         B     DAIRERR         24
+         B     DAIRERR         28
+         B     DAIRERR         32
+         B     FINI            36
+         B     DAIRERR         40
+         B     DAIRERR         44
+GETJFCB  MVI   ALOCFLG,X'FF'           DD ALLOCATED
+         MVC   VTOCDCB+40(8),DA08DDN   MOVE DDNAME TO DCB
+         MVC   DIRDCB+40(8),DA08DDN    MOVE DDNAME TO DCB
+         LA    1,JFCB
+         ST    1,JFCBLIST
+         MVI   JFCBLIST,X'87'
+         LR    8,1
+         ST    8,WKADDR
+         RDJFCB (VTOCDCB)              CHANGE JFCB FOR VTOC
+         MVI   JFCB,X'04'
+         MVC   JFCB+1(43),JFCB
+         OI    JFCB+52,X'08'           DONT WRITE BACK JFCB
+         OPEN  (VTOCDCB,INPUT),TYPE=J
+         TM    VTOCDCB+48,X'10'        DID VTOC GET OPENED OK?
+         BNO   NOOPEN
+         MVI   DSCBAREA,X'04'
+         MVC   DSCBAREA+1(43),DSCBAREA
+         XC    BLKADDR(4),BLKADDR      SEARCH FROM BEGINNING OF VTOC
+*
+*        READ FMT1 DSCB
+*
+         READ  DECB1,DK,VTOCDCB,DSCBAREA+44,'S',DSCBAREA,BLKADDR,MF=E
+         WAIT  ECB=DECB1
+         CLC   DECB1+1(2),ZEROS        ANY ERRORS
+         BNE   VTOCIO
+GETTRKS  LH    4,DSCBAREA+64
+         STH   4,TRKCYL
+         TM    OPTFLG,X'10'            TOTAL TRACKS ONLY?
+         BO    G5
+         BAL   14,P2
+         MVC   BUF+1(16),MSG18         PRINT VOL AND TYPE
+         MVC   BUF+9(6),VOLSER
+         BAL   14,P2                   PRINT VOL AND TYPE
+         TM    OPTFLG,X'E0'
+         BNO   TST80
+         MVC   BUF(120),HEADER1
+         BAL   14,P2
+         B     G5
+TST80    EQU   *
+         TM    OPTFLG,X'80'
+         BNO   H2
+PRTHD    MVC   BUF(52),HEADER2
+         BAL   14,P7
+         B     G5
+H2       TM    OPTFLG,X'40'
+         BNO   NOTE0
+         MVC   BUF(44),HEADER4
+         B     GOTOP4
+NOTE0    TM    OPTFLG,X'20'
+         BNO   GOTOP4
+         MVC   BUF(50),HEADER3
+         BAL   14,P5
+         B     G5
+GOTOP4   BAL    14,P4
+G5       EQU   *
+         NI    OPTFLG1,X'00'
+         L     2,PTRLIST
+         B     TESTEND
+READ     L     2,PTRLIST
+         LA    2,54(2)                 INCREMENT FOR NEXT DATASET
+TESTEND  C     2,ENDLIST               END OF LIST?
+         BL    SAVEPTR
+         TM    OPTFLG,X'10'            TOTAL SPACE ONLY?
+         BNO   ALLDONE
+         MVI   BUF,C' '
+         MVC   BUF+1(132),BUF
+         MVC   BUF+1(55),MSG16
+         L     1,TOTALOC               GET OLD TOTALS
+         CVD   1,DBWK
+         MVC   BUF+8(6),PAT5
+         ED    BUF+8(6),DBWK+5
+         L     1,TOTUSED
+         CVD   1,DBWK
+         MVC   BUF+25(6),PAT5
+         ED    BUF+25(6),DBWK+5
+         L     1,TOTDS
+         CVD   1,DBWK
+         MVC   BUF+42(4),PAT3
+         ED    BUF+42(4),DBWK+6
+         BAL   14,P2                   PRINT THE TOTALS
+         B     ALLDONE
+SAVEPTR  ST    2,PTRLIST
+         CLC   44(6,2),VOLSER          IS DATASET ON THIS VOLUME?
+         BE    READVTOC
+*
+*        CLEAN UP AFTER ATTENTIONS
+*
+CLEANUP  TM    VTOCDCB+48,X'10'        IS DCB OPENED?
+         BNO   TESTDIR
+         CLOSE (VTOCDCB)
+TESTDIR  TM    DIRDCB+48,X'10'         IS DCB OPENED?
+         BNO   TESTDD
+         CLOSE (DIRDCB)
+TESTDD   CLI   ALOCFLG,X'FF'           IS DD ALLOCATED?
+         BE    FREEDD
+         B     FINI
+ALLDONE  CLOSE (VTOCDCB)
+FREEDD   CLI   ALOCFLG,X'00'           FREE DATASET IF NECESSARY
+         BE    CKATN
+         LA    5,DAIRBLK
+         USING DAPB18,5
+         BAL   14,GETDAPL
+         MVC   DA18CD(2),=X'0018'
+         XC    DA18FLG(6),DA18FLG
+         LA    1,DUMMYDSN
+         ST    1,DA18PDSN
+         XC    DA18DDN(8),DA18DDN
+         MVC   DA18MNM(10),BUF
+         MVC   DA18DPS2(2),=X'0800'
+         MVC   DA18JBNM(8),BUF
+         LA    1,DAIRLIST
+         LINK  EP=IKJDAIR
+         B     TESTFREE(15)
+TESTFREE B     CKEND
+         B     FINI
+         B     FINI            8
+         B     TESTDYN         12
+         B     DAIRERR         16
+         B     DAIRERR         20
+         B     DAIRERR         24
+         B     DAIRERR         28
+         B     DAIRERR         32
+         B     FINI            36
+         B     DAIRERR         40
+         B     DAIRERR         44
+CKEND    MVI   ALOCFLG,X'00'           RESET ALLOCATED FLAG
+CKATN    CLI   ATTFLAG,X'FF'           WAS ATTENTION HIT?
+         BE    FINI
+         C     2,ENDLIST
+         BNL   FINI
+         B     READJFCB                PROCESS NEXT VOLUME
+READVTOC XC    BLKADDR(4),BLKADDR
+         TM    OPTFLG1,X'01'
+         BNO   XA
+         NI    OPTFLG1,X'00'
+         MVC   BUF(52),HEADER2
+         BAL   14,P7
+XA       EQU   *
+         CLI   ATTFLAG,X'FF'           WAS ATTENTION HIT?
+         BE    CLEANUP
+SEARCH   READ  DECB1,DK,VTOCDCB,DSCBAREA+44,'S',(2),BLKADDR,MF=E
+         WAIT  ECB=DECB1
+         L     7,INDSIZE               STRIP HIGH LEVEL INDEX
+         LA    7,0(2,7)
+         CLC   DECB1+1(2),ZEROS
+         BE    GOODIO1
+         TM    DECB1+1,X'80'           WAS RECORD FOUND?
+         BNO   VTOCIO
+         MVC   BUF+1(35),0(7)          DATASET NOT FOUND
+         MVC   BUF+37(19),=C'NOT FOUND ON VOLUME'
+         BAL   14,P2
+         B     READ                    TRY NEXT ONE
+GOODIO1  TM    OPTFLG,X'10'
+         BO    TRKUSED
+         MVC   BUF+1(35),0(7)          MOVE DSNAME
+         TM    DSCBAREA+82,X'02'       PARTITIONED DSORG?
+         BNO   NOPO
+         OI    OPTFLG,X'04'            SET PO INDICATOR
+         MVC   SAVEDSN(44),0(2)        SAVE DSNAME
+         B     CKHIST
+NOPO     NI    OPTFLG,X'FB'            RESET PO INDICATOR
+CKHIST   EQU   *
+         TM    OPTFLG,X'20'            WANT HISTORY?
+         BNO   BYPASS1                 NO
+         MVC   BUF+36(6),DSCBAREA+45
+         CLI   BUF+39,C'*'
+         BNE   NOSPEC
+         CLI   BUF+31,C' '
+         BNE   NOCT
+         LH    15,BUF+40
+         CVD   15,DBWK
+         OI    DBWK+7,15
+         UNPK  BUF+31(4),DBWK+5(3)
+NOCT     LH    14,DSCBAREA+46
+         CVD   14,DBWK
+         OI    DBWK+7,15
+         UNPK  BUF+39(3),DBWK+6(2)
+         MVC   BUF+35(4),=CL4' '
+         MVC   BUF+38(1),DSCBAREA+45
+         CLI   BUF+38,C'C'
+         BNE   NOTCC
+         MVC   BUF+37(2),=C'CB'
+NOTCC    EQU   *
+         CLI   DSCBAREA+45,C' '
+         BNL   DONACT
+         UNPK  BUF+37(5),DBWK+5(3)
+         SR    15,15
+         IC    15,DSCBAREA+45
+         SLL   15,1
+         LA    15,@LOC7(15)
+         MVC   BUF+36(2),0(15)
+         CLC   BUF+38(4),=C'0000'
+         BNE   DONACT
+         MVC   BUF+36(6),=C'??????'
+         B     DONACT
+@LOC7    DC    C'V CBDRGCIN'
+         DC    C'MHALAKCPCH'
+         DC    C'MLMVHOIHWH'
+         DC    C'HHGFKJMURR'
+         DC    C'WVV ????'
+DONACT   DS    0H
+NOSPEC   EQU   *
+         XC    WK(1),WK
+         MVC   WK+1(3),DSCBAREA+53     MOVE CREATION DATE
+         CLC   WK(4),ZEROS             WAS DATE SPECIFIED?
+         BE    G1                      NO
+         BAL   14,JULDTE               GET JULIAN DATE
+         MVC   BUF+48(9),DTEPAT
+         ED    BUF+48(9),JDATE
+         B     G2
+G1       EQU   *
+         MVC   BUF+50(6),NODATE
+G2       EQU   *
+         XC    WK(1),WK
+         MVC   WK+1(3),DSCBAREA+75     MOVE LAST ACCESSED DATE  CTL
+         CLC   WK(4),ZEROS             WAS DATE SPECIFIED
+         BE    G3                      NO
+         BAL   14,JULDTE               GET JULIAN DATE
+         MVC   BUF+57(9),DTEPAT
+         ED    BUF+57(9),JDATE
+         B     G4
+G3       EQU   *
+         MVC   BUF+59(6),NODATE
+G4       XC    WK(2),WK
+         MVC   WK(2),DSCBAREA+51       MOVE VOL SEQ NUMBER
+         LH    1,WK
+         CVD   1,DBWK                  VOL SEQ FOR PRINT
+         OI    DBWK+7,X'0F'
+         UNPK  BUF+43(4),DBWK+4(4)     MOVE TO PRINT BUF
+         XC    WK(2),WK
+         NI    OPTFLG,X'FB'            RESET PO INDICATOR
+BYPASS1  TM    OPTFLG,X'80'
+         BO    YDCB
+         TM    OPTFLG,X'40'            DCB PARAMETERS?
+         BNO   BYPASS2
+YDCB     TM    DSCBAREA+82,X'80'
+         BO    IS
+         TM    DSCBAREA+82,X'40'
+         BO    PS
+         TM    DSCBAREA+82,X'20'
+         BO    DA
+         TM    DSCBAREA+82,X'02'
+         BO    PO
+         TM    DSCBAREA+82,X'01'
+         BO    UNDEF
+         B     UNMOVE
+IS       MVC   BUF+68(2),=C'IS'        INDEX SEQUENTIAL
+         B     UNMOVE
+PS       MVC   BUF+68(2),=C'PS'        PHYSICAL SEQUENTIAL
+         B     UNMOVE
+DA       MVC   BUF+68(2),=C'DA'        DIRECT ACCESS
+         B     UNMOVE
+PO       MVC   BUF+68(2),=C'PO'        PARTITIONED
+         OI    OPTFLG,X'04'
+         B     UNMOVE
+UNDEF    MVC   BUF+68(2),=C'U '        UNDEFINED LENGTH
+UNMOVE   TM    DSCBAREA+82,X'01'
+         BZ    RECFM
+         MVI   BUF+70,C'U'             UNMOVABLE
+RECFM    LA    10,BUF+72
+         TM    DSCBAREA+84,X'C0'
+         BNO   FFMT
+         MVI   0(10),C'U'              UNKNOWN
+         LA    10,1(10)
+         B     BLOCKED
+FFMT     TM    DSCBAREA+84,X'80'
+         BNO   VFMT
+         MVI   0(10),C'F'              FIXED
+         LA    10,1(10)
+         B     BLOCKED
+VFMT     TM    DSCBAREA+84,X'40'
+         BNO   BLOCKED
+         MVI   0(10),C'V'              VARIABLE
+         LA    10,1(10)
+BLOCKED  TM    DSCBAREA+84,X'10'
+         BNO   TRKOVFL
+         MVI   0(10),C'B'              BLOCKED
+         LA    10,1(10)
+TRKOVFL  TM    DSCBAREA+84,X'20'
+         BNO   SPANNED
+         MVI   0(10),C'T'              TRACK OVERFLOW
+         LA    10,1(10)
+SPANNED  TM    DSCBAREA+84,X'08'
+         BNO   ASA
+         MVI   0(10),C'S'              SPANNED
+         LA    10,1(10)
+ASA      TM    DSCBAREA+84,X'04'
+         BNO   MACHINE
+         MVI   0(10),C'A'              ASA
+         B     BLKSIZE
+MACHINE  TM    DSCBAREA+84,X'02'
+         BNO   BLKSIZE
+         MVI   0(10),C'M'              MACHINE
+BLKSIZE  MVC   WK(2),DSCBAREA+86       BLOCKSIZE
+         LH    1,WK
+         CVD   1,DBWK
+         MVC   BUF+77(6),PAT5
+         ED    BUF+77(6),DBWK+5
+LRECL    MVC   WK(2),DSCBAREA+88       LRECL
+         LH    1,WK
+         CVD   1,DBWK
+         MVC   BUF+83(6),PAT5
+         ED    BUF+83(6),DBWK+5
+KEY      SR    1,1                     KEYLEN
+         IC    1,DSCBAREA+90
+         CVD   1,DBWK
+         MVC   BUF+89(4),PAT3
+         ED    BUF+89(4),DBWK+6
+OPTION   LA    0,1
+         SR    1,1
+         IC    1,DSCBAREA+85
+         BAL   14,HEX
+         MVC   BUF+94(2),DBWK+6
+BYPASS2  TM    OPTFLG,X'E0'
+         BO    EX
+         TM    OPTFLG,X'40'
+         BNO   TST20
+         MVC   DIRDATA(35),BUF
+         MVC   BUF(28),BUF+68
+         MVC   BUF+65(7),=C'       '
+         MVC   BUF+28(3),=C'   '
+         MVC   BUF+30(35),DIRDATA
+         B     BAL14
+TST20    TM    OPTFLG,X'20'
+         BNO   EX
+         MVC   DIRDATA(30),BUF
+         MVC   BUF(36),BUF+30
+         MVC   BUF+65(7),=C'       '
+         MVC   BUF+36(2),=C'  '
+         MVC   BUF+36(30),DIRDATA
+         B     BAL14
+EX       SR    1,1
+         IC    1,DSCBAREA+59
+         CVD   1,DBWK
+         MVC   BUF+108(4),PAT3
+         ED    BUF+108(4),DBWK+6
+TRKUSED  XC    WK(2),WK
+         MVC   WK(2),DSCBAREA+98       LAST TRACK USED
+         TM    DSCBAREA+100,X'FF'      IS RELATIVE BLOCK > 0
+         BZ    SECQU                   NO OF TRACKS USED
+         LH    1,WK
+         LA    1,1(1)                  +1
+         CVD   1,DBWK
+         A     1,TOTUSED
+         ST    1,TOTUSED
+         TM    OPTFLG,X'10'
+         BO    TRKALOC
+         MVC   BUF+103(6),PAT5
+         ED    BUF+103(6),DBWK+5
+SECQU    MVC   WK(4),DSCBAREA+94       SECONDARY ALLOC
+         L     1,WK
+         LA    1,0(1)
+         CVD   1,DBWK
+         MVC   BUF+112(6),PAT5
+         ED    BUF+112(6),DBWK+5
+         SR    1,1
+         IC    1,WK
+         SRL   1,6
+         LA    2,SECALLOC
+         AR    1,2
+         MVC   BUF+119(1),0(1)         MOVE TYPE OF ALLOCATION
+TRKALOC  EQU   *
+         MVC   NUMEXT(1),DSCBAREA+59   SAVE TOTAL NO. OF EXTENTS
+         XC    NUMTRKS(4),NUMTRKS
+         LA    0,3                     GET FIRST 3 EXTENTS
+         LA    1,DSCBAREA+105
+         BAL   14,GETEXT
+         CLI   NUMEXT,X'03'            MORE THAN 3?
+         BNH   PRTTRKS                 NO
+         XC    DSKADDR(8),DSKADDR
+         MVC   DSKADDR+3(5),0(1)       CCHHR OF FMT3 DSCB
+         BAL   9,CONVERT
+*
+*        READ FMT3 DSCB
+*
+         READ  DECB1,DI,VTOCDCB,DSCBAREA+44,'S',DSCBAREA,BLKADDR,MF=E
+         WAIT  ECB=DECB1
+         CLC   DECB1+1(2),ZEROS
+         BE    GOODIO2
+         B     VTOCIO
+GOODIO2  EQU   *
+         LA    0,4                     GET NEXT 4 EXTENTS
+         LA    1,DSCBAREA+4
+         BAL   14,GETEXT
+         CLI   NUMEXT,X'07'            MORE THAN 7?
+         BNH   PRTTRKS
+         LA    0,9                     LAST 9 EXTENTS
+         LA    1,DSCBAREA+45
+         BAL   14,GETEXT
+PRTTRKS  L     2,NUMTRKS
+         CVD   2,DBWK
+         A     2,TOTALOC
+         ST    2,TOTALOC
+         L     1,TOTDS                 NUMBER OF DATASETS
+         LA    1,1(1)
+         ST    1,TOTDS
+         TM    OPTFLG,X'10'
+         BO    READ
+         MVC   BUF+97(6),PAT5          TRACKS ALLOCATED
+         ED    BUF+97(6),DBWK+5
+         TM    OPTFLG,X'E0'
+         BO    BYPASS3
+         TM    OPTFLG,X'80'            SOME SPECIFIED?
+         BNO   BYPASS3
+         MVC   DIRDATA(36),BUF+1
+         MVI   BUF,C' '
+         MVC   BUF+1(35),BUF
+         MVC   BUF+1(3),BUF+72
+         MVC   BUF+6(5),BUF+84
+         MVC   BUF+12(5),BUF+78
+         MVC   BUF+18(2),BUF+68
+         MVC   BUF+22(5),BUF+98
+         MVC   BUF+28(5),BUF+104
+         MVC   BUF+34(2),BUF+110
+         MVC   BUF+39(36),DIRDATA
+BAL14    BAL   14,P7
+         B     BYPASS4
+BYPASS3  BAL   14,P2                   GO PRINT IT
+BYPASS4  TM    OPTFLG,X'0C'            WANT A PDS LISTING?
+         BNO   READ
+         MVC   BUF+11(9),=C'-MEMBERS-'
+         BAL   14,P4
+*
+*        PRINT OUT THE MEMBERS OF ALL PDS'S
+*
+GETDIR   EQU   *
+         LA    1,DIRJFCB
+         ST    1,DIRJLIST
+         MVI   DIRJLIST,X'87'
+         LA    8,BUF
+INST1    LA    2,7
+         SR    3,3
+         XC    BLKCNT(2),BLKCNT
+         XC    BLKUSED(2),BLKUSED
+         RDJFCB  (DIRDCB)
+         MVC   DIRJFCB(44),SAVEDSN
+         OI    DIRJFCB+52,X'08'        DON'T WRITE BACK JFCB
+         OPEN  (DIRDCB,INPUT),TYPE=J
+         TM    DIRDCB+48,X'10'
+         BNO   BADDIR
+*
+*        READ A DIRECTORY BLOCK
+*
+NEXTDIR  READ  DECB2,SF,DIRDCB,DIRBUF,MF=E
+         CHECK DECB2
+         CLI   ATTFLAG,X'FF'           ATTENTION HIT?
+         BE    CLEANUP
+         LH    1,BLKCNT
+         LA    1,1(1)                  BUMP DIRECTORY BLOCK COUNT
+         STH   1,BLKCNT
+         STH   1,BLKUSED
+         LH    5,DIRCNT                DIRECTORY BLOCK SIZE
+         LA    6,DIRCNT                START OF BLOCK
+         AR    6,5                     END OF BLOCK
+         LA    5,DIRDATA               FIRST ENTRY
+NEXTMEM  CLI   0(5),X'FF'              LAST ENTRY?
+         BE    LASTMEM
+         LA    3,1(3)                  BUMP
+         CR    3,2                     HIGH?
+         BNH   MVMEM
+         BAL   14,P6
+MVMEM    MVC   0(8,8),0(5)
+         LA    8,10(8)
+         LA    0,X'1F'
+         SR    7,7
+         IC    7,11(5)                 LENGTH OF USER DATA
+         NR    7,0                     USER DATA HALFWORDS
+         SLL   7,1                     USER BYTES
+ENDMEM   LA    5,12(5)
+         AR    5,7
+         CR    5,6                     END OF DIRECTORY BLOCK?
+         BNL   NEXTDIR                 YES
+         B     NEXTMEM                 NO GET NEXT MEMBER
+LASTMEM  LH    2,BLKCNT
+*
+*        COUNT UNUSED BLOCKS
+*
+GETEMPTY READ  DECB2,SF,DIRDCB,DIRBUF,MF=E
+         CHECK DECB2
+         LA    2,1(2)
+         B     GETEMPTY
+ENDDIR   CLOSE (DIRDCB)
+         C     3,=F'0'
+         BE    MV12
+         BAL   14,P7
+MV12     MVC   BUF+1(30),MSG12
+         CVD   2,DBWK                  NUMBER BLOCKS ALLOCATED
+         MVC   BUF+1(4),PAT3
+         ED    BUF+1(4),DBWK+6
+         LH    1,BLKUSED               CONVERT DIR BLKS USED
+         CVD   1,DBWK
+         MVC   BUF+22(4),PAT3
+         ED    BUF+22(4),DBWK+6
+D4       BAL   14,P2
+         BAL   14,P2
+         TM    OPTFLG,X'E0'
+         BO    READ
+         OI    OPTFLG1,X'01'
+         B     READ
+BADDIR   MVC   BUF+12(38),MSG26
+         B     D4
+*
+*        PRINT ROUTINE FOR DATASET CHARACTERISTICS TABLE
+*
+P5       LA    0,50
+         LA    1,BUF
+         B     P0
+P4       LA    0,44
+         LA    1,BUF
+         B     P0
+P6       LA    3,1
+INST2    LA    2,7
+         LA    8,BUF
+P7       LA    0,72
+         LA    1,BUF
+INST3    B     P0
+P2       LA    0,120
+         LA    1,BUF
+P0       TPUT  (1),(0),R
+         LTR   15,15
+         BP    FINI
+BLANK    MVI   BUF,C' '
+         MVC   BUF+1(132),BUF
+         BR    14
+GETDAPL  EQU   *
+         L     3,CPPLADR               GET CPPL ADDR
+         USING CPPL,3
+         LA    4,DAIRLIST
+         USING DAPL,4
+*
+*        BUILD DAIR PARAMETER LIST
+*
+         MVC   DAPLUPT(4),CPPLUPT
+         MVC   DAPLECT(4),CPPLECT
+         LA    1,CPECB
+         ST    1,DAPLECB
+         XC    CPECB(4),CPECB
+         MVC   DAPLPSCB(4),CPPLPSCB
+         DROP  3
+         LA    1,DAIRBLK
+         ST    1,DAPLDAPB
+         DROP  4
+         BR    14
+GETEXT   CLI   0(1),X'00'              IS THIS A GOOD EXTENT
+         BE    NOEXT                   NO
+         MVC   WK(4),2(1)
+         LH    3,WK
+         MH    3,TRKCYL
+         AH    3,WK+2                  LOWER EXT LIMIT IN TRKS
+         MVC   WK(4),6(1)
+         LH    4,WK
+         MH    4,TRKCYL
+         AH    4,WK+2                  UPPER EXT LIMIT IN TRKS
+         SR    4,3                     TRKS IN EXTENT
+         LA    4,1(4)
+         A     4,NUMTRKS               TOTAL TRKS
+         ST    4,NUMTRKS
+         LA    1,10(1)                 GET NEXT EXTENT
+         BCT   0,GETEXT
+NOEXT    BR    14
+*
+*        CONVERT CCHHR TO TTR
+*
+CONVERT  LA    2,DSKADDR               CCHHR TO BE CONVERTED
+         L     1,VTOCDCB+44            DEB ADDRESS
+         STM   9,12,SAVE4              SAVE REGISTERS
+         LR    7,13
+         L     15,16                   CVT
+         L     15,X'20'(15)            CONVERT ROUTINE
+         BALR  14,15
+         LR    13,7
+         LM    9,12,SAVE4              RESTORE REGS
+         ST    0,BLKADDR               SAVE TTR
+         BR    9                       RETURN
+*
+*        CONVERT BINARY TO PRINTABLE HEX
+*
+HEX      STM   2,5,SAVE4
+         LTR   0,0
+         BNP   NOHEX
+         LA    3,4
+         CR    0,3                    4 OR LESS BYTES?
+         BNH   DOHEX                  YES
+         LR    0,3                    NO, FORCE 4
+DOHEX    SLL   0,1                    DOUBLE TO GET HEX DIGITS
+         LA    5,DBWK+7
+         LR    3,1
+         SLDL  2,28
+NEXTCHAR SRL   3,28
+         LA    4,HEXTAB
+         AR    4,3
+         MVC   0(1,5),0(4)
+         BCTR  5,0
+         SRDL  2,4
+         BCT   0,NEXTCHAR
+         LM    2,5,SAVE4
+NOHEX    BR    14
+*
+*        COMPUTE JULIAN DATE
+*
+JULDTE   LH    1,WK+2                  DAY OF YEAR
+         CVD   1,DBWK
+         L     0,DBWK+4                SAY DAY
+         LH    1,WK                    GET YEAR
+         CVD   1,DBWK
+         NI    DBWK+7,X'F0'            FLUSH SIGN
+         L     1,DBWK+4
+         SLL   1,12                    SHIFT YEAR
+         OR    1,0                     00YYDDDS
+CONVDTE  STM   2,5,SAVE4
+         ST    1,JDATE
+         XC    DBWK(8),DBWK
+         MVI   DBWK+7,X'0F'
+         MVO   DBWK+5(3),JDATE(2)      0-0YYD
+         CVB   2,DBWK                  YEAR
+         N     2,LPYRM                 DIVISIBLE BY 4?
+         BZ    LPYR                    YES
+         LA    2,28                    NO, THEN 28 DAYS IN FEB
+         B     MON
+LPYR     LA    2,29                    LEAP YEAR, 29 DAYS IN FEB
+MON      ST    2,FEB
+         MVC   DBWK+6(2),JDATE+2       DAYS
+         MVC   JDATE+2(1),JDATE+1      POSITION YEAR DIGITS
+         MVI   JDATE+3,X'0F'           POSITION SIGN
+         CVB   4,DBWK                  DAYS IN BINARY
+         LA    3,1
+         C     4,Q31
+         BNH   MONDAT                  MONTH IS JANUARY
+         S     4,Q31
+         LA    3,1(3)
+         C     4,FEB
+         BNH   MONDAT                  FEBRUARY
+         S     4,FEB
+         BAL   5,D31                   MARCH
+         BAL   5,D30                   APRIL
+         BAL   5,D31                   MAY
+         BAL   5,D30                   JUNE
+         BAL   5,D31                   JULY
+         BAL   5,D31                   AUGUST
+         BAL   5,D30                   SEPTEMBER
+         BAL   5,D31                   OCTOBER
+         BAL   5,D30                   NOVEMBER
+         LA    3,1(3)                  DECEMBER
+         B     MONDAT
+*
+D30      LA    3,1(3)
+         S     4,Q30                   SUB DAYS IN MONTH
+         BCR   3,5                     RETURN IF POSITIVE
+         A     4,Q30                   ADD BACK DAYS IN MONTH
+         B     MONDAT
+D31      LA    3,1(3)
+         S     4,Q31
+         BCR   3,5
+         A     4,Q31
+*
+MONDAT   CVD   3,DBWK                  MONTH
+         L     1,DBWK+4
+         SRL   1,4                     ELIMINATE SIGN
+         STC   1,JDATE
+         CVD   4,DBWK                  DAY
+         L     1,DBWK+4
+         SRL   1,4
+         STC   1,JDATE+1
+         BR    14
+         TITLE 'DSINFO - CONSTANTS'
+         READ  DECB1,DI,VTOCDCB,MF=L
+         READ  DECB2,SF,DIRDCB,MF=L
+*
+*        FOR VTOC READS
+*
+VTOCDCB  DCB   DSORG=DA,MACRF=RKI,DDNAME=X,BLKSIZE=96,KEYLEN=44,       X
+               RECFM=FS,EXLST=JFCBLIST,EODAD=ALLDONE,LIMCT=57,OPTCD=E
+*
+*        FOR DIRECTORY READS
+*
+DIRDCB   DCB   DSORG=PS,MACRF=R,DDNAME=X,RECFM=FS,LRECL=256,           X
+               BLKSIZE=256,KEYLEN=8,EODAD=ENDDIR,EXLST=DIRJLIST
+MV1      MVC   0(0,10),0(9)
+MV2      MVC   0(0,9),0(3)
+C214     DC    XL2'0214'
+C218     DC    XL2'0218'
+         LTORG
+PCLPTR   DC    V(PARMS)
+ZEROS    DC    D'0'
+JFCBLIST DC    F'0'
+DIRJLIST DC    F'0'
+PAT5     DC    XL6'402020202120'
+PAT3     DC    XL4'40202120'
+DTEPAT   DC    XL9'402120612020612020'
+SECALLOC DC    C'ABTC'
+Q30      DC    F'30'
+Q31      DC    F'31'
+LPYRM    DC    F'3'
+NODATE   DC    CL6'00.000'
+TABSIZE  DC    F'5400'                 MIN WK AREA SIZE
+         DC    F'54000'                MAX WK AREA SIZE
+SORTTAB  DS    F
+SORTLEN  DS    F
+ZZZ      DS    0D
+XXX      DC    XL1'00'
+CVOL     DS    CL6
+INDCVOL  DC    CL6' '                  SAVE CVOL
+INDIMAGE DC    CL8' '                  HIGH LEVEL INDEX         FRBNY
+*
+*        TO SEARCH CATALOG BY NAME
+*
+CATNAME  CAMLST NAME,XXX,,ZZZ
+*
+*        TO SEARCH CATALOG VIA TTR
+*
+CATTTR   CAMLST BLOCK,XXX,CVOL,ZZZ
+DAIRFLG  DC    XL8'0808080000000000'
+HEXTAB   DC    CL16'0123456789ABCDEF'
+HEADER1  DC    CL30' ',C'USAGE'
+         DC    C'-ACCT#--SEQ----CREDT----LASTAC'
+         DC    C'----DSO-RECFM-BLKSZ-LRECL-KEY'
+         DC    C'-OP--TRKAL-TRKUS-EX-SEQU--T'
+HEADER2  DC    CL28'RECFM-LRECL-BLKSZ-DSO-TRKAL-'
+         DC    CL24'TRKUS-EX   DATA-SET NAME'
+HEADER3  DC    C'USAGE-ACCT#--SEQ----CREDT----LASTAC  DATA-SET NAME'
+HEADER4  DC    C'DSO-RECFM-BLKSZ-LRECL-KEY-OP   DATA-SET NAME'
+MSG11    DC    CL26'IO ERROR IN VTOC ON VOLUME'
+MSG12    DC    CL30'     DIR BLKS ALLOC ;     USED'
+MSG15    DC    CL42'VTOC COULD NOT BE OPENED FOR VOLUME       '
+MSG16    DC    CL55'TOTALS:       TRKS ALOC;       TRKS USED;     DATASS
+               ETS'
+MSG18    DC    CL21'VOLUME "      "'
+MSG20    DC    CL40'DEVICE TYPE FOR VOLUME "      " NOT DASD'
+MSG21    DC    CL55'VOLUME "      " UNAVAILABLE FOR THE FOLLOWING DATA S
+               SETS'
+MSG23    DC    CL41'REGION SIZE TOO SMALL FOR CURRENT REQUEST'
+MSG26    DC    CL38'DIRECTORY WAS NOT OPENED SUCCESSFULLY '
+         TITLE 'DSINFO - PARSE PARAMETERS'
+PARMS    IKJPARM
+IND      IKJKEYWD
+         IKJNAME 'LEVEL',SUBFLD=IND#
+DSN      IKJKEYWD
+         IKJNAME 'DSNAME',SUBFLD=DSN#
+TOT      IKJKEYWD
+         IKJNAME 'TOTALS'
+TRK      IKJKEYWD
+         IKJNAME 'SOME'
+ORG      IKJKEYWD
+         IKJNAME 'DCB'
+DTE      IKJKEYWD
+         IKJNAME 'HISTORY'
+ALL      IKJKEYWD
+         IKJNAME 'ALL'
+PDS      IKJKEYWD
+         IKJNAME 'MEMBERS'
+DSN#     IKJSUBF
+DSN#P    IKJPOSIT DSNAME,PROMPT='DSNAME'
+IND#     IKJSUBF
+IND#P    IKJPOSIT DSNAME,PROMPT='INDEX LEVEL'
+         IKJENDP
+         TITLE 'DSINFO - DSECTS'
+WKAREA   DSECT
+SAVE     DS    18F
+DSCBAREA DS    35F
+SAVEDSN  DS    CL44
+JFCB     DS    44F
+DIRJFCB  DS    44F
+BUF      DS    CL133
+OPTFLG1  DC    X'00'
+WK       DS    F
+DBWK     DS    D
+WKADDR   DS    F
+NUMEXT   DS    XL1
+NUMTRKS  DS    F
+BLKADDR  DS    F
+DSKADDR  DS    D
+TRKCYL   DS    H
+DEVTYP   DS    F
+VOLSER   DS    CL6
+TYPE     DS    CL4
+SAVE4    DS    4F
+TOTUSED  DS    F
+TOTALOC  DS    F
+TOTDS    DS    F
+SAVE14   DS    F
+ENDTAB   DS    F
+ENDLIST  DS    F
+PTRLIST  DS    F
+MEMCNT   DS    H
+BLKCNT   DS    H
+BLKUSED  DS    H
+DIRBUF   DS    0H
+DIRKEY   DS    CL8
+DIRCNT   DS    H
+DIRDATA  DS    CL254
+ALOCFLG  DS    XL1
+OPTFLG   DS    XL1
+POFLAG   DS    XL1
+MAXTRK   DS    F
+FEB      DS    F
+JDATE    DS    F
+INDSIZE  DS    F
+CPPLADR  DS    F
+CPECB    DS    F
+DAIRLIST DS    5F
+DAIRBLK  DS    20F
+LINELEN  DS    F
+LINEADR  DS    F
+DUMMYDSN DS    23H
+PPLWK    DS    7F
+PDLPTR   DS    F
+DUMECB   DS    F
+         DS    0F
+CARD     DS    CL48
+         DS    0H
+LVSTACK  DS    5CL10
+STACK    DS    20D
+CATBLK   DS    0D
+         DS    20CL272                 SPACE FOR 20 CATALOG BLOCKS
+ENDAREA  DS    0D
+         SPACE 3
+VOLBLK   DSECT                         VOLUME LIST BLOCK
+VOLCNT   DS    XL2                     VOLUME COUNT
+VOLDEV   DS    XL4                     DEVCODE
+VOLSER#  DS    XL6                     SERIAL NUMBER
+VOLSEQ   DS    XL2                     SEQ NUMBER
+         SPACE 3
+INDPTR   DSECT                         INDEX POINTER ENTRY
+INDNAME  DS    CL8                     INDEX NAME
+INDTTR   DS    XL3                     TTR OF INDEX
+INDCNT   DS    XL1                     COUNT
+         SPACE 3
+DSPTR    DSECT                         DATASET POINTER ENTRY
+DSNAME   DS    CL8                     LOWEST LEVEL OF DATASET
+DSDUM    DS    XL3                     POINTER FIELD
+DSCNT    DS    XL1                     COUNT
+DSVCNT   DS    XL2                     VOLUME COUNT
+DSDEV    DS    XL4                     DEVICE CODE
+DSSER    DS    XL6                     SEIAL NUMBER
+DSSEQ1   DS    XL2                     SEQUENCE NUMBER
+         SPACE 3
+LNKIND   DSECT                         INDEX LINK ENTRY
+LNKNAME  DS    CL8                     NAME X'FFFFFFFFFFFFFFFF'
+LNKTTR   DS    XL3                     TTR OF NEXT BLOCK
+LNKCNT   DS    XL1                     COUNT
+         PRINT NOGEN
+         IKJCPPL                       CPPL
+         IKJDAPL                       DAPL
+         IKJPPL                        PPL
+         IKJDAP08                      DAPB 08
+         IKJDAP18                      DAPB 18
+         END

@@ -1,0 +1,1121 @@
+DASD     TITLE 'DASDCHK - PROBLEM PROGRAM TO SUM UP TRACKS IN A VTOC'
+*
+*
+*  DASDCHK ---
+*
+*
+*  FUNCTION ---
+*     READ DASD VTOC'S AND VERIFY IF THEY ARE "GOOD" OR "BAD":
+*     CHECK FOR - THE SUM OF TRACKS NOT BEING EQUAL TO THE DASD
+*                 CAPACITY
+*               - THE "DIRF" BIT BEING ON
+*               - DSCB'S WITH INVALID FORMATS
+*               - I/O ERRORS
+*               - KEY HALF OF DSCB NOT BELONGING TO ITS DATA HALF
+*               - CORRECT PROPORTIONS OF DIFFERENT TYPES OF DSCB'S
+*                 (WHATEVER THAT MEANS)
+*
+*
+*  AUTHOR ---
+*     MAC B. JOHNSON    IBM SAN JOSE, CALIFORNIA  JUNE 1972
+*
+*
+*  DISCLAIMER OF RESPONSIBILITY ---
+*     THIS PROGRAM HAS NOT BEEN SUBMITTED TO ANY FORMAL IBM TEST.
+*     POTENTIAL USERS SHOULD EVALUATE ITS USEFULNESS IN THEIR OWN
+*     ENVIRONMENT.  THIS PROGRAM WAS WRITTEN BY THE AUTHOR FOR HIS OWN
+*     USE TO AID IN DEBUGGING NEW VERSIONS OF DADSM IN A TEST
+*     ENVIRONMENT.  DISTRIBUTION OF THIS PROGRAM IS FOR THE CONVENIENCE
+*     OF OTHERS WHO MAY FIND IT USEFUL, AND IN NO WAY IS TO BE
+*     CONSTRUED OR IMPLIED AS FORMALLY OR INFORMALLY SUPPORTED BY IBM.
+*
+*
+*  INPUT ---
+*     JCL DD STATEMENTS POINTING TO DIRECT ACCESS UNITS.
+*     ALL SYSIN/SYSOUT DATA SETS ARE BYPASSED,
+*     ALONG WITH ALL OF THE FOLLOWING DDNAMES -
+*        (BLANK) CONCATENATIONS
+*        JOBLIB
+*        STEPLIB
+*        SYSCHK
+*        PGM=.DD
+*        SYSIN
+*        SYSPRINT
+*        SYSABEND
+*        SYSUDUMP
+*
+*
+*  OUTPUT ---
+*   WTO AND WTP VTOC GOOD OR BAD ERROR MESSAGES IDENTIFYING THE BAD
+*   UNIT AND VOLUME AND SOMETIMES THE RECORD CCHHR AND TYPE OF ERROR.
+*   IF A SYSABEND OR SYSUDUMP DD STATEMENT IS PRESENT, ALL FOLLOWING
+*   DD'S PROCESSED WILL RESULT IN A SYSTEM "BAD" ABEND IF AN ERROR
+*   IS DETECTED, OTHERWISE PROCESSING WILL PROCEED TO THE NEXT DD.
+*
+*
+* SAMPLE JCL ---
+*   //DASDCHK EXEC PGM=DASDCHK
+*   //V2305     DD UNIT=2305-2,VOL=SER=ZZZRES,DISP=OLD
+*   //V2311     DD UNIT=2311,VOL=SER=SJREGC,DISP=OLD
+*   //V2314     DD UNIT=2314,VOL=SER=D77LIB,DISP=OLD
+*   //V2321     DD UNIT=2321,VOL=SER=232101,DISP=OLD
+*   //SYSUDUMP  DD SYSOUT=A
+*   //V3330     DD UNIT=3330,VOL=SER=SCRTCH,DISP=OLD
+*
+*
+*
+*  VERSION 1.0   ---   FRANK PAJERSKI, 25MAY78
+*     . RE-DO INITIAL DOCUMENTATION
+*
+*
+DASDCHK  CSECT
+R0       EQU   0                        REGISTER 0
+R1       EQU   1
+R2       EQU   2                        REGISTER 2
+RBASE    EQU   3
+R4       EQU   4                        REGISTER 4
+RTRKCNT  EQU   7                        REGISTER 7
+RTIOT    EQU   9                        REGISTER 9 - TIOT ADDRESS
+RUCB     EQU   10                       REGISTER 10 - UCB ADDRESS
+REXT     EQU   11                       REGISTER 11 - PTR TO CUR EXTENT
+RLOOPCNT EQU   12
+RD       EQU   13                       REGISTER 13 - SAVE AREA POINTER
+RE       EQU   14                       REG 14 - SUBR RETURN ADDR
+RF       EQU   15                       REG 15 - VERY TEMP WORK REG
+*
+N        EQU   3                        READ 1 DSCB PER NTH RECORD ON
+*                                       EACH REVOLUTION.  SET VALUE
+*                                       ACCORDING TO CPU SPEED AND
+*                                       TASK DISPATCHING PRIORITY.
+*
+         SAVE  (14,12),,*               SAVE CALLER'S REGISTERS 14-12
+         LR    RBASE,RF                 LOAD BASE REGISTER 3
+         USING DASDCHK,RBASE           DEFINE BASE REGISTER
+         LA    RF,SAVE                  LOAD ADDR OF MY SAVE AREA
+         ST    RD,SAVE+4                BACK CHAIN SAVE AREAS
+         ST    RF,8(,RD)                FORWARD CHAIN SAVE AREAS
+         LR    RD,RF                    POINT TO CURRENT SAVE AREA
+*
+***********************************************************************
+*
+*  STEP THRU TIOT STOPPING AT DD ENTRIES FOR DIRECT ACCESS UCB.S
+*
+         L     RTIOT,CVTPTR             GET CVT ADDR
+         L     RTIOT,CVTTCBP-CVT(,RTIOT)  GET TCB POINTER ADDR
+         L     RTIOT,4(,RTIOT)          GET CURRENT TCB ADDR
+         L     RTIOT,TCBTIO-TCB(,RTIOT)  GET TIOT ADDR
+         LA    RTIOT,TIOENTRY-TIOT(,RTIOT)  POINT TO FIRST DD ENTRY
+         USING TIOENTRY,RTIOT           DEFINE BASE TO TIOT DD ENTRY
+         B     TIOTSTRT                 BR TO START LOOP THRU TIOT
+*
+TIOTABND MVI   ABENDSW,X'FF'            SET ABEND ON ERROR SWITCH
+*
+TIOTADV  L     RTIOT,TIOTADDR           ADDR CURRENT TIOT DD ENTRY
+         SR    RF,RF                    INIT FOR IC INSTR
+         IC    RF,TIOELNGH              GET LENGTH OF THIS DD ENTRY
+         AR    RTIOT,RF                 ADVANCE TO NEXT DD ENTRY
+*
+TIOTSTRT ST    RTIOT,TIOTADDR           SAVE ADDR TIOT DD ENTRY
+         SR    RF,RF                    INIT FOR IC INSTR
+         IC    RF,TIOELNGH              GET LENGTH OF THIS DD ENTRY
+         LTR   RF,RF                    IS THIS END OF TIOT
+         BZ    RETURN                   BR IF YES, ALL DONE
+*
+         CLI   TIOEDDNM,C' '            IS DDNAME=(BLANK) CONCATENATED
+         BE    TIOTADV                  BR IF YES, SKIP THIS ENTRY
+         CLC   TIOEDDNM,JOBLIB          IS DDNAME=JOBLIB
+         BE    TIOTADV                  BR IF YES, SKIP THIS ENTRY
+         CLC   TIOEDDNM,STEPLIB         IS DDNAME=STEPLIB
+         BE    TIOTADV                  BR IF YES, SKIP THIS ENTRY
+         CLC   TIOEDDNM,SYSCHK          IS DDNAME=SYSCHK
+         BE    TIOTADV                  BR IF YES, SKIP THIS ENTRY
+         CLC   TIOEDDNM,PGMDD           IS DDNAME=PGM=*.DD
+         BE    TIOTADV                  BR IF YES, SKIP THIS ENTRY
+         CLC   TIOEDDNM,SYSIN           IS DDNAME=SYSIN
+         BE    TIOTADV                  BR IF YES, SKIP THIS ENTRY
+         CLC   TIOEDDNM,SYSPRINT        IS DDNAME=SYSPRINT
+         BE    TIOTADV                  BR IF YES, SKIP THIS ENTRY
+         CLC   TIOEDDNM,SYSABEND        IS DDNAME=SYSABEND
+         BE    TIOTABND                 BR IF YES TO SET ABEND SWITCH
+         CLC   TIOEDDNM,SYSUDUMP        IS DDNAME=SYSUDUMP
+         BE    TIOTABND                 BR IF YES TO SET ABEND SWITCH
+*
+*  CHECK FOR DIRECT ACCESS UCB
+*
+         L     RUCB,TIOEFSRT-1          LOAD UCB ADDR FROM TIOT
+         USING UCBOB,RUCB               DEFINE BASE TO MAIN UCB
+         LA    RUCB,0(RUCB)             CLEAR HIGH ORDER BYTE
+         LTR   RUCB,RUCB                IS THIS DUMMY DATA SET
+         BZ    TIOTADV                  BR IF YES TO ADVANCE TO NEXT DD
+*
+         CLI   UCBID,UCBMAIN            IS THIS 2321 SUB UCB
+         BNE   UCB2321A                 BR IF YES 2321
+*
+         CLI   UCBTBYT3,UCB3DACC        IS THIS DIRECT ACCESS UCB
+         BNE   TIOTADV                  BR IF NO TO NEXT TIOT DD ENTRY
+*
+UCB2321A EQU   *
+*
+***********************************************************************
+*
+*  READ VTOC JFCB, SET DSNAME TO X'04'S, AND OPEN VTOC DCB FOR INPUT
+*
+         MVC   DCBDDNAM-DCB+VTOCDCB,TIOEDDNM  MOVE TIOT DDNAME TO DCB
+*
+         RDJFCB (VTOCDCB)               READ VTOC JFCB
+*
+         TM    JFCBTSDM,JFCSDS          IS THIS SYSIN/SYSOUT DATA SET
+         BO    TIOTADV                  BR IF YES TO NEXT TIOT DD ENTRY
+*
+         MVI   JFCBDSNM,X'04'           CHANGE DSNAME
+         MVC   JFCBDSNM+1(L'JFCBDSNM-1),JFCBDSNM  TO X'04'S
+         OI    JFCBTSDM,JFCNWRIT        INHIBIT JFCB WRITE BACK
+*
+         OPEN  (VTOCDCB,(INPUT)),TYPE=J OPEN VTOC FOR INPUT EXCP
+*
+         TM    DCBOFLGS-DCB+VTOCDCB,X'10'  IS DCB OPEN
+         BZ    NOTOPEN                  BR IF NO, ERROR
+*
+         XC    CNTFMT0(CNTENDZ),CNTFMT0  RESET DSCB COUNTERS
+*
+*  SAVE UCB INFORMATION SO IT CAN BE USED IN A MAIN/SUB UCB
+*  INDEPENDENT MANNER
+*
+         L     RUCB,TIOEFSRT-1          RELOAD FIRST UCB ADDR FROM TIOT
+*                                       IN CASE OPEN ROTATED MULTI UCBS
+         CLI   UCBID,UCBMAIN            IS THIS 2321 SUB UCB
+         BE    MAINUCB                  BR IF NOT 2321
+*
+         USING UCBDCELL,RUCB            DEFINE BASE TO SUB UCB
+         MVC   VOLSERNO,UCBDVOLI        SAVE 2321 VOL SER NO.
+         MVC   VTOCTTR(3),UCBDVTOC      SAVE 2321 VTOC TTR
+         LH    RF,UCBDBBNR              PICK UP BB NUMBER
+         SLA   RF,4                     MULTIPLY BB NUMBER BY 16
+         LA    RF,UCBDCELL-UCBOB(RF)    (BB)(16) + MAIN UCB LENGTH
+         SR    RUCB,RF                  CALC ADDR OF MAIN 2321 UCB
+         B     COMONUCB                 BR TO SAVE MAIN UCB INFORMATION
+*
+         USING UCBOB,RUCB               DEFINE BASE TO MAIN UCB
+MAINUCB  EQU   *
+         MVC   VOLSERNO,UCBVOLI         SAVE VOL SER NO. FROM UCB
+         MVC   VTOCTTR(3),UCBVTOC       SAVE VTOC TTR
+*
+COMONUCB EQU   *
+         MVC   NAMEUCB,UCBNAME          SAVE UCB DEVICE ADDR NAME
+         ST    RUCB,UCBADDR             SAVE UCB ADDRESS FOR ENQ / DEQ
+         XC    VTOCTTR(2),VTOCTTR       ZERO VTOC TT SINCE THE DEB
+*                                       STARTS AT THE VTOC TRACK
+*
+         SR    RF,RF                    GET UCB DIRECT ACCESS
+         IC    RF,UCBTBYT4              DEVICE TYPE
+         SLL   RF,2                     INDEX TO INTERNAL TABLE
+         LA    RF,DEVTABLE-4(RF)        OF DEVICE CHARACTERISTICS
+         MVC   DEVSIZEC(4),0(RF)        SAVE NO. OF CYL + TRK ON DEVICE
+*
+         LH    RF,DEVSIZEC              CALC NO. OF TRACKS ON DISK
+         MH    RF,DEVSIZET              AS CYLS * (TRK/CYL)
+         STH   RF,DEVSIZES              SAVE NO. OF TRACKS ON DISK
+*
+*  POINT TO THE FIRST RECORD IN THE VTOC, THE FORMAT 4 DSCB
+*
+         L     R0,VTOCTTR               LOAD VTOC TTR0
+         L     R1,DCBDEBAD-DCB+VTOCDCB  LOAD DEB ADDR FROM DCB
+         LA    R2,IOBSEEK               POINT TO MBBCCHHR RESULT FIELD
+         LR    R4,RD                    SAVE SAVE AREA POINTER
+         L     RF,CVTPTR                GET CVT ADDR
+         L     RF,CVTPCNVT-CVT(,RF)     GET IECPCNVT ROUTINE ADDR
+         BALR  RE,RF                    BR TO CONVERT TTR TO MBBCCHHR
+         LR    RD,R4                    RESTORE SAVE AREA POINTER
+         MVC   VTOCCHHR,IOBSEEK+3       SAVE VTOC CCHHR
+         MVC   COUNT(5),IOBSEEK+3       START CCHHR FOR READ LOOP
+*
+         MVC   REALHWM,IOBSEEK+3        HIGH WATER MARK FOLLOWS
+         IC    RF,REALHWM+4             THE FMT4 AND FMT5
+         LA    RF,2(RF)                 DSCB.S ON AN
+         STC   RF,REALHWM+4             EMPTY OR FRESH VTOC
+*
+***********************************************************************
+*
+*  ENQ TO LOCK THIS SYSTEM'S DADSM OFF OF THE VTOC
+*  AND OTHER SYSTEMS OFF OF THE DISK ENTIRELY.
+*  HOWEVER, THIS STILL ALLOWS THIS SYSTEM'S OPEN/CLOSE/EOV TO UPDATE
+*  THE FORMAT 1 DSCB INFORMATION, BUT NOT THE AMOUNT OF SPACE ALLOCATED
+*
+         RESERVE (SYSVTOC,VOLSERNO,S,6,SYSTEMS),UCB=UCBADDR,RET=HAVE
+*
+***********************************************************************
+*
+*  READ NON-ZERO KEY DSCB RECORDS AND SUM UP THE TRACKS THEY REPRESENT
+*
+         SR    RTRKCNT,RTRKCNT          ZERO TRACK COUNTER
+         MVI   NPASS,1                  RESET TO FIRST NTH PASS
+         MVI   CCW3+4,0                 ZERO CCW CHAIN TO KEY SEARCH
+         B     READ                     BR TO START READ LOOP
+*
+REREAD   EQU   *
+         CLI   ECB,X'42'                ARE WE OUT OF EXTENT
+         BE    FMT5STRT                 BR IF YES
+*
+         CLI   CCW3+4,0                 IS THIS STILL READ DIRECT
+         BE    READDIR                  BR IF YES TO CALC MBBCCHHR
+*
+         MVC   IOBSEEK+3(5),COUNT       CCHHR OF NEXT DSCB IN VTOC
+         B     READ                     BR TO READ AND SEARCH KEY
+*
+READDIR  EQU   *
+         SR    RF,RF                    INCREMENT DSCB
+         IC    RF,IOBSEEK+7             NEXT RECORD NUMBER
+         LA    RF,N(RF)                 BY N TO DO EVERY
+         STC   RF,IOBSEEK+7             NTH RECORD
+         SR    RE,RE                    IS THIS RECORD NUMBER
+         IC    RE,D4DEVDT               BEYOND THE
+READNTST CR    RF,RE                    END OF THE VTOC TRACK
+         BNH   READD                    BR IF NO TO READ IT
+*
+         CLI   NPASS,N                  IS THIS LAST NTH PASS
+         BE    READEND2                 BR IF YES TO START NEXT TRACK
+*
+         IC    RF,NPASS                 INCREMENT NPASS
+         LA    RF,1(RF)                 COUNTER
+         STC   RF,NPASS                 BY 1
+*
+         IC    RF,VTOCTTR+2             INCREMENT RECORD NUMBER
+         LA    RF,1(RF)                 BY 1 TO
+         STC   RF,VTOCTTR+2             FIRST NTH RECORD
+         STC   RF,IOBSEEK+7             ON THIS TRACK
+         B     READNTST                 BR TO CHECK IF RECORD ON TRACK
+*
+READEND2 EQU   *
+         CLC   D4VTOCE,IOBSEEK+3        IS THIS LAST TRACK OF VTOC
+         BE    FMT5STRT                 BR IF YES, DONE READING
+*
+         LH    RF,VTOCTTR               GET PREVIOUS VTOC TT
+         LA    RF,1(RF)                 ADVANCE TT BY 1
+         STH   RF,VTOCTTR               TO NEXT TRACK
+         MVI   VTOCTTR+2,1              SET TO READ R1 OF NEXT TRACK
+         MVI   NPASS,1                  RESET TO FIRST NTH PASS
+*
+         L     R0,VTOCTTR               LOAD TTR0 TO CONVERT
+         L     R1,DCBDEBAD-DCB+VTOCDCB  LOAD DEB ADDR FROM DCB
+         LA    R2,IOBSEEK               POINT TO MBBCCHHR RESULT FIELD
+         LR    R4,RD                    SAVE SAVE AREA POINTER
+         L     RF,CVTPTR                GET CVT ADDR
+         L     RF,CVTPCNVT-CVT(,RF)     GET IECPCNVT ROUTINE ADDR
+         BALR  RE,RF                    BR TO CONVERT TTR TO MBBCCHHR
+         LR    RD,R4                    RESTORE SAVE AREA POINTER
+*
+         CLC   D4DEVDT,CNTDSCB0+1       WAS WHOLE TRACK FMT0 HOLES
+         MVI   CNTDSCB0+1,0             RESET COUNT OF FMT0 HOLES
+         BNE   READD                    BR IF NO TO READ DIRECT ONLY
+*
+         MVI   CCW3+4,X'40'             ENABLE CHAIN TO SEARCH KEY
+*
+READD    EQU   *
+         MVC   COUNT(5),IOBSEEK+3       START CCHHR FOR READ LOOP/ERR
+*
+READ     EQU   *
+         XC    DSCB,DSCB                ZERO DSCB WORK AREA
+*
+         EXCP  IOB                      ISSUE EXCP TO READ DSCB
+*
+         WAIT  ECB=ECB                  WAIT FOR I/O TO COMPLETE
+*
+         CLI   ECB,X'7F'                CHECK FOR I/O ERROR
+         BE    CHKTYPE                  BR IF NO
+         CLI   ECB,X'42'                END OF EXTENT
+         BNE   ERRWTO                   BR IF NO, I/O ERROR
+*
+***********************************************************************
+*
+*  DETERMINE TYPE OF DSCB JUST READ
+*
+CHKTYPE  EQU   *
+         NC    DSCB,DSCB                FORMAT 0 DSCB
+         BZ    F0RTN                    BR IF YES
+         XC    CNTDSCB0,CNTDSCB0        ZERO NO. OF HOLES ON THIS TRACK
+         CLI   DS1FMTID,C'1'            FORMAT 1 DSCB
+         BE    F1RTN                    BR IF YES
+         CLI   DS2FMTID,C'2'            FORMAT 2 DSCB
+         BE    F2RTN                    BR IF YES
+         CLI   DS3FMTID,C'3'            FORMAT 3 DSCB
+         BE    F3RTN                    BR IF YES
+         CLI   DS4IDFMT,C'4'            FORMAT 4 DSCB
+         BE    F4RTN                    BR IF YES
+         CLI   DS5FMTID,C'5'            FORMAT 5 DSCB
+         BE    F5RTN                    BR IF YES
+         CLI   DS6FMTID,C'6'            FORMAT 6 DSCB
+         BE    F6RTN                    BR IF YES
+         B     DSCBERR                  BR, INVALID DSCB READ
+*
+***********************************************************************
+*
+*  SUM UP NUMBER OF TRACKS BY TYPE OF DSCB
+*
+F0RTN    EQU   *
+         LH    RF,CNTDSCB0              INCREMENT COUNT
+         LA    RF,1(RF)                 OF FMT 0 HOLES ON
+         STH   RF,CNTDSCB0              THIS TRACK BY 1
+         B     REREAD                   BR TO READ NEXT DSCB
+*
+F1RTN    EQU   *
+         CLI   DS1DSNAM,X'07'           CHECK IF FMT 0-6 KEY
+         BL    DSCBERR                  BR IF YES, ERROR
+*
+         L     RF,CNTFMT1               INCREMENT COUNT
+         LA    RF,1(RF)                 OF FMT 1 DSCB.S
+         ST    RF,CNTFMT1               BY 1
+*
+         NC    DS1PTRDS,DS1PTRDS        IS FMT 1 DSCB CHAINED
+         BZ    NOFMT1C                  BR IF NO
+         L     RF,CNTFMT1C              INCREMENT COUNT
+         LA    RF,1(RF)                 OF FMT 1 DSCB.S
+         ST    RF,CNTFMT1C              WITH CHAIN BY 1
+NOFMT1C  EQU   *
+*
+         MVC   REALHWM,IOBSEEK+3        SAVE REAL FMT 1 HWM
+*
+         LA    REXT,DS1EXT1             POINT TO FMT1 FIRST EXTENT
+         LA    RLOOPCNT,3               SET LOOP CTR
+CHKZER1  EQU   *
+         MVC   EXTENT,0(REXT)           MOVE EXTENT TO WORK AREA
+         CLI   EXTENTYP,0               EXTENT 0
+         BE    REREAD                   BR IF YES
+         NC    EXTENSCC(8),EXTENSCC     ZERO SPACE EXTENT
+         BZ    REREAD                   BR IF YES
+         CLI   EXTENTYP,X'80'           SPLIT CYL D. S.
+         BE    *+8                      IGNORE THIS EXTENT
+         BAL   RE,TRAKCALC              CALC # TRACKS
+         LA    REXT,10(REXT)            POINT TO NEXT EXTENT
+         BCT   RLOOPCNT,CHKZER1         LOOP FOR 3 FMT1 EXTENTS
+         B     REREAD                   BR TO READ NEXT DSCB
+*
+F2RTN    EQU   *
+         CLI   IECSDSF2,X'02'           FORMAT 2 KEY
+         BNE   DSCBERR                  BR IF NO, ERROR
+*
+         L     RF,CNTFMT2               INCREMENT COUNT
+         LA    RF,1(RF)                 OF FMT 2 DSCB.S
+         ST    RF,CNTFMT2               BY 1
+*
+         NC    DS2PTRDS,DS2PTRDS        IS FMT 2 DSCB CHAINED
+         BZ    NOFMT2C                  BR IF NO
+         L     RF,CNTFMT2C              INCREMENT COUNT
+         LA    RF,1(RF)                 OF FMT 2 DSCB.S
+         ST    RF,CNTFMT2C              WITH CHAIN BY 1
+NOFMT2C  EQU   *
+*
+         B     REREAD                   BR TO READ NEXT DSCB
+*
+F3RTN    EQU   *
+         CLC   IECSDSF3(4),KEY03        FORMAT 3 KEY
+         BNE   DSCBERR                  BR IF NO, ERROR
+*
+         L     RF,CNTFMT3               INCREMENT COUNT
+         LA    RF,1(RF)                 OF FMT 3 DSCB.S
+         ST    RF,CNTFMT3               BY 1
+*
+         NC    DS3PTRDS,DS3PTRDS        IS FMT 3 DSCB CHAINED
+         BZ    NOFMT3C                  BR IF NO
+         L     RF,CNTFMT3C              INCREMENT COUNT
+         LA    RF,1(RF)                 OF FMT 3 DSCB.S
+         ST    RF,CNTFMT3C              WITH CHAIN BY 1
+NOFMT3C  EQU   *
+*
+         MVI   SWITCH,0                 SET FIRST PASS SWITCH
+         LA    REXT,DS3EXTNT            POINT TO FMT3 FIRST EXTENT
+         LA    RLOOPCNT,4               SET LOOP CTR
+CHKZER3  EQU   *
+         MVC   EXTENT,0(REXT)           MOVE EXTENT TO WORK AREA
+         CLI   EXTENTYP,0               EXTENT 0
+         BE    REREAD                   BR IF YES
+         NC    EXTENSCC(8),EXTENSCC     ZERO SPACE EXTENT
+         BZ    REREAD                   BR IF YES
+         BAL   RE,TRAKCALC              CALC # TRACKS
+         LA    REXT,10(REXT)            POINT TO NEXT EXTENT
+         BCT   RLOOPCNT,CHKZER3
+         CLI   SWITCH,0                 FIRST PASS
+         BNE   REREAD                   BR IF NO
+         MVI   SWITCH,X'FF'
+         LA    REXT,DS3ADEXT            POINT TO FMT3 FIFTH EXTENT
+         LA    RLOOPCNT,9               SET LOOP CTR
+         B     CHKZER3
+*
+F4RTN    EQU   *
+         CLI   DS1DSNAM,X'04'           FORMAT 4 KEY
+         BNE   DSCBERR                  BR IF NO, ERROR
+*
+         NC    CNTFMT0(CNTENDL),CNTFMT0  IS THIS VERY FIRST DSCB
+         BNZ   DSCBERR                  BR IF NO, EXTRA FMT 4 DSCB
+*
+         MVI   CNTFMT4+3,1              SET COUNT OF FMT4 DSCB.S TO 1
+*
+         NC    DS4F6PTR,DS4F6PTR        IS FMT 6 DSCB CHAINED FROM FMT4
+         BZ    NOFMT46C                 BR IF NO
+         L     RF,CNTFMT6C              INCREMENT COUNT
+         LA    RF,1(RF)                 OF FMT 6 DSCB.S
+         ST    RF,CNTFMT6C              WITH CHAIN BY 1
+NOFMT46C EQU   *
+*
+         MVC   D4HPCHR,DS4HPCHR         SAVE FMT 1 HIGH WATER MARK
+         MVC   D4DSREC,DS4DSREC         SAVE NO. OF HOLES IN VTOC
+         MVC   D4DEVDT,DS4DEVDT         SAVE NO. OF DSCB.S PER TRACK
+*
+         MVC   D4VTOCE,DS4VTOCE+6       SAVE END OF VTOC CCHH
+         MVC   EXTENT,DS4VTOCE          MOVE EXTENT TO WORK AREA
+         BAL   RE,TRAKCALC              CALC # TRACKS IN VTOC
+*
+         SR    RF,RF                    CALC NO. OF DSCB.S IN VTOC AS
+         IC    RF,DS4DEVDT              NO. DSCB.S/TRK
+         MR    RE,RTRKCNT               TIMES NO. TRACKS IN VTOC
+         SR    RE,RE                    DECREMENT TOTAL DSCB.S IN
+         IC    RE,IOBSEEK+7             VTOC IF DOS DISK
+         BCTR  RE,0                     AND VTOC DOES
+         SR    RF,RE                    NOT START AT RECORD R1
+         ST    RF,NOVTDSCB              SAVE DSCB COUNT FOR VALID TEST
+         NC    IOBSEEK+3(4),IOBSEEK+3   IS THIS DOS VTOC STARTING ON
+         BZ    DOSVTOC                  TRACK 0, BR IF YES
+         LA    RTRKCNT,1(RTRKCNT)       COUNT 1 FOR IPL-VOL LBL TRACK
+DOSVTOC  EQU   *
+*
+         TM    DS4VTOCI,X'84'           IS DOS OR DIRF BIT ON
+         BZ    F4RET                    BR IF NO
+*
+         MVC   DIRFMSGU(3),NAMEUCB      MOVE UCB ADDR NAME TO MSG
+         MVC   DIRFMSGV(6),VOLSERNO     MOVE VOL SER NO. TO MSG
+         UNPK  DIRFMSGB(3),DS4VTOCI(2)  UNPACK INDICATOR BYTE TO MSG
+         TR    DIRFMSGB(2),TRTABLE      CONVERT FA-FF TO A-F
+         MVI   DIRFMSGB+2,C' '          CLEAR UNPK GARBAGE BYTE
+         WTO   MF=(E,DIRFMSG)           WRITE DOS-DIRF ERROR MSG
+*
+F4RET    EQU   *
+         B     REREAD                   BR TO READ NEXT DSCB
+*
+F5RTN    EQU   *
+         CLC   DS5KEYID,KEY05           FORMAT 5 KEY
+         BNE   DSCBERR                  BR IF NO, ERROR
+*
+         L     RF,CNTFMT5               INCREMENT COUNT
+         LA    RF,1(RF)                 OF FMT 5 DSCB.S
+         ST    RF,CNTFMT5               BY 1
+*
+         NC    DS5PTRDS,DS5PTRDS        IS FMT 5 DSCB CHAINED
+         BZ    NOFMT5C                  BR IF NO
+         L     RF,CNTFMT5C              INCREMENT COUNT
+         LA    RF,1(RF)                 OF FMT 5 DSCB.S
+         ST    RF,CNTFMT5C              WITH CHAIN BY 1
+NOFMT5C  EQU   *
+*
+F5RTN6   EQU   *
+         MVI   SWITCH,0                 SET FIRST PASS SWITCH
+         LA    REXT,DS5AVEXT            POINT TO FMT5 FIRST EXTENT
+         LA    RLOOPCNT,8               SET LOOP CTR
+CHKZER5  EQU   *
+         NC    0(5,REXT),0(REXT)        IS NEXT EXTENT 0
+         BZ    REREAD                   BR IF YES
+         SR    RF,RF                    ZERO WORK REG
+         CLI   DS6FMTID,C'6'            FORMAT 6 DSCB
+         BE    SKIP5                    BR IF YES, HAS NO EXTRA TRACKS
+         IC    RF,4(REXT)               # FREE TRACKS
+         AR    RTRKCNT,RF               ADD TO COUNTER
+SKIP5    EQU   *
+         MVC   EXTENSCC,2(REXT)         # OF CYLS
+         LH    RF,EXTENSCC
+         MH    RF,DEVSIZET              CONVERT TO TRACKS
+         AR    RTRKCNT,RF               ADD TO COUNTER
+         LA    REXT,5(REXT)             POINT TO NEXT EXTENT
+         BCT   RLOOPCNT,CHKZER5
+         CLI   SWITCH,0                 FIRST PASS
+         BNE   REREAD                   BR IF NO
+         MVI   SWITCH,X'FF'             INDICATE WE'VE BEEN HERE
+         LA    REXT,DS5MAVET            POINT TO FMT5 NINETH EXTENT
+         LA    RLOOPCNT,18              SET LOOP CTR
+         B     CHKZER5
+*
+F6RTN    EQU   *
+         CLC   DS6KEYID,KEY06           FORMAT 6 KEY
+         BNE   DSCBERR                  BR IF NO, ERROR
+*
+         L     RF,CNTFMT6               INCREMENT COUNT
+         LA    RF,1(RF)                 OF FMT 6 DSCB.S
+         ST    RF,CNTFMT6
+*
+         NC    DS6PTRDS,DS6PTRDS        IS FMT 6 DSCB CHAINED
+         BZ    NOFMT6C                  BR IF NO
+         L     RF,CNTFMT6C              INCREMENT COUNT
+         LA    RF,1(RF)                 OF FMT 6 DSCB.S
+         ST    RF,CNTFMT6C              WITH CHAIN BY 1
+NOFMT6C  EQU   *
+*
+         B     F5RTN6                   BR TO SHARE FMT 5 CODE
+*
+***********************************************************************
+*
+*  SUBROUTINE TO CALCULATE THE NUMBER OF TRACKS IN A FMT 1,3,4 EXTENT
+*
+TRAKCALC EQU   *
+         CLI   DEVSIZEC,X'03'           IS THIS 2321
+         BE    CALC2321                 BR IF YES
+*
+         LH    RF,EXTENECC              END OF EXTENT CC
+         SH    RF,EXTENSCC              LESS START OF EXTENT CC
+         MH    RF,DEVSIZET              CONVERT TO TRACKS
+         AR    RTRKCNT,RF               ADD CYL TRKS TO COUNTER
+         LH    RF,EXTENEHH              END OF EXTENT HH
+         SH    RF,EXTENSHH              LESS START OF EXTENT HH
+         LA    RTRKCNT,1(RTRKCNT,RF)    ADD TRACKS TO COUNTER
+         BR    RE                       RETURN
+*
+CALC2321 LA    RF,4                     INDEX TO BYTES IN C/C/H/H
+LOOP2321 SR    R1,R1                    GET END OF EXTENT C/C/H/H
+         IC    R1,EXTENECC-1(RF)        GET END OF EXTENT C/C/H/H
+         SR    R0,R0
+         IC    R0,EXTENSCC-1(RF)        GET START OF EXTENT C/C/H/H
+         SR    R1,R0                    CALC DIFFERENCE IN C/C/H/H
+         SLL   RF,1                     MODIFY INDEX TO HALF WORD
+         LH    R0,DEV2321X-2(RF)        GET NO. OF TRACKS PER C/C/H/H
+         SRL   RF,1                     MODIFY INDEX TO BYTE
+         MR    R0,R0                    CALC NO. OF TRACKS
+         AR    RTRKCNT,R1               INCR TRACK COUNTER
+         BCT   RF,LOOP2321              LOOP ON C/C/H/H
+         LA    RTRKCNT,1(RTRKCNT)       INCR BY 1 FOR FIRST TRACK
+         BR    RE                       RETURN
+*
+***********************************************************************
+*
+*  READ FORMAT 5 DSCB CHAIN AND VERY CAREFULLY VALIDITY CHECK DATA
+*
+FMT5STRT EQU   *
+         MVC   IOBSEEK+3(5),VTOCCHHR    RESTORE VTOC CCHHR
+         IC    RF,IOBSEEK+7             FIRST FMT 5 DSCB ADDR
+         LA    RF,1(RF)                 IS VTOC ADDR
+         STC   RF,IOBSEEK+7             PLUS 1
+         MVI   CCW3+4,X'00'             SET TO ONLY READ KEY + DATA
+*
+FMT5READ EQU   *
+         XC    DSCB,DSCB                ZERO DSCB WORK AREA
+*
+         EXCP  IOB                      ISSUE EXCP TO READ FMT5 DSCB
+*
+         WAIT  ECB=ECB                  WAIT FOR I/O TO COMPLETE
+*
+         CLI   ECB,X'7F'                CHECK FOR I/O ERROR
+         BE    FMT5RDOK                 BR IF NO
+*
+         B     ERRWTO                   BR TO WRITE I/O ERROR MESSAGE
+*
+FMT5RDOK EQU   *
+         CLC   DS5KEYID,KEY05           FORMAT 5 KEY
+         BNE   FMT5BAD                  BR IF NO, ERROR
+*
+         CLI   DS5FMTID,C'5'            FORMAT 5 DSCB ID
+         BNE   FMT5BAD                  BR IF NO, ERROR
+*
+         NC    CNTFMT5B,CNTFMT5B        IS THIS FIRST FMT 5 DSCB
+         BZ    FMT5FRST                 BR IF YES, OK IF NO EXTENTS
+*
+         NC    DS5AVEXT,DS5AVEXT        IS FIRST EXTENT ZERO
+         BZ    FMT5BAD                  BR IF YES, ERROR
+*
+FMT5FRST EQU   *
+         L     RF,CNTFMT5B              INCREMENT COUNT OF
+         LA    RF,1(RF)                 CHAINED FMT 5
+         ST    RF,CNTFMT5B              DSCB.S BY 1
+*
+         MVI   SWITCH,0                 SET FIRST PASS SWITCH
+         LA    REXT,DS5AVEXT            POINT TO FMT5 FIRST EXTENT
+         LA    RLOOPCNT,8               SET LOOP CTR
+*
+FMT5CKLP EQU   *
+         NC    0(5,REXT),0(REXT)        IS NEXT EXTENT ZERO
+         BNZ   FMT5NZ                   BR IF NO
+*
+         MVI   FMT5ZIND,X'FF'           SET ZERO EXTENT INDICATOR ON
+         B     FMT5ADVL                 BR TO ADVANCE TO NEXT EXTENT
+*
+FMT5NZ   EQU   *
+         CLI   FMT5ZIND,0               PREV ZERO EXTENT IN FMT5
+         BNE   FMT5BAD                  BR IF YES, ERROR
+*
+         CLC   FMT5TT,0(REXT)           IS TT IN ASCENDING ORDER
+         BNL   FMT5BAD                  BR IF NO, ERROR
+         CLC   DEVSIZES,0(REXT)         IS TT .GE. DISK
+         BNH   FMT5BAD                  BR IF YES, ERROR
+*
+         MVC   FMT5TT,0(REXT)           UPDATE TT OF CURRENT FMT5 EXT
+*
+         CLC   FMT5TT,FMT5TTN           IS TT BEYOND PREVIOUS EXTENT
+         BL    FMT5BAD                  BR IF NO, ERROR
+*
+         CLC   DEVSIZEC,2(REXT)         IS CONTIGUOUS CYL .GE. DISK
+         BNH   FMT5BAD                  BR IF YES, ERROR
+*
+         MVC   EXTENSCC,2(REXT)         MOVE TO HW
+         LH    RF,EXTENSCC              MULTIPLY CONTIGUOUS CYLS
+         MH    RF,DEVSIZET              BY TRKS/CYL
+         AH    RF,FMT5TT                ADD BEGINNING REL TRACK ADDR
+         SR    R0,R0                    GET NO. OF NON-CONTIGUOUS
+         IC    R0,4(REXT)               TRACKS
+         AR    RF,R0                    ADD TO SUM
+         STH   RF,FMT5TTN               SAVE FOR NEXT TT CHECK
+         CLC   FMT5TTN,DEVSIZES         IS NEXT TRACK .GT. DISK
+         BH    FMT5BAD                  BR IF YES, ERROR
+*
+         LH    RF,DEVSIZET              GET NO. OF TRACKS/CYL
+         BCTR  RF,0                     DECR FOR 1 LESS THAN CYL ON END
+         SR    R0,R0                    INIT FOR DIVIDE
+         LH    R1,FMT5TT                CALC TRACKS BEFORE
+         LH    RE,DEVSIZET              FIRST
+         DR    R0,RE                    CYLINDER BOUNDARY
+         LTR   R0,R0                    IS REMAINDER ZERO
+         BZ    FMT5SCYL                 BR IF YES
+         AH    RF,DEVSIZET              TRACKS/CYL - REMAINDER
+         SR    RF,R0                    FOR TRACKS IN FRONT
+FMT5SCYL EQU   *
+         IC    R0,4(REXT)               GET NO. OF NON-CONTIGUOUS TRKS
+         CR    R0,RF                    IS TRACK COUNT TOO BIG
+         BH    FMT5BAD                  BR IF YES, ERROR
+*
+FMT5ADVL EQU   *
+         LA    REXT,5(REXT)             POINT TO NEXT EXTENT
+         BCT   RLOOPCNT,FMT5CKLP        BR IF MORE EXTENTS
+*
+         CLI   SWITCH,0                 FIRST PASS
+         BNE   FMT5NEXT                 BR IF NO
+         MVI   SWITCH,X'FF'             SET SECOND PASS SWITCH
+         LA    REXT,DS5MAVET            POINT TO FMT5 NINETH EXTENT
+         LA    RLOOPCNT,18              SET LOOP CTR
+         B     FMT5CKLP                 BR TO PROCESS DATA PART
+*
+FMT5NEXT EQU   *
+         NC    DS5PTRDS,DS5PTRDS        IS FMT 5 DSCB CHAINED
+         BZ    COUNTCHK                 BR IF NO
+*
+         CLI   FMT5ZIND,0               PREVIOUS ZERO EXTENT IN FMT 5
+         BNE   FMT5BAD                  BR IF YES, ERROR
+*
+         MVC   IOBSEEK+3(5),DS5PTRDS    POINT TO NEXT FMT 5 DSCB
+         B     FMT5READ                 BR TO READ NEXT FMT 5 DSCB
+*
+***********************************************************************
+*
+*  WRITE GOOD OR BAD ERROR MESSAGES
+*
+ERRWTO   EQU   *
+         MVC   ERRMSGU(3),NAMEUCB       MOVE UCB ADDR NAME TO MSG
+         MVC   ERRMSGV(6),VOLSERNO      MOVE VOL SER NO. TO MSG
+         UNPK  ERRMSGC(11),COUNT(6)     UNPACK BINARY CCHHR TO MSG
+         TR    ERRMSGC(10),TRTABLE      CONVERT FA-FF TO A-F
+         MVI   ERRMSGC+10,C' '          CLEAR UNPK GARBAGE BYTE
+         WTO   MF=(E,ERRMSG)            ISSUE I/O ERROR MSG
+         B     ABEND                    BR TO DEQ AND ABEND
+*
+DSCBERR  EQU   *
+         MVC   DSCBMSGU(3),NAMEUCB      MOVE UCB ADDR NAME TO MSG
+         MVC   DSCBMSGV(6),VOLSERNO     MOVE VOL SER NO. TO MSG
+         UNPK  DSCBMSGC(11),IOBSEEK+3(6)  UNPACK BINARY CCHHR TO MSG
+         TR    DSCBMSGC(10),TRTABLE     CONVERT FA-FF TO A-F
+         MVI   DSCBMSGC+10,C' '         CLEAR UNPK GARBAGE BYTE
+         WTO   MF=(E,DSCBMSG)           WRITE BAD DSCB ERROR MSG
+         B     ABEND                    BR TO DEQ AND ABEND
+*
+FMT5BAD  EQU   *
+         MVC   FMT5MSGU(3),NAMEUCB      MOVE UCB ADDR NAME TO MSG
+         MVC   FMT5MSGV(6),VOLSERNO     MOVE VOL SER NO. TO MSG
+         UNPK  FMT5MSGC(11),IOBSEEK+3(6)  UNPACK BINARY CCHHR TO MSG
+         TR    FMT5MSGC(10),TRTABLE     CONVERT FA-FF TO A-F
+         MVI   FMT5MSGC+10,C' '         CLEAR UNPK GARBAGE BYTE
+         WTO   MF=(E,FMT5MSG)           WRITE INVALID FMT5 ERROR MSG
+         B     ABEND                    BR TO DEQ AND ABEND
+*
+COUNTWTO EQU   *
+         MVC   COUNTMGU(3),NAMEUCB      MOVE UCB ADDR NAME TO MSG
+         MVC   COUNTMGV(6),VOLSERNO     MOVE VOL SER NO. TO MSG
+         WTO   MF=(E,COUNTMSG)          WRITE BAD FMTX COUNT MSG
+         MVI   ABENDSW2,X'FF'           SET ABEND CONDITION SW ON
+         BR    RE                       RETURN
+*
+COUNTCHK EQU   *
+         ST    RTRKCNT,CNTTRACK         SAVE COUNT OF TRACKS FOR DUMP
+         CLC   DEVSIZES,CNTTRACK+2      ARE ALL TRACKS ALLOCATED
+         BE    FMTXVLDY                 BR IF YES
+*
+         MVC   TRKMSGU(3),NAMEUCB       MOVE UCB ADDR NAME TO MSG
+         MVC   TRKMSGV(6),VOLSERNO      MOVE VOL SER NO. TO MSG
+         WTO   MF=(E,TRKMSG)            WRITE BAD TRACK COUNT ERROR MSG
+         MVI   ABENDSW2,X'FF'           SET ABEND CONDITION SW ON
+*
+***********************************************************************
+*
+*  VALIDITY CHECK THE RELATIONSHIP BETWEEN COUNT DSCB.S READ BY TYPE
+*
+FMTXVLDY EQU   *
+         CLC   CNTFMT2,CNTFMT1C         IS F2 .LE. F1C
+         BNH   FMT3VLDY                 BR IF YES
+         MVI   COUNTMGF,C'2'            FMT2 TO MSG
+         BAL   RE,COUNTWTO              CALL SUBR TO WRITE FMT2 ERR MSG
+*
+FMT3VLDY EQU   *
+         CLC   CNTFMT3,CNTFMT1C         IS F3 .LE. F1C
+         BH    FMT3BAD                  BR IF NO, ERROR
+*
+FMTCVLDY EQU   *
+         L     RF,CNTFMT1C              IS F3 .EQ.
+         A     RF,CNTFMT2C              F1C + F2C - F2 + F3C
+         S     RF,CNTFMT2
+         A     RF,CNTFMT3C
+         C     RF,CNTFMT3
+         BE    FMT5VLDY                 BR IF YES
+FMT3BAD  EQU   *
+         MVI   COUNTMGF,C'3'            FMT3 TO MSG
+         BAL   RE,COUNTWTO              CALL SUBR TO WRITE FMT3 ERR MSG
+*
+FMT5VLDY EQU   *
+         L     RF,CNTFMT5C              IS F5 .EQ. F5C + 1
+         LA    RF,1(RF)
+         C     RF,CNTFMT5
+         BNE   FMT5VBAD                 BR IF NO, ERROR
+*
+         CLC   CNTFMT5B,CNTFMT5         WERE ALL FMT 5 DSCB.S CHAINED
+         BE    FMT6VLDY                 BR IF YES
+*
+FMT5VBAD EQU   *
+         MVI   COUNTMGF,C'5'            FMT5 TO MSG
+         BAL   RE,COUNTWTO              CALL SUBR TO WRITE FMT5 ERR MSG
+*
+FMT6VLDY EQU   *
+         CLC   CNTFMT6,CNTFMT6C         IS F6 .EQ. F6C
+         BE    FMT0VLDY                 BR IF YES
+         MVI   COUNTMGF,C'6'            FMT6 TO MSG
+         BAL   RE,COUNTWTO              CALL SUBR TO WRITE FMT6 ERR MSG
+*
+FMT0VLDY EQU   *
+         L     RF,NOVTDSCB              IS FMT4 HOLE COUNT .EQ.
+         S     RF,CNTFMT1               NO. OF DSCB SLOTS IN VTOC
+         S     RF,CNTFMT2               LESS NO. OF FMT1,2,3,4,5,6
+         S     RF,CNTFMT3               DSCB.S READ
+         S     RF,CNTFMT4
+         S     RF,CNTFMT5
+         S     RF,CNTFMT6
+         CH    RF,D4DSREC
+         BE    FMT4VLDY                 BR IF YES
+         MVI   COUNTMGF,C'0'            FMT0 TO MSG - ERROR IN HOLE CNT
+         BAL   RE,COUNTWTO              CALL SUBR TO WRITE FMT0 ERR MSG
+*
+FMT4VLDY EQU   *
+         CLC   D4HPCHR,REALHWM          IS FMT4 HWM .GE. FMT1 HWM
+         BNL   ABENDTST                 BR IF YES
+         MVC   COUNTMGF(7),CFMT4HWM     MOVE '4 HWM' TO MSG
+         BAL   RE,COUNTWTO              CALL SUBR TO WRITE FMT4 HWM MSG
+         MVC   COUNTMGF+2(5),TRKMSGV+22  RESTORE 'COUNT' TO MSG
+*
+ABENDTST EQU   *
+         CLI   ABENDSW2,X'FF'           IS ABEND CONDITION SW SET
+         BNE   OUT                      BR IF NO TO DEQ, CLOSE, DO NEXT
+         MVI   ABENDSW2,0               RESET ABEND CONDITION SW TO OFF
+*
+ABEND    EQU   *
+         MVI   RETCODE,8                SET RETURN CODE FOR EXIT
+*
+         BAL   RE,DEQRTN                DEQ FROM VTOC
+*
+         CLI   ABENDSW,X'FF'            IS SYSABEND OR SYSUDUMP PRESENT
+         BNE   CLOSE                    BR IF NO TO CONTINUE NEXT ENTRY
+*
+         LA    1,X'BAD'                 LOAD BAD ABEND CODE
+         SLL   1,12
+         ABEND (1),DUMP
+*
+OUT      EQU   *
+         BAL   RE,DEQRTN                DEQ FROM VTOC
+*
+         MVC   GOODMSGU(3),NAMEUCB      MOVE UCB ADDR NAME TO MSG
+         MVC   GOODMSGV(6),VOLSERNO     MOVE VOL SER NO. TO MSG
+         WTO   MF=(E,GOODMSG)           WRITE VTOC IS GOOD MESSAGE
+*
+CLOSE    EQU   *
+         CLOSE (VTOCDCB)                CLOSE DCB
+*
+         TM    DCBOFLGS-DCB+VTOCDCB,X'10'  DID DCB CLOSE OK
+         BO    NOTOPEN                  BR IF NO
+         B     TIOTADV                  BR TO DO NEXT TIOT DD ENTRY
+*
+NOTOPEN  EQU   *
+         MVI   RETCODE,4                SET RETURN CODE TO 4
+*
+RETURN   EQU   *
+         SR    RF,RF                    INIT FOR IC INSTR
+         IC    RF,RETCODE               LOAD RETURN CODE
+         L     RD,SAVE+4                RESTORE CALLING SAVE AREA PTR
+         RETURN (14,12),RC=(15)         RETURN TO CALLER
+*
+DEQRTN   EQU   *
+         DEQ   (SYSVTOC,VOLSERNO,6,SYSTEMS),UCB=UCBADDR
+         BR    RE                       RETURN FROM INTERNAL SUBR
+*
+         EJECT
+*
+***********************************************************************
+*
+*  CONSTANTS
+*
+*  DDNAMES THAT ARE NOT TO BE PROCESSED
+JOBLIB   DC    C'JOBLIB  '              DDNAME=JOBLIB
+STEPLIB  DC    C'STEPLIB '              DDNAME=STEPLIB
+SYSCHK   DC    C'SYSCHK  '              DDNAME=SYSCHK
+PGMDD    DC    C'PGM=*.DD'              DDNAME=PGM=*.DD
+SYSIN    DC    C'SYSIN   '              DDNAME=SYSIN
+SYSPRINT DC    C'SYSPRINT'              DDNAME=SYSPRINT
+SYSABEND DC    C'SYSABEND'              DDNAME=SYSABEND
+SYSUDUMP DC    C'SYSUDUMP'              DDNAME=SYSUDUMP
+*
+SYSVTOC  DC    C'SYSVTOC '              MAJOR ENQ NAME
+*
+TRTABLE  EQU   *-C'0'                   TABLE ONLY HANDLES F0 - FF
+         DC    C'0123456789ABCDEF'      HEXADECIMAL CONVERSION
+*
+*              CYLS HEADS               DEVICE  UCB TYPE
+DEVTABLE DC    H'200',H'10'             2311    01          3 ALT CYLS
+         DC    H'1',H'200'              2301    02
+         DC    H'80',H'10'              2303    03
+         DC    H'250',H'46'             2302    04
+         DC    H'980',H'20'             2321    05         20 ALT CYLS
+         DC    H'48',H'8'               2305-1  06
+         DC    H'96',H'8'               2305-2  07
+         DC    H'200',H'20'             2314    08          3 ALT CYLS
+         DC    H'404',H'19'             3330    09          7 ALT CYLS
+*
+DEV2321X DC    0H'0',AL2(10*5*20)       NO. OF TRACKS PER C/0/0/0
+         DC    AL2(5*20)                NO. OF TRACKS PER 0/C/0/0
+         DC    AL2(20)                  NO. OF TRACKS PER 0/0/H/0
+         DC    AL2(1)                   NO. OF TRACKS PER 0/0/0/H
+*
+KEY03    DC    X'03030303'              KEY OF FORMAT 3 DSCB
+KEY05    DC    X'05050505'              KEY OF FORMAT 5 DSCB
+KEY06    DC    X'06060606'              KEY OF FORMAT 6 DSCB
+         EJECT
+*
+*  MODIFIABLE CONSTANTS
+*
+DIRFMSG  WTO   'DASDCHK  **** XXX,XXXXXX VTOC DOS-DIRF BIT XX IS ON ***+
+               *',MF=L,                                                X
+               DESC=4,                  SYSTEM STATUS                  X
+               ROUTCDE=(2,              MASTER CONSOLE INFORMATIONAL   X
+               4,                       DIRECT ACCESS POOL             X
+               6,                       DISK LIBRARY                   X
+               9,                       SYSTEM SECURITY                X
+               10,                      SYSTEM/ERROR MAINTENANCE       X
+               11)                      PROGRAMMER INFORMATION
+DIRFMSGU EQU   DIRFMSG+18               ADDR XXX IN DIRFMSG
+DIRFMSGV EQU   DIRFMSG+22               ADDR XXXXXX IN DIRFMSG
+DIRFMSGB EQU   DIRFMSG+47               ADDR XX IN DIRFMSG
+*
+ERRMSG   WTO   'DASDCHK  **** XXX,XXXXXX VTOC I/O ERROR AT CCHHR XXXXXX+
+               XXXX ****',MF=L,                                        X
+               DESC=4,                  SYSTEM STATUS                  X
+               ROUTCDE=(2,              MASTER CONSOLE INFORMATIONAL   X
+               4,                       DIRECT ACCESS POOL             X
+               6,                       DISK LIBRARY                   X
+               9,                       SYSTEM SECURITY                X
+               10,                      SYSTEM/ERROR MAINTENANCE       X
+               11)                      PROGRAMMER INFORMATION
+ERRMSGU  EQU   ERRMSG+18                ADDR XXX IN ERRMSG
+ERRMSGV  EQU   ERRMSG+22                ADDR XXXXXX IN ERRMSG
+ERRMSGC  EQU   ERRMSG+53                ADDR XXXXXXXXXX IN ERRMSG
+*
+DSCBMSG  WTO   'DASDCHK  **** XXX,XXXXXX VTOC INVALID DSCB AT CCHHR XXX+
+               XXXXXXX ****',MF=L,                                     X
+               DESC=4,                  SYSTEM STATUS                  X
+               ROUTCDE=(2,              MASTER CONSOLE INFORMATIONAL   X
+               4,                       DIRECT ACCESS POOL             X
+               6,                       DISK LIBRARY                   X
+               9,                       SYSTEM SECURITY                X
+               10,                      SYSTEM/ERROR MAINTENANCE       X
+               11)                      PROGRAMMER INFORMATION
+DSCBMSGU EQU   DSCBMSG+18               ADDR XXX IN DSCBMSG
+DSCBMSGV EQU   DSCBMSG+22               ADDR XXXXXX IN DSCBMSG
+DSCBMSGC EQU   DSCBMSG+56               ADDR XXXXXXXXXX IN DSCBMSG
+*
+FMT5MSG  WTO   'DASDCHK  **** XXX,XXXXXX VTOC INVALID FMT5 AT CCHHR XXX+
+               XXXXXXX ****',MF=L,                                     X
+               DESC=4,                  SYSTEM STATUS                  X
+               ROUTCDE=(2,              MASTER CONSOLE INFORMATIONAL   X
+               4,                       DIRECT ACCESS POOL             X
+               6,                       DISK LIBRARY                   X
+               9,                       SYSTEM SECURITY                X
+               10,                      SYSTEM/ERROR MAINTENANCE       X
+               11)                      PROGRAMMER INFORMATION
+FMT5MSGU EQU   FMT5MSG+18               ADDR XXX IN FMT5MSG
+FMT5MSGV EQU   FMT5MSG+22               ADDR XXXXXX IN FMT5MSG
+FMT5MSGC EQU   FMT5MSG+56               ADDR XXXXXXXXXX IN FMT5MSG
+*
+TRKMSG   WTO   'DASDCHK  **** XXX,XXXXXX VTOC TRACK COUNT ERROR ****', +
+               MF=L,DESC=4,             SYSTEM STATUS                  X
+               ROUTCDE=(2,              MASTER CONSOLE INFORMATIONAL   X
+               4,                       DIRECT ACCESS POOL             X
+               6,                       DISK LIBRARY                   X
+               9,                       SYSTEM SECURITY                X
+               10,                      SYSTEM/ERROR MAINTENANCE       X
+               11)                      PROGRAMMER INFORMATION
+TRKMSGU  EQU   TRKMSG+18                ADDR XXX IN TRKMSG
+TRKMSGV  EQU   TRKMSG+22                ADDR XXXXXX IN TRKMSG
+*
+GOODMSG  WTO   'DASDCHK  **** XXX,XXXXXX VTOC IS GOOD ****',MF=L,      +
+               DESC=4,                  SYSTEM STATUS                  X
+               ROUTCDE=(2,              MASTER CONSOLE INFORMATIONAL   X
+               11)                      PROGRAMMER INFORMATION
+GOODMSGU EQU   GOODMSG+18               ADDR XXX IN GOODMSG
+GOODMSGV EQU   GOODMSG+22               ADDR XXXXXX IN GOODMSG
+*
+CFMT4HWM DC    C'4 HWM  '               COUNTMSG ERROR CONSTANT
+*                                                         4 HWM
+COUNTMSG WTO   'DASDCHK  **** XXX,XXXXXX VTOC ERROR IN FMTX COUNT ****'+
+               ,MF=L,                                                  X
+               DESC=4,                  SYSTEM STATUS                  X
+               ROUTCDE=(2,              MASTER CONSOLE INFORMATIONAL   X
+               4,                       DIRECT ACCESS POOL             X
+               6,                       DISK LIBRARY                   X
+               9,                       SYSTEM SECURITY                X
+               10,                      SYSTEM/ERROR MAINTENANCE       X
+               11)                      PROGRAMMER INFORMATION
+COUNTMGU EQU   COUNTMSG+18              ADDR XXX IN COUNTMSG
+COUNTMGV EQU   COUNTMSG+22              ADDR XXXXXX IN COUNTMSG
+COUNTMGF EQU   COUNTMSG+46              ADDR X IN COUNTMSG
+         EJECT
+VTOCDCB  DCB   DDNAME=VTOC,DSORG=PS,MACRF=(E),IOBAD=IOB,EXLST=EXLST,   X
+               DEVD=DA
+*
+EXLST    DC    0F'0',X'87',AL3(JFCB)    DCB EXIT LIST - JFCB ADDR
+*
+         EJECT
+ECB      DC    F'0'                     EVENT CONTROL BLOCK
+*
+IOB      DC    0D'0'                    EXCP IOB TO READ VTOC DSCB.S
+         DC    X'02000000'              IOB UNRELATED
+         DC    A(ECB)                   ECB TO POST ADDR
+         DC    D'0'                     CSW
+         DC    A(CCW1)                  START ADDR OF CCW.S
+         DC    A(VTOCDCB)               DCB ADDRESS
+         DC    F'0'
+         DC    F'0'
+IOBSEEK  DC    D'0'                     SEEK ADDRESS (MBBCCHHR)
+*
+CCW1     CCW   X'31',IOBSEEK+3,X'40',5  SEARCH ID EQUAL
+         CCW   X'08',CCW1,0,0           TIC *-8
+CCW3     CCW   X'0E',DSCB,X'40',140     READ KEY + DATA OF DSCB
+CCW4     CCW   X'92',COUNT,X'60',5      READ COUNT (MT) (END EXTENT)
+         CCW   X'49',KEY,X'60',1        SEARCH KEY HI (NON-ZERO)
+         CCW   X'08',CCW4,0,0           TIC *-16
+         CCW   X'03',0,X'20',1          NOP (HIT NON-ZERO KEY)
+*
+COUNT    DC    X'0000000000'            CCHHR SAVE AREA
+*
+KEY      DC    X'00'                    KEY OF ZERO
+*
+         EJECT
+*
+*  WORK AREAS
+*
+SAVE     DC    18F'0'                   REGISTER SAVE AREA
+*
+RETCODE  DC    X'00'                    RETURN CODE SAVE AREA
+NPASS    DC    X'00'                    NTH PASS ON TRACK COUNTER
+SWITCH   DC    X'00'                    FMT 3/5 2ND HALF DSCB SWITCH
+ABENDSW  DC    X'00'                    ABEND ON ERROR SWITCH (OFF)
+ABENDSW2 DC    X'00'                    ABEND CONDITION DETECTED SW OFF
+         DC    0H'0'                    ALIGN WORK AREA
+EXTENT   DC    0XL10'00'                WORK AREA FOR ONE EXTENT
+EXTENTYP DC    X'00'                    EXTENT TYPE
+         DC    X'00'                    EXTENT NUMBER
+EXTENSCC DC    H'0'                     START OF EXTENT CC
+EXTENSHH DC    H'0'                     START OF EXTENT HH
+EXTENECC DC    H'0'                     END OF EXTENT CC
+EXTENEHH DC    H'0'                     END OF EXTENT HH
+*
+CNTFMT0  DC    F'0'                     COUNT OF FORMAT 0 DSCB.S
+CNTFMT1  DC    F'0'                     COUNT OF FORMAT 1 DSCB.S
+CNTFMT2  DC    F'0'                     COUNT OF FORMAT 2 DSCB.S
+CNTFMT3  DC    F'0'                     COUNT OF FORMAT 3 DSCB.S
+CNTFMT4  DC    F'0'                     COUNT OF FORMAT 4 DSCB.S
+CNTFMT5  DC    F'0'                     COUNT OF FORMAT 5 DSCB.S
+CNTFMT6  DC    F'0'                     COUNT OF FORMAT 6 DSCB.S
+CNTENDL  EQU   *-CNTFMT0                THESE MUST BE ZERO WHEN FMT4 RD
+*
+CNTFMT1C DC    F'0'                     COUNT OF FMT 1 DSCB WITH CHAINS
+CNTFMT2C DC    F'0'                     COUNT OF FMT 2 DSCB WITH CHAINS
+*                                       (DOS ONLY) -
+CNTFMT3C DC    F'0'                     COUNT OF FMT 3 DSCB WITH CHAINS
+CNTFMT5B DC    F'0'                     COUNT OF FMT 5 DSCB IN CHAIN
+CNTFMT5C DC    F'0'                     COUNT OF FMT 5 DSCB WITH CHAINS
+*                                       PLUS 1 IF CHAINED FROM FMT 4 -
+CNTFMT6C DC    F'0'                     COUNT OF FMT 6 DSCB WITH CHAINS
+*
+VTOCCHHR DC    X'0000000000'            CCHHR OF VTOC
+REALHWM  DC    X'0000000000'            HWM OF LAST FMT 1 DSCB READ
+D4HPCHR  DC    X'0000000000'            FMT 1 HWA FROM FMT 4 DSCB
+D4DSREC  DC    H'0'                     NO. OF HOLES IN VTOC
+D4DEVDT  DC    X'00'                    NO. OF DSCB.S PER TRACK
+D4VTOCE  DC    X'00000000'              END OF VTOC CCHH
+FMT5ZIND DC    X'00'                    ZERO EXTENT IN FMT5 IND, OFF
+FMT5TT   DC    H'0'                     REL TRACK OF FMT5 EXTENT
+FMT5TTN  DC    H'0'                     REL TRK FMT5 NEXT POSSIBLE EXT
+CNTDSCB0 DC    H'0'                     NO. OF FMT0 HOLES ON THIS TRACK
+CNTENDZ  EQU   *-CNTFMT0                LENGTH OF WORK AREA TO ZERO
+*
+CNTTRACK DC    F'0'                     SUM OF TRACKS DESCRIBED IN VTOC
+VTOCTTR  DC    F'0'                     TTR0 OF START OF VTOC AND
+*                                       OF START NTH PASS ON CUR TRACK
+NOVTDSCB DC    F'0'                     NO. OF DSCB SLOTS IN VTOC
+DEVSIZEC DC    H'0'                     NO. OF LOGICAL CYLINDERS
+DEVSIZET DC    H'0'                     NO. OF TRACKS PER LOGICAL CYL
+DEVSIZES DC    H'0'                     NO. OF TRACKS ON DISK
+TIOTADDR DC    A(0)                     ADDR OF CURRENT TIOT DD ENTRY
+UCBADDR  DC    A(0)                     ADDRESS OF UCB
+VOLSERNO DC    C'XXXXXX'                VOLUME SERIAL NO. FROM UCB
+NAMEUCB  DC    C'XXX'                   DEVICE ADDR NAME FROM UCB
+         EJECT
+         CNOP  4,8                      ALIGN DSCB FOR DUMPS
+         DC    C'DSCB'                  VISUAL AID FOR DUMPS
+DSCB     DC    0XL140'00'               DSCB KEY + DATA WORK AREA
+         IECSDSL1 (1)                   INVOKE DSCB FMT 1 MACRO
+         EJECT
+         ORG   DSCB                     ORG TO DSCB WORK AREA
+         IECSDSL1 (2)                   INVOKE DSCB FMT 2 MACRO
+         EJECT
+         ORG   DSCB                     ORG TO DSCB WORK AREA
+         IECSDSL1 (3)                   INVOKE DSCB FMT 3 MACRO
+         EJECT
+         ORG   DSCB+44                  ORG TO DSCB DATA WORK AREA
+         IECSDSL1 (4)                   INVOKE DSCB FMT 4 MACRO
+         EJECT
+         ORG   DSCB                     ORG TO DSCB WORK AREA
+         IECSDSL1 (5)                   INVOKE DSCB FMT 5 MACRO
+         EJECT
+         ORG   DSCB                     ORG TO DSCB WORK AREA
+         IECSDSL1 (6)                   INVOKE DSCB FMT 6 MACRO
+         EJECT
+         ORG   DSCB+L'DSCB              ORIGIN AFTER DSCB
+         DC    0D'0'                    ALIGN JFCB FOR DUMPS
+JFCB     DC    0XL176'00'               JFCB WORK AREA RDJFCB, OPENJ
+*        IEFJFCBN                       INVOKE JFCB MACRO
+         IEFJFCBN
+*
+         DC    0D'0'                    PAD MODULE TO DOUBLE WORD
+         EJECT
+CVT      DSECT
+         CVT   ,                        INVOKE CVT DSECT MACRO
+         EJECT
+         IKJTCB ,                       INVOKE TCB DSECT MACRO
+         EJECT
+TIOT     DSECT
+         IEFTIOT1 ,                     INVOKE TIOT DSECT MACRO
+         EJECT
+UCB      DSECT
+         IEFUCBOB ,                     INVOKE UCB DSECT MACRO
+*
+UCBMAIN  EQU   X'FF'                    MAIN UCB INDICATOR
+         EJECT
+         DCBD  DSORG=BS,DEVD=DA         INVOKE DCB DSECT MACRO
+*
+DCB      EQU   IHADCB                   SHORT NAME FOR IHADCB
+*
+         END   DASDCHK

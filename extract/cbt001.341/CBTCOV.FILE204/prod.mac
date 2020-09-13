@@ -1,0 +1,2100 @@
+         LCLC  &TABSIZ,&JAREASZ,&CARDNUM
+         LCLA  &SZ,&CSZ
+&TABSIZ  SETC  '16'              LENGTH OF MEMBER NAME TABLE
+&TABNUM  SETC  '300'      MAX  NUMBER OF ENTRIES IN MEMBER NAME TABLE
+&CARDNUM SETC  '16000'    MAX NUMBER OF JCL CARDS THAT CAN BE SUBMITTED
+&CSZ     SETA  &CARDNUM
+&SZ      SETA  ((&CSZ*80)*8+7)/8
+&JAREASZ SETC  '&SZ'
+         REGS  R
+PROD     CSECT
+         TITLE 'PROD - PRODUCTION JCL SUBMISSION PROGRAM'
+***********************************************************************
+*                                                                     *
+*        PROD - PRODUCTION JCL SUBMISSION PROGRAM                     *
+*                                                                     *
+*               THIS PROGRAM WILL SUBMIT JCL TO THE INTERNAL READER   *
+*               BASED ON INFORMATION SUPPLIED IN THE PARM FIELD OF    *
+*               THE EXECUTE CARD OR BY RESPONSE TO A WTOR.  THREE     *
+*               TYPES OF RESPONSE MAY BE SUPPLIED IN THE PARM FIELD   *
+*               AND TWO FOR THE WTOR.                                 *
+*                                                                     *
+*               1) THE PARM FIELD MAY HAVE PARM='$$$$$$$$' SPECIFIED  *
+*                  TO TURN ON TESTING BITS TO ALLOW TESTING FROM A    *
+*                  TSO TERMINAL.  FILES SYSIN AND SYSPRINT ARE OPENED *
+*                  FOR WTO, WTOR RESPONSES.                           *
+*                                                                     *
+*               2) THE PARM OR WTOR RESPONSE MAY BE A JOBNAME WHICH   *
+*                  IS A MEMBER IN A JCL PDS FILE, OR, THE PARM OR     *
+*                  WTOR RESPONSE MAY BE AN ASTERISK FOLLOWED BY A     *
+*                  JOBSTREAM MEMBER NAME WHICH CONTAINS A LIST OF     *
+*                  JOBS TO BE SUBMITTED.                              *
+*                                                                     *
+*               BEFORE SUBMITTING A JOB TO THE INTERNAL READER THE    *
+*               PROGRAM WILL SCAN A PASSWORD TABLE KEYED ON ACCOUNT   *
+*               NUMBER FOR SUCH INFORMATION AS USER, GROUP, AND       *
+*               PASSWORD.  IF THEY ARE PRESENT IN THE TABLE AND NOT   *
+*               ON THE JOB JCL STATEMENT THEN THE PROGRAM WILL INSERT *
+*               THESE KEYWORDS WITH THEIR PARAMETERS.                 *
+*                                                                     *
+*                                                                     *
+*               DDNAMES -                                             *
+*                                                                     *
+*                  INTRDR - INTERNAL READER DDNAME.  JCL IS SUBMITTED *
+*                           TO THIS DDNAME                            *
+*                  SYSUT1 - DDNAME OF PDS WHICH CONTAINS JOB JCL      *
+*                  TABLE1 - DDNAME WHICH POINTS TO THE LOAD LIBRARY   *
+*                           CONTAINING THE PASSWORD TABLE             *
+*                  SYSIN  - (TESTING ONLY) - INPUT TO PROGRAM IN PLACE*
+*                           OF WTOR                                   *
+*                SYSPRINT - (TESTING ONLY) - OUTPUT FROM PROGRAM IN   *
+*                           PLACE OF WTO                              *
+*                  IOCTL  - DDNAME WHICH POINTS TO THE I/O CONTROL    *
+*                           CARD LIBRARY. (DYNAMICALLY ALLOCATED).    *
+*                                                                     *
+*                                                                     *
+*       AUTHOR - KEVIN MUZIN                                          *
+*                DEAN WITTER REYNOLDS                                 *
+*                TECHNICAL SYSTEMS, 17TH FLOOR                        *
+*                2 BROADWAY                                           *
+*                NEW YORK, NY 10004                                   *
+*                212-524-4101                                         *
+*                                                                     *
+*  DEAN WITTER MAKES NO CLAIMS AS TO THE ACCURACY OF THIS PROGRAM     *
+*  AND DISTRIBUTES THE PROGRAM AT NO CHARGE THROUGH THE SHARE         *
+*  ORGANIZATION.  NO SUPPORT CAN BE GUARANTEED FOR THIS PROGRAM.      *
+*  SUPPORT WILL BE PROVIDED ON AN AS AVAILABLE BASIS.                 *
+*                                                                     *
+*       MODIFICATIONS -                                               *
+*                                                                     *
+*         03/31/80 - CREATION DATE OF PROGRAM                         *
+*                                                                     *
+*         MOD 1 - 3/31/80 - ADD SECURITY CONSIDERATIONS               *
+*                                                                     *
+*         MOD 2 - 4/8/80  - MESSAGE IMPROVEMENTS                      *
+*                                                                     *
+*         MOD 3 - 4/9/80  - JOBSTREAM HANDLING IMPROVEMENTS           *
+*                                                                     *
+*         MOD 4 - 4/25/80 - I/O CONTROL UPDATE QUERY IMPROVEMENTS     *
+*                                                                     *
+*         MOD 5 - 5/15/80 - ERROR MESSAGE IMPROVEMENT                 *
+*                                                                     *
+*         MOD 6 - 2/26/81 - NO S522 OF PGM. RESTRICT PSWDTABLE        *
+*                           LIBRARY ACCESS. ALLOW REPETITION          *
+*                           COUNT ON INDIVIDUAL JOBS.                 *
+*                                                                     *
+***********************************************************************
+         USING *,R15
+         SAVE  (14,12),,*         SET UP SAVE AREA LINKAGE
+         LA    R2,SAVE001
+         ST    R13,SAVE001+4
+         ST    R2,8(,R13)
+         LR    R13,R2
+         LR    R10,R15
+         DROP  R15
+         USING PROD,R10,R11,R12,R8,R9
+         LA    R11,4095(,R10)
+         LA    R11,1(,R11)
+         LA    R12,4095(,R11)
+         LA    R12,1(,R12)
+         LA    R8,4095(,R12)
+         LA    R8,1(,R8)
+         LA    R9,4095(,R8)
+         LA    R9,1(,R9)
+         B     SAVE001A
+SAVE001  DS    18F
+SAVE001A EQU   *
+         MVI   INDICATR,X'00'     CLEAR FLAGS
+         MVI   JOBIND,X'00'       CLEAR FLAGS
+         MVI   JOBIND2,X'00'      CLEAR FLAGS
+         MVI   IOCIND,X'00'       CLEAR FLAGS
+         OI    IOCIND,IOCOPNO     SET NEED TO OPEN I/O CTL FILE
+         OI    INDICATR,PROTECT   SET PASSWORD PROTECTION
+         ST    R1,PARMPTR         SAVE POINTER TO PARM FIELD
+         L     R1,0(,R1)          POINT TO THE PARM FIELD
+         CLC   2(8,R1),=C'$$$$$$$$' IS THIS A TEST FROM TSO?
+         BNE   TEST02               NO, ASSUME BATCH
+         OI    INDICATR,TEST      SET TSO TEST FLAG
+TEST02   DS    0H
+         TM    INDICATR,TEST      IS THIS TSO TEST MODE?
+         BZ    RESTRCT            NO, SKIP TST TEST OPENS
+         SPACE 3
+         OPEN  (SYSIN,(INPUT),SYSPRINT,(OUTPUT))  ***TEST***
+         B     OPEN               GO OPEN OTHER NECESSARY DCBS
+RESTRCT  DS    0H
+         L     R2,16              CVT
+         L     R2,0(,R2)          TCB WORDS
+         L     R2,4(,R2)          CURRENT TCB
+         L     R2,12(,R2)         TIOT
+         LA    R6,JOBTABLE        POINT TO JOBNAME AUTH TABLE
+         LA    R4,JOBLEN          LENGTH OF EACH JOBNAME ENTRY
+         LA    R5,JOBTABEN(,R6)   ADDRESS OF END OFJOBNAME AUTH TABLE
+RESTRCT1 DS    0H
+         TM    INDICATR,TEST      IS THIS TSO TEST MODE?
+         BO    ENQ0               YES, THEN SKIP JOB AND DSN TABLE
+         CLC   0(8,R2),0(R6)      MATCH ON JOBNAME?
+         BE    ENQ0               YES, AUTHORIZED JOBNAME. DONT  CK DSN
+         BXLE  R6,R4,RESTRCT1     LOOP BACK AND CK NEXT JOBNAM
+         RDJFCB (TABLECK,(INPUT))
+         LA    R2,TABJFCB         ADDRESS THE JFCB
+         USING IEFJFCBN,R2
+         OPEN  (TABLECK,(INPUT)),TYPE=J
+         LA    R4,DSNLEN          LENGTH OF EACH DSN ENTRY
+         LA    R6,DSNTABLE        POINT TO BEGINNING OF DSNAME TABLE
+         LA    R5,DSNTABEN(,R6)   POINT TO END OF DSNAME TABLE
+RESTRCT2 DS    0H
+         CLC   TABJDSN,0(R6)      MATCH ON DSNAME?
+         BE    RESTERR1           YES, THEN UNAUTHORIZED JOBNAME USING
+*                                 RESTRICTED DATA SET NAME
+         DROP  R2
+         BXLE  R6,R4,RESTRCT2     LOOP BACK AND CK NEXT DSNAME
+         CLOSE TABLECK
+         B     ENQ0               NO UNAUTHORIZED DSNS. GO TO ENQ.
+RESTERR1 DS    0H
+         LA    R1,=CL80'PROD034E   JOB IS USING RESTRICTED LIBRARY'
+         BAL   R14,MSGINF         GO DISPLAY MSG
+         CLOSE TABLECK
+         B     EOJ                EXIT
+ENQ0     DS    0H        ENQ SO THAT ONLY 1 BATCH VERSION AT A TIME
+         ENQ   (QNPROD,RNPROD,E,0,SYSTEM),RET=USE
+         LTR   R15,R15            IS THIS ONLY PROD EXECUTING
+         BZ    ENQ1               YES
+         LA    R1,=CL80'PROD017E   PROD IS ALREADY ACTIVE'
+         BAL   R14,MSGINF        GO TELL OPERATOR
+         B     EOJ               EXIT
+ENQ1     DS    0H
+         OI    INDICATR,ENQ      SET THAT ENQ HAS OCCURRED
+         SPACE 3
+OPEN     DS    0H                 OPEN ALL FILES
+         OPEN  (INTRDR,(OUTPUT),SYSUT1,(INPUT),TABLE1,(INPUT))
+         XR    R2,R2              CLEAR OPEN FAILURE INDICATOR
+         TM    INTRDR+48,X'10'    OPEN OK ON INTRDR?
+         BO    OPEN1              YES CK NEXT OPEN
+         LA    R2,1               SET OPEN FAILURE INDICATOR
+         LA    R1,=CL80'PROD003E   OPEN FAILED FOR INTRDR DCB'
+         BAL   R14,MSGINF         GO SEND MSG
+OPEN1    DS    0H
+         TM    SYSUT1+48,X'10'    OPEN OK FOR SYSUT1?
+         BO    OPEN2              YES, CHECK NEXT OPEN
+         LA    R2,1               SET OPEN FAILURE INDICATOR
+         LA    R1,=CL80'PROD003E   OPEN FAILED FOR SYSUT1 DCB'
+         BAL   R14,MSGINF         GO SEND INFO
+OPEN2    DS    0H
+         TM    TABLE1+48,X'10'    OPEN OK FOR TABLE1?
+         BO    OPEN3              YES, CHECK NEXT OPEN
+         LA    R2,1               SET OPEN FAILURE INDICATOR
+         LA    R1,=CL80'PROD003E   OPEN FAILED FOR TABLE1 DCB'
+         BAL   R14,MSGINF         GO SEND INFO
+OPEN3    DS    0H
+         LTR   R2,R2              OPEN FAILURE OCCURRED?
+         BNZ   ABEND              YES, GO ABEND PGM
+BLKSIZ   DS    0H                 DETERMINE BLKSIZE OF INPUT FILE
+         XR    R2,R2              CLEAR ERROR COUNTER
+         LA    R6,SYSUT1
+         USING IHADCB,R6
+         LA    R7,INTRDR
+         USING IHADCB,R7
+         LH    R2,DCBBLKSI-IHADCB(R6)  BLKSIZE OF INPUT FILE
+         ST    R2,BLKINSZ         SAVE THE INPUT BLKSIZE
+         LH    R3,DCBBLKSI-IHADCB(R7)
+         CH    R3,=H'80'          BLKSIZE NOT BLOCKED?
+         BE    BLKSIZ1            YES,CONTINUE
+         LA    R2,1               SET ERROR INDICATOR
+         LA    R1,=CL80'PROD004E   DDNAME INTRDR BLKSIZE MUST BE 80'
+         BAL   R14,MSGINF         GO SEND THE MSG
+BLKSIZ1  DS    0H                CALCULATE INPUT FILE AS MULTIPLE OF 80
+         XR    R2,R2
+         LH    R3,DCBBLKSI-IHADCB(R6)
+         D     R2,=F'80'
+         ST    R3,BLKINNUM        SAVE THE INPUT BLOCKING FACTOR
+         LTR   R2,R2              BLOCKSIZE MULTIPLE OF 80?
+         BZ    LRECL              YES, CONTINUE
+         LA    R2,1               SET ERROR INDICATOR
+         LA    R1,=CL80'PROD005E   DDNAME SYSUT1 BLKSIZE NOT MULTIPLE OX
+               F 80'
+         BAL   R14,MSGINF         GO SEND MSG
+LRECL    DS    0H                RECORD LENGTH MUST BE 80 FOR ALL FILES
+         LH    R3,DCBLRECL-IHADCB(R6)
+         CH    R3,=H'80'
+         BE    LRECL1
+         LA    R2,1               SET ERROR INDICATOR
+         LA    R1,=CL80'PROD006E   RECORD LENGTH OF DDNAME SYSUT1 NOT 8X
+               0'
+         BAL   R14,MSGINF         GO SEND MSG
+LRECL1   DS    0H
+         LH    R3,DCBLRECL-IHADCB(R7)
+         CH    R3,=H'80'
+         BE    RECFM
+         LA    R2,1               SET ERROR INDICATOR
+         LA    R1,=CL80'PROD006E   RECORD LENGTH OF DDNAME INTRDR NOT 8X
+               0'
+         BAL   R14,MSGINF         GO SEND MSG
+RECFM    DS    0H                 CHECK RECORD FORMAT F
+         TM    DCBRECFM-IHADCB(R6),X'80'  RECFM=F?
+         BO    RECFM1             YES, CK NEXT FILE
+         LA    R2,1               SET ERROR INDICATOR
+         LA    R1,=CL80'PROD007E   RECORD FORMAT OF DDNAME SYSUT1 NOT FX
+               IXED'
+         BAL   R14,MSGINF         GO SEND INFO
+RECFM1   DS    0H
+         TM    DCBRECFM-IHADCB(R7),X'80'    RECFM=F?
+         BO    FILESCK            YES,CONTINUE
+         LA    R2,1               SET ERROR INDICATOR
+         LA    R1,=CL80'PROD007E   RECORD FORMAT OF DDNAME INTRDR NOT FX
+               IXED'
+         BAL   R14,MSGINF         GO SEND INFO
+FILESCK  DS    0H                 CHECK FOR FILE DEFINITION ERRORS
+         LTR   R2,R2              ANY FILE DEFINITION ERRORS?
+         BNZ   ABEND              YES, GO ABEND
+GETMAIN  DS    0H                 GET STORAGE FOR INPUT I/O BUFFER
+         LH    R0,DCBBLKSI-IHADCB(R6)
+         GETMAIN R,LV=(0)
+         ST    R1,BLKINADR        SAVE ADDRESS OF INPUT BUFFER
+         ST    R0,BLKINLEN        SAVE SIZE OF INPUT BUFFER
+         LA    R0,3360            GETMAIN IOCTL BUFFER
+         GETMAIN R,LV=(0)
+         ST    R1,IOCINADR
+         ST    R0,IOCINSZ
+*
+         GETMAIN VC,LA=JAREASZ,A=JAREA
+         L     R1,JAREAADR
+         L     R0,JAREALEN
+         FREEMAIN R,LV=(0),A=(1)
+         L     R1,JAREALEN       JCL CARD SAVE AREA TO HOLD THE  CARDS
+         S     R1,=F'51200'       SUBTRACT 50K
+         LR    R0,R1
+         GETMAIN R,LV=(0)
+         ST    R1,JAREAADR        ADR OF JOB AREA
+         ST    R1,JAREACUR        ADR OF CURRENT ENTRY IN JOB AREA
+         ST    R0,JAREALEN        LEN OF JOB AREA
+         AR    R1,R0
+         ST    R1,JAREAEND        SAVE ADR OF END OF JOB AREA
+         DROP  R7,R6
+PARM     DS    0H                 TEST FOR PARM FIELD
+         L     R1,PARMPTR
+PARM1    DS    0H                 DETERMINE PARM FIELD LENGTH
+         TM    INDICATR,TEST     IS THIS TSO TEST?
+         BO    REPEAT            YES, THEN GO ASK FOR JOBS
+         LR    R2,R1             POINT TO PARM FIELD LENGTH
+         L     R2,0(,R2)         ...
+         MVC   REPLYLEN(2),0(R2)  SAVE PARM FIELD LENGTH
+         LH    R3,0(,R2)          OBTAIN PARM FIELD LENGTH
+         LTR   R3,R3              ZERO PARM FIELD?
+         BZ    REPEAT             YES, GO ASK OPERATOR FOR MORE JOBS
+         BCTR  R3,0              DROP BY 1 FOR EXECUTE
+         MVI   MREPLY,X'40'      CLEAR REPLY AREA
+         MVC   MREPLY+1(L'MREPLY-1),MREPLY ...
+         MVC   MREPLY(1),2(R2)   COPY IN PARM FIELD JOBNAME REQUEST
+         EX    R3,*-6            ...
+         LA    R3,1(,R3)   BRING JOBNAME LENGTH BACK TO CORRECT VALUE
+         LA    R2,MREPLY         LOAD AND SAVE ADR OF JOBNAME REQUEST
+         ST    R2,REPLYADR       ...
+PARM1A   DS    0H                 TEST FOR ALPHMERICS IN PARM
+         NI    INDICATR,X'FF'-(MEMBER+PREFIX)  TURN OFF RETRIEVE INDS
+         NI    JOBIND2,X'FF'-(JOBMANY)  TURN OFF JOB REPETITION FLAG
+         LR    R4,R2             ADR OF JOBNAME REQUEST
+         MVI   JOBREPBN,X'01'     INIT JOB REPETITION COUNT
+         BCTR  R3,0              DROP LENGTH BY 1 FOR EXECUTE TRT
+         TRT   0(*-*,R4),ALPHAMER ANY INVALID CHARS?
+         EX    R3,*-6             ...
+         BZ    PARM2              NO, PARSE THE FIELD
+PARM1B   DS    0H
+         LA    R1,=CL80'PROD002E   INVALID CHARACTER IN JOB NAME'
+         BAL   R14,MSGINF         GO SEND INFO
+         B     REPEAT            GO ASK OPERATOR FOR MORE JOBS
+PARM2    DS    0H                 PARSE THE PARM FIELD
+         CLI   0(R2),C'*'         JOB NAME PREFIX SEARCH?
+         BNE   PARM3              NO, GO FIND 1 MEMBER
+         CLC   REPLYLEN,=H'1'     IS ONLY ASTERISK SPECIFIED?
+         BE    REPEAT             YES, GO ASK OPERATOR FOR JOBS
+         OI    INDICATR,PREFIX    SET PREFIX SEARCH
+         B     INDCK             GO CK FOR MEM OR PREFIX SUBMISSION
+PARM3    DS    0H
+         OI    INDICATR,MEMBER    SET 1 MEMBER SEARCH
+INDCK    DS    0H                 CK TYPE OF SCAN DESIRED
+         TM    INDICATR,MEMBER    ONLY 1 MEMBERNAME DESIRED?
+         BZ    LOCMEM             NO, CK PREFIX
+MEM1     DS    0H
+         L     R6,REPLYADR       OBTAIN JOBNAME
+         CLC   0(4,R6),=C'EOJ '  DOES USER WISH TO TERMINATE PGM
+         BE    EOJ                YES, GO TO END OF JOB PROCESSING
+         CLC   0(4,R6),=C'END '  DOES USER WISH TO TERMINATE PGM
+         BE    EOJ                YES, GO TO END OF JOB PROCESSING
+         MVI   ALPHAMER+C'*',C'*'  SETUP CHECK FOR ASTERISK
+         MVC   TABLE(12),0(R6)      COPY JOBNAME TO BLDL TABLE
+         LA    R6,TABLE             RELOAD ADR OF JOBNAME
+         TRT   0(*-*,R6),ALPHAMER LOC POSS ASTERISK FOR REPETITION CT
+         EX    R3,*-6             ASTERISK THERE?
+         MVI   ALPHAMER+C'*',X'00'  RESET ASTERISK AS VALID TRT CHAR
+         BZ    MEM1B              NO, BYPASS JOB REPETITION CODE
+         STC   R2,BYTE            SAVE FUNCTION BYTE
+         CLI   BYTE,C'*'          IS BYTE ASTERISK?
+         BNE   PARM1B             NO, THEN NOT A REPETITION CT
+         LR    R2,R1              GET ADDRESS OF ASTERISK IN JOBNAME
+         SR    R2,R6              GET DISPLACEMENT OF ASTERISK IN JOBNM
+         LH    R3,REPLYLEN       OBTAIN LENGTH OF JOBNAME
+         LR    R1,R3             OBTAIN LENGTH OF JOBNAME
+         SR    R3,R2              CALC NUM BYTES IN REPETITION CT
+         BCTR  R3,0               DROP NUM BYTES BY 1 FOR EXECUTE
+         CH    R3,=H'2'           GREATER THAN 2 DIGITS?
+         BH    MEMCTBIG           YES, ERROR
+         LA    R3,1(,R3)          BUMP REP CT LENGTH BACK UP
+         SR    R1,R3              CALC TRUE JOBNAME LENGTH
+         CH    R1,=H'8'          LENGTH > MAX?
+         BNH   MEM11             NO, OK
+         LA    R1,=CL80'PROD008E   JOBNAME EXCEEDS 8 CHARACTERS'
+         BAL   R14,MSGINF         GO SEND INFO
+         B     REPEAT             GO ISSUE WTOR FOR NEXT JOB OR EOB
+MEM11    DS    0H
+         LA    R2,1(R2,R6)        POINT TO REPETITION COUNT
+         BCTR  R3,0               DROP LENGTH BY 1 FOR ASTERISK
+         BCTR  R3,0               DROP NUM BYTES BY 1 FOR EXECUTE
+         TRT   0(*-*,R2),TRTNUM     DIGITS NOT NUMERIC?
+         EX    R3,*-6             ...
+         BNZ   MEMCTBIG           YES, ERROR
+         CLC   0(*-*,R2),=XL2'F9F9' DIGITS GREATER THAN 99?
+         EX    R3,*-6             ...
+         BH    MEMCTBIG           YES, ERROR
+         CLC   0(*-*,R2),=XL2'F0F0' DIGITS LESS THAN 01?
+         EX    R3,*-6             ...
+         BNH   MEMCTBIG           YES, ERROR
+         MVC   JOBREP,=XL2'F0F1'  SET REPETITION COUNT TO 1
+         LA    R1,2               CALC INDEX FOR COPY INTO JOBREP
+         LA    R3,1(,R3)          ...
+         SR    R1,R3              ...
+         LA    R1,JOBREP(R1)      ...
+         BCTR  R3,0               ...
+         MVC   0(*-*,R1),0(R2)    COPY JOB REPETITION COUNT
+         EX    R3,*-6             ...
+         PACK  DOUBLE(8),JOBREP   CONVERT REPETITION COUNT TO BINARY
+         CVB   R1,DOUBLE          ...
+         STC   R1,JOBREPBN        SAVE REPETITION COUNT IN BINARY
+         BCTR  R2,0               BACK UP TO ASTERISK IN JOBNAME
+         MVC   0(3,R2),=X'404040' CLEAR OUT ASTERISK AND REPETITION CT
+MEM1A    DS    0H
+         LA    R1,=CL80'PROD035A   DO YOU WISH TO SUBMIT XX COPIES OF JX
+               OBNAME          ( Y OR N )'
+         MVC   33(2,R1),JOBREP    COPY IN REPETITION COUNT
+         MVC   54(8,R1),0(R6)     COPY IN JOBNAME
+         BAL   R14,MSGWTOR        GO ASK  OPERATOR
+         CLC   0(2,R1),=C'Y '     OK TO CONTINUE?
+         BE    MEM1AB             YES, OPERATOR SAID YES
+         CLC   0(2,R1),=C'N '     OPERATOR SAID NO?
+         BNE   MEM1A              NO, OPER RESPONSE UNCLEAR ASK AGAIN
+         LA    R1,=CL80'PROD036I   MULTIPLE COPIES OF JOB         WILL X
+               NOT BE SUBMITTED'
+         MVC   34(8,R1),0(R6)     COPY JOBNAME INTO MESSAGE
+         BAL   R14,MSGINF         GO TELL OPERATOR
+         LA    R1,=CL80'PROD015I            WILL NOT BE SUBMITTED'
+         MVC   11(8,R1),0(R6)     COPY IN MEMBERNAME
+         BAL   R14,MSGINF         GO TELL OPERATOR
+         B     REPEAT             GO ASK OPERATOR FOR MORE JOBS
+MEM1AB   DS    0H
+         OI    JOBIND2,JOBMANY    INDICATE A REPETITION COUNT
+MEM1B    DS    0H
+         XR    R2,R2             CLEAR ERROR INDICATOR
+         MVC   TABLE-2(2),=H'&TABSIZ' LENGTH OF EACH MEMBER ENTRY
+         MVC   TABLE-4(2),=X'0001' NUMBER OF ENTRIES
+         BLDL  SYSUT1,TABLE-4
+         LTR   R15,R15            ANY ERROR?
+         BZ    PTMEM              NO, GO POINT TO MEMBER
+         CH    R15,=H'4'
+         BNE   MEM2
+         LA    R1,=CL80'PROD009E   JOBSTREAM NAME OR JOBNAME(S) NOT FOUX
+               ND'
+         BAL   R14,MSGINF
+         LA    R1,=CL80'PROD030I   JOBNAME NOT FOUND IS: '
+         MVC   36(8,R1),TABLE
+         BAL   R14,MSGINF
+         B     REPEAT
+MEMCTBIG DS    0H
+         LA    R1,=CL80'PROD037E   JOB REPETITION COUNT GREATER THAN 99X
+                OR LESS THAN 1'
+         BAL   R14,MSGINF
+         B     REPEAT
+MEM2     DS    0H
+         CH    R15,=H'4'
+         BE    MEM5
+         CH    R15,=H'8'
+         BE    MEM3
+         LA    R1,=CL80'PROD019E   UNKNOWN ERROR IN BLDL FOR DDNAME SYSX
+               UT1..CC=1'
+         BAL   R14,MSGINF         GO SEND INFO
+         B     ABEND
+MEM3     DS    0H
+         LTR   R0,R0
+         BNZ   MEM4
+         LA    R1,=CL80'PROD011E   PERMANENT I/O ERROR ON DIRECTORY FORX
+                DDNAME SYSUT1'
+         BAL   R14,MSGINF
+         B     ABEND
+MEM4     DS    0H
+         LA    R1,=CL80'PROD012E   INSUFFICIENT STORAGE TO PROCESS DDNAX
+               ME SYSUT1'
+         BAL   R14,MSGINF
+         B     ABEND
+MEM5     DS    0H
+         LA    R1,=CL80'PROD009E   JOBSTREAM NAME OR JOBNAME(S) NOT FOUX
+               ND'
+         BAL   R14,MSGINF         GO SEND INFO
+         LA    R1,=CL80'PROD030I   JOBNAME NOT FOUND IS: '
+         MVC   36(8,R1),TABLE
+         BAL   R14,MSGINF
+         B     REPEAT
+PTMEM    DS    0H                 POINT TO THE DESIRED MEMBER
+         POINT SYSUT1,TABLE+8
+PTREAD   DS    0H
+         L     R3,BLKINADR       POINT TO BUFFER AREA
+         XC    DECB,DECB
+         READ DECB,SF,SYSUT1,(3),'S'
+         CHECK DECB
+         L     R6,BLKINADR       LOAD ADR OF BUFFER AREA
+         LR    R5,R6             ...
+         A     R5,BLKINSZ        COMPUTE END OF BUFFER AREA
+         S     R5,=F'80'         ...
+         L     R1,DECB+16         OBTAIN RESIDUAL COUNT
+         LH    R1,14(,R1)         ...
+         CL    R1,BLKINSZ         END OF DATA?
+         BE    ENDMEM             YES,GO FINISH UP MEMBER PROCESS
+         SLR   R5,R1              CALCULATE END OF BLOCK - 80
+         LA    R4,80             RECORD LENGTH FOR BXLE INSTRUCTION
+PTREAD1  DS    0H
+         TM    JOBIND,NT1STCRD    IS THIS 1ST CARD
+         BZ    PTREAD2            YES, THEN CK FOR JOBCARD
+         TM    JOBIND,JOBCONT     DOES JOBCARD HAVE CONTINUATION?
+         BO    PTREAD4            YES, GO CK FOE END JOB CONTINUATIONS
+         TM    JOBIND,JOBCARD     JOBCARD SCAN COMPLETE?
+         BZ    PTREAD6            YES, GO COPY ALL ELSE PAST JOBCARD
+         B     PTREAD5A          GO CHECK PASSWORD TABLE
+PTREAD2  DS    0H
+         OI    JOBIND,NT1STCRD   SET 1ST CARD ALREADY ENCOUNTERED
+         BAL   R14,JOBCRD         LOOK FOR ACCT # ON JOBCARD
+         MVC   TABLE(8),JOBNAME   COPY IN JOBNAME FOR MESSAGES
+         LTR   R15,R15            ANY ERRORS?
+         BZ    PTREAD3            NO, THEN CONTINUE
+         LA    R1,=CL80'PROD016E   ERROR ON JOBCARD OF JOBNAME='
+         MVC   40(8,R1),TABLE     COPY IN MEMBERNAME
+         BAL   R14,MSGINF         GO TELL OPERATOR
+         LA    R1,=CL80'PROD015I            WILL NOT BE SUBMITTED'
+         MVC   11(8,R1),TABLE     COPY IN MEMBERNAME
+         BAL   R14,MSGINF         GO TELL OPERATOR
+         OI    INDICATR,ERROR
+         B     ENDMEM
+PTREAD3  DS    0H
+         BAL   R14,CKCONT        DETERMINE IF CONTINUATION PRESENT
+         TM    IOCIND,IOCMSG      DOES JOB CONTAIN I/O CTL UPDTE?
+         BZ    PTREAD50           NO, CONTINUE
+PTREAD3A DS    0H
+         LA    R1,=CL80'PROD014A   INPUT CTL CARD UPDATED FOR JOBNAME= X
+                      ?'
+         MVC   46(8,R1),TABLE     COPY IN MEMBERNAME
+         BAL   R14,MSGWTOR        GO GET OPERATOR RESPONSE
+         CLC   0(2,R1),=C'Y '     ANSWER YES?
+         BE    PTREAD50           YES, CONTINUE
+         CLC   0(2,R1),=C'N '     ANSWER NO?
+         BNE   PTREAD3A           NO, REPEAT QUESTION
+         LA    R1,=CL80'PROD015I            WILL NOT BE SUBMITTED'
+         MVC   11(8,R1),TABLE     COPY IN MEMBERNAME
+         BAL   R14,MSGINF         GO TELL OPERATOR
+         OI    INDICATR,ERROR
+         B     ENDMEM
+PTREAD4  DS    0H
+         BAL   R14,JOBCRD         GO GET ADDITIONAL JOB KEYWORDS
+         LTR   R15,R15            ERRORS?
+         BZ    PTREAD5            NO, CONTINUE
+         LA    R1,=CL80'PROD016E   ERROR ON JOBCARD OF JOBNAME='
+         MVC   40(8,R1),TABLE     COPY IN MEMBERNAME
+         BAL   R14,MSGINF         GO TELL OPERATOR
+         LA    R1,=CL80'PROD015I            WILL NOT BE SUBMITTED'
+         MVC   11(8,R1),TABLE     COPY IN MEMBERNAME
+         BAL   R14,MSGINF         GO TELL OPERATOR
+         OI    INDICATR,ERROR
+         B     ENDMEM
+PTREAD5  DS    0H
+         BAL   R14,CKCONT        DETERMINE IF CONTINUATION PRESENT
+PTREAD50 DS    0H
+         TM    JOBIND,JOBCONT     ANY ADDITIONAL CONTINUATIONS?
+         BO    PTREAD6            YES, CONTINUE
+PTREAD5A DS    0H
+         NI    JOBIND,X'FF'-(JOBCARD+JOBCONT) JOBCRD PROCES DONE
+         NI    IOCIND,X'FF'-(IOCMSG) JOBCRD PROCES DONE
+         BAL   R14,LKPASS         GO CK PASSWORD TABLE
+         LTR   R15,R15            ANY ERRORS?
+         BZ    PTREAD5B           NO, CONTINUE
+         LA    R1,=CL80'PROD018E   ACCT # MATCH NOT FOUND IN ACCT TABLEX
+                FOR JOBNAME= '
+         MVC   60(8,R1),TABLE    COPY IN JOBNAME
+         BAL   R14,MSGINF        GO SEND MSG
+         LA    R1,=CL80'PROD015I            WILL NOT BE SUBMITTED'
+         MVC   11(8,R1),TABLE     COPY IN MEMBERNAME
+         BAL   R14,MSGINF         GO TELL OPERATOR
+         OI    INDICATR,ERROR
+         B     ENDMEM            GO PERFORM END OF MEMBER PROCESSING
+PTREAD5B DS    0H
+         LR    R1,R6             ADDRESS OF BUFFER AREA
+         TM    JOBIND,PSWDPARM   ANY PASSWORD TABLE PARMS INSERTED?
+         BZ    PTREAD6           NO, GO WRITE LAST JOBCARD RECORD
+         BAL   R14,CONT           GO INSERT CONTINUATION
+*        PUT   INTRDR,0(R6)      OUTPUT THE LAST CONTINUATION
+         L     R1,JAREACUR
+         MVC   0(80,R1),0(R6)
+         LA    R1,80(,R1)
+         ST    R1,JAREACUR
+         C     R1,JAREAEND
+         BNL   PTREAD8
+         TM    JOBIND,KEYMOVE    WAS KEYWORD REMOVED TO CONTINU JOBCRD?
+         BZ    PTREAD5C          NO, GO WRITE LAST JOBCARD CREATED
+         L     R14,CARDEND       GET NEXT AVAIL POSITION ON LAST JOBCRD
+         L     R15,KEYLEN        LENGTH OF KEYWORD MOVED
+         MVC   0(1,R14),KEYSAVE  COPY KEYWORD TO CREATED JOBCARD
+         EX    R15,*-6           ...
+         NI    JOBIND,X'FF'-(KEYMOVE)  SET KEY MOVE FLAG OFF
+PTREAD5C DS    0H
+*        PUT   INTRDR,CARD       PUT OUT LAST JOBCARD
+         L     R1,JAREACUR
+         MVC   0(80,R1),CARD
+         LA    R1,80(,R1)
+         ST    R1,JAREACUR
+         C     R1,JAREAEND
+         BNL   PTREAD8
+         MVC   CARD(80),NEWCARD  CLEAR OUT CREATE JOBCARD FIELD
+         B     PTREAD7            GO SKIP PUT TO INTERNAL RDR
+PTREAD6  DS    0H
+*        MVC   INTREC(80),0(R6)  COPY RECORD TO INTRDR BUFFER
+*        PUT   INTRDR,INTREC
+         L     R1,JAREACUR
+         MVC   0(80,R1),0(R6)
+         CLC   0(2,R1),=C'*/'
+         BNE   PTREAD6A
+         MVI   0(R1),C'/'
+PTREAD6A DS    0H
+         LA    R1,80(,R1)
+         ST    R1,JAREACUR
+         C     R1,JAREAEND
+         BNL   PTREAD8
+         CLC   0(2,R6),=C'*/'
+         BNE   PTREAD7
+         LA    R1,TABLE
+         ST    R1,MEMADR
+         BAL   R14,IOCDSN
+         LTR   R15,R15            ANY ERRORS?
+         BZ    PTREAD7           NO
+         OI    INDICATR,ERROR    SET ERROR DURING MEMBER PROCESSING
+         NI    IOCIND,X'FF'-(IOCJOB)
+         LA    R1,=CL80'PROD015I            WILL NOT BE SUBMITTED'
+         MVC   11(8,R1),TABLE     COPY IN MEMBERNAME
+         BAL   R14,MSGINF         GO TELL OPERATOR
+         B     ENDMEM            GO PERFORM END OF MEMBER PROCESSING
+PTREAD7  DS    0H
+         BXLE  R6,R4,PTREAD1     LOOP BACK AND GET NEXT RECORD IN BLK
+         B     PTREAD            LOOP BACK AND GET NEXT BLOCK
+PTREAD8  DS    0H
+         LA    R1,=CL80'PROD020E   MAXIMUM NUMBER OF JCL CARDS EXCEEDEDX
+                FOR MEMBER AND/OR JOBSTREAM'
+         BAL   R14,MSGINF
+         LA    R1,=CL80'PROD020E   INCREASE REGION SIZE'
+         BAL   R14,MSGINF
+         OI    INDICATR,ERROR    SET ERROR DURING MEMBER PROCESSING
+         OI    INDICATR,FLUSH    SET ERROR AND FLUSH MEMBER
+         B     ENDMEM
+         SPACE 3
+LOCMEM   DS    0H
+         LA    R14,1              INITIALIZE MEMBER NAME COUNTER
+         ST    R14,MEMCTR         ...
+         OI    INDICATR,AMPER    SET AMPERSAND PREFIX MEMBER BLDL
+         NI    JOBIND,X'FF'-(MEMS)  CLEAR MEMBERS FOUND FLAG
+         LA    R7,TABLE          ADDRESS OF MEMBERNAME TABLE
+         ST    R7,CURTABP         SAVE CURRENT TABLE POINTER
+         LA    R7,&TABNUM        MAX # OF TABLE ENTRIES
+         ST    R7,NUMMEMS         SAVE # OF ELIGIBLE MEMBERS REMAINING
+         LH    R3,REPLYLEN       GET JOBSTREAM LENGTH
+         BCTR  R3,0              DROP LENGTH BY 1 FOR EXECUTE INSTR
+         L     R6,REPLYADR       GET JOBSTREAM NAME
+         MVI   0(R6),C'@'        MOVE IN AT SIGN IN PLACE OF ASTERISK
+         CH    R3,=H'7'          JOBSTREAM NAME LENGTH TOO LARGE?
+         BNH   LOCMEMP           NO, CONTINUE
+         LA    R1,=CL80'PROD008E   JOBNAME EXCEEDS 8 CHARACTERS'
+         BAL   R14,MSGINF        GO TELL OPERATOR
+         B     REPEAT            GO ASK OPERATOR FOR MORE JOBS
+LOCMRERR DS    0H
+         LA    R1,=CL80'PROD038E   REPETITION COUNT NOT ALLOWED ON JOBSX
+               TREAM NAME'
+         BAL   R14,MSGINF         GO TELL OPER
+         B     REPEAT GO ASK OPERATOR FOR MORE JOBS
+LOCMEMP  DS    0H
+         BCTR  R3,0               DROP COUNT FOR AT SIGN
+         MVI   ALPHAMER+C'*',C'*' SET UP TEST FOR NO ASTERISK
+         TRT   1(*-*,R6),ALPHAMER ANY ILLEGAL ASTERISKS?
+         EX    R3,*-6             ...
+         LA    R3,1(,R3)          BUMP COUNT UP FOR AT SIGN
+         MVI   ALPHAMER+C'*',X'00' RESET TRANSLATE TABLE
+         BNZ   LOCMRERR           YES, ILLEGAL ASTERISK->ISSUE ERROR
+         MVC   TABLE(8),=8X'40'  CLEAR MEMBERNAME FIELD IN TABLE
+         MVC   TABLE(1),0(R6)    COPY IN MEMBER NAME TO SEARCH
+         EX    R3,*-6            ...
+         MVC   TABLE-2(2),=H'&TABSIZ' LENGTH OF EACH ENTRY
+         MVC   TABLE-4(2),=X'0001' NUMBER OF ENTRIES
+         BLDL  SYSUT1,TABLE-4
+         LTR   R15,R15            ANY ERRORS
+         BZ    LOCMEMP2          NO, CONTINUE
+LOCMP2   DS    0H
+         CH    R15,=H'4'
+         BE    LOCMP5
+         CH    R15,=H'8'
+         BE    LOCMP3
+         LA    R1,=CL80'PROD019E   UNKNOWN ERROR IN BLDL FOR DDNAME SYSX
+               UT1..CC=1'
+         BAL   R14,MSGINF         GO SEND INFO
+         B     ABEND
+LOCMP3   DS    0H
+         LTR   R0,R0
+         BNZ   LOCMP4
+         LA    R1,=CL80'PROD011E   PERMANENT I/O ERROR ON DIRECTORY FORX
+                DDNAME SYSUT1'
+         BAL   R14,MSGINF
+         B     ABEND
+LOCMP4   DS    0H
+         LA    R1,=CL80'PROD012E   INSUFFICIENT STORAGE TO PROCESS DDNAX
+               ME SYSUT1'
+         BAL   R14,MSGINF
+         B     ABEND
+LOCMP5   DS    0H
+         LA    R1,=CL80'PROD009E   JOBSTREAM NAME OR JOBNAME(S) NOT FOUX
+               ND'
+         BAL   R14,MSGINF         GO SEND INFO
+         LA    R1,=CL80'PROD032E   JOBSTREAM NAME NOT FOUND IS: *  '
+         MVC   41(7,R1),TABLE+1
+         BAL   R14,MSGINF         GO SEND INFO
+         B     REPEAT
+LOCMEMP2 DS    0H
+         POINT SYSUT1,TABLE+8
+LOCMEMP3 DS    0H
+         L     R3,BLKINADR       ADDRESS OF BUFFER AREA
+         XC    DECB2,DECB2
+         READ DECB2,SF,SYSUT1,(3),'S'
+         CHECK DECB2
+         L     R6,BLKINADR       ADDRESS OF BUFFER AREA
+         LR    R5,R6             ...
+         A     R5,BLKINSZ        CALCULATE END OF BUFFER
+         S     R5,=F'80'         ...
+         L     R1,DECB2+16        OBTAIN RESIDUAL COUNT
+         LH    R1,14(,R1)         ...
+         CL    R1,BLKINSZ         EODAD?
+         BE    ENDMEM         YES, GO PERFORM END OF MEMBER PROCESSING
+         SLR   R5,R1              CALCULATE END OF BLOCK - 80
+         LA    R4,80             LENGTH OF RECORD
+LOCMEMP4 DS    0H
+         BAL   R14,MEMLST         GO CREATE TABLE WITH THIS RECORD
+         LTR   R15,R15            ANY ERRORS?
+         BZ    LOCMEMP5          NO, CONTINUE
+         LA    R1,=CL80'PROD010E   TOO MANY JOBNAMES...UNABLE TO CONTINX
+               UE'
+         B     REPEAT
+LOCMEMP5 DS    0H
+         BXLE  R6,R4,LOCMEMP4     LOOP BACK AND GET NEXT RECORD
+         B     LOCMEMP3           LOOP BACK AND GET NEXT BLOCK
+LOCMEMP6 DS    0H
+         TM    JOBIND,MEMS        WERE ANY MEMBERS LOCATED?
+         BO    LOCMB1             YES, CONTINUE
+         LA    R1,=CL80'PROD009E   JOBSTREAM NAME OR JOBNAME(S) NOT FOUX
+               ND'
+         BAL   R14,MSGINF        GO TELL OPERATOR
+         LA    R1,=CL80'PROD030I   JOBNAME NOT FOUND IS: '
+         MVC   36(8,R1),TABLE
+         BAL   R14,MSGINF
+         B     REPEAT            GO ASK OPERATOR FOR MORE JOBS
+LOCMB1   DS    0H
+         NI    JOBIND,X'FF'-(MEMS) RESET MEMBERS INDICATOR
+         L     R7,CURTABP        GET ADR CURRENT LOCATION IN TABLE
+         MVC   0(8,R7),=8X'FF'   COPY IN ENDING DELIMITER
+         LA    R7,&TABNUM        MAX # OF TABLE ENTRIES
+         L     R6,NUMMEMS        NUMBER OF TABLE ENTRIES NOT USED
+         SR    R7,R6             CALCULATE # OF TABLE ENTRIES USED
+         STH   R7,TABLE-4         SAVE NUMBER OF ENTRIES
+         MVC   TABLE-2(2),=H'&TABSIZ' LENGTH OF EACH ENTRY
+         BAL   R14,SORT           SORT THE TABLE ENTRIES BEFORE BLDL
+         BAL   R14,ORDERSV
+         BLDL  SYSUT1,TABLE-4
+         LTR   R15,R15            ANY ERRORS?
+         BZ    LOCMEMP7           NO
+LOCMB2   DS    0H
+         CH    R15,=H'4'
+         BE    LOCMB5
+         CH    R15,=H'8'
+         BE    LOCMB3
+         LA    R1,=CL80'PROD019E   UNKNOWN ERROR IN BLDL FOR DDNAME SYSX
+               UT1..CC=1'
+         BAL   R14,MSGINF         GO SEND INFO
+         B     ABEND
+LOCMB3   DS    0H
+         LTR   R0,R0
+         BNZ   LOCMB4
+         LA    R1,=CL80'PROD011E   PERMANENT I/O ERROR ON DIRECTORY FORX
+                DDNAME SYSUT1'
+         BAL   R14,MSGINF
+         B     ABEND
+LOCMB4   DS    0H
+         LA    R1,=CL80'PROD012E   INSUFFICIENT STORAGE TO PROCESS DDNAX
+               ME SYSUT1'
+         BAL   R14,MSGINF
+         B     ABEND
+LOCMB5   DS    0H
+         LA    R1,=CL80'PROD009E   JOBSTREAM NAME OR JOBNAME(S) NOT FOUX
+               ND'
+         BAL   R14,MSGINF         GO SEND INFO
+         LH    R5,TABLE-4
+         LA    R3,TABLE
+         LA    R4,&TABSIZ
+LOCMB5A  DS    0H
+         CLI   10(R3),X'00'
+         BNE   LOCMB5B
+         LA    R1,=CL80'PROD033I   FIRST JOBNAME NOT FOUND IN JOBSTREAMX
+                IS: '
+         MVC   52(8,R1),0(R3)
+         BAL   R14,MSGINF
+         B     REPEAT
+LOCMB5B  DS    0H
+         LA    R3,0(R4,R3)
+         BCT   R5,LOCMB5A
+         B     REPEAT
+LOCMEMP7 DS    0H
+         NI    INDICATR,X'FF'-(AMPER) NOTE AMPERSAND MEMBER SEARCH OVER
+         BAL   R14,REORDER
+         BAL   R14,NUMSRT    RESORT BACK INTO ORIGINAL SEQUENCE
+PREFRD   DS    0H                 READ A MEMBER SELECTED BY PREFIX
+PREFRD0  DS    0H
+         LA    R2,TABLE          ADDRESS OF MEMBER NAME TABLE
+         LA    R3,&TABSIZ        LENGTH OF EACH TABLE ENTRY
+PREFRD1  DS    0H
+         L     R1,JAREACUR
+         ST    R1,JAREAJOB
+         MVC   TTR(3),8(R2)       COPY MEMBER TTR
+         POINT SYSUT1,TTR
+PREFRD1A DS    0H
+         L     R6,BLKINADR       ADR OF BUFFER AREA
+         XC    DECB1,DECB1
+         READ  DECB1,SF,SYSUT1,(6),'S'
+         CHECK DECB1
+         L     R6,BLKINADR       ADR OF BUFFER AREA
+         LR    R5,R6             ...
+         A     R5,BLKINSZ        CALCULATE END OF BUFFER
+         S     R5,=F'80'         ...
+         L     R1,DECB1+16        OBTAIN RESIDUAL COUNT
+         LH    R1,14(,R1)         ...
+         CL    R1,BLKINSZ         END OF DATA?
+         BE    ENDMEM             YES,GO FINISH UP MEMBER PROCESS
+         SLR   R5,R1              CALCULATE END OF BLOCK - 80
+         LA    R4,80             LENGTH OF RECORD
+PREFAA1  DS    0H
+         TM    JOBIND,NT1STCRD    IS THIS 1ST CARD
+         BZ    PREFAA2            YES, THEN CK FOR JOBCARD
+         TM    JOBIND,JOBCONT     DOES JOBCARD HAVE CONTINUATION?
+         BO    PREFAA4            YES, GO CK FOE END JOB CONTINUATIONS
+         TM    JOBIND,JOBCARD     JOBCARD SCAN COMPLETE?
+         BZ    PREFAA6            YES, GO COPY ALL ELSE PAST JOBCARD
+         B     PREFAA5A          GO CK IF LAST CONTINUATION
+PREFAA2  DS    0H
+         OI    JOBIND,NT1STCRD   SET 1ST CARD ALREADY ENCOUNTERED
+         BAL   R14,JOBCRD         LOOK FOR ACCT # ON JOBCARD
+         MVC   0(8,R2),JOBNAME    MOVE IN JOBNAME FOR MESSAGES
+         LTR   R15,R15            ANY ERRORS?
+         BZ    PREFAA3            NO, THEN CONTINUE
+         LA    R1,=CL80'PROD016E   ERROR ON JOBCARD OF JOBNAME='
+         MVC   40(8,R1),0(R2)     COPY IN MEMBERNAME
+         BAL   R14,MSGINF         GO TELL OPERATOR
+         LA    R1,=CL80'PROD015I            WILL NOT BE SUBMITTED'
+         MVC   11(8,R1),0(R2)     COPY IN MEMBERNAME
+         BAL   R14,MSGINF         GO TELL OPERATOR
+         OI    INDICATR,ERROR    SET ERROR DURING MEM PROCESSING
+         B     ENDMEM            GO PERFORM END OF MEM PROCESSING
+PREFAA3  DS    0H
+         BAL   R14,CKCONT        DETERMINE IF LAST CONTINUATION
+         TM    IOCIND,IOCMSG      DOES JOB CONTAIN I/O CTL UPDTE?
+         BZ    PREFAA50           NO, CONTINUE
+PREFAA3A DS    0H
+         LA    R1,=CL80'PROD014A   INPUT CTL CARD UPDATED FOR JOBNAME= X
+                      ?'
+         MVC   46(8,R1),0(R2)     COPY IN MEMBERNAME
+         BAL   R14,MSGWTOR        GO GET OPERATOR RESPONSE
+         CLC   0(2,R1),=C'Y '     ANSWER YES?
+         BE    PREFAA50           YES, CONTINUE
+         CLC   0(2,R1),=C'N '     ANSWER NO?
+         BNE   PREFAA3A           YES,REPEAT QUESTION
+         LA    R1,=CL80'PROD015I            WILL NOT BE SUBMITTED'
+         MVC   11(8,R1),0(R2)     COPY IN MEMBERNAME
+         BAL   R14,MSGINF         GO TELL OPERATOR
+         OI    INDICATR,ERROR    SET ERROR DURING MEMBER PROCESSING
+         B     ENDMEM            GO PERFORM END OF MEMBER PROCESSING
+PREFAA4  DS    0H
+         BAL   R14,JOBCRD         GO GET ADDITIONAL JOB KEYWORDS
+         LTR   R15,R15            ERRORS?
+         BZ    PREFAA5            NO, CONTINUE
+         LA    R1,=CL80'PROD016E   ERROR ON JOBCARD OF JOBNAME='
+         MVC   40(8,R1),0(R2)     COPY IN MEMBERNAME
+         BAL   R14,MSGINF         GO TELL OPERATOR
+         LA    R1,=CL80'PROD015I            WILL NOT BE SUBMITTED'
+         MVC   11(8,R1),0(R2)     COPY IN MEMBERNAME
+         BAL   R14,MSGINF         GO TELL OPERATOR
+         OI    INDICATR,ERROR    SET ERROR DURING MEMBER PROCESSING
+         B     ENDMEM            GO PERFORM END OF MEMBER PROCESSING
+PREFAA5  DS    0H
+         BAL   R14,CKCONT        DETERMINE IF LAST CONTINUATION
+PREFAA50 DS    0H
+         TM    JOBIND,JOBCONT     ANY ADDITIONAL CONTINUATIONS?
+         BO    PREFAA6            YES, CONTINUE
+PREFAA5A DS    0H
+         NI    JOBIND,X'FF'-(JOBCARD+JOBCONT) JOBCRD PROCES DONE
+         NI    IOCIND,X'FF'-(IOCMSG) JOBCRD PROCES DONE
+         BAL   R14,LKPASS         GO CK PASSWORD TABLE
+         LTR   R15,R15            ANY ERRORS?
+         BZ    PREFAA5B           NO, CONTINUE
+         LA    R1,=CL80'PROD018E   ACCT # MATCH NOT FOUND IN ACCT TABLEX
+                FOR JOBNAME= '
+         MVC   60(8,R1),0(R2)    COPY IN JOBNAME
+         BAL   R14,MSGINF        GO TELL OPERATOR
+         LA    R1,=CL80'PROD015I            WILL NOT BE SUBMITTED'
+         MVC   11(8,R1),0(R2)     COPY IN MEMBERNAME
+         BAL   R14,MSGINF         GO TELL OPERATOR
+         OI    INDICATR,ERROR    SET ERROR DURING MEMBER PROCESSING
+         B     ENDMEM            GO PERFORM END OF MEMBER PROCESSING
+PREFAA5B DS    0H
+         LR    R1,R6             ADR OF LAST CARD TO ADD CONTINUE COMMA
+         TM    JOBIND,PSWDPARM   NEED TO ADD CONTINUATION?
+         BZ    PREFAA6           NO, CONTINUE
+         BAL   R14,CONT           GO INSERT CONTINUATION
+*        PUT   INTRDR,0(R6)      OUTPUT CONTINUATION CARD
+         L     R1,JAREACUR
+         MVC   0(80,R1),0(R6)
+         LA    R1,80(,R1)
+         ST    R1,JAREACUR
+         C     R1,JAREAEND END OF STORAGE?
+         BNL   PREFAA8           YES, GO GIVE ERROR
+         TM    JOBIND,KEYMOVE    WAS KEYWORD MOVED OFF PREVIOUS JOBCARD
+         BZ    PREFAA5C          NO,
+         L     R14,CARDEND       POINT TO END OF INSERTION CARD
+         L     R15,KEYLEN        LENGTH OF KEYWORD
+         MVC   0(1,R14),KEYSAVE  COPY IN KEYWORD
+         EX    R15,*-6           ...
+         NI    JOBIND,X'FF'-(KEYMOVE)  TURN OFF KEYWORD MOVED FLAG
+PREFAA5C DS    0H
+*        PUT   INTRDR,CARD       OUTPUT LAST JOBCARD
+         L     R1,JAREACUR
+         MVC   0(80,R1),CARD
+         MVC   CARD(80),NEWCARD  CLEAR OUT CREATE JOBCARD FIELD
+         LA    R1,80(,R1)
+         ST    R1,JAREACUR
+         C     R1,JAREAEND
+         BNL   PREFAA8            GO GIVE ERROR
+         B     PREFAA7            GO SKIP PUT TO INTERNAL RDR
+PREFAA6  DS    0H
+*        MVC   INTREC(80),0(R6)  COPY RECORD TO INTRDR BUFFER
+*        PUT   INTRDR,INTREC
+         L     R1,JAREACUR
+         MVC   0(80,R1),0(R6)
+         CLC   0(2,R1),=C'*/'
+         BNE   PREFAA6A
+         MVI   0(R1),C'/'
+PREFAA6A DS    0H
+         LA    R1,80(,R1)
+         ST    R1,JAREACUR
+         C     R1,JAREAEND
+         BNL   PREFAA8 GO GIVE ERROR
+         ST    R2,MEMADR
+         CLC   0(2,R6),=C'*/'
+         BNE   PREFAA7
+         BAL   R14,IOCDSN
+         LTR   R15,R15
+         BZ    PREFAA7
+         OI    INDICATR,ERROR    SET ERROR DURING MEMBER PROCESSING
+         NI    IOCIND,X'FF'-(IOCJOB)
+         L     R1,JAREAJOB
+         ST    R1,JAREACUR
+         LA    R1,=CL80'PROD015I            WILL NOT BE SUBMITTED'
+         MVC   11(8,R1),0(R2)     COPY IN MEMBERNAME
+         BAL   R14,MSGINF         GO TELL OPERATOR
+         B     ENDMEM
+PREFAA7  DS    0H
+         BXLE  R6,R4,PREFAA1     LOOP BACK AND GET NEXT RECORD
+         B     PREFRD1A          LOOP BACK AND GET NEXT BLOCK
+PREFAA8  DS    0H
+         LA    R1,=CL80'PROD020E   MAXIMUM NUMBER OF JCL CARDS EXCEEDEDX
+                FOR MEMBER AND/OR JOBSTREAM'
+         BAL   R14,MSGINF
+         LA    R1,=CL80'PROD020E   INCREASE REGION SIZE'
+         BAL   R14,MSGINF
+         OI    INDICATR,ERROR    SET ERROR DURING MEMBER PROCESSING
+         OI    INDICATR,FLUSH    SET ERROR AND FLUSH MEMBER
+         B     ENDMEM
+ENDMEM   DS    0H
+         TM    INDICATR,AMPER    IS THIS SEARCH FOR MEMBER WITH
+*                                LIST OF JOBNAMES
+         BO    LOCMEMP6          YES, SKIP WRITE EOF
+*        PUT   INTRDR,EOF         WRITE A SLASH ASTERISK EOF
+  NI JOBIND,X'FF'-(JOBCONT+PSWDPARM+JOBCARD+NT1STCRD+QUOTE+KEYMOVE)
+         NI    JOBIND2,X'FF'-(USER+GROUP+PASSWORD)
+         NI    IOCIND,X'FF'-(IOCJOB+IOCMSG)
+         TM    INDICATR,MEMBER   IS THIS MEMBER PROCESSING?
+         BO    ENDMEM5           YES, WRITE MSG FOR 1 MEMBER
+         TM    INDICATR,ERROR    ERROR DURING JOBSTREAM PREFIX PROCESS?
+         BO    ENDMEM0           YES, DONT MARK SUCCESS WRITE OF MEM
+         MVC   8(2,R2),=C'YS'    MARK MEMBER SUCCESSFULLY WRITTEN
+         OI    JOBIND,JOBS       MARK AT LEAST 1 JOB TO SUBMIT
+         L     R1,JAREACUR
+         MVC   0(80,R1),EOF COPY IN SLASH ASTERISK END-OF-FILE
+         LA    R1,80(,R1)
+         ST    R1,JAREACUR
+ENDMEM0  DS    0H
+         NI    INDICATR,X'FF'-(ERROR)    CLEAR MEMBER ERROR FLAG
+         LA    R3,&TABSIZ
+         LA    R2,0(R3,R2)   INCR TO NEXT DIRECTORY TABLE ENTRY
+         CLI   0(R2),X'FF'        END OF TABLE?
+         BNE   PREFRD1            NO, GO GET NEXT MEMBER
+         TM    JOBIND,JOBS      ANY JOBS TO SUBMIT?
+         BZ    REPEAT NO, GO ASK OPERATOR FOR MORE JOBS
+         TM    INDICATR,FLUSH   FLUSH ALL JOBS BECAUSE OF ERROR?
+         BO    REPEAT           YES, GO ASK OPERATOR FOR MORE JOBS
+         L     R6,JAREAADR
+         L     R5,JAREACUR
+         LA    R4,80
+         SLR   R5,R4
+ENDMEM0A DS    0H
+         PUT   INTRDR,0(R6)
+         BXLE  R6,R4,ENDMEM0A
+         LA    R1,=CL80'PROD013I FOLLOWING JOBNAMES HAVE BEEN SUBMITTEDX
+               :'
+         MVC   49(8,R1),=CL8' '  INSURE BLANK FROM PREVIOUS WRITES
+         BAL   R14,MSGINF        GO SEND MSG
+         LA    R2,TABLE          ADR OF MEMBER TABLE
+         LA    R3,&TABSIZ        RECORD LENGTH OF TABLE
+ENDMEM1  DS    0H
+         LA    R4,6           # OF JOBNAMES TO WRITE ON EACH MSG LINE
+         LA    R1,=CL80'PROD013I     '
+         LA    R5,11(,R1)        MARK START OF WHERE TO WRITE JOBNAME
+         LR    R7,R5             ...
+         MVC   11(69,R1),10(R1)  CLEAR OUT THE LINE
+ENDMEM2  DS    0H
+         CLC   8(2,R2),=C'YS'    MEMBER WRITTEN OK?
+         BNE   ENDMEM3           NO, THEN DO NOT OUTPUT SUCCESS
+         MVC   0(8,R5),0(R2)     COPY IN JOBNAME
+         MVC   8(2,R5),=CL2' '   ADD A LITTLE SPACE
+         LA    R5,10(,R5)        INCREMENT TO NEXT SLOT ON LINE
+         BCTR  R4,0              DECREMENT LINE COUNTER IF SUCCESS
+ENDMEM3  DS    0H
+         LA    R4,1(,R4)         INCREMENT LINE CTR IF UNSUCCESS
+         LA    R2,0(R3,R2)       INCREMENT TO NEXT JOBNAME
+         CLC   0(8,R2),=8X'FF'   END OF TABLE?
+         BE    ENDMEM4           YES,
+         BCT   R4,ENDMEM2        LOOP BACK AND CONTINU FILLING MSG LINE
+         BAL   R14,MSGINF        GO TELL OPERATOR
+         BCT   R4,ENDMEM1        LOOP BACK AND START NEW MSG LINE
+ENDMEM4  DS    0H
+         CR    R7,R5             END OF MEMBERS?
+         BE    REPEAT            YES, GO ASK OPERATOR FOR MORE JOBS
+         BAL   R14,MSGINF        ELSE OUTPUT LAST LINE
+         B     REPEAT            GO ASK OPERATOR FOR MORE JOBS
+         CNOP  0,4
+ENDMEM5  DS    0H
+         TM    INDICATR,ERROR
+         BO    REPEAT
+         TM    INDICATR,FLUSH
+         BO    REPEAT
+         L     R1,JAREACUR
+         MVC   0(80,R1),EOF COPY IN SLASH ASTERISK END-OF-FILE
+         LA    R1,80(,R1)
+         SR    R2,R2              GET THE JOB REPETITION COUNT
+         IC    R2,JOBREPBN        ...
+         ST    R1,JAREACUR
+ENDMEM6A DS    0H
+         L     R6,JAREAADR
+         L     R5,JAREACUR
+         LA    R4,80
+         SLR   R5,R4
+ENDMEM6B DS    0H
+         PUT   INTRDR,0(R6)
+         BXLE  R6,R4,ENDMEM6B
+         BCT   R2,ENDMEM6A LOOP BACK AND OUTPUT JOB AGAIN IF NECESSARY
+         LA    R1,=CL80'PROD013I FOLLOWING JOBNAMES HAVE BEEN SUBMITTEDX
+               :'
+         MVC   49(8,R1),TABLE    COPY IN JOBNAME
+         BAL   R14,MSGINF        GO TELL OPERATOR
+         TM    JOBIND2,JOBMANY   JOB REPETITION IN EFFECT?
+         BZ    REPEAT             NO, JUST GO ASK OPER FOR MORE JOBS
+         LA    R1,=CL80'PROD037I   JOB          HAS BEEN SUBMITTED XX TX
+               IMES'
+         MVC   15(8,R1),TABLE     COPY IN JOBNAME
+         MVC   43(2,R1),JOBREP    COPY IN REPETITION COUNT
+         BAL   R14,MSGINF         GO TELL OPERATOR
+REPEAT   DS    0H
+         NI    INDICATR,X'FF'-(MEMBER+PREFIX+AMPER+ERROR+FLUSH)
+   NI JOBIND,X'FF'-(JOBCARD+NT1STCRD+JOBCONT+PSWDPARM+JOBS+QUOTE+MEMS)
+         NI    IOCIND,X'FF'-(IOCMSG+IOCJOB)
+         NI    JOBIND2,X'FF'-(USER+GROUP+PASSWORD+JOBMANY)
+         L     R1,JAREAADR        RESET CURRENT ENTRY IN JOB AREA...
+         ST    R1,JAREACUR        TO BEGINNING OF BLOCK
+         LA    R1,=CL80'PROD099A   ENTER JOBNAME OR JOBSTREAM NAME'
+         BAL   R14,MSGWTOR        GO SEND INFO AND WAIT FOR RECEIPT
+         BAL   R14,FINDLEN        GO DETERMINE LENGTH OF REPLY
+         STH   R0,REPLYLEN        SAVE REPLY LENGTH
+         ST    R1,REPLYADR        SAVE REPLY ADDRESS
+         LR    R3,R0              SET UP FOR REPLY TESTING
+         LR    R2,R1              ...
+         B     PARM1A             GO TEST AND PROCESS THE REPLY
+MSGINF   DS    0H
+         STM   R0,R15,LVL1SAVE
+         TM    INDICATR,TEST
+         BZ    MSGINF1
+         MVC   SYSPREC(80),0(R1)  ***TEST***
+         PUT   SYSPRINT,SYSPREC   ***TEST***
+         LM    R0,R15,LVL1SAVE    ***TEST***
+         BR    R14                ***TEST***
+MSGINF1  DS    0H
+         MVC   MSGWTO+4(80),0(R1)
+         LA    R1,MSGWTO
+         WTO   MF=(E,(1))
+         LM    R0,R15,LVL1SAVE
+         BR    R14
+MSGWTO   WTO   '                                                       X
+                                        ',ROUTCDE=(13),MF=L
+MSGWTOR  DS    0H
+         STM   R0,R15,LVL1SAVE
+         TM    INDICATR,TEST
+         BZ    MSGWTORA
+         MVC   SYSPREC(80),0(R1)  ***TEST***
+         PUT   SYSPRINT,SYSPREC   ***TEST***
+         GET   SYSIN,SYSINREC     ***TEST***
+         LM    R0,R15,LVL1SAVE    ***TEST***
+         LA    R1,SYSINREC        ***TEST***
+         LA    R0,12              ***TEST***
+         BR    R14                ***TEST***
+MSGWTORA DS    0H
+         LR    R3,R1              COPY ADR OF MSG
+         XC    STIMECB,STIMECB    CLEAR STIMER ECB
+         STIMER REAL,STIMRTN,BINTVL=DELAY
+         LA    R2,MREPLY
+         MVI   0(R2),X'40'        CLEAR REPLY AREA
+         MVC   1(L'MREPLY-1,R2),0(R2)
+         MVC   MWTOR+12(80),0(R3)
+         XC    MRPLYECB(4),MRPLYECB
+         LA    R1,MWTOR
+         WTOR  MF=(E,(1))
+MSGWAIT  DS    0H
+         WAIT  1,ECBLIST=ECBLIST
+         TM    STIMECB,POST       STIMER POSTED?
+         BZ    MSGRET             NO, THEN MUST BE WTOR
+         XC    STIMECB,STIMECB    CLEAR STIMER ECB
+         STIMER REAL,STIMRTN,BINTVL=DELAY
+         B     MSGWAIT            GO WAIT FOR A POST
+MSGRET   DS    0H
+         TTIMER CANCEL
+         LM    R0,R15,LVL1SAVE
+         LA    R1,MREPLY
+         LA    R0,12
+         BR    R14
+MWTOR    WTOR  '                                                       X
+                                                  ',MREPLY,12,MRPLYECB,X
+               MF=L,ROUTCDE=(13)
+STIMRTN  DS    0H
+         SAVE  (14,12),,*
+         LR    R3,R15
+         USING STIMRTN,R3
+         LA    R4,SAVE2
+         ST    R4,8(,R13)
+         ST    R13,4(,R4)
+         LR    R13,R4
+         POST  STIMECB
+         L     R13,SAVE2+4
+         RETURN (14,12),RC=0
+SAVE2    DS    18F
+STIMECB  DC    F'0'
+POST     EQU   X'40'
+         DROP  R3
+ECBLIST  DS    0A
+         DC    X'00',AL3(MRPLYECB)
+         DC    X'80',AL3(STIMECB)
+DELAY    DC    F'90000'  15 MINUTES;  900 SECONDS.
+FINDLEN  DS    0H
+         XR    R3,R3
+         LR    R2,R1       ADDRESS OF STRING TO SEARCH FOR LENGTH
+         LR    R4,R0       TOTAL LENGTH OF STRING
+FINDLOOP DS    0H
+         CLI   0(R2),X'40'
+         BE    FINDEND
+         LA    R2,1(,R2)
+         LA    R3,1(,R3)
+         BCT   R4,FINDLOOP
+FINDEND  DS    0H
+         LR    R0,R3     LENGTH OF STRING TO FIRST BLANK
+         BR    R14
+LKPASS   DS    0H                 INTERROGATE PASSWORD TABLE
+         STM   R0,R15,LVL1SAVE
+         LOAD  EP=PSWDTABL,DCB=TABLE1
+         LR    R3,R0              ADDRESS OF PASSWORD TABLE
+         USING PSWDDSEC,R3
+         LA    R5,CARD
+         MVC   3(76,R5),2(R5)
+         LA    R5,3(,R5)
+         XR    R4,R4
+LKPASS1  DS    0H
+         CLC   PSWDACCT,ACCT      ACCT # MATCH?
+         BE    LKPASSU            YES, GO TEST THIS ACCT NUMBER
+         IC    R4,PSWDLEN         OBTAIN LENGTH OF TABLE ENTRY
+         LTR   R4,R4              DID END OF ACCT TABLE OCCUR?
+         BNZ   LKPASS2            NO
+         LA    R15,4              SET NO MATCH ON ACCT #
+         B     LKPASSR            GO RETURN
+LKPASS2  DS    0H
+         LA    R3,0(R4,R3)        INCR TO NEXT ACCT #
+         B     LKPASS1            GO TEST NEXT ACCT #
+LKPASSU  DS    0H
+         CLI   PSWDUSER,C' '
+         BE    LKPASSP
+         TM    JOBIND2,USER       USER ALREADY SPECIFIED?
+         BO    LKPASSP            YES, GO TEST NEXT PARM
+         OI    JOBIND,PSWDPARM
+         MVC   0(5,R5),=C'USER='
+         MVC   5(8,R5),PSWDUSER
+         TRT   5(9,R5),BLANKTRT
+         MVI   0(R1),C','
+         SR    R1,R5
+         LA    R5,1(R1,R5)
+LKPASSP  DS    0H
+         CLI   PSWDPSWD,X'FF'
+         BE    LKPASSG
+         TM    JOBIND2,PASSWORD   PSWD ALREADY SPECIFIED?
+         BO    LKPASSG            YES, GO TEST NEXT PARM
+         OI    JOBIND,PSWDPARM
+         MVC   0(9,R5),=C'PASSWORD='
+         MVC   9(8,R5),PSWDPSWD
+         TM    INDICATR,PROTECT
+         BZ    LKPASSP0
+         TR    9(8,R5),TRPSWD
+LKPASSP0 DS    0H
+         TM    INDICATR,TEST+PROTECT
+         BM    LKPASSP1
+*        TM    INDICATR,PROTECT
+*        BNZ   LKPASSP1
+*        TM    INDICATR,TEST
+*        BNZ   LKPASSP1
+         MVC   9(8,R5),=C'PASSWORD'
+LKPASSP1 DS    0H
+         TRT   9(9,R5),BLANKTRT
+         MVI   0(R1),C','
+         SR    R1,R5
+         LA    R5,1(R1,R5)
+LKPASSG  DS    0H
+         CLI   PSWDGRP,C' '
+         BE    LKPASSR0
+         TM    JOBIND2,GROUP     GROUP ALREADY SPECIFIED?
+         BO    LKPASSR0           YES, GO TEST NEXT PARM
+         OI    JOBIND,PSWDPARM
+         MVC   0(6,R5),=C'GROUP='
+         MVC   6(8,R5),PSWDGRP
+         TRT   6(9,R5),BLANKTRT
+         MVI   0(R1),C','
+         SR    R1,R5
+         LA    R5,1(R1,R5)
+LKPASSR0 DS    0H
+         DELETE EP=PSWDTABL
+         BCTR  R5,0
+         MVI   0(R5),C' '
+         ST    R5,CARDEND
+         XR    R15,R15
+         B     LKPASSRX
+LKPASSR  DS    0H
+         DELETE EP=PSWDTABL
+LKPASSRX DS    0H
+         LM    R0,R14,LVL1SAVE
+         LA    R1,CARD
+         BR    R14
+         SPACE 3
+CKCONT   DS    0H  DETERMINE IF THIS CARD HAS A CONTINUATION
+         STM   R0,R15,LVL1SAVE
+         LA    R5,71(,R6)
+         LA    R6,2(,R6)
+         LA    R4,1
+         CLI   0(R6),C'*'         JCL COMMENT?
+         BE    CKCONTR0           YES, THEN SKIP THIS CARD
+         CLI   0(R6),C' '
+         BE    CKCONT0A
+CKCONT0  DS    0H
+         CLC   0(5,R6),=C' JOB '
+         BE    CKCONT5
+         BXLE  R6,R4,CKCONT0
+CKCONT0A DS    0H
+         CLI   0(R6),C' '
+         BNE   CKCONT1
+         BXLE  R6,R4,CKCONT0A
+         B     CKCONTNC
+CKCONT1  DS    0H
+         CLI   0(R6),C''''
+         BE    CKCONT3
+         CLC   0(2,R6),=C', '
+         BE    CKCONTCM
+CKCONT2  DS    0H
+         BXLE  R6,R4,CKCONT1
+         B     CKCONTNC
+CKCONTCM DS    0H
+         TM    JOBIND,QUOTE
+         BO    CKCONT2
+         OI    JOBIND,JOBCONT
+         B     CKCONTR0
+CKCONT3  DS    0H
+         TM    JOBIND,QUOTE
+         BO    CKCONT4
+         OI    JOBIND,QUOTE
+         B     CKCONT2
+CKCONT4  DS    0H
+         NI    JOBIND,X'FF'-(QUOTE)
+         B     CKCONT2
+CKCONT5  DS    0H
+         LA    R6,4(,R6)
+         B     CKCONT0A
+CKCONTNC DS    0H
+         NI    JOBIND,X'FF'-(QUOTE+JOBCONT)
+         B     CKCONTR0
+CKCONTR0 DS    0H
+         LM    R0,R14,LVL1SAVE
+         XR    R15,R15
+         BR    R14
+CONT     DS    0H                 ADD CONTINUATION TO END OF JOB CARD
+         STM   R0,R15,LVL1SAVE
+         LR    R6,R1
+         LA    R5,70(,R6)
+         LA    R6,2(,R6)
+         LA    R4,1
+         CLI   0(R6),C'*'
+         BE    CONTR0
+         CLI   0(R6),C' '
+         BE    CONT0A
+CONT0    DS    0H
+         CLC   0(5,R6),=C' JOB '
+         BE    CONT5
+         BXLE  R6,R4,CONT0
+CONT0A   DS    0H
+         CLI   0(R6),C' '
+         BNE   CONT1
+         BXLE  R6,R4,CONT0A
+         B     CONTNC
+CONT1    DS    0H
+         CLI   0(R6),C''''
+         BE    CONT3
+         CLI   0(R6),C' '
+         BE    CONTCM             GO INSERT COMMA
+CONT2    DS    0H
+         BXLE  R6,R4,CONT1
+         B     CONTMV
+CONTCM   DS    0H
+         TM    JOBIND,QUOTE
+         BO    CONT2
+         MVC   0(2,R6),=C', '
+         B     CONTR0
+CONT3    DS    0H
+         TM    JOBIND,QUOTE
+         BO    CONT4
+         OI    JOBIND,QUOTE
+         B     CONT2
+CONT4    DS    0H
+         NI    JOBIND,X'FF'-(QUOTE)
+         B     CONT2
+CONT5    DS    0H
+         LA    R6,4(,R6)
+         B     CONT0A
+CONTNC   DS    0H
+         NI    JOBIND,X'FF'-(QUOTE+JOBCONT)
+         B     CONTR0
+CONTMV   DS    0H
+         LR    R5,R1
+         LA    R6,70(,R5)
+         L     R4,=F'-1'
+CONTMV1  DS    0H
+         CLI   0(R6),C','
+         BE    CONTMV2
+         BXH   R6,R4,CONTMV1
+         B     CONTNC
+CONTMV2  DS    0H
+         LA    R5,70(,R1)
+         SR    R5,R6
+         MVC   KEYSAVE(1),0(R6)
+         EX    R5,*-6
+         ST    R5,KEYLEN
+         BCTR  R5,0
+         BCTR  R5,0
+         MVI   1(R6),X'40'
+         MVC   2(1,R6),1(R6)
+         EX    R5,*-6
+         OI    JOBIND,KEYMOVE
+CONTR0   DS    0H
+         LM    R0,R14,LVL1SAVE
+         XR    R15,R15
+         BR    R14
+MEMLST   DS    0H LOCATE MEMBERS AND COPY TO BLDL TABLE
+         STM   R0,R15,LVL1SAVE
+         L     R14,MEMCTR
+         LA    R15,&TABSIZ
+         L     R7,CURTABP
+         L     R4,NUMMEMS
+         MVC   72(8,R6),=8X'40'
+         LA    R5,74
+MEMLST1  DS    0H
+         EX    R5,TRTBC           LOCATE START OF MEMBER
+         BZ    MEMLSTR0
+         LR    R3,R1              CALCULATE NEW LENGTH TO SCAN
+         SR    R3,R6
+         SR    R5,R3
+         LR    R6,R1              SET NEW START LOC FOR MEMNAME BEGIN
+         EX    R5,TRTMEM          LOCATE DELIMITER
+         BZ    MEMLSTR0
+         LR    R3,R1
+         SR    R3,R6
+         SR    R5,R3
+         BCTR  R3,0
+         MVC   0(8,R7),=8X'40'
+         MVC   0(1,R7),0(R6)
+         EX    R3,*-6
+         STCM  R14,3,14(R7)       SAVE NUMBER OF THIS ENTRY
+         LR    R6,R1
+         OI    JOBIND,MEMS
+         LA    R7,0(R15,R7)
+         ST    R7,CURTABP
+         LA    R14,1(,R14)
+         BCT   R4,MEMLST1
+         LA    R15,4
+         B     MEMLSTR4
+MEMLSTR0 DS    0H
+         ST    R4,NUMMEMS
+         ST    R14,MEMCTR
+         LM    R0,R14,LVL1SAVE
+         XR    R15,R15
+         BR    R14
+MEMLSTR4 DS    0H
+         LM    R0,R14,LVL1SAVE
+         BR    R14
+TRTMEM   TRT   0(*-*,R6),ALPHAMER LOCATE START OF MEMBER
+TRTBC    TRT   0(*-*,R6),BCTRT    LOCATE DELIMITER
+         SPACE 3
+ORDERSV  DS    0H
+         STM   R0,R15,LVL1SAVE
+         LA    R5,TABORD
+         LH    R7,TABLE-4
+         LA    R4,&TABSIZ
+         LA    R6,TABLE
+ORDLP    DS    0H
+         MVC   0(2,R5),14(R6)
+         LA    R6,0(R4,R6)
+         LA    R5,2(,R5)
+         BCT   R7,ORDLP
+ORDR0    DS    0H
+         LM    R0,R15,LVL1SAVE
+         BR    R14
+         SPACE 3
+REORDER  DS    0H
+         STM   R0,R15,LVL1SAVE
+         LA    R5,TABORD
+         LH    R7,TABLE-4
+         LA    R4,&TABSIZ
+         LA    R6,TABLE
+REOLP    DS    0H
+         MVC   14(2,R6),0(R5)
+         LA    R6,0(R4,R6)
+         LA    R5,2(,R5)
+         BCT   R7,REOLP
+REOR0    DS    0H
+         LM    R0,R15,LVL1SAVE
+         BR    R14
+         SPACE 3
+SORT     DS    0H
+         STM   R0,R14,LVL1SAVE
+         CLC   TABLE-4(2),=X'0001'
+         BE    SORTR0
+         LA    R1,&TABSIZ         LENGTH OF RECORD
+         XR    R6,R6              CLEAR SORT END TEST REG
+SORT0    DS    0H
+         XR    R5,R5 CLEAR SORT END TEST REG
+         LA    R3,TABLE-&TABSIZ
+         LH    R2,TABLE-4
+         BCTR  R2,0
+SORT1    DS    0H
+         LA    R3,0(R1,R3)
+         LA    R4,0(R1,R3)
+         CLC   0(8,R3),0(R4)      A>B?
+         BH    SORT3              YES, GO INTERCHANGE
+         BCT   R2,SORT1
+SORT2    DS    0H
+         CR    R5,R6              DONE WITH SORT?
+         BNE   SORT0              NO, MAKE ANOTHER PASS
+SORTR0   DS    0H
+         LM    R0,R15,LVL1SAVE
+         BR    R14
+SORT3    DS    0H
+         MVC   STORE(&TABSIZ),0(R4)
+         MVC   0(&TABSIZ,R4),0(R3)
+         MVC   0(&TABSIZ,R3),STORE
+         LA    R5,1 SET SORT INTERCHANGE REG ON
+         BCT   R2,SORT1
+         B     SORT2
+         SPACE 3
+NUMSRT   DS    0H
+         STM   R0,R14,LVL1SAVE
+         CLC   TABLE-4(2),=X'0001'
+         BE    NUMSRTR0
+         LA    R1,&TABSIZ         LENGTH OF RECORD
+         XR    R6,R6              CLEAR SORT END TEST REG
+NUMSRT0  DS    0H
+         XR    R5,R5 CLEAR SORT END TEST REG
+         LA    R3,TABLE-&TABSIZ
+         LH    R2,TABLE-4
+         BCTR  R2,0
+NUMSRT1  DS    0H
+         LA    R3,0(R1,R3)
+         LA    R4,0(R1,R3)
+         CLC   14(2,R3),14(R4) A>B?
+         BH    NUMSRT3            YES, GO INTERCHANGE
+         BCT   R2,NUMSRT1
+NUMSRT2  DS    0H
+         CR    R5,R6              DONE WITH SORT?
+         BNE   NUMSRT0            NO, MAKE ANOTHER PASS
+NUMSRTR0 DS    0H
+         LM    R0,R15,LVL1SAVE
+         BR    R14
+NUMSRT3  DS    0H
+         MVC   STORE(&TABSIZ),0(R4)
+         MVC   0(&TABSIZ,R4),0(R3)
+         MVC   0(&TABSIZ,R3),STORE
+         LA    R5,1 SET SORT INTERCHANGE REG ON
+         BCT   R2,NUMSRT1
+         B     NUMSRT2
+         SPACE 3
+IOCDSN   DS    0H
+         STM   R0,R15,LVL2SAVE
+         MVI   0(R6),C'/'
+         TM    IOCIND,IOCJOB
+         BO    IOCDS0
+         LA    R1,=CL80'PROD028E   JOB* NOT SPECIFIED ON JOBCARD AND ANX
+                I/O CTL DD STMT IS PRESENT'
+         BAL   R14,MSGINF         GO TELL OPERATOR
+         B     IOCDR4             GO RETURN WITH ERROR
+IOCDS0   DS    0H
+         LA    R4,1
+         LA    R5,72(,R6)
+IOCDS1   DS    0H
+         CLC   0(4,R6),=C'DSN='
+         BE    IOCDS3
+         CLC   0(7,R6),=C'DSNAME='
+         BE    IOCDS3
+         CLC   0(2,R6),=C', '
+         BE    IOCDS2           ERROR, CONTINUATION W/O DSN ON 1ST CARD
+         BXLE  R6,R4,IOCDS1
+IOCDS2   DS    0H
+         LA    R1,=CL80'PROD023E   DSNAME FOR I/O CTL LIBRARY ON CONTINX
+               UATION CARD OR NOT PRESENT'
+         BAL   R14,MSGINF
+         B     IOCDR4             RETURN WITH ERROR
+IOCDS3   DS    0H
+         MVI   BLANKTRT+C'=',C'='
+         LA    R7,10
+         EX    R7,IOCDTRT
+         LA    R6,1(,R1)
+         MVI   BLANKTRT+C'=',X'00'
+         LR    R7,R5
+         SR    R7,R6
+         MVI   BLANKTRT+C'(',C'('
+         MVI   BLANKTRT+C')',C')'
+         EX    R7,IOCDTRT         SCAN FOR COMMA OR BLANK
+         CLI   0(R1),C'('
+         BE    IOCDS4
+         LA    R1,=CL80'PROD024E   MEMBER NAME NOT SPECIFIED ON I/O CTLX
+                 CARD IN DSNAME FIELD'
+         BAL   R14,MSGINF
+         B     IOCDR4
+IOCDS4   DS    0H
+         SR    R1,R6
+         BCTR  R1,0
+         MVI   IDSN,X'40'
+         MVC   IDSN+1(43),IDSN
+         MVC   IDSN(1),0(R6)
+         EX    R1,*-6
+         LA    R6,2(R1,R6)
+         LR    R7,R5
+         SR    R7,R6
+         EX    R7,IOCDTRT
+         CLI   0(R1),C')'
+         BE    IOCDS4A
+         LA    R1,=CL80'PROD024E   MEMBER NAME NOT SPECIFIED ON I/O CTLX
+                 CARD IN DSNAME FIELD'
+         BAL   R14,MSGINF
+         B     IOCDR4
+IOCDS4A  DS    0H
+         MVI   BLANKTRT+C'(',X'00'
+         MVI   BLANKTRT+C')',X'00'
+         SR    R1,R6
+         BCTR  R1,0
+         MVI   IMEM,X'40'
+         MVC   IMEM+1(7),IMEM
+         MVC   IMEM(1),0(R6)
+         EX    R1,*-6
+         CLC   IDSN,JFCBDSN
+         BNE   IOCDS5
+         TM    IOCIND,IOCOPNO FIRST TIME OPEN?
+         BO    IOCDS5A        YES,BYPASS CLOSE BUT PERFORM OPEN
+         B     IOCDD2             BYPASS CLOSE AND OPEN
+IOCDS5   DS    0H
+         CLOSE IOCTL
+         NI    IOCIND,X'FF'-(IOCOPEN)  CLEAR I/O CTL FILE OPEN FLAG
+IOCDS5A  DS    0H
+         MVI   JFCBAREA,X'00'
+         MVC   JFCBAREA+1(175),JFCBAREA
+         MVI   IOCTL,X'00'
+         MVC   IOCTL+1((IOCMDLE)-1),IOCTL
+         MVC   IOCTL(IOCMDLE),IOCMDL
+         MVC   S99DSNAM(44),IDSN
+         LA    R1,S99RBPTR
+         DYNALLOC
+         LTR   R15,R15            ANY ERRORS?
+         BZ    IOCDS5B            NO, CONTINUE WITH OPEN
+         LA    R1,=CL80'PROD031E   ALLOCATION ERROR FOR      '
+         MVC   33(44,R1),IDSN
+         BAL   R14,MSGINF
+         B     IOCDR4
+IOCDS5B  DS    0H
+         RDJFCB (IOCTL,(INPUT))
+         LA    R4,JFCBAREA
+         USING IEFJFCBN,R4
+         OI    JFCBTSDM,JFCNWRIT
+         MVC   JFCBDSN,IDSN
+         XR    R4,R4           CLEAR OPEN ERROR FLAG
+         OPEN  (IOCTL,(INPUT)),TYPE=J
+         TM    IOCTL+48,X'10'     OPEN OK ON IOCTL?
+         BO    IOCDS6             YES CK NEXT OPEN
+         LA    R4,1               SET OPEN FAILURE INDICATOR
+         LA    R1,=CL80'PROD003E   OPEN FAILED FOR IOCTL DCB'
+         BAL   R14,MSGINF         GO SEND MSG
+         B     IOCDR4
+IOCDS6   DS    0H
+         OI    IOCIND,IOCOPEN            MARK I/O CTL FILE AS OPENED
+         NI    IOCIND,X'FF'-(IOCOPNO)    CLEAR NEED 1ST TIME OPEN FLAG
+         LA    R6,IOCTL
+         USING IHADCB,R6
+         LH    R2,DCBBLKSI-IHADCB(R6) BLKSIZE IF IOCTL FILE
+         ST    R2,IOCINBLK        SAVE THE IOCTL BLKSIZE
+         C     R2,=F'3360'        IS MAX BLKSIZE OF 3360 EXCEEDED?
+         BNH   IOCDS6A            NO
+         LA    R1,=CL80'PROD025E   BLKSIZE>3360 FOR I/O L= '
+         MVC   34(44,R1),IDSN      COPY IN DSNAME IN ERROR
+         MVI   JFCBDSN,X'40'           CLEAR JFCB DSNAME FIELD ON ERROR
+         MVC   JFCBDSN+1(43),JFCBDSN   ...
+         BAL   R14,MSGINF
+         LA    R4,1    SET ERROR HAS OCCURRED
+IOCDS6A  DS    0H
+         LH    R3,DCBLRECL-IHADCB(R6)
+         CH    R3,=H'80'
+         BE    IOCDS6B
+        LA    R1,=CL80'PROD006E   RECORD LENGTH OF DDNAME IOCTL NOT 80'
+         BAL   R14,MSGINF
+         LA    R4,1    SET ERROR HAS OCCURRED
+IOCDS6B  DS    0H
+         TM    DCBRECFM-IHADCB(R6),X'80'    RECFM=F?
+         BO    IOCDS6C            YES,CONTINUE
+         LA    R1,=CL80'PROD007E   RECORD FORMAT OF DDNAME IOCTL  NOT FX
+               IXED'
+         BAL   R14,MSGINF         GO SEND INFO
+         LA    R4,1               SET ERROR INDICATOR
+IOCDS6C  DS    0H
+         LTR   R4,R4
+         BNZ   IOCDR4             GO RETURN WITH ERROR
+         DROP  R6
+IOCDD2   DS    0H
+         MVC   IOCBLDL-2(2),=AL2(76) LENGTH OF EACH ENTRY
+         MVC   IOCBLDL-4(2),=AL2(1) # OF ENTRIES
+         MVC   IOCBLDL(8),IMEM
+         BLDL  IOCTL,IOCBLDL-4
+         LTR   R15,R15
+         BZ    IOCDSNP
+         CH    R15,=H'4'
+         BE    IOCDSN5
+         CH    R15,=H'8'
+         BE    IOCDSN3
+         LA    R1,=CL80'PROD019E   UNKNOWN ERROR IN BLDL FOR DDNAME IOCX
+               TL..CC=1'
+         BAL   R14,MSGINF         GO SEND INFO
+         B     IOCDR4
+IOCDSN3  DS    0H
+         LTR   R0,R0
+         BNZ   IOCDSN4
+         LA    R1,=CL80'PROD011E   PERMANENT I/O ERROR ON DIRECTORY FORX
+                DDNAME IOCTL'
+         BAL   R14,MSGINF
+         B     IOCDR4
+IOCDSN4  DS    0H
+         LA    R1,=CL80'PROD012E   INSUFFICIENT STORAGE TO PROCESS DDNAX
+               ME IOCTL'
+         BAL   R14,MSGINF
+         B     IOCDR4
+IOCDSN5  DS    0H
+         LA    R1,=CL80'PROD026E   MEMBER NOT FOUND: '
+         MVC   29(8,R1),IMEM       COPY IN MEMBER NAME
+         BAL   R14,MSGINF         GO SEND INFO
+         B     IOCDR4
+IOCDSNP  DS    0H
+         BAL   R14,IOCM
+         LA    R1,PROD021I
+         BAL   R14,MSGINF
+         LA    R1,PROD022I
+         BAL   R14,MSGINF
+         LA    R1,IOCSCALE
+         BAL   R14,MSGINF
+         POINT IOCTL,IOCBLDL+8
+IOCRD1   DS    0H
+         L     R3,IOCINADR        PT TO BUFFER AREA
+         XC    DECB4,DECB4
+         READ DECB4,SF,IOCTL,(3),'S'
+         CHECK DECB4
+         L     R6,IOCINADR
+         LR    R5,R6
+         A     R5,IOCINBLK
+         S     R5,=F'80'
+         L     R1,DECB4+16
+         LH    R1,14(,R1)
+         CL    R1,IOCINSZ         END OF DATA?
+         BE    IOCEOD             YES
+         SLR   R5,R1
+         LA    R4,80
+IOCRD2   DS    0H
+         LR    R1,R6
+         BAL   R14,MSGINF
+         BXLE  R6,R4,IOCRD2
+         B     IOCRD1
+IOCEOD   DS    0H
+         LA  R1,=CL80'PROD027A   CARDS OK?   M=         L= '
+         MVC   25(8,R1),IMEM
+         MVC   36(44,R1),IDSN
+         BAL   R14,MSGWTOR
+         CLC   0(2,R1),=C'Y '
+         BE    IOCDR0
+         CLC   0(2,R1),=C'N '
+         BE    IOCDR4
+         B     IOCEOD
+IOCDR0   DS      0H
+         LM    R0,R14,LVL2SAVE
+         LA    R15,0
+         BR    R14
+IOCDR4   DS      0H
+         LM    R0,R14,LVL2SAVE
+         LA    R15,4
+         BR    R14
+         SPACE 3
+IOCM     DS    0H
+         STM   R0,R15,LVL1SAVE
+         LA    R14,IOCBLDL
+         USING DIR,R14
+         MVC   P21LIB,IDSN
+         MVC   P21MEM,DIRMEM
+         CLI   DIRWDS,X'00'
+         BNE   IOCMI
+         MVC   P22USER,=CL8'UNKNOWN'
+         MVC   P22MODDT,=CL6'N/A'
+         MVC   P22MODTM,=CL5'N/A'
+         B     IOCMR0
+IOCMI    DS    0H
+         MVC   P22USER,DIRUSER
+         LA    R7,P22MODDT+1
+         LA    R6,DIRMODDT+1
+         LA    R5,1(,R6)
+         LA    R4,1
+         XR    R2,R2
+         LR    R3,R2
+IOCMI1   DS      0H
+         IC    R2,0(R6)
+         SRDL  R2,4
+         STC   R2,0(R7)
+         TR    0(1,R7),NUMBERS
+         XR    R2,R2
+         SLDL  R2,4
+         STC   R2,1(R7)
+         TR    1(1,R7),NUMBERS
+         LA    R7,2(,R7)
+         BXLE  R6,R4,IOCMI1
+         IC    R2,0(R6)
+         SRDL  R2,4
+         STC   R2,0(R7)
+         TR    0(1,R7),NUMBERS
+         MVC   P22MODDT(1),P22MODDT+1
+         MVC   P22MODDT+1(1),P22MODDT+2
+         MVI   P22MODDT+2,C'.'
+         LA    R7,P22MODTM+1
+         LA    R6,DIRMODTM
+         LA    R5,1(,R6)
+IOCMI2   DS      0H
+         IC    R2,0(R6)
+         SRDL  R2,4
+         STC   R2,0(R7)
+         TR    0(1,R7),NUMBERS
+         XR    R2,R2
+         SLDL  R2,4
+         STC   R2,1(R7)
+         TR    1(1,R7),NUMBERS
+         LA    R7,2(,R7)
+         BXLE  R6,R4,IOCMI2
+         MVC   P22MODTM(1),P22MODTM+1
+         MVC   P22MODTM+1(1),P22MODTM+2
+         MVI   P22MODTM+2,C':'
+         DROP  R14
+IOCMR0   DS      0H
+         LM    R0,R14,LVL1SAVE
+         LA    R15,0
+         BR    R14
+IOCMR4   DS      0H
+         LM    R0,R14,LVL1SAVE
+         LA    R15,4
+         BR    R14
+IOCDTRT  TRT   0(*-*,R6),BLANKTRT
+         SPACE 3
+JOBCRD   DS    0H             DETERMINE IF JOBCARD AND OBTAIN ACCT #
+         STM   R0,R15,LVL1SAVE
+         LA    R5,66(,R6)
+         LA    R4,1
+         TM    JOBIND,JOBCONT     BEEN THROUGH HERE ONCE?
+         BO    JOBCRDCN           YES, GO GET ADDITIONAL KEYWORDS
+         CLC   0(2,R6),=C'//'
+         BNE   JOBCRDR4           RETURN WITH NO JOBCARD
+         LA    R6,2(,R6)
+         LR    R1,R6
+JOBCRDJ1 DS    0H
+         CLI   0(R6),X'40'
+         BE    JOBCRDJ2
+         BXLE  R6,R4,JOBCRDJ1
+         B     JOBCRDR4
+JOBCRDJ2 DS    0H
+         LR    R2,R6
+         SR    R2,R1
+         BCTR  R2,0
+         CH    R2,=H'7'
+         BNH   JOBCRDJ3
+         LA    R2,7
+JOBCRDJ3 DS    0H
+         MVC   JOBNAME(8),=8X'40'
+         MVC   JOBNAME(1),0(R1)
+         EX    R2,*-6
+JOBCRD0  DS    0H
+         CLC   0(5,R6),=C' JOB*'
+         BNE   JOBCRD1
+         OI    IOCIND,IOCJOB
+         MVI   4(R6),X'40'
+         OI    JOBIND,JOBCARD
+         OI    IOCIND,IOCMSG      SET NEED FOR MSG TO OPER
+         B     JOBCRD3            GO GET ACCT #
+JOBCRD1  DS    0H
+         CLC   0(5,R6),=C' JOB '
+         BNE   JOBCRD2
+         OI    JOBIND,JOBCARD
+         B     JOBCRD3            GO GET ACCT #
+JOBCRD2  DS    0H
+         BXLE  R6,R4,JOBCRD0
+         B     JOBCRDR4           RETURN WITH NO JOBCARD
+JOBCRD3  DS    0H
+         CLC   0(2,R6),=C' ('
+         BE    JOBCRD4
+         BXLE  R6,R4,JOBCRD3
+         B     JOBCRDR4
+JOBCRD4  DS    0H
+         TM    2(R6),X'F0'        1ST DIGIT NUMERIC
+         BNO   JOBCRDR4           NO, BAD ACCT #
+         MVC   ACCT,2(R6)         SAVE ACCT #
+JOBCRDCN DS    0H
+         CLI   2(R6),C'*'   COMMENT CARD?
+         BE    JOBCRDR0      YES, EXIT
+         CLC   0(5,R6),=C'USER='
+         BNE   JOBCRD5
+         OI    JOBIND2,USER       SET USER KEYWORD FOUND
+         B     JOBCRDI            CK NEXT KEYWORD
+JOBCRD5  DS    0H
+         CLC   0(9,R6),=C'PASSWORD='
+         BNE   JOBCRD6
+         OI    JOBIND2,PASSWORD
+         B     JOBCRDI
+JOBCRD6  DS    0H
+         CLC   0(6,R6),=C'GROUP='
+         BNE   JOBCRD7
+         OI    JOBIND2,GROUP
+JOBCRD7  DS    0H   ADDITIONAL PARMS GO AFTER THIS STMT
+JOBCRDI  DS    0H
+         BXLE  R6,R4,JOBCRDCN
+         B     JOBCRDR0
+JOBCRDR0 DS    0H          RETURN WITH JOBCARD AND ACCT #
+         XR    R15,R15
+         LM    R0,R14,LVL1SAVE
+         BR    R14
+JOBCRDR4 DS    0H
+         LA    R15,4       RETURN W/O JOBCARD OR ACCT #
+         LM    R0,R14,LVL1SAVE
+         BR    R14
+EOJ      DS    0H
+         TM    INDICATR,ENQ
+         BZ    EOJ1
+         DEQ   (QNPROD,RNPROD,0,SYSTEM),RET=NONE
+EOJ1     DS    0H
+         TM    IOCIND,IOCOPEN
+         BZ    EOJ2
+         CLOSE (IOCTL)
+EOJ2     DS    0H
+         CLOSE (SYSUT1,,INTRDR,,TABLE1)
+         L     R13,4(,R13)
+         LM    R14,R12,12(R13)
+         XR    R15,R15
+         BR    R14
+ABEND    DS    0H
+         ABEND 2,DUMP
+         EJECT
+***********************************************************************
+*                                                                     *
+*            CONSTANTS, DCBS, WORKAREA                                *
+*                                                                     *
+*                                                                     *
+***********************************************************************
+         LTORG
+JOBTABLE DS    0H LIST OF JOBNAMES EXEMPTED FROM DSNAME RESTRICTIONS
+JOB1     DC    CL8'SYSPKM1'
+JOBLEN   EQU   *-JOB1
+JOB2     DC    CL8'PROD'
+JOB3     DC    CL8'TCSJOB'
+JOB4     DC    CL8'SYSPKM2'
+JOBTABEN EQU   ((*-JOBTABLE)-JOBLEN)
+DSNTABLE DS    0H                 LIST OF RESTRICTED DATA SET NAMES
+DSN1     DC    CL44'SYS2.JESTABLE'
+DSNLEN   EQU   *-DSN1
+DSNTABEN EQU   ((*-DSNTABLE)-DSNLEN)
+PARMPTR  DS    F
+BLANKTRT DC    256X'00'
+         ORG   BLANKTRT+X'40'
+         DC    X'40'
+         ORG
+TRPSWD   DC    256X'40'
+         ORG   TRPSWD+X'00'
+         DC    C'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#$@'
+         ORG
+BCTRT    DC    256X'FF'
+         ORG   BCTRT+X'40'
+         DC    X'00'
+         ORG   BCTRT+C','
+         DC    X'00'
+         ORG
+TRTNUM   DC    256X'FF'
+         ORG   TRTNUM+C'0'
+         DC   10X'00' 0123456789
+         ORG
+ALPHAMER DC    256X'FF'
+         ORG   ALPHAMER+C'A'
+         DC    9X'00'
+         ORG   ALPHAMER+C'J'
+         DC    9X'00'
+         ORG   ALPHAMER+C'S'
+         DC    8X'00'
+         ORG   ALPHAMER+C'0'
+         DC    10X'00'
+         ORG   ALPHAMER+C'*'
+         DC    X'00'
+         ORG
+INDICATR DS    X
+PREFIX   EQU   X'80'
+MEMBER   EQU   X'40'
+ERROR    EQU   X'20'
+ENQ      EQU   X'10'
+TEST     EQU   X'08'
+PROTECT  EQU   X'04'
+AMPER    EQU   X'02'
+FLUSH    EQU   X'01'
+JOBIND   DS    X
+JOBCONT  EQU   X'80'
+PSWDPARM EQU   X'40'
+JOBS     EQU   X'20'
+JOBCARD  EQU   X'10'
+NT1STCRD EQU   X'08'
+MEMS     EQU   X'04'
+QUOTE    EQU   X'02'
+KEYMOVE  EQU   X'01'
+JOBIND2  DS    X
+USER     EQU   X'80'
+GROUP    EQU   X'40'
+PASSWORD EQU   X'20'
+JOBMANY  EQU   X'08'
+IOCIND   DS    X
+IOCMSG   EQU   X'08'
+IOCOPEN  EQU   X'04'
+IOCOPNO  EQU   X'02'
+IOCJOB   EQU   X'01'
+         SPACE 3
+DOUBLE  DC     D'0'
+BLKINSZ DS     F
+NUMMEMS DS     F
+MEMCTR  DS     F
+CURTABP DS     F
+SYSPREC  DC    CL80' '            ***TEST***
+SYSINREC DC    CL80' '            ***TEST***
+EOF      DC    CL80'/*EOF '
+CARD     DC    CL80'// '
+         DC    256X'40'   OVERFLOW FOR CARD
+IDSN     DC    CL44' '
+IMEM     DC    CL8' '
+IOCSCALE DC    CL80'----+----1----+----2----+----3----+----4----+----5-X
+               ---+----6----+----7----+----8'
+NEWCARD  DC    CL80'// '
+NUMBERS  DC    C'0123456789ABCDEF'
+JOBNAME  DS    CL8
+QNPROD   DC    CL8'PRODJCL'
+RNPROD   DC    X'07',CL7'ONLYONE'
+STORE    DS    CL&TABSIZ
+ACCT     DS    CL4
+JOBREP   DC    C'01'
+JOBREPBN DC    X'01'
+BYTE     DC    CL1' '
+LVL1SAVE DS    16F
+LVL2SAVE DS    16F
+MEMADR   DS    F
+INPBAREA DS    F
+CARDEND  DS    F
+KEYLEN   DS    F
+INPBSIZ  DS    F
+BLKINNUM DS    F
+BLKINADR DS    F
+BLKINLEN DS    F
+REPLYADR DS    F
+JAREACUR DS    F
+JAREAJOB DS    F
+JAREAEND DS    F
+JAREA    DS    0F
+JAREAADR DS    F    ADR OF STORAGE
+JAREALEN DS    F    LEN OF STORAGE
+JAREASZ  DC    F'204800'
+         DC    F'&JAREASZ'
+IOCINADR DS    F
+IOCINSZ  DS    F
+IOCINBLK DS    F
+TTR      DS    XL3
+         DC    X'00'
+MREPLY   DC    CL13' '
+         DC    X'40'
+MRPLYECB DC    F'0'
+INTREC   DC    CL80' '
+KEYSAVE  DS    80X'40'
+REPLYLEN DS    H
+         DS    F                  NEED FOR TABLE BLDL
+IOCBLDL  DS    XL76
+JFCBADR  DS    0F
+         DC    X'07'
+         DC    AL3(JFCBAREA)
+JFCBAREA DS    0F
+         DS    176C
+         ORG   JFCBAREA
+JFCBDSN  DC    CL44' '
+         ORG
+         SPACE 3
+TABJFCBA DS    0F
+         DC    X'07'
+         DC    AL3(TABJFCB)
+TABJFCB  DS    0F
+         DS    176C
+         ORG   TABJFCB
+TABJDSN  DC    CL44' '
+         ORG
+         SPACE 3
+         CNOP  0,4
+S99RBPTR DC    X'80',AL3(S99RB)
+S99RB    DS    XL20
+         ORG   S99RB
+S99RBLN  DC    AL1(20)
+S99VERB  DC    X'01'              SET FOR DSNAME ALLOCATION
+S99FLAG1 DC    B'11100000',X'00'
+S99ERROR DC    XL2'0000'
+S99INFO  DC    XL2'0000'
+S99TXTPP DC    A(S99TUPL)
+S99RES   DC    F'0'
+S99FLAG2 DC    F'0'
+         ORG
+         CNOP  0,4
+S99TUPL  DC    X'00',AL3(S99DDN)  DDNAME
+         DC    X'00',AL3(S99DSN)  DSNAME
+         DC    X'00',AL3(S99SDISP)   STATUS SPECIFICATION OF SHARED
+*                                    DATASET
+         DC    X'00',AL3(S99NDISP)   NORMAL DISP
+         DC    X'00',AL3(S99CDISP)   CONDITIONAL DISP
+         DC    X'80',AL3(S99UALOC)   UNALLOCATION AT CLOSE
+         DC    X'80',AL3(S99UNIT)    UNIT FIELD SPECIFICATION
+S99DDN   DS    0F
+         DC    X'0001',X'0001',AL2(5),C'IOCTL'
+S99DSN   DS    0F
+         DC    X'0002',X'0001',AL2(44)
+S99DSNAM DC    CL44' '
+S99SDISP DS    0F
+         DC    X'0004',X'0001',AL2(1),X'08'
+S99NDISP DS    0F
+         DC    X'0005',X'0001',AL2(1),X'08'
+S99CDISP DS    0F
+         DC    X'0006',X'0001',AL2(1),X'08'
+S99UALOC DS    0F
+         DC    X'001C',X'0000'
+S99UNIT  DS    0F
+         DC    X'0015',X'0001',AL2(4),C'DISK'
+         SPACE 3
+PROD021I DC    CL80' '
+         ORG   PROD021I
+         DC    C'PROD021I   '
+         DC    C'LIB='
+P21LIB   DS    CL44
+         DC    C' MEM='
+P21MEM   DS    CL8
+         DC    C'   '
+         ORG
+PROD022I DC    CL80' '
+         ORG   PROD022I
+         DC    C'PROD022I   '
+         DC    C'LAST MOD DATE IS  '
+P22MODDT DS    CL6
+         DC    C'  AT  '
+P22MODTM DS    CL5
+         DC    C'  BY USER='
+P22USER  DS    CL8
+         ORG
+         SPACE 3
+INTRDR   DCB   DDNAME=INTRDR,DSORG=PS,MACRF=PM,LRECL=80,BLKSIZE=80,    X
+               RECFM=F
+SYSUT1   DCB   DDNAME=SYSUT1,DSORG=PO,MACRF=R,EODAD=ENDMEM
+IOCMDL   DCB   DDNAME=IOCTL,DSORG=PO,MACRF=R,EODAD=IOCEOD,             X
+               EXLST=JFCBADR
+IOCMDLE  EQU   *-IOCMDL
+IOCTL    DS    (IOCMDLE)X
+TABLE1   DCB   DDNAME=TABLE1,DSORG=PO,MACRF=R
+TABLECK  DCB   DDNAME=TABLE1,DSORG=PO,MACRF=R,EXLST=TABJFCBA
+*              SYSIN AND SYSPRINT ARE ***TEST*** DCB
+SYSIN    DCB   DDNAME=SYSIN,LRECL=80,BLKSIZE=80,RECFM=F,MACRF=GM,      X
+               DSORG=PS
+SYSPRINT DCB   DDNAME=SYSPRINT,LRECL=80,BLKSIZE=80,RECFM=F,MACRF=PM,   X
+               DSORG=PS
+*
+TABORD   DS    &TABNUM.XL2        ALLOW FOR 300 MEMBER NAMES
+         DS    F                  NEED FOR TABLE BLDL
+TABLE    DS    &TABNUM.XL&TABSIZ  ALLOW FOR 300 MEMBER NAMES
+         DS    XL&TABSIZ  ALLOW FOR TABLE DLIMITER IF NECESSARY
+         PRINT NOGEN
+         IHADCB DSORG=PO
+         PRINT GEN
+DIR      DSECT
+DIRMEM   DS    CL8
+DIRTTR   DS    XL3
+DIRFIL   DS    XL2
+DIRWDS   DS    XL1
+DIRSSI   DS    XL4
+DIRCRDTE DS    XL4
+DIRMODDT DS    XL4
+DIRMODTM DS    XL2
+DIR1     DS    XL2
+DIR2     DS    XL2
+DIR3     DS    XL2
+DIRUSER  DS    CL8
+PSWDDSEC DSECT
+PSWDLEN  DS XL1
+PSWDACCT DS CL4
+PSWDUSER DS CL8
+PSWDPSWD DS CL8
+PSWDGRP  DS CL8
+IEFJFCBN DSECT
+         IEFJFCBN
+         END

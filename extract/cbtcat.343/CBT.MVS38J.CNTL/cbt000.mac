@@ -1,0 +1,26 @@
+//HERC01  JOB  (CBT),
+//             'Remove CBT cat',
+//             CLASS=A,
+//             MSGCLASS=X,
+//             MSGLEVEL=(1,1),
+//             NOTIFY=HERC01
+//********************************************************************
+//*
+//* Name: CBT.MVS38J.CNTL(CBT000)
+//*
+//* Desc: Cleanup/delete CBT Usercatalogs
+//*
+//********************************************************************
+//DELETE  EXEC PGM=IDCAMS
+//SYSPRINT DD  SYSOUT=*
+//SYSIN    DD  *
+ DELETE SYS1.UCAT.CBT129 FORCE PURGE USERCATALOG
+ DELETE SYS1.UCAT.CBT249 FORCE PURGE USERCATALOG
+ DELETE SYS1.UCAT.CBT429 FORCE PURGE USERCATALOG
+ EXPORT SYS1.UCAT.CBT129 DISCONNECT
+ EXPORT SYS1.UCAT.CBT429 DISCONNECT
+ EXPORT SYS1.UCAT.CBT249 DISCONNECT
+ DELETE CBT429 ALIAS
+ DELETE CBT249 ALIAS
+ DELETE CBT129 ALIAS
+ DELETE CBT072 ALIAS

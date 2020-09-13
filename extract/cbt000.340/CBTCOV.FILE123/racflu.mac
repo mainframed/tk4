@@ -1,0 +1,213 @@
+ RACFLU:    /*  RACF USER PROFILE LISTING GENERATOR                  */
+ PROC OPTIONS(MAIN) REORDER;
+-/********************************************************************/
+ /*     PROGRAM WHICH EXAMINES EACH USER PROFILE IN THE RACF         */
+ /*         DATASET, EXTRACTS PERTINENT INFORMATION, AND FOR         */
+ /*         EACH GROUP TO WHICH THE USER IS CONNECTED, CREATES       */
+ /*         A CONDENSED RECORD OF THAT INFORMATION.                  */
+ /*                                                                  */
+ /*                          VERSION 2.0    JACK TAYLOR              */
+ /*                             12-01-80                             */
+ /*                                                                  */
+ /*     INPUT FILES:  RACF DATASET---- VIA MANAGER SVC132            */
+ /*                                                                  */
+ /*     OUTPUT FILES: OUTFILE...RECORDS BY USERID SEQUENCE           */
+ /*                                                                  */
+ /*     EXTERNAL REFERENCES -                                        */
+ /*       RACFMGR - ASSEMBLER INTERFACE TO RACF MANAGER(INCLUDED)    */
+ /*                  MUST BE INSTALLED IN AUTHORIZED LIBRARY         */
+ /*                                                                  */
+ /*     INTERNAL REFERENCES -                                        */
+ /*       RACFUSR - COMMON ROUTINE FOR PROCESSING REQUESTS           */
+ /*                  AGAINST RACF USER PROFILES                      */
+ /*       MGRERR  - COMMON ROUTINE FOR PROCESSING NON-ZERO           */
+ /*                  RETURN CODES FROM THE RACF MANAGER              */
+ /*                                                                  */
+ /*     METHOD OF OPERATION                                          */
+ /*     *******************                                          */
+ /*     EACH RACF USER ENTRY IS LOCATED VIA A NEXT CALL TO THE       */
+ /*     RACF MANAGER.  SINCE A USER MAY BE CONNNECTED TO VARIOUS     */
+ /*     GROUPS, EACH CORRESPONDING CONNECT PROFILE IS EXAMINED TO    */
+ /*     DETERMINE ANY OVERRIDING ADSP, SPECIAL, OPERATIONS, REVOKE,  */
+ /*     OR GRPACC ATTRIBUTES.  THEN FOR EACH ONE OF THESE CONNECT    */
+ /*     GROUPS, THE CORRESPONDING GROUP PROFILE IS EXAMINED TO       */
+ /*     TO DETERMINE THE USER'S AUTHORITY TO THE GROUP AND THE       */
+ /*     DEFAULT INDICATOR 'D' IS SET IF THE GROUP IS THE DEFAULT     */
+ /*     CONNECT GROUP.  FOR EACH SUCH GROUP A RECORD IS CONSTRUCTED  */
+ /*     AND WRITTEN OUT TO DATASET OUTFILE.  CERTAIN FIELDS SUCH AS  */
+ /*     USERRACX AND EXPDTINFO ARE EXTRACTED FROM USRDATA AREAS IN   */
+ /*     THE RACF USER PROFILE.                                       */
+ /*                                                                  */
+ /*     NOTES                                                        */
+ /*     *****                                                        */
+ /*     THIS VERSION ASSUMES THE EXISTENCE OF CERTAIN DATA AREAS     */
+ /*     WHICH ARE UNIQUE TO THE APS INSTALLATION.  THE INSTALLATION  */
+ /*     DATA AREA IS ASSUMED TO CONTAIN A 4 BYTE MAIL STATION        */
+ /*     FOLLOWED BY A 4 BYTE UNIT NUMBER.  USER DATA AREAS ARE ALSO  */
+ /*     EXAMINED FOR THE PRESENCE OF VARIOUS ACCESS BIT FLAGS.       */
+ /*                                                                  */
+ /********************************************************************/
+1/********************************************************************/
+ /*     DECLARE STRUCTURES                                           */
+ /********************************************************************/
+0DCL
+     1 OUTBUF,                         /* RECORD BUFFER FOR OUTPUT   */
+        2 USERID      CHAR(8),            /*  USERID                 */
+        2 NAME        CHAR(20),           /*  PROGRAMMER NAME        */
+        2 OWNER       CHAR(8),            /*  PROFILE OWNER          */
+        2 DEFDATE     FIXED DEC(5,0) UNALIGNED,  /* DATE USER CREATED*/
+        2 USERATR1,                    /*    RACF USER/CONNECT ATTR. */
+          3 USERADSP  BIT(1),          /*    ADSP                    */
+          3 USERSPEC  BIT(1),          /*    SPECIAL                 */
+          3 USEROPER  BIT(1),          /*    OPERATIONS              */
+          3 USERREVK  BIT(1),          /*    USER REVOKED (BY GROUP) */
+          3 USERGRPA  BIT(1),          /*    GRPACC-AUTO.GRP ACC.:DS */
+          3 USERAUDT  BIT(1),          /*    AUDITOR ATTRIBUTE       */
+          3 USERNOPW  BIT(1),          /*    NO PASSWORD REQUIRED    */
+          3 USEROIDC  BIT(1),          /*    OID CARD REQUIRED       */
+        2 USERATR2,                    /*    MORE USER ATTRIBUTES    */
+          3 AUDITUSR  BIT(1),          /*    AUDIT USER ACTIVITY     */
+          3 ATR2RSV1  BIT(7),          /*    RESERVED                */
+        2 USERRACX,                    /*    APS USER AUTHORITIES    */
+          3 RACXSTCU  BIT(1),          /*    STC AUTHORITY           */
+          3 RACXCPWU  BIT(1),          /*    AUTHORIZED TO USER CPW  */
+          3 RACXNOTO  BIT(1),          /*    NOT TO BE TIMED OUT     */
+          3 RACXTIQA  BIT(1),          /*    FULL TIQ AUTHORITY      */
+          3 RACXRSV1  BIT(4),          /*    RESERVED                */
+          3 RACXAPBA  BIT(1),          /*    BATCH AUTHORITY         */
+          3 RACXAPTS  BIT(1),          /*    TSO AUTHORITY           */
+          3 RACXAPIP  BIT(1),          /*    IMS AUTHORITY           */
+          3 RACXAPIT  BIT(1),          /*    IMS TEST AUTHORITY      */
+          3 RACXRSV2  BIT(4),          /*    RESERVED                */
+          3 RACXRSV3  BIT(8),          /*    RESERVED                */
+          3 RACXRSV4  BIT(8),          /*    RESERVED                */
+        2 MS          CHAR(4),         /*    MAIL STATION            */
+        2 UNIT        CHAR(4),         /*    APS UNIT NUMBER         */
+        2 DATELC      FIXED DEC(5,0) UNALIGNED, /* LAST CONNECT  DATE*/
+        2 TIMELC      FIXED BIN(31,0) UNALIGNED,/* LAST CONNECT  TIME*/
+        2 GROUP       CHAR(8),          /*   RACF GROUP NAME         */
+        2 DEFAULT     CHAR(1),          /*   DEFAULT GROUP NAME(='D')*/
+        2 GRPAUTH     CHAR(1),/* AUTHORITY TO THIS GROUP             */
+        2 EXPDTINFO,          /* INFORMATION ABOUT PASSWORD EXPIRAT'N*/
+          3 PSWDDATE  CHAR(5),         /*    JULIAN DATE PSWD EXPIRES*/
+          3 PSWDFLAG  CHAR(1),         /*    RACF INDICATOR ('-')    */
+          3 PSWDRETP  CHAR(2),         /*    PASSWORD RETENTION(DAYS)*/
+          3 PSWDMAXR  CHAR(2);         /*    MAXIMUM PSWD RETENTION  */
+ %INCLUDE MDUSR;
+ %INCLUDE MDGRP;
+ %INCLUDE MDCON;
+-/****************************************************************/
+ /*     DECLARE OTHER VARIABLES                                  */
+ /****************************************************************/
+0DCL    USRID    CHAR(8) VARYING;      /*   USERID ENTITY DEFINITION */
+ DCL    GRPID    CHAR(8) VARYING;      /*   GROUP  ENTITY DEFINITION */
+ DCL    CONID    CHAR(17) VARYING;     /*  CONNECT ENTITY DEFINITION */
+ DCL    (I,J)    FIXED BIN(15,0);               /* WORK VARIABLES    */
+ DCL    GRPLEN   FIXED BIN(15,0);               /* LEN. OF GROUP NAME*/
+ DCL    MGRRC    FIXED BIN(31,0) INIT(0);       /* MANAGER RETURN CDE*/
+ DCL    RACF_DONE BIT(1);                       /* RACF DONE FLAG    */
+-/****************************************************************/
+ /*     DECLARE FILES                                            */
+ /****************************************************************/
+ DCL
+      OUTFILE FILE RECORD OUTPUT ENV(FB RECSIZE(80) TOTAL),
+      SYSPRINT FILE OUTPUT STREAM PRINT;
+ %INCLUDE BUILTIN;
+1        /************************************************************/
+         /**REFER TO PROGRAMMER'S GUIDE FOR THE OPTIONS AVAILABLE*****/
+         /**TO CHANGE THE VARIABLES-OPTIONS,PROGRAM,OR RETCODE      **/
+         /**ASSIGN THE VALUES YOU WANT INTO THE PROPER NAME,AFTER   **/
+         /**YOUR INCLUDE STATEMENT.                                 **/
+         /**PROGRAM -- A USER DEFINED IDENTIFICATION FOR YOUR DUMP. **/
+         /**OPTIONS -- THE OPTIONS FOR THE DUMP.                    **/
+         /**RETCODE -- A RETURN CODE MAY BE SPECIFIED IF NEEDED.    **/
+         /**IF YOU NEED INSTRUCTIONS ON HOW TO USE PLIDUMP THEN USE  **/
+         /**  %INCLUDE INSTRUC                                       **/
+         /************************************************************/
+         DCL PLIDUMP BUILTIN;
+         DCL OPTIONS CHAR         (10)   INIT('FBSATH')  STATIC;
+         DCL PROGRAM CHAR         (90)   INIT('PLIDUMP') STATIC;
+         DCL RETCODE FIXED BINARY (31,0);
+         ON ERROR
+            BEGIN;
+               CLOSE FILE(OUTFILE),FILE(SYSPRINT);
+               RETCODE=0;              /*   SET RETURN CODE          */
+               ON ERROR SYSTEM;
+               CALL PLIRETC(RETCODE);
+               CALL PLIDUMP(OPTIONS,PROGRAM);
+            END;
+ /*********************************************************************/
+1/********************************************************************/
+ /*    GENERAL INITIALIZATION AND FILE OPENING STATEMENTS            */
+ /********************************************************************/
+ OPEN FILE (OUTFILE), FILE(SYSPRINT);
+0/********************************************************************/
+ /*    READ RACF DATASET FOR EACH USER PROFILE                       */
+ /********************************************************************/
+0USRID=LOW(1); /* SET USRID NAME=X'00' FOR 1ST RECORD IN RACF        */
+ RACF_DONE=OFF; /* RESET RACF ALL DONE FLAG                          */
+ DO WHILE(RACF_DONE=OFF);   /*  PROCESS UNTIL MGRERR SETS RACF_DONE  */
+    CALL RACFUSR('NEXT    ',USRID,MGRRC);    /* PROCESS REQUEST      */
+    IF MGRRC^=0 THEN CALL MGRERR(USRID,MGRRC); /* IF ERROR, CALL ERR */
+                ELSE                   /*   OTHERWISE CREATE RECORD  */
+    DO;
+       USERID=USRID;      /* ASSIGN ALL THE VARIABLES TO OUTPUT      */
+       NAME=PGMRNAME;
+       OWNER=USROWNER;
+       DEFDATE=USRCREAT;
+       USERAUDT=USRAUDT(1);
+       USERNOPW=USRNOPW(1);
+       USEROIDC=USROIDC(1);
+       AUDITUSR=SUBSTR(UAUDIT,1,1);
+       ATR2RSV1='0000000'B;
+       USERRACX=UDRACX, BY NAME;
+       MS=STA#;
+       UNIT=UNIT#;
+       DATELC=USRDATE;
+       TIMELC=USRTIME;
+       EXPDTINFO=UDEXPDT, BY NAME;         /*  GET EXPDT INFORMATION */
+0      DO I = 1 TO MIN(CONGRPCT,DIM(CONGRPNM,1))
+                    WHILE(RACF_DONE=OFF);/* GET GROUP(S) AUTHORITY   */
+          GROUP=CONGRPNM(I);           /* ASSIGN CONNECT GROUP       */
+          GRPLEN=INDEX(GROUP,' ')-1;/* COMPUTE LENGTH OF GROUPNAME   */
+          IF GRPLEN < 1 THEN GRPLEN=8; /* IF NO BLANK, LENGTH=8      */
+          GRPID=SUBSTR(GROUP,1,GRPLEN); /* CHANGE TO VARYING STRING  */
+          IF GROUP=DFLTGRP THEN DEFAULT='D'; /* SET DEFAULT IND.     */
+                           ELSE DEFAULT=' '; /* ELSE TURN IT OFF     */
+          CONID=USRID××LOW(1)××GRPID;/* CONNECT=USERID+X'00'+GROUPID */
+          CALL RACFCON('LOCATE  ',CONID,MGRRC); /* PROCESS CONNECT   */
+          IF MGRRC ^= 0 THEN CALL MGRERR(CONID,MGRRC); /*PROCESS ERR */
+                        ELSE           /* OTHERWISE PROCESS FLDS/GRP */
+          DO;
+             USERADSP=USRADSP(1) × CONADSP(1);/* OR ATTRIBUTES       */
+             USERSPEC=USRSPEC(1) × CONSPEC(1);
+             USEROPER=USROPER(1) × CONOPER(1);
+             USERREVK=USRREVK(1) × CONREVK(1);
+             USERGRPA=USRGRPA(1) × CONGRPA(1);
+             CALL RACFGRP('LOCATE  ',GRPID,MGRRC); /*PROCESS GROUP   */
+             IF MGRRC ^= 0 THEN CALL MGRERR(GRPID,MGRRC); /*HANDLE - */
+                           ELSE         /* ANY ERROR, ELSE WRITE OUT */
+             DO J = 1 TO                /* A RECORD FOR EACH CONNECT */
+                MIN(GUSRCNT,DIM(GUSERID,1));/* FIND USR IN ACCESS LST*/
+                IF USERID=GUSERID(J) THEN     /* WHEN HE IS FOUND,   */
+                DO;                           /* GET HIS GROUP AUTH. */
+                                        /*        J = JOIN           */
+                                        /*        X = CONNECT        */
+                                        /*        C = CREATE         */
+                                        /*        U = USE            */
+                   GRPAUTH=BITBYTE(GUSRACS(J),'JXCU     ');
+                   J = GUSRCNT;           /*  SIGNAL DO END AND THEN */
+                   WRITE FILE(OUTFILE) FROM (OUTBUF); /* WRITE IT OUT*/
+                END;
+             END;
+          END;                         /*                            */
+       END;                            /*                            */
+    END;                               /*                            */
+ END;                                  /*  END PROCESS DO LOOP       */
+ CLOSE FILE(OUTFILE), FILE(SYSPRINT);  /*  ALL DONE                  */
+-%INCLUDE RACFUSR;
+ %INCLUDE RACFCON;
+ %INCLUDE RACFGRP;
+ %INCLUDE MGRERR;
+ %INCLUDE BITBYTE;
+ END RACFLU;

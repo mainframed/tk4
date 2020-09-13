@@ -1,0 +1,568 @@
+         TITLE 'IGE0010A LOCAL 2250 ERROR RECOVERY PROCEDURE'
+IGE0010A CSECT
+***********************************************************************
+*                                                                     *
+* MODULE NAME:                                                        *
+*    IGE0010A                                                         *
+*                                                                     *
+* DESCRIPTIVE NAME:                                                   *
+*    LOCAL 2250 ERROR RECOVERY PROCEDURE                              *
+*                                                                     *
+* COPYRIGHT:                                                          *
+*    NONE                                                             *
+*                                                                     *
+* STATUS:                                                             *
+*    CHANGE LEVEL 000                                                 *
+*                                                                     *
+* FUNCTION:                                                           *
+*    THIS MODULE IS THE ERP FOR LOCALLY ATTACHED  DEVICES OF THE      *
+*    2250 DISPAY SYSTEM. THE MODULE IS SCHEDULED BY IOS.              *
+*    THE FOLLOWING FUNCTIONS ARE PERFORMED BY THIS MODULE:            *
+*        * DETERMINES IF AN ERROR IS RETRYABLE BY THE ERP AND RETRIES *
+*          THOSE THAT ARE.                                            *
+*        * DETERMINES IF ERP RETRIES ARE SUCCESSFUL.                  *
+*        * MAINTAINS THE STATISTICS TABLE FOR THE DEVICE.             *
+*        * REQUESTS OBR LOGOUT WHEN REQUIRED.                         *
+*        * REQUESTS INT REQ OR PERM ERROR MESSAGES WHEN REQUIRED.     *
+*                                                                     *
+* NOTES:                                                              *
+*    DEPENDENCIES:                                                    *
+*        NONE                                                         *
+*    RESTRICTIONS:                                                    *
+*        THIS ERP IS FOR LOCALLY ATTACHED DEVICES ONLY USING EXCP     *
+*    REGISTER CONVENTIONS:                                            *
+*        SEE 'REGISTER DEFINITIONS' BELOW                             *
+*                                                                     *
+* PATCH LABEL:                                                        *
+*    PACHAREA (80 BYTES)                                              *
+*                                                                     *
+* MODULE TYPE:                                                        *
+*    PROCEDURE                                                        *
+*    PROCESSOR:                                                       *
+*        BAL                                                          *
+*    MODULE SIZE:                                                     *
+*        784 BYTES                                                    *
+*    ATTRIBUTES:                                                      *
+*        REENTRANT, ENABLED, KEY 0, SUPERVISOR STATE, NO LOCKS HELD   *
+*                                                                     *
+* ENTRY POINT:                                                        *
+*    IGE0010A                                                         *
+*    PURPOSE:                                                         *
+*        THIS MODULE IS ENTERED WHEN ONE OR MORE OF THE FOLLOWING     *
+*        CONDITIONS IS ENCOUNTERED:                                   *
+*            UNIT CHECK                                               *
+*            UNIT EXCEPTION                                           *
+*            INVALID COMMAND SEQUENCE                                 *
+*            INCORRECT LENGTH                                         *
+*            PROGRAM CHECK                                            *
+*            PROTECTION CHECK                                         *
+*            CHAINING CHECK                                           *
+*            CHANNEL DATA CHECK                                       *
+*            INTERFACE CONTROL CHECK                                  *
+*            CHANNEL CONTROL CHECK                                    *
+*            COMMAND REJECT                                           *
+*    LINKAGE:                                                         *
+*        THIS MODULE IS SCHEDULED FOR EXECUTION BY THE INPUT/OUTPUT   *
+*        SUPERVISOR. IT RUNS UNDER AN SIRB.                           *
+*    INPUT:                                                           *
+*        REG 1 = ADDRESS OF IOSB                                      *
+*    OUTPUT:                                                          *
+*        RECOVERABLE ERRORS:                                          *
+*            IOSERR IS SET ON FOR RETRY                               *
+*            IF A MESSAGE IS TO BE ISSUED, EXIT IS MADE TO IGE0025C   *
+*            IF NO MESSAGE, SVC 15 IS ISSUED, THEN EXIT IS VIA SVC 3  *
+*        CORRECTED ERRORS:                                            *
+*            IOSEX AND IOSERR ARE SET OFF                             *
+*            IOSB IS CLEANED UP                                       *
+*            EXIT IS TO IGE0025D TO UPDATE STATISTICS TABLE           *
+*        PERMANENT ERRORS:                                            *
+*            AN OBR LOGOUT IS SCHEDULED                               *
+*            A STATISTIC TABLE UPDATE IS SCHEDULED                    *
+*            IOSEX IS SET ON                                          *
+*            IOSERR IS SET OFF                                        *
+*            EXIT IS TO IGE0025C TO ISSUE PERM ERROR MESSAGE          *
+*        PROGRAMMING ERRORS:                                          *
+*            SVC 15 IS ISSUED                                         *
+*            IOSEX IS SET ON                                          *
+*            IOSERR IS SET OFF                                        *
+*            EXIT IS VIA SVC 3                                        *
+*                                                                     *
+* EXITS-NORMAL:                                                       *
+*    SUPERVISOR VIA SVC 3                                             *
+*    STATISTICS UPDATE ROUTINE (IGE0025D) VIA BRANCH ENTRY TO XCTL    *
+*    IOS-WTO ROUTINE (IGE0025C) VIA BRANCH ENTRY TO XCTL              *
+*                                                                     *
+* EXITS-ERROR:                                                        *
+*    NONE                                                             *
+*                                                                     *
+* EXTERNAL REFERENCES:                                                *
+*    ROUTINES:                                                        *
+*        SVC 15 ERROR EXCP                                            *
+*    DATA AREAS                                                       *
+*        CHANNEL PROGRAM                                              *
+*        ERP WORKAREA (MAPPED BY IECDERWA)                            *
+*    CONTROL BLOCKS                                                   *
+*        UCB          (MAPPED BY IEFUCBOB)                            *
+*        IOSB         (MAPPED BY IECDIOSB)                            *
+*        CVT          (MAPPED BY CVT)                                 *
+*        RQE          (MAPPED BY IECDRQE)                             *
+*        IOB          (MAPPED BY IEZIOB)                              *
+*        DCB          (MAPPED BY DCBD)                                *
+*                                                                     *
+* TABLES-WORKAREAS:                                                   *
+*    ERP WORKAREA                                                     *
+*                                                                     *
+* MACROS:                                                             *
+*    NONE                                                             *
+*                                                                     *
+* CHANGE ACTIVITY:                                                    *
+*    YM02594K (11/6/73)                                               *
+*    ZA14030  (10/7/76)                                     D11       *
+*                                                                     *
+***********************************************************************
+         EJECT
+*/*IGE0010A: CHART */
+*/* E IGE0010A */
+*/* D (YES,,NO,PERMER) EXCP */
+*/* D (YES,,NO,START) FIRST ENTRY */
+*/* P CLEAR EWASTUP */
+*/*START: P SET ERP IN CONTROL */
+*/* D (YES,RECOVER,NO,) ICC OR CCC */
+*/* D (YES,SEROUT,NO,) BAD STATUS */
+*/* D (YES,MODEL23,NO,) MOD 2 OR 3 */
+*/* D (YES,,NO,SEROUT) MOD 1 */
+*/* D (YES,SEROUT,NO,) BAD MOD 1 STATUS */
+*/*MODEL23: D (YES,SEROUT,NO,) BAD MOD 2 OR 3 STATUS */
+*/*ER224: D (YES,MAINER,NO,) UNIT CHECK */
+*/*TESTST: D (YES,TESTCONT,NO,) CDC */
+*/* D (YES,WTORTN,NO,) CDC RETRIED */
+*/* P (,RETRY) INDICATE CDC RETRIED */
+*/*TESTCONT: D (YES,,NO,PERMER) PROG OR PROT CHECK */
+*/* D (YES,,NO,CLEARUC) INCORRECT LENGTH */
+*/* P (,PERMER) RESET ERP ENTERED IN IOB */
+*/*CLEARUC: P (,NOERR) RESET UNIT CHECK IN IOSB */
+*/*NOERR: P (,RESET) RESET IOB AND IOSB ERP FLAGS */
+*/*MAINER: P RESET ERROR CORRECTION FLAGS IN DCB */
+*/* D (YES,SEROUT,NO,) IOSB INTERCEPT */
+*/* D (YES,MODL23,NO,) MOD 2 OR 3 */
+*/* D (YES,,NO,SEROUT) MOD 1 */
+*/* D (YES,MOD1BSC,NO,) BAD SENSE BYTE 1 */
+*/* D (YES,SEROUT,NO,NEXT) BAD SENSE BYTE 2 */
+*/*MODL23: D (YES,CKINTREQ,NO,) BAD SENSE BYTE 1 */
+*/* D (YES,SEROUT,NO,) BAD SENSE BYTE 2 */
+*/*NEXT: D (YES,SEROUT,NO,) COM REJ AND BUF RUN */
+*/* D (YES,ISCEDE,NO,) CHAN END AND DEV END */
+*/* D (YES,NOERR,NO,) ATTENTION */
+*/* D (YES,BO1CHK,NO,) BUS OUT CHK */
+*/* D (YES,PERMER,NO,) COM REJ, BUF RUN, DATA CHK */
+*/* D (YES,MOD1BSC,NO,) EQUIP CHECK */
+*/* D (YES,SEROUT,NO,TESTST) INPUT/OUTPUT CHECK */
+*/*BO1CHK: D (YES,WTORTN,NO,) BUSOUT RETRIED */
+*/* P (,RETRY) SET BUSOUT RETRIED */
+*/*ISCEDE: D (YES,BUSERR,NO,) BUS ERR */
+*/* D (YES,DATACX,NO,) DATA CHECK */
+*/* D (YES,MODTWO,NO,TESTST) MOD 2 OR 3 */
+*/*DATACX: D (YES,WTORTN,NO,) DATA CHK RETRIED */
+*/* P (,RETRY) SET DATA CHECK RETRIED */
+*/*BUSERR: D (YES,WTORTN,NO,) BUS ERR RETRIED */
+*/* P (,RETRY) SET BUS ERR RETRIED */
+*/*MODTWO: D (YES,INPERR,NO,) INPUT ERROR */
+*/* D (YES,OUTERR,NO,) OUTPUT ERROR */
+*/* D (YES,,NO,TESTST) EQUIP CHECK */
+*/* D (YES,WTORTN,NO,) ERROR RETRIED */
+*/* P (,RETRY) SET EQUIP CHECK RETRIED */
+*/*RETRY: S SVC 15: ERROR EXCP */
+*/* R SVC 3 */
+*/*INPERR: D (YES,WTORTN,NO,) INPUT ERR RETRIED */
+*/* P (,RETRY) SET INPUT ERR RETRIED */
+*/*OUTERR: D (YES,WTORTN,NO,) OUTPUT ERR RETRIED */
+*/* P (,RETRY) SET OUTPUT ERR RETRIED */
+*/*SEROUT: P INDICATE LOGOUT REQUIRED */
+*/*PERMER: P INDICATE PERMANENT ERROR */
+*/*RESET: P CLEAR ALL RETRY FLAGS */
+*/* P (,XCTL) LOAD STAT UPDATE ROUTINE NAME */
+*/*MOD1BSC: D (YES,,NO,CKINTREQ) EQUIP CHECK */
+*/* D (YES,NOERR,NO,WTORTN) ATTENTION */
+*/*CKINTREQ: D (YES,WTORTN,NO,SEROUT) INT REQ */
+*/*RECOVER: D (YES,ASROUT,NO,) ICC OR CCC RETRIED */
+*/* D (YES,ASROUT,NO,) IOSB INTERCEPT */
+*/* D (YES,ASROUT,NO,) UNCOND NO RETRY */
+*/* D (YES,MORETEST,NO,RETRY2) ERPIB CODE 2 */
+*/*RETRY2: P SET ICC OR CCC RETRIED */
+*/* P (,RETRY) ZERO OUT ERPIB */
+*/*MORETEST: D (YES,SIOTST,NO,) SIO */
+*/* D (YES,,NO,ASROUT) VALID COMMAND */
+*/* P FIND PREVIOUS CCW */
+*/* D (YES,ASROUT,NO,) PAST START OF CCWS */
+*/*CONTCCW: D (YES,ASROUT,NO,) READXY */
+*/* D (YES,ASROUT,NO,RETRY2) READMI */
+*/*SIOTST: P (,CONTCCW) POINT TO SIO CCW AND IOSB */        D11 ZA14030
+*/*ASROUT: P (,WTORTN) ZERO ERPIB */
+*/*WTORTN: D (YES,SEROUT,NO,) OP CONSOLE */
+*/* P SET PERM ERROR AND LOGOUT REQUIRED */
+*/* P CLEAR RETRY INDICATORS */
+*/* P (,XCTL) LOAD WTO ROUTINE NAME */
+*/*XCTL: P MOVE SENSE TO STAT ROUTINE FIELD IN IOSB */
+*/* R BRANCH REG 14 */
+         EJECT
+         USING *,BASERG
+         LR    BASERG,ERREG2       BASE PROGRAM
+         USING EWA,ERPWAREG
+         USING CVTMAP,CVTREG
+         USING IOSB,IOSBREG
+         USING UCBSET,UCBREG
+         USING IOBSTDRD,IOBREG
+         USING RQE,RQEREG
+         LR    IOSBREG,PARMREG          LOAD IOSB POINTER
+         L     CVTREG,CVTPTR            LOAD CVT POINTER
+         L     UCBREG,IOSUCB            BASE UCB
+         L     ERPWAREG,IOSERP          LOAD ERP WORKAREA POINTER
+         L     RQEREG,IOSUSE            BASE RQE
+         L     IOBREG,RQEIOB            BASE IOB
+         DROP  RQEREG
+         CLI   IOSDVRID,IOSXCPID        EXCP I/O
+         BNE   PERMER                   NO,PERM ERROR
+         TM    IOSFLA,IOSERR           FIRST ENTRY
+         BO    START                   NO
+         XC    EWASTUP(N2),EWASTUP     CLEAR STAT UPDATE AREA
+START    EQU   *
+         OI    IOSFLA,IOSERR+IOSEX      TURN ON ERROR BITS IN IOSB
+         OI    IOBFLAG1,IOBERRTN+IOBIOERR   ALSO IN IOB
+         OI    IOBERRCT,HEX01+HEX02     FLAGS FOR CHANNEL END APPENDAGE
+         TM    IOSTSB,ASRCHK            TEST FOR CCC OR ICC
+         BNZ   RECOVER                  ANY OR ALL ON
+         TM    IOSTSB,CHAIN             SHOULD NOT OCCUR STATUS
+         BNZ   SEROUT                   BRANCH IF ANY OR ALL SET
+         TM    UCBTBYT1,MODEL2          2250 MODEL 2 OR 3
+         BO    MODEL23                  YES
+         TM    UCBTBYT1,MODEL1          2250 MODEL 1
+         BNO   SEROUT                   NO
+         TM    IOSTSA,BADSTAT1          BAD STATUS FOR MOD 1
+         BNZ   SEROUT                   BRANCH IF ANY OR ALL
+MODEL23  EQU   *
+         TM    IOSTSA,BADSTAT2          BAD STATUS FOR MOD 2/3
+         BNZ   SEROUT                   BRANCH IF ANY OR ALL
+         TM    IOSTSB,CDCBIT            CHECK IF CHAN RETRY POSSIBLE
+         BNO   ER224                    IF CHANNEL OK, CONTINUE
+         OI    EWASTUP+N1,HEX01         SET CDC FOR STAT UPDATE
+ER224    EQU   *
+         TM    IOSTSA,UNITCK            UC PRIORITY OVER CDC
+         BO    MAINER                   BRANCH IF UNIT CHECK PRESENT
+TESTST   EQU   *
+         TM    IOSTSB,CDCBIT            CHECK IF CHAN RETRY POSSIBLE
+         BNO   TESTCONT                 IF CHANNEL OK, CONTINUE
+         TM    EWACNTR2,CDCIND          FIRST RETRY
+         BO    WTORTN                   IF NOT, NOTIFY OPERATOR
+         OI    EWACNTR2,CDCIND          IF YES, SET SWITCH
+         B     RETRY                    RESTART CHANNEL
+TESTCONT EQU   *
+         TM    IOSTSB,ST2ALL            PROGRAM CHECK/PROTECTION CHECK
+         BNZ   PERMER                   BRANCH IF ANY OR ALL PRESENT
+         TM    IOSTSB,INCLEN            INCORRECT LENGTH
+         BNO   CLEARUC                  NO
+         NI    IOBERRCT,N255-HEX02      RESET ERP ENTERED
+         B     PERMER                   GO SET REST OF INDICATORS
+CLEARUC  EQU   *
+         NI    IOSTSA,N255-UNITCK       RESET UNIT CHECK STATUS
+NOERR    EQU   *
+         NI    IOSFLA,N255-IOSEX-IOSERR   CLEAR IOSB ERROR FLAGS
+         NI    IOBFLAG1,N255-IOBERRTN-IOBIOERR   ALSO IN IOB
+         NI    IOSFLB,N255-IOSMSG-IOSLOG   CLEAR IOSB ERROR FLAGS
+         NI    IOBERRCT,N255-HEX02      RESET ERP ENTERED
+         B     RESET                    LEAVE
+MAINER   EQU   *
+         USING IHADCB,ERREG5
+         L     ERREG5,IOBDCBPT          BASE DCB
+         NI    DCBIFLGS,N255-DCBIFEC    RESET ERROR CORRECTION FLAGS
+         DROP  ERREG5
+         CLI   IOSCOD,IOSFINTC          IOSB INTERCEPT
+         BE    SEROUT                   IF YES TAKE BRANCH
+         TM    UCBTBYT1,MODEL2          2250 MOD 2 OR 3
+         BO    MODL23                   YES
+         TM    UCBTBYT1,MODEL1          2250 MOD 1
+         BNO   SEROUT                   NO
+         TM    IOSSNS,SNOCUR            SHOULD NOT OCCUR SENSE
+         BNZ   MOD1BSC                  TEST FOR EC OR IR
+         TM    IOSSNS+N1,SNOCUR12       SHOULD NOT OCCUR MOD 1 SENSE
+         BNZ   SEROUT                   BRANCH IF ANY OR ALL PRESENT
+         B     NEXT                     CONTINUE TESTING
+MODL23   EQU   *
+         TM    IOSSNS,SNOCUR2           TEST FOR SHOULD NOT OCCUR
+         BNZ   CKINTREQ                 ANY OR ALL PRESENT
+         TM    IOSSNS+N1,SNOCUR22       TEST FOR SHOULD NOT OCCUR
+         BNZ   SEROUT                   ANY OR ALL PRESENT
+NEXT     EQU   *
+         TM    IOSSNS,CRJBRN            COMMAND REJECT/BUFFER RUNNING
+         BO    SEROUT                   BRANCH IF BOTH PRESENT
+         TM    IOSTSA,CHNEND+DEVEND     CHAN END/DEV END
+         BO    ISCEDE                   BRANCH IF YES
+         TM    IOSTSA,ATTENT            TEST FOR ATTENTION
+         BO    NOERR                    BRANCH IF PRESENT
+         TM    IOSSNS,BUSOUT            TEST FOR BUS OUT CHECK
+         BO    BO1CHK                   BRANCH IF PRESENT
+         TM    IOSSNS,CRJBRN+DATACK     COMMAND REJECT/DATA CHECK
+*                                       OR BUFFER RUNNING
+         BNZ   PERMER                   BRANCH ANY OR ALL PRESENT
+         TM    IOSSNS,EQPCHK            EQUIPMENT CHECK
+         BO    MOD1BSC                  YES
+         TM    IOSSNS+N1,INCHK+OUTCHK   INPUT/OUTPUT CHECK
+         BNZ   SEROUT                   BRANCH ANY OR ALL PRESENT
+         B     TESTST                   BRANCH
+BO1CHK   EQU   *
+         TM    EWACNTR1,BO1IND          HAS ERROR BEEN RETRIED
+         BO    WTORTN                   BRANCH IF YES
+         OI    EWACNTR1,BO1IND          SET RETRY INDICATOR
+         B     RETRY                    BRANCH TO RETRY EXIT
+ISCEDE   EQU   *
+         TM    IOSSNS,BUSOUT            TEST FOR BUS OUT
+         BO    BUSERR                   BRANCH IF YES
+         TM    IOSSNS,DATACK            TEST FOR DATA CHECK
+         BO    DATACX                   BRANCH IF YES
+         TM    UCBTBYT1,MODEL2          2250 MODEL 2 OR 3
+         BO    MODTWO                   YES
+         B     TESTST                   BRANCH
+DATACX   EQU   *
+         TM    EWACNTR1,DC1IND          HAS ERROR BEEN RETRIED
+         BO    WTORTN                   BRANCH IF YES
+         OI    EWACNTR1,DC1IND          SET RETRY INDICATOR
+         B     RETRY                    BRANCH
+BUSERR   EQU   *
+         TM    EWACNTR1,BO2IND          HAS ERROR BEEN RETRIED
+         BO    WTORTN                   BRANCH IF YES
+         OI    EWACNTR1,BO2IND          TURN ON RETRY INDICATOR
+         B     RETRY                    BRANCH
+MODTWO   EQU   *
+         TM    IOSSNS+N1,INCHK          TEST FOR INPUT CHECK
+         BO    INPERR                   BRANCH IF PRESENT
+         TM    IOSSNS+N1,OUTCHK         TEST FOR OUTPUT CHECK
+         BO    OUTERR                   BRANCH IF PRESENT
+         TM    IOSSNS,EQPCHK            TEST FOR EQUIPMENT CHECK
+         BZ    TESTST                   BRANCH IF NOT EQUIPMENT CHECK
+         TM    EWACNTR1,ECIND           HAS ERROR BEEN RETRIED
+         BO    WTORTN                   BRANCH IF YES
+         OI    EWACNTR1,ECIND           SET RETRY INDICATOR
+RETRY    EQU   *
+         SVC   EXCPER                   ERROR EXECUTE CHANNEL PROGRAM
+         SVC   RETURN                   RETURN TO SUPERVISOR
+INPERR   EQU   *
+         TM    EWACNTR1,INPIND          HAS ERROR BEEN RETRIED
+         BO    WTORTN                   BRANCH IF YES
+         OI    EWACNTR1,INPIND          SET RETRY INDICATOR
+         B     RETRY                    BRANCH TO RETRY EXIT
+OUTERR   EQU   *
+         TM    EWACNTR1,OUTIND          HAS ERROR BEEN RETRIED
+         BO    WTORTN                   BRANCH IF YES
+         OI    EWACNTR1,OUTIND          SET RETRY INDICATOR
+         B     RETRY                    BRANCH TO RETRY EXIT
+SEROUT   EQU   *
+         OI    IOSFLB,IOSLOG            LOGOUT REQUIRED
+PERMER   EQU   *
+         NI    IOSFLA,N255-IOSERR       PERMANENT ERROR
+         NI    IOBFLAG1,N255-IOBERRTN   ALSO IN IOB
+RESET    EQU   *
+         XC    EWACNTR1(N2),EWACNTR1    RESET RETRY INDICATORS
+         LA    ERREG3,ERRNM1            LOAD STAT ROUTINE ID
+         B     XCTL                     GO TO XCTL TO STAT ROUTINE
+MOD1BSC  EQU   *
+         TM    IOSSNS,N255-ECIND        EQUIPMENT CHECK
+         BNZ   CKINTREQ                 IF NOT GO CHECK INT. REQ.
+         TM    IOSTSA,ATTENT            TEST FOR ATTENTION
+         BO    NOERR                    IF PRESENT TAKE BRANCH
+         B     WTORTN                   SET AS PERMANENT ERROR
+CKINTREQ EQU   *
+         TM    IOSSNS,INTREQ            INTERVENTION REQUIRED
+         BNO   SEROUT                   IF NOT GO LOG ERROR
+         B     WTORTN                   PERMANENT ERROR AND MESSAGE
+RECOVER  EQU   *
+         TM    EWACNTR2,ICCCCC          HAS OPERATION BEEN RETRIED
+         BO    ASROUT                   GO TO PERM ERROR IF YES
+         CLI   IOSCOD,IOSFINTC          IOSB INTERCEPT
+         BE    ASROUT                   YES, GO POST IT AS PERM
+         TM    EWARGFG1,EWANORTY        IS NO RETRY BIT SET
+         BO    ASROUT                   YES, PERM ERROR
+         TM    EWAXCSW2,HEX80           CODE GREATER THAN OR EQUAL 2
+         BO    MORETEST                 IF YES, TEST FURTHER
+RETRY2   EQU   *
+         OI    EWACNTR2,ICCCCC          TURN ON RETRY BIT
+         XC    EWAERPIB(N8),EWAERPIB    ZERO ERPIB
+         B     RETRY                    GO RETRY OPERATION
+MORETEST EQU   *
+         TM    EWARGFG1,HEX80           TEST FOR START I/O
+         BO    SIOTST                   YES, GET START CCW ADR
+         TM    EWAXCSW1,HEX04           CHECK FOR VALID COMMAND
+         BNO   ASROUT                   NOT VALID, NO RETRY
+         L     CCWREG,IOSCC             GET CCW ADDR
+         LA    CCWREG,ZERO(CCWREG)      GET RID OF UNWANTED BYTE
+         SH    CCWREG,EIGHT             SUBRACT 8
+         LTR   CCWREG,CCWREG            ADDRESS NEGATIVE
+         BM    ASROUT                   YES, ERROR
+CONTCCW  EQU   *
+         CLI   ZERO(CCWREG),READXY      CHECK FOR READXY COMMAND
+         BE    ASROUT                   NO RETRY IF YES
+         CLI   ZERO(CCWREG),READMI      CHECK FOR READMI COMMAND
+         BE    ASROUT                   NO RETRY IF YES
+         OI    EWAFLG2,EWAWTEMP         INDICATE WRITE FOR UPDATE RTN
+         B     RETRY2                   GO RETRY OPERATION
+SIOTST   EQU   *
+         L     CCWREG,IOSRST            LOAD ADDRESS OF SIO CCW
+         LR    PARMREG,CCWREG      SET AS PARAMETER            YM02594K
+         L     ERREG2,CVTPTRV      POINT TO TRANSLATOR         YM02594K
+         BALR  RTNREG,ERREG2       REAL TO VIRTUAL             YM02594K
+         LTR   ERREG2,ERREG2       GOOD COMPLETION             YM02594K
+         BNZ   SEROUT              NO, PERM ERROR              YM02594K
+         LR    CCWREG,PARMREG      RESET CCW REG               YM02594K
+         LR    PARMREG,IOSBREG     RESET PARMREG TO IOSB    D11 ZA14030
+         B     CONTCCW                  CHECK CCW              YM02594K
+ASROUT   EQU   *
+         XC    EWAERPIB(N8),EWAERPIB    CLEAR ERPIB
+WTORTN   EQU   *
+         TM    UCBSTAT,UCBSYSR          OPERATOR CONSOLE
+         BO    SEROUT                   YES
+         OI    IOSFLB,IOSMSG+IOSLOG     PERM ERROR MSG AND LOGOUT
+         NI    IOSFLA,N255-IOSERR       PERMANENT ERROR
+         NI    IOBFLAG1,N255-IOBERRTN   ALSO IN IOB
+         XC    EWACNTR1(N2),EWACNTR1    CLEAR RETRY INDICATORS
+         LA    ERREG3,WTO               LOAD WTO ID
+XCTL     EQU   *
+         L     RTNREG,CVTXTLER          BRANCH ENTRY POINT OF XCTL
+         BR    RTNREG                   BRANCH TO TRANSFER CONTROL
+         EJECT
+**********
+*
+*        CONSTANTS
+*
+**********
+EIGHT    DC    H'8'                     EIGHT
+PACHAREA EQU   *
+         DC    20C'010A'               PATCH AREA FOR MAINTENANCE
+         SPACE 2
+**********
+*
+*        REGISTER DEFINITIONS
+*
+**********
+ERREG4   EQU   0                        WORK REG
+PARMREG  EQU   1                        PARAMETER REG
+ERREG1   EQU   3                        WORK REG
+CVTREG   EQU   4                        CVT BASE
+ERREG5   EQU   5                        WORK REG
+IOBREG   EQU   6                        IOB BASE
+ERPWAREG EQU   7                        ERP WORKAREA BASE
+RQEREG   EQU   8                        RQE BASE
+CCWREG   EQU   9                        CHANNEL STATUS WORD REG
+IOSBREG  EQU   10                       IOSB BASE
+UCBREG   EQU   11                       UCB BASE
+BASERG   EQU   12                       PROGRAM BASE
+ERREG3   EQU   13                       WORK REG
+RTNREG   EQU   14                       EXIT REG
+ERREG2   EQU   15                       WORK REG
+         SPACE 2
+**********
+*
+*        MISCELLANEOUS EQUATES
+*
+**********
+ZERO     EQU   0                        ZERO
+N1       EQU   1                        ONE
+N2       EQU   2                        TWO
+N8       EQU   8                        EIGHT
+N9       EQU   9                        NINE
+N255     EQU   255                      MASK FOR AND IMMEDIATE
+EXCPER   EQU   15                       ERROR EXCP (SVC 15)
+RETURN   EQU   3                        RETURN TO SUPERVISOR (SVC 3)
+WTO      EQU   253                      WRITE TO OPERATOR ROUTINE
+ERRNM1   EQU   254                      STATICS UPDATE ROUTINE
+HEX01    EQU   X'01'                    MASK
+HEX02    EQU   X'02'                    MASK
+HEX04    EQU   X'04'                    MASK
+HEX7D    EQU   X'7D'                    MASK
+HEX80    EQU   X'80'                    MASK
+         SPACE 2
+**********
+*
+*        STATUS FLAGS
+*
+**********
+ATTENT   EQU   X'80'                    ATTENTION
+STATSMOD EQU   X'40'                    STATUS MODIFIER
+CONTUEND EQU   X'20'                    CONTROL UNIT END
+CHNEND   EQU   X'08'                    CHANNEL END
+DEVEND   EQU   X'04'                    DEVICE END
+UNITCK   EQU   X'02'                    UNIT CHECK
+UNITEXCP EQU   X'01'                    UNIT EXECPTION
+BADSTAT1 EQU   STATSMOD+CONTUEND+UNITEXCP   BAD STATUS MODEL 1
+BADSTAT2 EQU   UNITEXCP                 BAD STATUS MODEL 2 OR 3
+INCLEN   EQU   X'40'                    INCORRECT LENGTH
+PROGCK   EQU   X'20'                    PROGRAM CHECK
+PROTCK   EQU   X'10'                    PROTECTION CHECK
+CHAIN    EQU   X'01'                    CHAINING CHECK
+ST2ALL   EQU   PROGCK+PROTCK            PROGRAM AND PROTECTION CHECK
+ASRCHK   EQU   X'06'                    TOTAL OF INTERFACE AND
+*                                       CHANNEL CONTROL CHECKS
+CDCBIT   EQU   X'08'                    CHANNEL DATA CHECK
+         SPACE 2
+**********
+*
+*        SENSE BITS
+*
+**********
+COMREJ   EQU   X'80'                    COMMAND REJECT
+BUSOUT   EQU   X'20'                    BUS OUT
+EQPCHK   EQU   X'10'                    EQUIPMENT CHECK
+DATACK   EQU   X'08'                    DATA CHECK
+BUFRUN   EQU   X'02'                    BUFFER RUNNING
+CRJBRN   EQU   COMREJ+BUFRUN            COMMAND REJECT+BUFFER RUNNING
+INTREQ   EQU   X'40'                    INTERVENTION REQUIRED
+SNOCUR   EQU   X'55'                    BAD SENSE BYTE 0 MODEL 1
+SNOCUR12 EQU   X'1F'                    BAD SENSE BYTE 1 MODEL 1
+SNOCUR2  EQU   X'45'                    BAD SENSE BYTE 0 MODEL 2 OR 3
+SNOCUR22 EQU   X'19'                    BAD SENSE BYTE 1 MODEL 2 OR 3
+INCHK    EQU   X'02'                    2840 INPUT CHECK
+OUTCHK   EQU   X'04'                    2840 OUTPUT CHECK
+         SPACE 2
+**********
+*
+*        ERROR RETRY INDICATORS
+*
+**********
+BO1IND   EQU   X'80'                    BUS OUT 1
+BO2IND   EQU   X'40'                    BUS OUT 2
+DC1IND   EQU   X'20'                    DATA CHECK 1
+ECIND    EQU   X'10'                    EQUIPMENT CHECK
+INPIND   EQU   X'08'                    2840 INPUT CHECK
+OUTIND   EQU   X'04'                    2840 OUTPUT CHEK
+ICCCCC   EQU   X'80'                    ICC AND CCC
+CDCIND   EQU   X'40'                    CHANNEL DATA CHECK
+         SPACE 2
+**********
+*
+*       MODEL TYPES USED WITH UCBTBYT1
+*
+**********
+MODEL1   EQU   X'31'                    2250 MODEL 1 ID
+MODEL2   EQU   X'32'                    2250 MODEL 2 ID
+         SPACE 2
+**********
+*
+*        COMMAND CODES
+*
+**********
+READXY   EQU   X'12'                    READ X - Y REGISTERS
+READMI   EQU   X'0E'                    READ MANUAL INPUT
+         EJECT
+CVTSET   DSECT
+         CVT
+         EJECT
+         IECDIOSB
+         EJECT
+UCBSET   DSECT
+         IEFUCBOB
+         EJECT
+         IEZIOB
+         EJECT
+         IECDRQE
+         EJECT
+         IECDERWA
+         EJECT
+         DCBD
+         END

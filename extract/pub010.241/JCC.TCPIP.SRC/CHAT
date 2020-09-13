@@ -1,0 +1,214 @@
+/*
+ * MVS38j CHAT: Client to connect to a listening network-cat tool
+ *              like ncat, netcat or socat and perform a simple chat.
+ *
+ * Usage: The CHAT program prompts for a target address to connect to.
+ *        Enter the address of the listening network-cat in
+ *        <dotted decimal><:port> or <hostname><:port> notation.
+ *        If the port is omitted, port nummer 4466 is assumed; pressing
+ *        just enter uses 127.0.0.1:4466.
+ *
+ *        Conduct the chat by arbitrarily entering data on the CHAT
+ *        terminal to be displayed at the network-cat system and on the
+ *        network-cat system to be displayed at the CHAT terminal.
+ *
+ *        To terminate either enter /* on the CHAT terminal or send EOT
+ *        from the network-cat system.
+ *
+ * Author: Juergen Winkelmann, winkelmann@id.ethz.ch, 16/08/15
+ *
+ * Socket connection logic adapted from Jason Winter's sample EMAIL program.
+ *
+ */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <sockets.h>
+#include <mvsutils.h>
+ 
+#define buffer_size 256
+#define default_port 4466
+ 
+long   running = 0;
+long   sclosed = 0;
+SOCKET Ccom_han;
+ 
+unsigned char * TGET; /* TGET flags */
+unsigned char * TPUT; /* TPUT flags */
+ 
+void trim (char * s) {
+    long i;
+ 
+    i = strlen (s);
+    while (--i >= 0) if (s [i] == ' ') s [i] = 0; else break;
+};
+ 
+unsigned int read_term () {
+    char buffer  [buffer_size];
+    char editbuf [buffer_size];
+    char noinput [2] = {0x04, 0x0c};
+    char unlock  [4] = {0x27, 0xf1, 0xc3, 0x00};
+    long i;
+    * TGET = 0x90;     /* use TGET NOWAIT     */
+    * TPUT = 0x02;     /* use TPUT CONTROL    */
+    _putline (unlock); /* unlock keyboard     */
+    * TPUT = 0x00;     /* revert to TPUT EDIT */
+ 
+    strcpy (editbuf, "Sent:     ");
+ 
+    while (running) {
+        strcpy ((char*) buffer, _getline ());
+        if (strcmp (buffer, "/*") == 0) {
+            _putline ("terminating at EOD.");
+            running = 0;
+            break;
+        };
+ 
+        i = strlen (buffer);
+ 
+        if ((i == 2) && (memcmp (buffer, noinput, 2) == 0)) Sleep (250);
+ 
+        else {
+ 
+            strcpy (editbuf + 10, buffer);
+            ebcdic2ascii (buffer, i);
+            buffer [i++] = 10;
+ 
+            if (i != 1) {
+                if (send (Ccom_han, buffer, i, 0) == SOCKET_ERROR) {
+                    _putline ("send failed, terminating.");
+                    running = 0;
+                    break;
+                };
+            };
+            _putline (editbuf); /* repeat sent message locally */
+            * TPUT = 0x02;      /* use TPUT CONTROL            */
+            _putline (unlock);  /* unlock keyboard             */
+            * TPUT = 0x00;      /* revert to TPUT EDIT         */
+        };
+    };
+ 
+    if (sclosed) sclosed = closesocket (Ccom_han);
+    return (0);
+ 
+};
+ 
+int main () {
+    long             i;
+    long             rd_term;
+    char           * search;
+    long             size;
+    long             sockerr;
+    unsigned short   port_number;
+    char             ip_adx [260];
+    SOCKADDR_IN      Clocal_adx;
+    struct hostent * result;
+    char             buffer [buffer_size];
+    char             editbuf [buffer_size];
+    char newline [2] = {0x15, 0x00};
+ 
+    // The TGET and TPUT flag bytes can be found at the end of the
+    // MVSUTILC member of the JCC library, location zero is _putline.
+    // The hardcoded offsets need to be reviewed after MVSUTILC updates.
+ 
+    TGET = (unsigned char *) ((unsigned int) (&_putline) + 0x0ab2);
+    TPUT = (unsigned char *) ((unsigned int) (&_putline) + 0x0ab6);
+ 
+    strcpy (editbuf, "Received: ");
+ 
+    _putline ("Enter target address:");
+    strcpy ((char*) buffer, _getline ());
+ 
+    // set up socket
+    Clocal_adx.sin_family = AF_INET;
+    strcpy (ip_adx, buffer);
+ 
+    search = strstr (ip_adx, ":");
+    if (search == NULL) {
+        port_number = default_port;
+    } else {
+        search [0] = '\0';
+        search++;
+        port_number = atoi (search);
+    };
+ 
+    if ((Clocal_adx.sin_addr.s_addr = inet_addr (ip_adx)) == INADDR_NONE) {
+        ebcdic2ascii (ip_adx, strlen (ip_adx));
+        if ((result = gethostbyname (ip_adx)) == NULL) {
+            _putline ("gethostbyname failed.");
+            return (-1);
+        };
+        if (result->h_addr_list[0] == NULL) {
+            _putline ("gethostbyname returned null.");
+            return (-1);
+        };
+        Clocal_adx.sin_addr.s_addr = ((long *)(result->h_addr_list [0])) [0];
+    };
+ 
+    Clocal_adx.sin_port = ntohs (port_number);
+ 
+    if ((Ccom_han = socket (PF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) {
+        _putline ("socket failed.");
+        return (WSAGetLastError ());  // ERROR
+    };
+ 
+    // connect
+    if (connect (Ccom_han, (LPSOCKADDR)&Clocal_adx, sizeof (Clocal_adx))) {
+        _putline ("connect failed.");
+        sockerr = WSAGetLastError ();
+        closesocket (Ccom_han);
+        return (sockerr);  // ERROR
+    };
+ 
+    running = 1;
+    sclosed = 1;
+ 
+    strcpy (buffer, "Connected. Enter text to be transmitted, EOT (Ctrl-V Ctrl-D Enter) to terminate.");
+    i = strlen (buffer);
+    ebcdic2ascii (buffer, i);
+    buffer [i++] = 10;
+ 
+    if (send (Ccom_han, buffer, i, 0) == SOCKET_ERROR) {
+        _putline ("send failed, terminating.");
+        closesocket (Ccom_han);
+        return (-1);
+    };
+ 
+    rd_term = beginthread (&read_term, 0, NULL);
+    Sleep (100);
+    _putline ("Connected. Enter text to be transmitted, /* to terminate.");
+ 
+    while (running) {
+ 
+        // receive data
+        if ((i = recv (Ccom_han, buffer, buffer_size, 0)) == SOCKET_ERROR) {
+            if (WSAGetLastError() != ENOTSOCK)
+                _putline ("recv failed, terminating.");
+            running = 0;
+            break;
+        };
+ 
+        ascii2ebcdic (buffer, i);
+ 
+        if (buffer [0] == 55) {
+            _putline ("terminating at EOT.");
+            running = 0;
+            break;
+        };
+ 
+        // print to terminal
+        buffer [i-1] = 0;
+        strcpy (editbuf + 10, buffer);
+        * TPUT = 0x01;      /* use TPUT ASIS                         */
+        _putline (newline); /* prevent destroying not yet sent input */
+        * TPUT = 0x00;      /* revert to TPUT EDIT                   */
+        _putline (editbuf); /* display received message              */
+ 
+    };
+ 
+    if (sclosed) sclosed = closesocket (Ccom_han);
+    syncthread(rd_term);
+ 
+    return(0);
+};

@@ -1,0 +1,1064 @@
+TAPECOP  CSECT
+****************************************************************
+*
+*   EXPCOPY - TAPE COPY PROGRAM
+*
+*
+*   THIS PROGRAM READS AN INPUT TAPE (DDNAME=TAPER) AND COPIES
+*   IT ONTO ONE,TWO OR THREE OUTPUT TAPES (DDNAMES=TAPEW1,TAPEW2,
+*   AND TAPEW3).  THE NUMBER OF TAPES IS SPECIFIED BY THE USER IN
+*   A PARAMETER ON THE EXEC CARD (PARM=1, PARM=2 OR PARM=3).
+*   THIS PARAMETER MUST BE SPECIFIED.
+*
+*   ANY PHYSICAL BLOCK SIZE IS PERMISSABLE, BUT IF ONE GREATER THEN
+*   10000 IS REQUIRED THEN THE USER MUST SPECIFY IT ON THE DDCARD
+*   FOR THE INPUT TAPE(DDNAME=TAPER).  THIS ENABLES THE
+*   PROGRAM TO OBTAIN SUFFICIENT BUFFER SPACE.
+*
+*   THE PROGRAM WILL COPY LABELLED OR UNLABELLED TAPES, BUT IT
+*   EXPECTS TO FIND A DOUBLE TAPE MARK AT THE END OF THE DATA TO
+*   BE COPIED.   THUS THIS PROGRAM IS NOT SUITABLE FOR COPYING
+*   TAPES WHICH CONSTITUTE ONLY ONE PART OF A MULTI-VOLUME
+*   DATA SET.   SUCH TAPES END WITH ONLY A SINGLE TAPE MARK.
+*   ALL LABEL PROCESSING IS DONE BY THE PROGRAM, SO THAT EVEN WITH
+*   NON-STANDARD LABELS THE USER NEED NOT SPECIFY IN THE JCL THAT
+*   LABEL PROCESSING HAS TO BE BYPASSED.
+*   IN ALL CASES INFORMATION ON THE NUMBER OF RECORDS/FILE AND
+*   ON MINIMUM AND MAXIMUM COUNTS WILL BE PRINTED.  IN ADDITION,
+*   IF THE TAPE HAS STANDARD IBM LABELS, EXTRA INFORMATION WILL
+*   BE PRINTED.
+*
+*   THE USER MAY REQUEST THAT THE VOL-SER NUMBER OF THE OUTPUT
+*   TAPE(S) BE DIFFERENT FROM THAT ON THE INPUT TAPE.  THIS IS
+*   SPECIFIED ON THE EXEC CARD, E.G. PARM='1,E00029'.
+*   IF A VOLUME SERIAL NUMBER IS SPECIFIED IT MUST BE 6 CHARS LONG.
+*   IF MORE THAN ONE OUTPUT TAPE IS SPECIFIED THEN EITHER ALL
+*   THE TAPES TAKE THE SAME VOL-SER NUMBER AS THE INPUT TAPE,
+*   OR NEW VOL-SER NUMBERS MUST BE SPECIFIED FOR ALL THE OUTPUT TAPES.
+*   IF THE VOL-SER NUMBER OF THE INPUT TAPE IS TO BE COPIED ONTO
+*   THE  OUTPUT TAPE(S), THEN ONLY THE PARAMETER INDICATING THE
+*   THE NUMBER OF OUTPUT TAPES IS REQUIRED.
+*   IF THE TAPE IS UNLABELLED THEN THE SECOND PARAMETER MUST
+*   NOT BE SPECIFIED.
+*
+*   A FURTHER USEFUL FEATURE OF THE PROGRAM IS THAT IT CAN BE USED
+*   WITHOUT AN OUTPUT TAPE.  IN THIS CASE THE PROGRAM WILL PRINT OUT
+*   ALL THE HEADER INFORMATION FOR EACH DATA SET ON THE TAPE,
+*   AS WELL AS INFORMATION ON THE NUMBER OF RECORDS IN EACH DATASET
+*   AND MINIMUMAND MAXIMUM BLOCK COUNTS.
+*   IN ORDER TO USE THE PROGRAM IN THIS MODE IT IS NECESSARY TO SPECIFY
+*   PARM=0 ON THE EXEC CARD.
+*
+*   THE PROGRAM'S I/O IS BASED ON "EXCP'S" AND IS DOUBLE BUFFERED.
+*
+*
+*   EXAMPLE OF REQUIRED JCL:
+*
+*    // EXEC PGM=EXPCOPY,PARM='2,E00111,E00128'
+*    //TAPER DD UNIT=TAPE9,VOL=SER=E00199
+*    //TAPEW1 DD UNIT=TAPE9,VOL=SER=E00111
+*    //TAPEW2 DD UNIT=TAPE9,VOL=SER=E00128
+*    //SYSPRINT DD SYSOUT=A
+*
+*
+*     IMPORTANT NOTE:
+*
+*    THE PARM=3 OPTION HAS NOT BEEN TESTED BECAUSE OF LACK OF
+*    SUITABLE FACILITIES.
+*
+*
+*
+*
+*************** NOW THE PROGRAM ********************************
+*
+*
+******************** REGISTER USAGE **********************************
+*
+*    REGISTERS 5,6,7,11 AND 12 ARE USED FOR ADDRESSING
+*    REGISTER  2 IS THE COUNTOF THE INPUT RECORD
+*    REGISTER 3  CONTAINS THE NUMBER OF OUTPUT TAPES.
+*    REGISTER  4 IS A STORE FOR THE MAX COUNT
+*    REGISTER  8 IS THE RETURN ADDRESS USED IN CALLS TO LABQ
+*    REGISTER  9 IS USED ONLY LOCALLY
+*    REGISTER  10 CONTAINS THE BUFFER ADDRESS ON CALLS TO LABQ
+*
+*
+*       SYNONYMS
+*
+COUNT    EQU   2
+*
+*
+*      PRELIMINARIES
+*
+         STM   14,12,12(13)
+         BALR  12,0
+         USING *,12,11,7
+         USING BUFFERA,5
+         USING BUFFERB,6
+         CNOP  0,4
+         BAL   15,*+76
+         DC    18F'0'
+         ST    15,8(13)
+         ST    13,4(15)
+         LR    13,15
+         LA    11,2048(12)
+         LA    11,2048(11)
+         LA    7,2048(11)
+         LA    7,2048(7)
+*
+*      END OF PRELIMINARIES
+*
+*     EXTRACT INFORMATION FROM PARAMATER AREA
+         L     1,0(1)
+         IC    3,2(1)
+         SLL   3,28
+         SRL   3,28
+         ST    1,PAD    STORE ADDRESS OF PARAMETER REGION
+*
+*      OPEN PRINT FILE
+*
+         OPEN  (PRINT,OUTPUT)
+*
+*
+*      RDJFCB'S TO ENABLE US:
+*       (A) TO BYPASS LABEL PROCESSING
+*       (B) TO GET APPROPRIATE BUFFER SIZE
+*
+*       NOTE THAT R2 CONTAINS COUNT USED FOR ALL CCW'S
+*
+         RDJFCB TAPER
+         C     3,=F'0'
+         BE    BLP
+         RDJFCB TAPEW1
+         C     3,=F'1'
+         BE    BLP
+         RDJFCB TAPEW2
+         C     3,=F'2'
+         BE    BLP
+         RDJFCB TAPEW3
+BLP      EQU   *
+         MVI   JFCBR+66,16
+         MVI   JFCBW1+66,16
+         MVI   JFCBW2+66,16
+         MVI   JFCBW3+66,16
+         LH    COUNT,JFCBR+102
+         CH    COUNT,=H'0'
+         BNE   GETSPACE        BRANCH IF USER HAS PROVIDED BLKSIZE
+         LH    COUNT,=H'10000'
+*
+*         GET BUFFER SPACE (TWO BUFFERS)
+*
+GETSPACE ST    COUNT,LIST
+         MVI   LIST,X'FF'
+         GETMAIN EU,LV=(COUNT),A=BUFA
+         GETMAIN EU,LV=(COUNT),A=BUFB
+*
+*
+*
+*        PUT BUFFER ADDRESSES   INTO CCW'S
+*
+         MVC   CCWRA(4),BUFA
+         MVI   CCWRA,X'02'
+         MVC   CCWRB(4),BUFB
+         MVI   CCWRB,X'02'
+         MVC   CCWW1A(4),BUFA
+         MVI   CCWW1A,X'01'
+         MVC   CCWW1B(4),BUFB
+         MVI   CCWW1B,X'01'
+         L     5,BUFA
+         L     6,BUFB
+*
+*       STORE COUNT AS IT WILL BE NEEDED
+*
+         STH   COUNT,CCWRA+6
+         STH   COUNT,CCWRB+6
+         LR    4,COUNT
+*
+*
+*       NOW OPEN THE MAG TAPE FILES
+*
+*
+         OPEN  (TAPER,INPUT),TYPE=J
+         C     3,=F'0'
+         BE    NOWSTART
+         OPEN  (TAPEW1,OUTPUT),TYPE=J
+         C     3,=F'1'
+         BE    NOWSTART
+         OPEN  (TAPEW2,OUTPUT),TYPE=J
+         C     3,=F'2'
+         BE    NOWSTART
+         OPEN  (TAPEW3,OUTPUT),TYPE=J
+*
+*       NOW THE MAIN DOUBLE BUFFERING PROGRAM BEGINS
+*       (SEE FLOWCHART IN ROOM 416K)
+*
+NOWSTART EQU   *
+         MVI   ECBRA,0
+         EXCP  IOBRA
+         MVI   ECBRB,0
+         EXCP  IOBRB
+         WAIT  1,ECB=ECBRA    WAIT FOR INITIAL READ TO COMPLETE
+*
+         SH    COUNT,IOBRA+14
+         STH   COUNT,CCWW1A+6   COUNT FOR OUTPUT
+         BAL   8,VOLQ      GO OFF AND INSPECT FIRST RECORD
+         LR    COUNT,4
+         MVI   ECBW1A,0
+         C     3,=F'0'
+         BE    WAEBF
+         EXCP  IOBW1A           THE FIRST WRITE
+         WAIT  ECB=ECBW1A
+         C     3,=F'1'
+         BE    WAEBF
+         MVC   CODEA+4(6),NAME2
+         MVI   ECBW2A,0
+         EXCP  IOBW2A
+         WAIT  ECB=ECBW2A
+         C     3,=F'2'
+         BE    WAEBF
+         MVC   CODEA+4(6),NAME3
+         MVI   ECBW3A,0
+         EXCP  IOBW3A
+*
+******************NO RETURN ABOVE THIS POINT ***********************
+*
+WAEBF    EQU   *
+         C     3,=F'3'
+         BE    X3
+         C     3,=F'2'
+         BE    X2
+X1       WAIT  1,ECBLIST=EAEBF1
+         TM    ECBW1A,X'40'
+         BO    AE1
+         B     BF1
+X2       WAIT  1,ECBLIST=EAEBF2
+         TM    ECBRB,X'40'
+         BO    BF1
+         WAIT  2,ECBLIST=EAEBF2
+         TM    ECBRB,X'40'
+         BNO   AE1
+         B     BF1
+X3       WAIT  1,ECBLIST=EAEBF3
+         TM    ECBRB,X'40'
+         BO    BF1
+         WAIT  2,ECBLIST=EAEBF3
+         TM    ECBRB,X'40'
+         BO    BF1
+         WAIT  3,ECBLIST=EAEBF3
+         TM    ECBRB,X'40'
+         BNO   AE1
+*
+BF1      EQU   *
+         CLI   ECBRB,X'7F'
+         BE    BF2               BRANCH IF A GENUINE READ
+         TM    IOBRB+12,X'01'    TEST FOR TAPEMARK
+         BNO   BADEND            A BAD ENDING
+*
+TM2R     EQU   *
+         CLI   FLAG,X'FF'        TEST FOR DOUBLE TAPEMARK
+         BE    NORMENDA          NORMAL END A
+         MVI   FLAG,X'FF'        SET FLAG
+         BAL   8,LABQ
+         MVC   ADW1B,ACCWTM      GET APPROPRIATE CCW
+         MVI   ECBW1B,0          CLEAR FOR OUTPUT
+         C     3,=F'0'
+         BE    WRA
+         EXCP  IOBW1B            WRITE TAPEMARK
+         C     3,=F'1'
+         BE    WR
+         MVC   ADW2B,ACCWTM
+         MVI   ECBW2B,0
+         EXCP  IOBW2B
+         C     3,=F'2'
+         BE    WR
+         MVC   ADW3B,ACCWTM
+         MVI   ECBW3B,0
+         EXCP  IOBW3B
+         B     WR
+*
+BF2      EQU   *
+         MVI   FLAG,X'00'        A GENUINE READ, SET FLAG TO PROVE IT
+         MVC   ADW1B,ACCWW1B     GET CCW FOR WRITING
+         SH    COUNT,IOBRB+14    OBTAIN COUNT OF BLOCK JUST READ
+         STH   COUNT,CCWW1B+6    USE COUNT FOR OUTPUT
+         LA    10,BUFFERB   ADDRESS OF BUFFER AREA
+         BAL   8,LABQ       OFF TO INSPECT FOR DATA OR LABEL
+         LR    COUNT,4
+         MVI   ECBW1B,0
+         C     3,=F'0'
+         BE    WRA
+         EXCP  IOBW1B            WRITE RECORD
+         C     3,=F'1'
+         BE    WR
+         MVC   ADW2B,ACCWW1B
+         MVI   ECBW2B,0
+         EXCP  IOBW2B
+         C     3,=F'2'
+         BE    WR
+         MVC   ADW3B,ACCWW1B
+         MVI   ECBW3B,0
+         EXCP  IOBW3B
+*
+*
+WR       EQU   *
+         WAIT  1,ECB=ECBW1A       WAIT FOR A TO BECOME EMPTY
+         C     3,=F'1'
+         BE    WRA
+         WAIT  1,ECB=ECBW2A
+         C     3,=F'2'
+         BE    WRA
+         WAIT  1,ECB=ECBW3A
+WRA      MVI   ECBRA,X'00'
+         EXCP  IOBRA              READ A
+         CLI   FLAG,X'FF'
+         BE    TM4REX
+         B     WAFBE              OFF FOR ANOTHER LONG WAIT
+*
+*
+*
+AE1      EQU   *
+         MVI   ECBRA,0
+         EXCP  IOBRA              ISSUE A READ A
+*
+BF3      EQU   *
+         WAIT  1,ECB=ECBRB        WAIT FOR B TO BECOME FULL
+         CLI   ECBRB,X'7F'
+         BE    BF4                BRANCH IF A GENUINE READ
+         TM    IOBRB+12,X'01'            CHECK THAT IT IS A TM
+         BNO   BADEND
+*
+TM4R     EQU   *
+         CLI   FLAG,X'FF'
+         BE    NORMEND  NOTHING OUTSTANDING
+         MVI   FLAG,X'FF'
+         BAL   8,LABQ    OFF TO PROCESS TAPEMARK
+         MVC   ADW1B,ACCWTM
+         MVI   ECBW1B,0
+         C     3,=F'0'
+         BE    TM4REX
+         EXCP  IOBW1B
+         C     3,=F'1'
+         BE    TM4REX
+         MVC   ADW2B,ACCWTM
+         MVI   ECBW2B,0
+         EXCP  IOBW2B
+         C     3,=F'2'
+         BE    TM4REX
+         MVC   ADW3B,ACCWTM
+         MVI   ECBW3B,0
+         EXCP  IOBW3B
+TM4REX   WAIT  1,ECB=ECBRA
+         B     AF1
+*
+BF4      EQU   *
+         MVI   FLAG,X'00'
+         MVC   ADW1B,ACCWW1B
+         SH    COUNT,IOBRB+14
+         STH   COUNT,CCWW1B+6
+         LA    10,BUFFERB    ADDRESS OF THIS BUFFER
+         BAL   8,LABQ
+         LR    COUNT,4
+         MVI   ECBW1B,0
+         C     3,=F'0'
+         BE    WAFBE
+         EXCP  IOBW1B
+         C     3,=F'1'
+         BE    WAFBE
+         MVC   ADW2B,ACCWW1B
+         MVI   ECBW2B,0
+         EXCP  IOBW2B
+         C     3,=F'2'
+         BE    WAFBE
+         MVC   ADW3B,ACCWW1B
+         MVI   ECBW3B,0
+         EXCP  IOBW3B
+         B     WAFBE
+*
+*
+*       NOW THE OTHER (SYMMETRICAL) HALF OF THE DB PROCESS
+*
+*
+WAFBE    EQU   *
+         C     3,=F'3'
+         BE    Y3
+         C     3,=F'2'
+         BE    Y2
+Y1       WAIT  1,ECBLIST=EAFBE1
+         TM    ECBW1B,X'40'
+         BO    BE1
+         B     AF1
+Y2       WAIT  1,ECBLIST=EAFBE2
+         TM    ECBRA,X'40'
+         BO    AF1
+         WAIT  2,ECBLIST=EAFBE2
+         TM    ECBRA,X'40'
+         BNO   BE1
+         B     AF1
+Y3       WAIT  1,ECBLIST=EAFBE3
+         TM    ECBRA,X'40'
+         BO    AF1
+         WAIT  2,ECBLIST=EAFBE3
+         TM    ECBRA,X'40'
+         BO    AF1
+         WAIT  3,ECBLIST=EAFBE3
+         TM    ECBRA,X'40'
+         BNO   BE1
+*
+AF1      EQU   *
+         CLI   ECBRA,X'7F'
+         BE    AF2                         A GENUINE READ
+         TM    IOBRA+12,X'01'              CHECK THAT IT IS A TM
+         BNO   BADEND                      NOT A TM
+*
+TM2L     EQU   *
+         CLI   FLAG,X'FF'        TEST FOR DOUBLE TM
+         BE    NORMENDB          WRITE B OUTSTANDING
+         MVI   FLAG,X'FF'        SET TM FLAG
+         BAL   8,LABQ   OFF TO PROCESS THIS TAPEMARK
+         MVC   ADW1A,ACCWTM
+         MVI   ECBW1A,0
+         C     3,=F'0'
+         BE    WLA
+         EXCP  IOBW1A
+         C     3,=F'1'
+         BE    WL
+         MVC   ADW2A,ACCWTM
+         MVI   ECBW2A,0
+         EXCP  IOBW2A
+         C     3,=F'2'
+         BE    WL
+         MVC   ADW3A,ACCWTM
+         MVI   ECBW3A,0
+         EXCP  IOBW3A
+         B     WL
+*
+AF2      EQU   *
+         MVI   FLAG,X'00'
+         MVC   ADW1A,ACCWW1A
+         SH    COUNT,IOBRA+14
+         STH   COUNT,CCWW1A+6
+         LA    10,BUFFERA    ADDRESS OF THIS BUFFER AREA
+         BAL   8,LABQ
+         LR    COUNT,4
+         MVI    ECBW1A,0
+         C     3,=F'0'
+         BE    WLA
+         EXCP  IOBW1A
+         C     3,=F'1'
+         BE    WL
+         MVC   ADW2A,ACCWW1A
+         MVI   ECBW2A,0
+         EXCP  IOBW2A
+         C     3,=F'2'
+         BE    WL
+         MVC   ADW3A,ACCWW1A
+         MVI   ECBW3A,0
+         EXCP  IOBW3A
+*
+WL       EQU    *
+         WAIT  1,ECB=ECBW1B
+         C     3,=F'1'
+         BE    WLA
+         WAIT  1,ECB=ECBW2B
+         C     3,=F'2'
+         BE    WLA
+         WAIT  1,ECB=ECBW3B
+WLA      MVI   ECBRB,X'00'
+         EXCP  IOBRB
+         CLI   FLAG,X'FF'
+         BE    TM4LEX
+         B     WAEBF
+*
+BE1      EQU   *
+         MVI   ECBRB,0
+         EXCP  IOBRB
+*
+AF3      EQU   *
+         WAIT  1,ECB=ECBRA
+         CLI   ECBRA,X'7F'
+         BE    AF4                  A GENUINE READ
+         TM    IOBRA+12,X'01'       CHECK FOR TM
+         BNO   BADEND
+*
+TM4L     EQU   *
+         CLI   FLAG,X'FF'
+         BE    NORMEND     NOTHING OUTSTANDING
+         MVI   FLAG,X'FF'
+         BAL   8,LABQ    OFF TO PROCESS THIS TAPEMARK
+         MVC   ADW1A,ACCWTM
+         MVI   ECBW1A,0
+         C     3,=F'0'
+         BE    TM4LEX
+          EXCP  IOBW1A
+         C     3,=F'1'
+         BE    TM4LEX
+         MVC   ADW2A,ACCWTM
+         MVI   ECBW2A,0
+         EXCP  IOBW2A
+         C     3,=F'2'
+         BE    TM4LEX
+         MVC   ADW3A,ACCWTM
+         MVI   ECBW3A,0
+         EXCP  IOBW3A
+TM4LEX   WAIT  1,ECB=ECBRB
+         B     BF1
+AF4      EQU   *
+         MVI   FLAG,X'00'
+         MVC   ADW1A,ACCWW1A
+         SH    COUNT,IOBRA+14
+         STH   COUNT,CCWW1A+6
+         LA    10,BUFFERA
+         BAL   8,LABQ
+         LR    COUNT,4
+         MVI   ECBW1A,0
+         C     3,=F'0'
+         BE    WAEBF
+         EXCP  IOBW1A
+         C     3,=F'1'
+         BE    WAEBF
+         MVC   ADW2A,ACCWW1A
+         MVI   ECBW2A,0
+         EXCP  IOBW2A
+         C     3,=F'2'
+         BE    WAEBF
+         MVC   ADW3A,ACCWW1A
+         MVI   ECBW3A,0
+         EXCP  IOBW3A
+         B     WAEBF
+*
+*
+*     NORMAL END - SIMPLY WAIT FOR OUTSTANDING I/O
+*     AND THEN WRITE THE LAST TAPE MARK
+*
+NORMENDA EQU   *
+         C     3,=F'0'
+         BE    BADEND
+         WAIT  1,ECB=ECBW1A
+         C     3,=F'1'
+         BE    NORMEND
+         WAIT  1,ECB=ECBW2A
+         C     3,=F'2'
+         BE    NORMEND
+         WAIT  1,ECB=ECBW3A
+         B     NORMEND
+NORMENDB EQU   *
+         C     3,=F'0'
+         BE    BADEND
+         WAIT  1,ECB=ECBW1B
+         C     3,=F'1'
+         BE    NORMEND
+         WAIT  1,ECB=ECBW2B
+         C     3,=F'2'
+         BE    NORMEND
+         WAIT  1,ECB=ECBW3B
+NORMEND  EQU   *
+         C     3,=F'0'
+         BE    BADEND
+         MVC   ADW1A,ACCWTM
+         AP    TCNT(2),PONE(1)
+         MVI   ECBW1A,0
+         EXCP  IOBW1A             WRITE THE LAST TAPE MARK
+         C     3,=F'1'
+         BE    LASTWAIT
+         MVC   ADW2A,ACCWTM
+         MVI   ECBW2A,0
+         EXCP  IOBW2A
+         C     3,=F'2'
+         BE    LASTWAIT
+         MVC   ADW3A,ACCWTM
+         MVI   ECBW3A,0
+         EXCP  IOBW3A
+LASTWAIT EQU   *
+         WAIT  1,ECB=ECBW1A
+         C     3,=F'1'
+         BE    BADEND
+         WAIT  1,ECB=ECBW2A
+         C     3,=F'2'
+         BE    BADEND
+         WAIT  1,ECB=ECBW3A
+*
+*      WRITE OUT TM  COUNT
+*
+BADEND   EQU   *
+         C     3,=F'0'
+         BNE   BADON
+         AP    TCNT(2),PONE(1)
+BADON    UNPK  SUCC+13(3),TCNT
+         OI    SUCC+15,X'F0'
+         PUT   PRINT,SUCC
+         CLOSE PRINT
+         CLOSE (TAPER)
+         C     3,=F'0'
+         BE    ENDPROT
+         CLOSE (TAPEW1)
+         C     3,=F'1'
+         BE    ENDPROT
+         CLOSE (TAPEW2)
+         C     3,=F'2'
+         BE    ENDPROT
+         CLOSE (TAPEW3)
+*
+*       END PROTOCOL
+*
+ENDPROT  EQU   *
+         L     13,4(13)
+         LM    14,12,12(13)
+         LA    15,0
+         BR    14
+*
+*
+**********************************************************************
+*
+*
+*     SUBROUTINE VOLQ - USED TO INSPECT FIRST RECORD READ
+*
+VOLQ     CH    2,=H'80'   ON ENTRY R2 CONTAINS LENGTH READ
+         BNE   VOLQW
+         CLC   CODEA(4),=C'VOL1'     CHECK CODE
+         BNE   VOLQW
+         MVI   IBM,X'FF'  STANDARD LABELS - SET FLAG
+*
+*    EXTRACT HEADER INFO AND PRINT IT
+*
+         MVC   PREC(80),SPACE
+         MVC   PREC(21),=C'VOLUME SERIAL NUMBER='
+         MVC   PREC+22(6),CODEA+4       PUT VOLSER NUMBER IN
+         PUT   PRINT,SPACE
+         B     VOLQX
+VOLQW    MVC   PREC(15),=C'UNLABELLED TAPE'
+         PUT   PRINT,SPACE
+VOLQX    MVC   PREC(80),SPACE
+         PUT   PRINT,SPACE
+         PUT   PRINT,SPACE
+*
+*       SET UP NREC, MINCOUNT AND MAXCOUNT
+*
+*
+          LA    9,0
+         ST    9,MAXCOUNT
+         ST    4,MINCOUNT
+         ST    9,NREC
+*
+*   NOW LOOK AT VOL-SER PARAMATER
+*   THE NEXT BRANCH TO VOLQY SHOULD BE TAKEN IF THE TAPE
+*   IS UNLABELLED.
+*
+         MVC   NAME2(6),CODEA+4
+         MVC   NAME3(6),NAME2
+         L     1,PAD   LOAD ADDRESS OF PARAMETER REGION
+         CLC   0(2,1),=H'1'  IS LENGTH OF REGION 1 ?
+         BE    VOLQY         ONLY TAPE NUMBER GIVEN
+         MVC   CODEA+4(6),4(1)
+         C     3,=F'1'
+         BE    VOLQY
+         MVC   NAME2(6),11(1)
+         C     3,=F'2'
+         BE    VOLQY
+         MVC   NAME3(6),18(1)
+VOLQY    BR    8
+*
+******************************************************************
+*
+*
+*
+*    SUBROUTINE MESS - CALLED BY  LABQ IF NON-STANDARD
+*                        LAYOUT IS FOUND.
+*
+*
+*
+MESS     PUT   PRINT,MESSAGE
+         MVI   IBM,X'00'   RESET IBM FLAG TO INDICATE NON-SL'S
+         BR    9              RETURN TO LABQ
+*
+*
+*
+*
+*********************************************************************
+*
+*
+*              SUBROUTINE LABQ - THIS IS WHERE IT ALL HAPPENS
+*
+*
+*
+*      SUBROUTINE LABQ IS CALLED FROM THE MAIN PROG EVERY TIME
+*      A READ IS 'COMPLETED'.   LABQ TAKES APPROPRIATE ACTION
+*      CHECKS VALIDITY OF STANDARD TAPE LAYOUT, STORES RELEVANT
+*      INFORMATION.  NOTE THAT LABQ RETURNS IMMEDIATELY IF THE
+*      IBM FLAG IS NOT SET - I.E. IF SUBROUTINE VOLQ DECIDED THAT
+*      THE TAPE BEING READ HAS NON-SL'S.
+*      ON ENTRY
+*            R2 CONTAINS COUNT OF RECORD JUST READ
+*            R8 CONTAINS RETURN ADDRESS
+*            R10 CONTAINS ADDRESS OF BUFFER AREA USED
+*
+*
+*      LABQ ALSO USES ANOTHER FLAG BYTE, 'EXPECT'
+*      'EXPECT' TAKES THE FOLLOWING VALUESS:
+*      01   EXPECTING HDR1
+*      02   EXPECTING HDR2
+*      03   EXPECTING UHL OR TM
+*      04   EXPECTING UTL OR TM
+*      05   EXPECTING EOF1
+*      06   EXPECTING EOF2
+*      07   EXPECTING DATA OR TM
+*      08   EXPECTING DATA
+*
+*
+*
+LABQ     CLI   FLAG,X'FF'   TAPE MARK ?
+          BE    TMARK1       DEAL WITH IT
+         C     2,MINCOUNT
+         BNL   CMAX
+         ST    2,MINCOUNT
+         B     ADDONE
+CMAX     C     2,MAXCOUNT
+         BNH   ADDONE
+         ST    2,MAXCOUNT
+ADDONE   EQU   *
+         L     1,NREC
+         LA    1,1(0,1)   ADD 1 TO RECORD COIUNTER
+         ST    1,NREC
+         CLI   IBM,X'00'
+         BCR   8,8
+         CLI   EXPECT,X'07'   ARE WE EXPECTING DATA ?
+          BE    DATA
+          CLI   EXPECT,X'08' DATA ?
+          BE    DATA
+*
+*     NOT DATA SO MUST BE A LABEL
+*
+         CH    2,=H'80'      TEST LENGTH - SHOULD BE 80
+         BE    COUNTOK       BRANCH IF OK
+         BAL   9,MESS        PRINT MESSAGE IF NOT
+         BR    8             RETURN
+COUNTOK   CLC   0(4,10),=C'HDR1'    IS IT HDR1 ?
+          BE    HDR11
+          CLC   0(4,10),=C'HDR2'    IS IT HDR2 ?
+          BE    HDR21
+          CLC   0(4,10),=C'EOF1'    IS IT EOF1 ?
+          BE    EOF11
+          CLC   0(4,10),=C'EOF2'    IS IT EOF2 ?
+         BE    EOF21
+         CLC   0(3,10),=C'UHL'    IS IT A USER HEADER LABEL ?
+         BE    UHL
+         CLC   0(3,10),=C'UTL'    IS IT A USER TRAILER LABEL ?
+         BE    UTL
+         BAL   9,MESS   NONE OF THESE - NO GOOD AT ALL
+         BR    8        FORGET ABOUT IT BEING A LABELLED TAPE
+*
+*      PROCESS TAPEMARK
+*
+TMARK1   AP    TCNT(2),PONE(1)    ADD 1 TO TAPE MARK
+         CLI   IBM,X'00'
+         BE    TMARK4
+         CLI   EXPECT,X'03'
+         BNE   TMARK2
+         LA    9,0
+         ST    9,MAXCOUNT
+         ST    4,MINCOUNT
+         ST    9,NREC
+         MVI   EXPECT,X'08'  EXPECT DATA NEXT
+         BR    8
+TMARK2   CLI   EXPECT,X'04'
+         BNE   TMARK3
+         MVI   EXPECT,X'01'   EXPECT HDR1 NEXT
+         BR   8
+TMARK3   CLI   EXPECT,X'07'  WE WERE EXPECTING DATA OR A TM
+         BE    TMARK4
+         BAL   9,MESS         NO GOOD AGAIN - ABANDON EFFORT
+         BR    8
+*
+*   PRINT OUT INFORMATION IN NREC, MINCOUNT AND MAXCOUNT
+*
+TMARK4   MVC   PREC(80),SPACE    FILL PREC WITH SPACES
+         MVC   PREC(27),=C'NUMBER OF RECORDS IN FILE ='
+         L     9,NREC
+         CVD   9,DOUB
+         UNPK  PREC+30(7),DOUB+4(4)
+         OI    PREC+36,X'F0'
+         PUT   PRINT,SPACE
+         MVC   PREC(80),SPACE    PROPAGATE SPACES
+         MVC   PREC(24),=C'MINIMUM RECORD LENGTH IS'
+         L     9,MINCOUNT
+         CVD   9,DOUB
+         UNPK  PREC+27(7),DOUB+4(4)
+         OI    PREC+33,X'F0'
+         PUT   PRINT,SPACE
+         MVC   PREC(80),SPACE
+         MVC   PREC(24),=C'MAXIMUM RECORD LENGTH IS'
+         L     9,MAXCOUNT
+         CVD   9,DOUB
+         UNPK  PREC+27(7),DOUB+4(4)
+         OI    PREC+33,X'F0'
+         PUT   PRINT,SPACE
+         MVC   PREC(80),SPACE
+         PUT   PRINT,SPACE
+         PUT   PRINT,SPACE
+         CLI   IBM,X'00'
+         BNE   TMARK5
+         MVC   PREC(16),=C'** TM COPIED ** '
+         PUT   PRINT,SPACE
+         MVC   PREC(80),SPACE
+         PUT   PRINT,SPACE
+         PUT   PRINT,SPACE
+*
+*
+*    AFTER PRINTING RESET NREC,MINCOUNT AND MAXCOUNT
+*
+TMARK5   LA    9,0
+         ST    9,MAXCOUNT
+         ST    4,MINCOUNT
+         ST    9,NREC
+         MVI   EXPECT,X'05'  EXPECT EOF1 NEXT
+*
+*
+         BR    8
+*
+*
+*    END OF TAPEMARK PROCESSING
+*
+*
+*    NOW PROCESSING OF A DATA RECORD
+*
+*
+DATA     MVI   EXPECT,X'07'
+         BR    8
+*
+*      END OF PROCESSING OF A DATA RECORD
+*
+*
+*     NOW PROCESS ALL OTHER LABELS
+*
+*
+UHL      CLI   EXPECT,X'03'
+         BCR   8,8
+         BAL   9,MESS
+         BR    8
+UTL      CLI   EXPECT,X'04'
+         BCR   8,8
+         BAL   9,MESS
+         BR    8
+HDR11    CLI   EXPECT,X'01'
+         BE    HDR12
+         BAL   9,MESS   GOT HDR1 BUT NOT EXPECTING IT
+         BR    8
+HDR12    MVC   PREC(80),SPACE
+         MVC   PREC(7),=C'DSNAME='
+         MVC   PREC+8(17),4(10)   MOVE DSNAME IN TO PRINT BUFFER
+         MVC   PREC+30(13),=C'FILE NUMBER= '
+         MVC   PREC+43(4),31(10)
+         PUT   PRINT,SPACE
+         MVC   PREC(80),SPACE
+         MVC   PREC(14),=C'CREATION DATE='
+         MVC   PREC+15(6),41(10)
+         MVC   PREC+30(12),=C'EXPIRY DATE='
+         MVC   PREC+43(6),47(10)
+         PUT   PRINT,SPACE
+         MVI   EXPECT,X'02'
+         BR    8
+HDR21    CLI   EXPECT,X'02'
+         BE    HDR22
+         BAL   9,MESS    GOT HDR2 BUT NOT EXPECTING ITT
+         BR    8
+HDR22    MVC   PREC(80),SPACE
+         MVC   PREC(15),=C'FILE CREATED BY'
+         MVC   PREC+17(17),17(10)
+         PUT   PRINT,SPACE
+         MVC   PREC(80),SPACE
+         MVC   PREC(36),=C'RECFM:      BLKSIZE:          LRECL:'
+         MVC   PREC+7(1),4(10)
+         MVC   PREC+21(5),5(10)
+         MVC   PREC+37(5),10(10)
+         PUT   PRINT,SPACE
+         MVI   EXPECT,X'03'
+         BR    8
+*
+EOF11    CLI   EXPECT,X'05'
+         BNE   EOF12
+         MVI   EXPECT,X'06'
+         BR    8
+EOF12    BAL   9,MESS
+         BR    8
+EOF21    CLI   EXPECT,X'06'
+         BNE   EOF22
+         MVI   EXPECT,X'04'
+         BR    8
+EOF22    BAL   9,MESS
+         BR    8
+*
+*        END OF LABQ
+*
+*****************************************************************
+*
+*
+*       STORAGE REQUIREMENTS
+*
+*
+*
+*    FIRST THE DCB'S
+*
+TAPER    DCB   DSORG=PS,MACRF=(E),DDNAME=TAPER,EXLST=EXR
+TAPEW1   DCB   DSORG=PS,MACRF=(E),DDNAME=TAPEW1,EXLST=EXW1
+TAPEW2   DCB   DSORG=PS,MACRF=(E),DDNAME=TAPEW2,EXLST=EXW2
+TAPEW3   DCB   DSORG=PS,MACRF=(E),DDNAME=TAPEW3,EXLST=EXW3
+PRINT    DCB   DSORG=PS,MACRF=PM,DDNAME=SYSPRINT,RECFM=FA,             *
+               LRECL=133,BLKSIZE=133
+*
+*    NOW THE EXIT LISTS, JFCB'S ECB'S AND ECB-LISTS
+*
+EXR      DC    X'87',AL3(JFCBR)
+EXW1     DC    X'87',AL3(JFCBW1)
+EXW2     DC    X'87',AL3(JFCBW2)
+EXW3     DC    X'87',AL3(JFCBW3)
+*
+JFCBR    DC    44F'0'
+JFCBW1   DC    44F'0'
+JFCBW2   DC    44F'0'
+JFCBW3   DC    44F'0'
+*
+ECBRA    DC    F'0'
+ECBRB    DC    F'0'
+ECBW1A   DC    F'0'
+ECBW1B   DC    F'0'
+ECBW2A   DC    F'0'
+ECBW2B   DC    F'0'
+ECBW3A   DC    F'0'
+ECBW3B   DC    F'0'
+*
+EAEBF1   DC    A(ECBW1A)
+         DC    X'FF',AL3(ECBRB)
+EAEBF2   DC    A(ECBW1A)
+         DC    A(ECBW2A)
+         DC    X'FF',AL3(ECBRB)
+EAEBF3   DC    A(ECBW1A)
+         DC    A(ECBW2A)
+         DC    A(ECBW3A)
+         DC    X'FF',AL3(ECBRB)
+EAFBE1   DC    A(ECBRA)
+         DC    X'FF',AL3(ECBW1B)
+EAFBE2   DC    A(ECBRA)
+         DC    A(ECBW1B)
+         DC    X'FF',AL3(ECBW2B)
+EAFBE3   DC    A(ECBRA)
+         DC    A(ECBW1B)
+         DC    A(ECBW2B)
+         DC    X'FF',AL3(ECBW3B)
+*
+*     NOW THE IOB'S
+*
+IOBRA    DC    X'02000000'
+         DC    A(ECBRA)
+         DC    2F'0'
+         DC    A(CCWRA)
+         DC    A(TAPER)
+         DC    2F'0'
+*
+IOBRB     DC    X'02000000'
+          DC    A(ECBRB)
+          DC    2F'0'
+          DC    A(CCWRB)
+          DC    A(TAPER)
+          DC    2F'0'
+*
+IOBW1A   DC    X'02000000'
+         DC    A(ECBW1A)
+         DC    2F'0'
+ADW1A    DC    A(CCWW1A)
+         DC    A(TAPEW1)
+         DC    2F'0'
+*
+IOBW1B   DC    X'02000000'
+         DC    A(ECBW1B)
+         DC    2F'0'
+ADW1B    DC    A(CCWW1B)
+         DC    A(TAPEW1)
+         DC    2F'0'
+*
+IOBW2A   DC    X'02000000'
+         DC    A(ECBW2A)
+         DC    2F'0'
+ADW2A    DC    A(CCWW1A)
+         DC    A(TAPEW2)
+         DC    2F'0'
+*
+IOBW2B   DC    X'02000000'
+         DC    A(ECBW2B)
+         DC    2F'0'
+ADW2B    DC    A(CCWW1B)
+         DC    A(TAPEW2)
+         DC    2F'0'
+*
+IOBW3A   DC    X'02000000'
+         DC    A(ECBW3A)
+         DC    2F'0'
+ADW3A    DC    A(CCWW1A)
+         DC    A(TAPEW3)
+         DC    2F'0'
+*
+IOBW3B   DC    X'02000000'
+         DC    A(ECBW3B)
+         DC    2F'0'
+ADW3B    DC    A(CCWW1B)
+         DC    A(TAPEW3)
+         DC    2F'0'
+*
+*
+*
+*
+*       NOW THE CCW'S AND ASSOCIATED ADCONS
+*
+*
+AREA     DS    F
+CCWRA    CCW   X'02',AREA,X'20',10000
+CCWRB    CCW   X'02',AREA,X'20',10000
+CCWW1A   CCW   X'01',AREA,X'20',10000
+CCWW1B   CCW   X'01',AREA,X'20',10000
+CCWTM    CCW   X'1F',AREA,X'20',100
+*
+ACCWRA   DC    A(CCWRA)
+ACCWRB   DC    A(CCWRB)
+ACCWW1A  DC    A(CCWW1A)
+ACCWW1B  DC    A(CCWW1B)
+ACCWTM  DC    A(CCWTM)
+*
+*
+*
+*      OTHER STORAGE, INCLUDING DIAGNOSTIC PRINT MESSAGES
+*
+*
+*
+*
+*
+*
+BUFA     DS    F    ADDRESS OF BUFFER A
+BUFB     DS    F    ADDRESS OF BUFFER B
+LIST     DS    F    LIST FOR GETMAIN MACRO
+PONE     DC    X'1F'   PACKED DECIMAL ONE
+TCNT     DC    X'000F'
+SUCC     DC    CL133'  COMPLETED        TAPE MARKS COPIED'
+FLAG     DC    X'00'
+IBM      DC    X'00'
+DOUB     DS    D
+MINCOUNT DS    F
+MAXCOUNT DS    F
+NREC     DS    F
+MESSAGE  DC    CL133' IBM STANDARD LABEL LAYOUT VIOLATED'
+SPACE    DC    C' '
+PREC     DC    CL133' '
+PAD      DS    F
+EXPECT   DC    X'01'
+NAME2    DS    6C
+NAME3    DS    6C
+*
+*
+*
+*
+*        FINALLY THE DREADED DSECT'S
+*
+*
+*
+BUFFERA  DSECT
+CODEA    DS    F
+BUFFERB  DSECT
+CODEB    DS    F
+         END

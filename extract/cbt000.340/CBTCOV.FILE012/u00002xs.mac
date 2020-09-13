@@ -1,0 +1,1097 @@
+AMM.     TITLE 'RT5031M - DASD ANALYSIS PROGRAM - A.MORRISH.'
+RT5031M  CSECT
+***********************************************************************
+*                                                                     *
+*  THIS PROGRAM ACTS AS A MONITOR FOR THE TWO INDEPENDENT SUBROUTINES *
+* THAT ARE ASSEMBLED WITH IT. THESE SUB-ROUTINES ARE :                *
+*                                                                     *
+*   RTP5004M   LIST ALLOCATED ALTERNATE TRACKS.                       *
+*                                                                     *
+*   RTP5032M   CHECK EVERY PRIMARY TRACK FOR ERRORS.                  *
+*                                                                     *
+*                                                                     *
+*  THE PROGRAM LINKS TO THE SUB-ROUTINES PASSING PARAMETERS AS SET    *
+* BY THE INPUT PARAMETERS. TO INVOKE THE PROGRAM CODE :               *
+*                                                                     *
+*        //JOBNAME JOB                                                *
+*        //       EXEC PGM=RTP5031M,PARM='PARM-LIST'                  *
+*        //SYSPRINT DD SYSOUT=A                                       *
+*                                                                     *
+*        THE PARAMETER LIST CONSIST OF A SERIES OF THREE CHARACTER    *
+* ENTRIES SEPARATED BY COMMAS. EACH ENTRY IS EITHER A DEVICE ADDRESS  *
+* (2321 NOT SUPPORTED) OR ONE OF THE FOLLOWING OPTIONS :              *
+*                                                                     *
+*   PRI        PRIMARY TRACKS TO BE SCANNED FOR ERRORS.               *
+*                                                                     *
+*   ALT        ALTERNATE TRACKS TO BE LISTED.                         *
+*                                                                     *
+*   GET        GETALT STATEMENT ARE TO BE GENERATED FOR ALL DEFECTIVE *
+*              PRIMARY TRACKS ENCOUNTERED. (IMPLIES PRI).             *
+*                                                                     *
+*   ALL        GETALT STATEMENTS ARE TO BE GENERATED FOR ALL TRACKS   *
+*              THAT ARE EITHER DEFECTIVE OR FLAGGED AS DEFECTIVE THAT *
+*              ARE ENCOUNTERED. IMPLIES PRI & GET.                    *
+*                                                                     *
+*   DEF        GETALT STATEMENTS ARE TO BE GENERATED FOR ALL TRACKS   *
+*              THAT ARE FLAGGED AS DEFECTIVE. (IMPLIES ALT)           *
+*                                                                     *
+*                                                                     *
+*        THESE OPTIONS MAY BE SPECIFIED AT ANY POINT IN THE PARAMETER *
+* LIST BUT APPLY ONLY TO THE DEVICE ADDRESSES THAT FOLLOW THEM IN THE *
+* PARAMETER LIST. EACH RECURRENCE OF AN OPTION SET RESETS ALL OPTIONS.*
+* THUS THE FOLLOWING :                                                *
+*                                                                     *
+*        PARM=(PRI,230,231,GET,232,PRI,ALT,537)                       *
+*                                                                     *
+*        SPECIFIES THAT DEFECTIVE PRIMARY TRACKS ARE TO BE LISTED FOR *
+* DEVICES 230,231,232 & 537. GETALT STATEMENTS ARE TO BE GENERATED    *
+* FOR TRACKS THAT GIVE ERRORS BUT ARE NOT FLAGGED AS DEFECTIVE ON 232 *
+* AND THE ALTERNATE TRACKS ON 537 ARE TO BE LISTED.                   *
+*                                                                     *
+***********************************************************************
+         SPACE 1                                                      *
+* REGISTER USAGE.
+R0       EQU   0                   WORK REGISTER / PARAMETER REGISTER.
+R1       EQU   1                   WORK REGISTER / PARAMETER REGISTER.
+R2       EQU   2                   ADDRESS OF OUTPUT LINE.
+R3       EQU   3                   LINK REGISTER.
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9                   POINTER TO ADDRESS OF 1ST ALT TRACK.
+R10      EQU   10
+R11      EQU   11                  POINTER TO COMMUNICATION CSECT.
+RBASE    EQU   12                  BASE REGISTER.
+R13      EQU   13                  SAVE AREA POINTER.
+R14      EQU   14                  RETURN ADDRESS.
+R15      EQU   15                  ENTRY POINT ADDRESS/ RETURN CODE.
+         USING COMAR,R11           DEFINE BASE FOR COMMON AREA.
+         EJECT
+         BEGIN ISAVE,BASE=RBASE    INITIALISE AND DEFINE BASE REGISTER.
+         SPACE 1                                                      *
+*                                                                     *
+*        INITIALISE COMMON AREA POINTER AND IDENTIFY ENTRY.           *
+*                                                                     *
+         SPACE 1                                                      *
+         L     R11,IVCON           SET GR11 -> COMMON AREA.
+         OI    SW,SW31M            SET ON ENTRY ROUTE.
+         MVC   HDGID,INAME         STORE PROGRAM ENTRY NAME.
+         SPACE 1                                                      *
+*                                                                     *
+*        INITIALISE PARAMETER SCAN.                                   *
+*                                                                     *
+         SPACE 1                                                      *
+         L     R10,0(R1)           SET GR10 -> PARAMETER LIST.
+         LH    R9,0(R10)           SET GR9 = LENGTH OF PARAMET
+         LA    R10,2(R10)          INCREMENT OVER PARAMETER LENGTH.
+         LA    R6,4                SET GR6 = INCREMENT FOR TABLE SCAN.
+         LA    R7,IPAREND          SET GR7 -> END OF PARAMETER TABLE.
+         SPACE 1                                                      *
+*                                                                     *
+*        SCAN INPUT PARAMETERS.                                       *
+*                                                                     *
+         SPACE 1                                                      *
+ILOOPB   LA    R8,IPAR             SET GR8 -> PARAMETER TABLE.
+         LA    R5,3                SET GR5 = 3.
+         CLR   R9,R5               COMPARE FOR ROOM FOR VALID IDENTIFIR
+         BL    IENDUP              IF NOT THEN END.
+ILOOPA   CLC   0(3,R10),0(R8)      COMPARE FOR OPTION.
+         BE    IOPT                IF FOUND THEN GO TO PROCESS.
+         BXLE  R8,R6,ILOOPA        LOOP UNTIL ALL TESTED.
+         TM    SW,SWALT+SWPRI      ANY VALID OPTIONS SPECIFIED ?
+         BZ    INEXT               IF NOT THEN GO TO CONTINUE SCAN.
+         FINDUCB DEVADDR=0(R10),TO=(R1),VALID=YES      FIND UCB.
+         BNZ   INEXT               IF NOT VALID DEVICE THEN GO FIND NXT
+         CLI   18(R1),X'20'        IS DEVICE DASD ?
+         BNE   INEXT               IF NOT THEN IGNORE.
+         ST    R1,UCBPTR           STORE UCB ADDRESS.
+         LA    R0,1                SET GR0 = 1.
+         ST    R0,LINECT           STORE NEW RESIDUAL LINE COUNT.
+         OI    SW,SWDEV            SET DEVICE FOUND.
+         SPACE 1                                                      *
+*                                                                     *
+*        LINK TO SUB-ROUTINES.                                        *
+*                                                                     *
+         SPACE 1                                                      *
+         TM    SW,SWPRI            ARE PRIMARY TRACKS TO BE TESTED ?
+         BZ    INOPRI              IF NOT THEN LEAVE.
+         L     R15,VCON32          SET GR15 -> RTP5032M SUB-ROUTINE.
+         BALR  R14,R15             LINK TO ANALYZE PRIMARY TRACKS.
+         TM    SW,SWALT            ARE ALTERNATE TRACKS TO BE TESTED ?
+         BZ    INEXT               IF NOT THEN GO TO TEST NEXT PARAMETR
+         LA    R2,SPACE            SET GR2 -> BLANK LINE.
+         BAL   R3,PUTSUB           LINK TO WRITE BLANK LINE.
+INOPRI   TM    SW,SWALT            ARE ALTERNATE TRACKS TO BE TESTED ?
+         BZ    INEXT               IF NOT THEN LEAVE.
+         L     R15,VCON4           SET GR15 -> RTP5004M SUB-ROUTINE.
+         BALR  R14,R15             LINK TO ANALYZE ALTERNATE TRACKS.
+         SPACE 1                                                      *
+*                                                                     *
+*        TEST NEXT PARAMETER.                                         *
+*                                                                     *
+         SPACE 1                                                      *
+INEXT    SR    R9,R6               DECREMENT GR9 FOR NEXT.
+         BNP   IENDUP              IF NOT PLUS THEN END FOUND.
+         CLI   3(R10),C','         IS A DELIMITER PRESENT ?
+         BNE   IENDUP              IF NOT THEN END OF ERROR PARM.
+         AR    R10,R6              SET GR10 -> NEXT ENTRY.
+         B     ILOOPB              GO TO TEST NEXT ENTRY.
+         SPACE 1                                                      *
+*                                                                     *
+*        SET AND ACCUMULATE OPTIONS.                                  *
+*                                                                     *
+         SPACE 1                                                      *
+IOPT     TM    SW,SWDEV            WAS DEVICE FOUND SINCE LAST OPTION ?
+         BZ    *+8                 IF NOT THEN ACCUMULATE.
+         NI    SW,X'FF'-SWDEV-SWPRI-SWALT-SWGET-SWALL  CLEAR SWITCHES.
+         OC    SW(1),3(R8)         SET ON REQUIRED OPTIONS.
+         B     INEXT               GO TO SCAN NEXT PARAMETER.
+         SPACE 1
+*
+*        END UP.
+*
+         SPACE 1
+IENDUP   NI    SW,X'FF'-SW31M      SET OFF ROUTE SWITCH.
+         BAL   R3,CLOSE           LINK TO CLOSE ROUTINE.
+         CLOSE MF=(E,CLOSEL)       CLOSE OPENED DATA SETS.
+         GOBACK ISAVE              RETURN.
+         EJECT                                                        *
+*                                                                     *
+*        CONSTANTS AND SAVE AREA.                                     *
+*                                                                     *
+         SPACE 1                                                      *
+ISAVE    DC    18F'0'              SAVE AREA.
+IVCON    DC    V(COMAR)            POINTER TO COMMON AREA.
+INAME    DC    CL8'RTP5031M'       ENTRY IDENTIFIER.
+IPAR     DC    C'PRI',AL1(SWPRI)
+         DC    C'ALT',AL1(SWALT)
+         DC    C'GET',AL1(SWGET+SWPRI)
+         DC    C'DEF',AL1(SWGET+SWALT)
+IPAREND  DC    C'ALL',AL1(SWALL+SWGET+SWPRI)
+         TITLE 'RTP5004M - ALTERNATE TRACK ANALYSIS PROGRAM - A.M.M.'
+RTP5004M CSECT
+***********************************************************************
+*                                                                     *
+*  THIS SUB-ROUTINE PRODUCES A LISTING OF ALLOCATED ALTERNATE TRACKS  *
+* ON THE DEVICE SPECIFIED. THIS IS DONE BY READING THE HOME ADDRESS   *
+* AND RECORD ZERO FOR EACH ALLOCATED ALTERNATE TRACK AND READING THE  *
+* HOME ADDRESS AND RECORD ZERO FOR THE PRIMARY TRACK THAT IS FLAGGED  *
+* AS DEFECTIVE. ANY UNUSUAL CONDITION FOUND IS ALSO NOTED.            *
+*                                                                     *
+***********************************************************************
+         SPACE 3                                                      *
+         BEGIN ASAVE,BASE=RBASE    INITIALISE AND DEFINE BASE REGISTER.
+         L     R11,AVCON           SET GR11 -> COMMON AREA.
+         TM    SW,SW31M            TEST FOR ENTRY THROUGH RT5031M.
+         BO    ANOVER              IF ON THEN VERIFICATION MAY BE SKPD.
+         SPACE 1                                                      *
+*                                                                     *
+*        VERIFY INPUT PARAMETERS.                                     *
+*                                                                     *
+         SPACE 1                                                      *
+         MVC   HDGID,ANAME         STORE PROGRAM ENTRY NAME.
+         BAL   R3,VERIFY           LINK TO VERIFY INPUT.
+         SPACE 1                                                      *
+*                                                                     *
+*        OPEN SYSPRINT AND SIMULATE OPEN FOR DCB.                     *
+*                                                                     *
+         SPACE 1                                                      *
+ANOVER   BAL   R3,OPEN             LINK TO OPEN DATA SETS. ON RETURN
+*                        GR9 -> THE ADDRESS OF THE FIRST ALTERNATE TRK.
+         CLI   ECB,X'7F'           WAS LAST COMPLETION NORMAL ?
+         BNE   ABADF4              IF NOT THEN GO TO WRITE ERROR.
+         LTR   R9,R9               DOES DEVICE HAVE ALTERNATE TRACKS ?
+         BZ    ANOTALT             IF NOT THEN GO TO WRITE MESSAGE.
+         SPACE 1                                                      *
+*                                                                     *
+*        START FIRST CHANNEL PROGRAM.                                 *
+*                                                                     *
+         SPACE 1                                                      *
+         MVC   IOB+35(2),0(R9)     STORE CYLINDER ADDRESS OF 1ST ALT.
+         XC    IOB+37(3),IOB+37    CLEAR TRACK ADDRESS OF ALTERNATE.
+         CLC   F4+8(4),IOB+35      ARE THERE ANY ALTERNATE TRACKS ?
+         BE    ANONE               IF NOT THEN GO TO WRITE MESSAGE.
+         LA    R0,CPALT            SET GR0 -> READ RECORD ZERO CH PROG.
+         BAL   R3,SIO              LINK TO START I/O OPERATION.
+         SPACE 1                                                      *
+*                                                                     *
+*        AWAIT COMPLETION OF I/O.                                     *
+*                                                                     *
+         SPACE 1                                                      *
+AWAIT1   BAL   R3,TIO              LINK TO AWAIT COMPLETION.
+         CLI   ECB,X'7F'           IS IT NORMAL COMPLETION ?
+         BNE   AERR1               IF NOT THEN I/O ERROR.
+         SPACE 1                                                      *
+*                                                                     *
+*        LIST ALTERNATE TRACK (AND PRIMARY IF PRESENT).               *
+*                                                                     *
+         SPACE 1                                                      *
+         CLC   IOB+35(4),RECZ      IS A DEFECTIVE PRIMARY INDICATED ?
+         BE    ABAD1               IF NOT THEN ALTERNATE TRACK DEFCTIVE
+         MVC   AHA,IOB+35          SAVE CURRENT TRACK ADDRESS.
+         MVC   IOB+35(4),RECZ      STORE ADDRESS OF DEFECTIVE TRACK.
+         BAL   R3,SIOA             LINK TO START NEXT I/O OPERATION.
+         TM    SW,SWGET            ARE GETALTS REQUIRED ?
+         BZ    ANOALTS             IF NOT THEN LEAVE.
+         TM    SW,SWPRI            ARE PRIMARY TRACKS TO BE SCANNED ?
+         BO    ANOALTS             IF SO THEN LEAVE GETALTS TO PRIMARY.
+         UNPK  PCHADR(9),IOB+35(5) UNPACK PRIMARY TRACK ADDRESS.
+         TR    PCHADR(8),TRTAB     TRANSLATE TO PRINTABLE FORMAT.
+         MVI   PCHADR+8,C','       RESTORE FOLLOWING CHARACTER.
+         BAL   R3,PCHSUB           LINK TO PUNCH GETALT STATEMENT.
+ANOALTS  DS    0H
+         LA    R2,APRTA            SET GR2 -> OUTPUT LINE.
+         LA    R14,APRTHA          SET GR14 -> OUTPUT LOCATION.
+         LA    R15,AHA             SET GR15 -> ALTERNATE ADDRESS.
+         BAL   R3,HEXPRINT         LINK TO CONVERT TO CHARACTER FOR PRT
+         LA    R14,APRTRZ          SET GR14 -> OUTPUT LOCATION.
+         LA    R15,IOB+35          SET GR15 -> DEFECTIVE ADDRESS.
+         BAL   R3,HEXPRINT         LINK TO CONVERT TO CHARACTER FOR PRT
+         BAL   R3,TIO              LINK TO WAIT FOR COMPLETION.
+         MVC   IOB+35(4),AHA       RESTORE CURRENT TRACK ADDRESS.
+         OC    IOB+2(2),IOB+2          IS THERE AN ERROR ?
+         BNE   AERR2               IF NOT THEN UNREADABLE TRACK.
+         MVC   AHA,RECZ            SAVE CONTENTS OF RECORD ZERO ON BAD.
+         CLC   AHA,IOB+35          IS RECORD ZERO AS EXPECTED ?
+         BE    AINCR               IF SO THEN LEAVE.
+         LA    R14,APRTERRB        SET GR14 -> OUTPUT LOCATION.
+         LA    R15,AHA             SET GR15 -> ERROR ALTERNATE ADDRESS.
+         BAL   R3,HEXPRINT         LINK TO CONVERT TO CHARACTER FOR PRT
+AERR3    MVC   APRTERRA,AERRA      STORE 'WHICH GIVES' IN ERROR AREA.
+AINCR    BAL   R3,INCRMENT         LINK TO ADDRESS NEXT TRACK.
+         CLC   IOB+35,F4+8         IS THIS FIRST AVAILABLE ALTERNATE.
+         BL    *+12                IF NOT THEN GO TO ISSUE EXCP.
+         BAL   R3,PUTSUB           LINK TO WRITE A LINE.
+         B     AWINDUP             GO TO TERMINATE.
+         BAL   R3,SIOA             LINK TO RE-START I/O OPERATION.
+         BAL   R3,PUTSUB           LINK TO WRITE A LINE.
+         MVC   APRTERRA,APRTERRA-1 CLEAR ERROR MESSAGE.
+         MVC   APRTERRB,APRTERRB-1 CLEAR ERROR CODES.
+         B     AWAIT1              IF NOT THEN AN I/O IS OUTSTANDING.
+         SPACE 1                                                      *
+*                                                                     *
+*        EXIT FROM SUB-ROUTINE.                                       *
+*                                                                     *
+         SPACE 1                                                      *
+AWINDUP  LA    R2,APRTEND          SET GR2 -> END-UP MESSAGE.
+         B     *+8                 BRANCH AROUND ALTERNATE EXIT.
+ANONE    LA    R2,APRTNONE         SET GR2 -> 'NO ALTERNATES' MESSAGE.
+AEXIT    BAL   R3,PUTSUB           LINK TO WRITE OUTPUT.
+         BAL   R3,CLOSE            LINK TO FREE DEB FOR DISK.
+         GOBACK ASAVE              RETURN.
+         SPACE 1                                                      *
+*                                                                     *
+*        ERROR ON ALTERNATE TRACK.                                    *
+*                                                                     *
+         SPACE 1                                                      *
+AERR1    LA    R14,APRTERLA        SET GR14 -> PRINT ERROR LINE ADDRESS
+         LA    R15,IOB+35          SET GR15 -> ERROR ADDRESS.
+         BAL   R3,HEXPRINT         LINK TO CONVERT TO CHARACTER FOR PRT
+         LA    R14,APRTERLC        SET GR14 -> PRINT ERROR LINE CODE.
+         BAL   R3,ERRSUB           LINK TO SET UP ERROR CODES.
+         LA    R2,APRTERLN         SET GR2 -> ERROR LINE.
+         B     AINCR               GO TO INCREMENT ADDRESS.
+         SPACE 1                                                      *
+*                                                                     *
+*        ALTERNATE TRACK IS DEFECTIVE AND EMBEDDED.                   *
+*                                                                     *
+         SPACE 1                                                      *
+ABAD1    LA    R14,APRTBADA        SET GR14 -> PRINT BAD LINE ADDRESS.
+         LA    R15,IOB+35          SET GR15 -> ERROR ADDRESS.
+         BAL   R3,HEXPRINT         LINK TO CONVERT TO CHARACTER FOR PRT
+         LA    R2,APRTBADL         SET GR2 -> PRINT BAD LINE.
+         B     AINCR               GO TO INCREMENT ADDRESS.
+         SPACE 1                                                      *
+*                                                                     *
+*        ALTERNATE TRACK LISTING IS NOT POSSIBLE FOR THIS DEVICE.     *
+*                                                                     *
+         SPACE 1                                                      *
+ANOTALT  L     R1,UCBPTR           SET GR1 -> UCB.
+         MVC   ADRUMTP,AC2301      STORE 'PARALLEL DRUM' MESSAGE.
+         CLI   19(R1),X'02'        IS DEVICE A PARALLEL DRUM.?
+         BE    ANOTALTA            IF SO THEN GO TO WRITE.
+         MVC   ADRUMTP,AC2303      STORE 'SERIAL DRUM'MESSAGE.
+         CLI   19(R1),X'03'        IS DEVICE A SERIAL DRUM ?
+         BE    ANOTALTA            IF SO THEN GO TO WRITE.
+         MVC   ADRUMTP,AC2305      STORE'FIXED HEAD' MESSAGE.
+ANOTALTA LA    R2,ADRUMLN          SET GR2 -> 'DRUM' LINE.
+         B     AEXIT               GO TO EXIT.
+         SPACE 1                                                      *
+*                                                                     *
+*        ERROR ON DEFECTIVE PRIMARY TRACK.                            *
+*                                                                     *
+         SPACE 1                                                      *
+AERR2    LA    R14,APRTERRB        SET GR14 -> OUTPUT LOCATION.
+         BAL   R3,ERRSUB           LINK TO SET UP ERROR CODES.
+         B     AERR3               GO TO COMPLETE MESSAGE.
+         SPACE 1                                                      *
+*                                                                     *
+*        WRITE BAD F4 MESSAGE.                                        *
+*                                                                     *
+         SPACE 1                                                      *
+ABADF4   LA    R2,APRTF4           SET GR2 -> ERROR MESSAGE.
+         BAL   R3,PUTSUB           LINK TO WRITE MESSAGE.
+         B     AWINDUP             GO TO TERMINATE.
+         EJECT                                                        *
+*                                                                     *
+*        CONSTANTS AND TABLES.                                        *
+*                                                                     *
+         SPACE 1                                                      *
+ASAVE    DC    18F'0'              SAVE AREA.
+AVCON    DC    V(COMAR)            POINTER TO COMMON AREA.
+AHA      DS    F'0'
+AERRA    DC    C'WHICH GIVES'
+APRTA    DC    0H'0',AL2(ALAB1-APRTA,0),C' '
+APRTHA   DC    C'CCCC.HHHH',11C' ',C'ALTERNATE FOR   '
+APRTRZ   DC    C'XXXX.XXXX',6C' '
+APRTERRA DC    C'           ',2C' '
+APRTERRB DC   0C'CC.SENS.RIGHTCSW'
+         DC    C'                '
+ALAB1    DC    C' '
+APRTEND  DLINE 40,'    END OF ALTERNATE TRACK LISTING '
+APRTNONE DLINE 40,'   NO ALTERNATE TRACKS ALLOCATED '
+APRTERLN DC    0H'0',AL2(ALAB2-APRTERLN,0),C' '
+APRTERLA DC    C'CCCC.HHHH',11C' ',C'I/O ERROR.      '
+APRTERLC DC    C'XX.XXXX.XXXXXXXX'
+ALAB2    DC    C' '
+APRTBADL DC    0H'0',AL2(ALAB3-APRTBADL,0),C' '
+APRTBADA DC    C'CCCC.HHHH',11C' ',C'DEFECTIVE ALTERNATE TRACK.'
+ALAB3    DS    0C
+ADRUMLN  DC    0H'0',AL2(ALAB4-ADRUMLN,0),C' '
+         DC    C'ALTERNATE TRACKS ASSIGNED MANUALLY FOR A '
+ADRUMTP  DC   0C'2305 FIXED HEAD FACILITY.'
+         DC    C'                         '
+ALAB4    DS    0C
+AC2301   DC    CL(L'ADRUMTP)'2301 PARALLEL DRUM.'
+AC2303   DC    CL(L'ADRUMTP)'2303 SERIAL DRUM.'
+AC2305   DC    CL(L'ADRUMTP)'2305 FIXED HEAD FACILITY.'
+ANAME    DC    CL8'RTP5004M'       ENTRY POINT NAME.
+APRTF4   DLINE 40,'I/O ERROR ON VOLUME LABEL OR FORMAT 4 DSCB.'
+         TITLE 'RTP5032M - PRIMARY TRACK ANALYSIS SUB-ROUTINE - A.M.M.'
+RTP5032M CSECT
+***********************************************************************
+*                                                                     *
+*  THIS SUB-ROUTINE SCANS ALL PRIMARY TRACKS ON THE DEVICE SPECIFIED  *
+* FOR ERRORS. WHEN AN ERROR IS FOUND THE PROGRAM ANALYZES THE ERROR   *
+* AND PRODUCES A LISTING.OF TRACKS ON WHICH ERRORS HAVE BEEN FOUND.   *
+*  THE CHANNEL PROGRAMS USED ARE AS FOLLOWS :                         *
+*                                                                     *
+*   CPSCAN     SCAN A CYLINDER LOOKING FOR ERRORS. IF NONE FOUND THEN *
+*              RESTART AT NEXT CYLINDER.                              *
+*                                                                     *
+*   CPFM       RESTART SCAN WHEN A FILE MARK HAS BEEN ENCOUNTERED.    *
+*                                                                     *
+*   CPERR      AFTER AN ERROR HAS BEEN FOUND ON SCANNING BY CYLINDER, *
+*              SCAN BY TRACK TO FIND TRACK IN ERROR.                  *
+*                                                                     *
+*   CPFMERRB   RESTART SCAN BY TRACK WHEN A FILE MARK HAS BEEN FOUND. *
+*                                                                     *
+*   CPFMERR    SCAN TO FIND FILE MARK THAT HAS INTERRUPTED CPERR.     *
+*                                                                     *
+***********************************************************************
+         SPACE 3                                                      *
+         BEGIN PSAVE,BASE=RBASE    INITIALISE AND DEFINE BASE REGISTER.
+         L     R11,PVCON           SET GR11 -> COMMON AREA.
+         TM    SW,SW31M            TEST FOR ENTRY THROUGH RT5031M.
+         BO    PNOVER              IF ON THEN VERIFICATION IS SKIPPED.
+         SPACE 1                                                      *
+*                                                                     *
+*        VERIFY INPUT PARAMETERS.                                     *
+*                                                                     *
+         SPACE 1                                                      *
+         MVC   HDGID,PNAME         STORE PROGRAM ENTRY NAME.
+         BAL   R3,VERIFY           LINK TO VERIFY INPUT.
+         SPACE 1                                                      *
+*                                                                     *
+*        OPEN SYSPRINT AND SYSPUNCH AND SIMULATE OPEN FOR DASD.       *
+*                                                                     *
+         SPACE 1                                                      *
+PNOVER   BAL   R3,OPEN             LINK TO OPEN DATA SETS. ON RETURN
+*                                  GR9 -> THE ALTERNATE TRACK DEVICE
+*                                  CHARACTERISTICS TABLE.
+         MVI   PSW,0               CLEAR ALL INTERNAL SWITCHES.
+         SPACE 1                                                      *
+*                                                                     *
+*        START FIRST CHANNEL PROGRAM.                                 *
+*                                                                     *
+         SPACE 1                                                      *
+         XC    IOB+35(5),IOB+35    SET TO START AT CYL=0, HEAD=0.
+         XC    PCOUNT,PCOUNT       CLEAR COMPARISON COUNT FOR FILE MARK
+PEXCP1   LA    R0,CPSCAN           SET GR0 -> SCAN CHANNEL PROGRAM.
+         BAL   R3,SIO              LINK TO SCAN FOR ERRORS.
+         SPACE 1                                                      *
+*                                                                     *
+*        AWAIT COMPLETION OF I/O                                      *
+*                                                                     *
+         SPACE 1                                                      *
+PWAIT1   BAL   R3,TIO              LINK TO AWAIT COMPLETION.
+         SPACE 1                                                      *
+*                                                                     *
+*        IDENTIFY ERROR IF END OF CYLINDER OR FILE MARK.              *
+*                                                                     *
+         SPACE 1                                                      *
+         TM    IOB+12,X'01'        IS IT A FILE MARK ?
+         BO    PFM1                IF SO THEN GO TO RESTART SCAN.
+         TM    IOB+3,X'20'         IS IT CYLINDER END ?
+         BO    PCYLEND             IF SO THEN GO TO RESTART NEXT CYL.
+         SPACE 1                                                      *
+*                                                                     *
+*        NOW SCAN BY TRACK TO LOCATE TRACK IN ERROR.                  *
+*                                                                     *
+         SPACE 1                                                      *
+         CLC   IOB+35(3),COUNT     WAS THERE AN ERROR ON THE COUNT FLD?
+         BNE   PNEXTTRK            IF SO THEN MUST START FROM HEAD ZERO
+         MVC   IOB+38(1),COUNT+3   STORE TRACK NUMBER TO START SCAN.
+PNEXTTRK MVI   IOB+39,0            CLEAR RECORD NUMBER FOR FILE MARK.
+         LA    R0,CPERR            SET GR0 -> ERROR SCAN CHANNEL PROG.
+PSIO2    BAL   R3,SIO              LINK TO SCAN TRACK.
+         SPACE 1                                                      *
+*                                                                     *
+*        WAIT FOR COMPLETION OF TRACK SCAN.                           *
+*                                                                     *
+         SPACE 1                                                      *
+         BAL   R3,TIO              LINK TO WAIT FOR COMPLETION.
+         SPACE 1                                                      *
+*                                                                     *
+*        CHECK TO FIND IF TRACK IS IN ERROR.                          *
+*                                                                     *
+         SPACE 1                                                      *
+         CLI   ECB,X'7F'           IS TRACK GOOD ?
+         BE    PGOODTK             IF SO THEN GO TO TEST FOR NEXT.
+         TM    IOB+12,X'01'        IS IT A FILE MARK ?
+         BO    PFM2                IF SO THEN GO TO LOCATE AND RESTART.
+         SPACE 1                                                      *
+*                                                                     *
+*        TRACK IS IN ERROR. SET UP MESSAGE.                           *
+*                                                                     *
+         SPACE 1                                                      *
+         LA    R14,PPRTADDR        SET GR14 -> PRINT ERROR LINE ADDRESS
+         LA    R15,IOB+35          SET GR15 -> TRACK ADDRESS.
+         BAL   R3,HEXPRINT         LINK TO CONVERT TO CHARACTER FOR PRT
+         LA    R14,PPRTCODE        SET GR14 -> ERROR CODE AREA.
+         BAL   R3,ERRSUB           LINK TO SET UP ERROR CODE.
+         SPACE 1                                                      *
+*                                                                     *
+*        IF TRACK HAS TRACK CONDITION STORE ADDRESS OF ALTERNATE.     *
+*                                                                     *
+         SPACE 1                                                      *
+         TM    IOB+2,X'02'         IS IT TRACK CONDITION ?
+         BZ    PNOTRACK            IF NOT THEN GO TO TEST DATA CHECK.
+         LA    R14,PPRTALT         SET GR14 -> ALTERNATE ADDRESS AREA.
+         LA    R15,RECZ            SET GR15 -> RECORD ZERO.
+         BAL   R3,HEXPRINT         LINK TO CONVERT TO CHARACTER FOR PRT
+         MVC   PPRTERR,PCTRACK     STORE 'TRACK CONDITION' IN ERROR.MSG
+         B     PRESTART            GO TO RESTART SCAN.
+         SPACE 1                                                      *
+*                                                                     *
+*        CHECK FOR DATA CHECK OR MISSING ADDRESS MARKER.              *
+*                                                                     *
+         SPACE 1                                                      *
+PNOTRACK TM    IOB+2,X'08'         IS IT DATA CHECK ?
+         BZ    PNODATA             IF NOT THEN CHECK MISSING A.M.
+         MVC   PPRTERR,PCDATA      STORE 'DATA CHECK' IN ERROR MESSAGE.
+         B     PRESTART            GO TO RESTART SCAN.
+PNODATA  TM    IOB+3,X'02'         IS IT MISSING ADDRESS MARKER ?
+         BZ    PRESTART            IF NOT THEN NO MESSAGE.
+         MVC   PPRTERR,PCAM        STORE 'MISSING ADDRESS MARKER' IN ER
+         SPACE 1                                                      *
+*                                                                     *
+*        RESTART CHANNEL PROGRAM TO SCAN.                             *
+*                                                                     *
+         SPACE 1                                                      *
+PRESTART BAL   R3,INCRMENT         LINK TO SET ADDRESS TO NEXT TRACK.
+         CLC   IOB+35(2),0(R9)     IS IT END OF ALTERNATE TRACKS ?
+         BL    PSIO1               IF NOT THEN GO TO START SCAN.
+         OI    PSW,X'80'           SET NO WAIT EXPECTED.
+         B     PPRINT              GO TO PRINT LINE.
+PSIO1    LA    R0,CPSCAN           SET GR0 -> SCAN CHANNEL PROGRAM.
+         BAL   R3,SIO              LINK TO SCAN BY CYLINDER.
+         SPACE 1                                                      *
+*                                                                     *
+*        PRINT LINE.                                                  *
+*                                                                     *
+         SPACE 1                                                      *
+PPRINT   LA    R2,PLINE            SET GR2 -> OUTPUT LINE.
+         BAL   R3,PUTSUB           LINK TO WRITE OUTPUT.
+         SPACE 1                                                      *
+*                                                                     *
+*        PRODUCE GETALT STATEMENTS IF REQUESTED.                      *
+*                                                                     *
+         SPACE 1                                                      *
+         TM    SW,SWGET            ARE GETALT STATEMENTS REQUESTED ?
+         BZ    PNOALT              IF NOT THEN GO TO CLEAR ERRORS.
+         CLI   PPRTERR,C' '        IS ERROR RECOGNISED ?
+         BE    PNOALT              IF NOT THEN NO GETALT.
+         CLI   PPRTERR,C'T'        IS IT TRACK CONDITION ?
+         BNE   *+12                IF NOT THEN A GETALT IS REQUIRED.
+         TM    SW,SWALL            ARE ALL GETALTS REQUIRED ?
+         BZ    PNOALT              IF NOT THEN GO TO CLEAR ERRORS.
+         MVC   PCHADR(4),PPRTADDR  STORE CYLINDER ADDRESS IN GETALT.
+         MVC   PCHADR+4(4),PPRTADDR+5   STORE TRACK ADDRESS IN GETALT.
+         BAL   R3,PCHSUB           LINK TO PUNCH GETALT STATEMENT.
+         SPACE 1                                                      *
+*                                                                     *
+*        CLEAR ERROR CODES.                                           *
+*                                                                     *
+         SPACE 1                                                      *
+PNOALT   MVC   PPRTERR,PPRTERR-1   CLEAR ERROR TEXT.
+         MVC   PPRTALT,PPRTALT-1   CLEAR ALTERNATE TRACK ADDRESS.
+         TM    PSW,X'80'           IS IT END OF SCAN.
+         BZ    PWAIT1              GO TO WAIT FOR I/O COMPLETION.
+         SPACE 1
+*
+*        EXIT.
+*
+         SPACE 1
+PENDUP   BAL   R3,CLOSE            TERMINATE.I/O ACTIVITY.
+         GOBACK PSAVE              RETURN.
+         SPACE 1                                                      *
+*                                                                     *
+*        PROCESS A FILE MARK AND RESTART GENERAL SCAN.                *
+*                                                                     *
+         SPACE 1                                                      *
+PFM1     CLC   PCOUNT,COUNT        CHECK FOR LOOPING ON TRACK.
+         BNL   PGOODTK             IF SO THEN TRACK IS GOOD.
+         LA    R0,CPFM             SET GR0 -> FILE MARK CHANNEL PROGRAM
+         MVC   IOB+35(5),COUNT     STORE COUNT OF LAST (FAILING) RECORD
+         BAL   R3,SIO              LINK TO RESTART CHANNEL PROGRAM.
+         MVC   PCOUNT,IOB+35       SAVE COMPARISON COUNT FOR FILE MARKD
+         AP    FMCT,P1             INCREMENT FILE MARK COUNT.
+         B     PWAIT1              GO TO WAIT FOR COMPLETION.
+         SPACE 1                                                      *
+*                                                                     *
+*        PROCESS CYLINDER END.                                        *
+*                                                                     *
+         SPACE 1                                                      *
+PCYLEND  LA    R1,3                SET GR1 = 3
+         XC    IOB+38(2),IOB+38    CLEAR TRACK AND RECORD NUMBERS.
+         BAL   R3,INCRMENT+4       LINK TO INCREMENT CYLINDER NUMBER.
+         CLC   IOB+35(2),0(R9)     COMPARE FOR LAST PRIMARY TRACK ADDR.
+         BL    PEXCP1              GO TO RE-START SCAN.
+         B     PENDUP              GO TO EXIT.
+         SPACE 1                                                      *
+*                                                                     *
+*        PROCESS GOOD TRACK WHILE SEEKING ERROR TRACK.                *
+*                                                                     *
+         SPACE 1                                                      *
+PGOODTK  BAL   R3,INCRMENT         GO TO INCREMENT TRACK ADDRESS.
+         CLI   IOB+38,0            IS TRACK NUMBER ZERO ?
+         BE    PEXCP1              IF SO THEN ERROR HAS DISAPPEARED.
+         B     PNEXTTRK            GO TO SCAN NEXT TRACK.
+         SPACE 1                                                      *
+*                                                                     *
+*        PROCESS FILE MARK FOUND WHILE SEARCHING FOR ERROR TRACK.     *
+*                                                                     *
+         SPACE 1                                                      *
+PFM2     CLC   PCOUNT,COUNT        CHECK FOR LOOPING ON TRACK.
+         BNL   PGOODTK             IF SO THEN TRACK IS GOOD.
+         LA    R0,CPFMERR          SET GR0 -> SCAN CHANNEL PROGRAM.
+         MVC   PCOUNT,COUNT        SAVE COMPRAISON COUNT.
+         BAL   R3,SIO              LINK TO SCAN FOR FILE MARK.
+         AP    FMCT,P1             INCREMENT FILE MARK COUNT.
+         BAL   R3,TIO              WAIT FOR COMPLETION.
+         LA    R0,CPFMERRB         SET GR0 -> RESTART CHANNEL PROGRAM.
+         B     PSIO2               GO TO RESTART I/O.
+         EJECT                                                        *
+*                                                                     *
+*        CONSTANTS AND TABLES.                                        *
+*                                                                     *
+         SPACE 1                                                      *
+PSAVE    DC    18F'0'              SAVE AREA.
+PVCON    DC    V(COMAR)            POINTER TO COMMON AREA.
+PNAME    DC    CL8'RTP5032M'       ENTRY NAME.
+PLINE    DC    0H'0',AL2(PLINEND-PLINE,0),C' '
+PPRTADDR DC    C'CCCC.HHHH',11C' ',C'HAS ERROR',10C' '
+PPRTCODE DC    C'CC.SENS.RIGHTCSW',6C' '
+PPRTERR  DC   0C'MISSING ADDRESS MARKER. '
+         DC    C'                        '
+PPRTALT  DC    C'CCCC.HHHH'
+PLINEND  DS    C' '
+PCAM     DC    C'MISSING ADDRESS MARKER. '
+PCDATA   DC    C'DATA CHECK.             '
+PCTRACK  DC    C'TRACK CONDITION.    ALT='
+PSW      DC    AL1(0)
+PCOUNT   DC    XL5'0'              COUNT COMPARISON CHECK FOR FILE MARK
+         TITLE 'DASD ANALYSIS COMMON CODE AND WORK AREA - A.MORRISH.'
+*                                                                     *
+*        EQUATES FOR CHANNEL COMMAND WORDS.                           *
+*                                                                     *
+         SPACE 1                                                      *
+MT       EQU   X'80'               MULTI-TRACK OPERATION.
+HI       EQU   X'40'               SEARCH FOR HIGH.
+EQ       EQU   X'20'               SEARCH FOR EQUAL.
+HA       EQU   X'18'               HOME ADDRESS OPERATION.
+ID       EQU   X'10'               COUNT OPERATION.
+RZ       EQU   X'14'               RECORD ZERO OPERATION.
+KEY      EQU   X'08'               KEY OPERATION.
+TIC      EQU   X'08'               TRANSFER IN CHANNEL.
+DATA     EQU   X'04'               DATA OPERATION.
+NOP      EQU   X'03'               NOP INSTRUCTION.
+RD       EQU   X'02'               READ OPERATION.
+WRT      EQU   X'01'               WRITE OPERATION.
+SCH      EQU   X'01'               SEARCH OPERATION.
+         SPACE 2                                                      *
+CD       EQU   X'80'               DATA CHAINING.
+CC       EQU   X'40'               COMMAND CHAINING.
+SLI      EQU   X'20'               SUPPRESS ILLEGAL LENGTH INDICATION.
+SKIP     EQU   X'10'               SUPPRESS DATA TRANSFER.
+PCI      EQU   X'08'               PROGRAM CONTROLLED INTERRUPT.
+         SPACE 3                                                      *
+COMAR    CSECT
+CPVOL    CCW   SCH+ID+EQ,IOB+35,CC,5    SEARCH FOR VOLUME LABEL.
+         CCW   TIC,CPVOL,0,0            TIC UNTIL FOUND.
+         CCW   RD+ID+MT,COUNT,CC,8      READ COUNT OF VOLUME LABEL.
+         CCW   RD+DATA,VOL,0,80         READ VOLUME LABEL.
+         SPACE 1                                                      *
+CPF4     CCW   SCH+ID+EQ,IOB+35,CC,5    SEARCH FOR FORMAT 4 DSCB.
+         CCW   TIC,CPF4,0,0             TIC UNTIL FOUND.
+         CCW   RD+DATA,F4,0,96          READ DATA OF FORMAT 4 DSCB.
+         SPACE 1                                                      *
+CPALT    CCW   RD+HA,HOME,CC,5          READ HOME ADDRESS.
+         CCW   RD+RZ,RECZ,SLI,8         READ RECORD ZERO.
+         SPACE 1                                                      *
+CPSCAN   CCW   RD+HA,*,CC+SKIP,5        POSITION TO READ HOME ADDRESS.
+         CCW   RD+ID+MT,COUNT,CC,8      READ COUNT MULTI-TRACK.
+         CCW   RD+DATA,*,CC+SLI+SKIP,32767   SCAN DATA FIELD.
+         CCW   TIC,CPSCAN+8,0,0         LOOP UNTIL ERROR FOUND.
+         SPACE 1                                                      *
+CPFM     CCW   SCH+ID+EQ,IOB+35,CC,5    SEARCH FOR FAILING ADDRESS.
+         CCW   TIC,CPFM,0,0             TIC UNTIL FOUND.
+         CCW   TIC,CPSCAN+8,0,0         RESTART SCAN AT FOLLOWING RECD.
+         SPACE 1                                                      *
+CPERR    CCW   RD+HA,HOME,CC,5     READ HOME ADDRESS.
+         CCW   RD+RZ,RECZ,CC+SLI,8 READ RECORD ZERO.
+CPERRA   CCW   SCH+ID+EQ,IOB+35,CC,5    SEARCH FOR RECORD ZERO.
+         CCW   TIC,*+16,0,0             IF NOT FOUND THEN GO TO READ.
+         CCW   NOP,*,0,1                NORMAL END OF CHANNEL PROGRAM.
+         CCW   RD+DATA,*,CC+SLI+SKIP,32767   SCAN DATA FIELD.
+         CCW   TIC,CPERRA,0,0           GO TO CONTINUE SCAN.
+         SPACE 1                                                      *
+CPFMERR  CCW   SCH+ID+EQ,COUNT,CC,5     SEARCH FOR LAST FILE MARK.
+         CCW   TIC,CPFMERR,0,0          TIC UNTIL FOUND.
+CPFMERRA CCW   RD+ID,COUNT,CC,8         READ COUNT FIELD.
+         CCW   RD+DATA,*,CC+SLI+SKIP,32767   SCAN DATA FIELD.
+         CCW   TIC,CPFMERRA,0,0         TIC UNTIL STOPPED BY UNIT EX.
+         SPACE 1                                                      *
+CPFMERRB CCW   SCH+ID+EQ,COUNT,CC,5     SEARCH FOR NEW FILE MARK.
+         CCW   TIC,CPFMERRB,0,0         TIC UNTIL FOUND.
+         CCW   TIC,CPERRA,0,0           GO TO CONTINUE ERROR SCAN.
+         SPACE 1                                                      *
+*                                                                     *
+*        DATA CONTROL BLOCKS AND CONTROL BLOCKS FOR I/O.              *
+*                                                                     *
+         SPACE 1                                                      *
+DW       DS    D                   DOUBLE WORD GENERAL WORK AREA.
+DCB      EQU   *-40
+         DC    X'0000A000',X'0C',AL3(0),X'12',2A(0),3A(0),F'0'
+APP      DC    V(IGG019WF),4A(BR14)     APPENDAGE VECTOR TABLE.
+DEB      DC    4A(0),X'01',A(0,DCB),X'04',AL3(APP)
+         DC    X'40',AL3(0),H'0,0,1,0,1,1'
+DEBEND   DS    0A
+IOB      DC    0F'0',X'42',A(ECB,0,0,0,DCB,0,0),2A(0)
+ECB      DC    F'0'                EVENT CONTROL BLOCK.
+COUNT    DS    2F                  COUNT FIELD.
+HOME     DS    2F                  HOME ADDRESS.
+         SPACE 2
+PRT      DCB   DDNAME=SYSPRINT,DSORG=PS,MACRF=PM,RECFM=VBA,LRECL=123,  *
+               BLKSIZE=2178,EXLST=DCBEXIT
+PCH      DCB   DDNAME=SYSPUNCH,DSORG=PS,MACRF=PM,RECFM=FB,LRECL=80,    *
+               BLKSIZE=2000,EXLST=DCBEXIT
+         SPACE 1                                                      *
+*                                                                     *
+*        AUXILIARY I/O CONSTANTS AND WORK AREAS.                      *
+*                                                                     *
+         SPACE 1                                                      *
+UCBPTR   DC    A(0)                POINTER TO UCB.
+LINECT   DC    A(1)                RESIDUAL LINE COUNT.
+CLOSEL   CLOSE (PRT,,PCH),MF=L     CLOSE DATA SETS.
+OPENL    DC    A(PRT,PCH)          OPEN FOR OUTPUT.
+F4       DS    24F'0'              FORMAT 4 DSCB.
+VOL      DS    CL80' '             VOLUME LABEL.
+RECZ     DS    2F'0'               RECORD ZERO.
+IGG019WF DC    C'IGG019WF'         APPENDAGE NAME.
+CDASDR   DC    C'IEHDASDR'         FORMATTING PROGRAM NAME.
+CDASDI   DC    C'IBCDASDI'         FORMATTING PROGRAM NAME.
+         SPACE 1                                                      *
+*                                                                     *
+*        OTHER CONSTANTS AND WORK AREAS.                              *
+*                                                                     *
+         SPACE 1                                                      *
+VCON4    DC    V(RTP5004M)         ALTERNATE TRACK ANALYSIS SUB-ROUTINE
+VCON32   DC    V(RTP5032M)         PRIMARY TRACK ANALYSIS SUB-ROUTINE.
+SPMODEL  DC    V($SPMODE)          SUPERVISOR STATE SET ROUTINE.
+TRTAB    EQU   *-C'0'
+         DC    C'0123456789ABCDEF' TRANSLATE TABLE.
+TAB      DC    AL1(0,T2311-TAB,0,0,T2302-TAB,T2321-TAB,0,0,T2311-TAB)
+T2311    DC    H'200'             )
+T2302    DC    H'246'             )ADDRESS OF FIRST ALTERNATE TRACK.
+T2321    DC    AL1(19,6)          )
+LINE     DS    CL133' '            OUT-PUT AREA FOR FIXED LENGTH RECORD
+EXCPCT   DC    PL4'0'              COUNT OF NUMBER OF EXCPS.
+FMCT     DC    PL4'0'              COUNT OF NUMBER IF FILE MARKS.
+GETALTCT DC    PL4'0'               GETALT SEQUENCE COUNT.
+P1       DC    P'1'                INCREMENT VALUE.
+MASKDATE DC    X'4021204B202020'   DATE FORMAT AS 'YY.DDD'
+MASKTIME DC    X'402120204B2020'   TIME FORMAT AS ' HH.MM'
+MASK1    DC    X'40206B2020206B202120'  COUNT FORMAT.
+SW       DC    AL1(0)              SWITCH.
+SW31M    EQU   X'80'                    ENTRY THROUGH RT5031M
+SWALT    EQU   X'40'                    ALTERNATE TRACK SCAN REQUIRED.
+SWPRI    EQU   X'20'                    PRIMARY TRACK SCAN REQUIRED.
+SWDEV    EQU   X'10'                    A VALID DEVICE HAS BEEN FOUND.
+SWGET    EQU   X'08'                    GETALT STATEMENTS ARE REQUIRED.
+SWALL    EQU   X'04'                    GETALTS FOR ALL TRACKS REQUIRED
+SWLOAD   EQU   X'02'                    APPENDAGE HAS BEEN LOADED.
+SWENDUP  EQU   X'01'                    END-UP IS PENDING.
+         SPACE 1                                                      *
+*                                                                     *
+*        OUTPUT MESSAGES.                                             *
+*                                                                     *
+         SPACE 1                                                      *
+SPACE    DLINE 40,' '              BLANK LINE.
+HDG      DC    0H'0',AL2(HDGEND-HDG,0),C'1'
+HDGID    DC    CL8'RTP5004M',C' ANALYSIS OF DASD #'
+HDGSER   DC    C'000000',C'  ON DRIVE '
+HDGDEV   DC    C'000',C'   OWNER='
+HDGOWNER DC    CL10' ',C'   INITIALISED BY '
+HDGINIT  DC    CL8' ',C'    LISTED AT'
+HDGTIME  DC    X'402120204B2020',C' ON '
+HDGDATE  DC    X'4021204B202020'
+HDGEND   DS    0C
+PCHCARD  DC    CL72' '
+         ORG   PCHCARD
+         DC    C' GETALT TRACK='
+PCHADR   DC    C'CCCCHHHH',C',TODD=D'
+PCHSER   DC    C'SERIAL'
+         ORG   PCHCARD+72
+         ORG
+PCHSEQ   DC    C'00000000'
+SUMLINE  DC    0H'0',AL2(SUMLINND-SUMLINE,0),C'0 '
+SUMEXCP  DC    X'40206B2020206B202020',C'    EXCPS ISSUED.',10C' '
+SUMFILEM DC    X'40206B2020206B202020',C'    FILE MARKS ENCOUNTERED.'
+SUMLINND DS    0C
+         SPACE 2                                                      *
+DCBEXIT  DCBEXITS
+BR14     EQU   *-2
+         EJECT                                                        *
+*                                                                     *
+*        SUB-ROUTINE TO VERIFY INPUT PARAMETERS.                      *
+*                                                                     *
+         SPACE 1                                                      *
+VERIFY   LM    R14,R0,0(R1)        LOAD PARAMETERS.
+         ST    R14,OPENL           STORE ADDRESS OF OUTPUT DCB.
+         ST    R15,UCBPTR          STORE ADDRESS OF UCB.
+         ST    R0,OPENL+4          STORE ADDRESS OF PUNCH DCB.
+         LTR   R0,R0               TEST FOR PUNCH DCB PRESENT.
+         BZ    *+16                IF NOT THEN LEAVE.
+         OI    SW,SWGET            SET GETALTS REQUIRED.
+         BNM   *+8                 IF HI-ORDER BIT NOT SET THEN LEAVE.
+         OI    SW,SWALL            SET ALL GETALTS REQUIRED.
+         TM    OPENL+3,X'03'       IS PRINT DCB ON CORRECT BOUNDARY ?
+         BNZ   ERR01               IF NOT THEN ERROR.
+         L     R1,OPENL            SET GR1 -> PRINT DCB.
+         LA    R1,0(R1)            CLEAR HIGH ORDER BYTE.
+         L     R14,16              SET GR14 -> CVT.
+         TM    116(R4),X'10'       IS IT MVT ?
+         L     R14,0(R14)          SET GR14 -> TCB POINTERS.
+         L     R14,4(R14)          SET GR14 -> CURRENT TCB.
+         BZ    VERIFYA             IF NOT THEN GO TO FIND BOUNARY BOX.
+         L     R14,152(R14)        SET GR14 -> D-PQE.
+         L     R14,8(R14)          SET GR14 -> PQE (ASSUMED ONLY ONE).
+         L     R15,20(R14)         SET GR15 = SIZE OF REGION.
+         L     R14,24(R14)         SET GR14 -> START OF REGION.
+         AR    R15,R14             SET GR15 -> END OF REGION.
+         B     VERIFYB             GO TO CHECK DCB ADDRESS.
+VERIFYA  L     R14,24(R14)         SET GR14 -> BOUNDARY BOX.
+         LM    R14,R15,4(R14)      SET GR14 -> LO-ADDR, GR15 -> HI-ADDR
+VERIFYB  CR    R1,R14              COMPARE DCB ADDRESS WITH LOW BOUND.
+         BL    ERR01               IF LESS THEN ERROR.
+         CR    R1,R15              COMPARE DCB ADDRESS WITH HIGH BOUND.
+         BNL   ERR01               IF NOT LESS THEN ABEND.
+         TM    48(R1),X'02'        IS DCB IN I/O SUPPORT ?
+         BZ    ERR01               IF SO THEN PROBABLY NOT A DCB.
+         TM    36(R1),X'23'        ARE TK OVERFLOW, MC OR KEY SPEC'D ?
+         BNZ   ERR01               IF SO THEN PROBABLY NOT A DCB.
+* UCB
+         TM    UCBPTR+3,X'03'      IS UCB ON A FULL WORD BOUNDARY ?
+         BNZ   ERR02               IF NOT THEN ERROR.
+         L     R1,UCBPTR           SET GR1 -> UCB.
+         CLI   2(R1),X'FF'         IS IT A UCB.
+         BNE   ERR02               IF NOT THEN IGNORE POSSIBLE 2321.
+         CLI   18(R1),X'20'        IS DEVICE A DASD ?
+         BNE   ERR02               IF NOT THEN ERROR.
+* SYSPUNCH
+         TM    SW,SWGET            ARE GFTALTS REQUIRED ?
+         BCR   8,R3                IF NOT THEN RETURN.
+         TM    OPENL+7,X'03'       IS DCB ON A FULL WORD BOUNDARY ?
+         BNZ   ERR03               IF NOT THEN ERROR.
+         L     R1,OPENL+4          SET GR1 -> SYSPUNCH DCB.
+         LA    R1,0(R1)            CLEAR HIGH ORDER BYTE OF GR1.
+         CR    R1,R14              COMPARE DCB ADDRESS WITH LOW BOUND.
+         BL    ERR03               IF LESS THEN ERROR.
+         CR    R1,R15              COMPARE DCB ADDRESS WITH HIGH BOUND.
+         BNL   ERR03               IF NOT LESS THEN ERROR.
+         TM    48(R1),X'02'        IS DCB IN I/O SUPPORT ?
+         BZ    ERR03               IF SO THEN PROBABLY NOT A DCB.
+         TM    36(R1),X'23'        ARE TK OVERFLOW, MC CONTROL OR KEY ?
+         BNZ   ERR03               IF SO THEN PROBABLY NOT A DCB.
+         BR    R3                  RETURN.
+         SPACE 1                                                      *
+*                                                                     *
+*        SUB-ROUTINE TO OPEN DATA SETS.                               *
+*                                                                     *
+         SPACE 1                                                      *
+OPEN     MVI   OPENL,X'8F'         SET TO OPEN FOR OUTPUT.
+         MVI   OPENL+4,X'8F'       SET TO OPEN FOR OUTPUT.
+         LA    R1,OPENL            SET GR1 -> L-FORM OPEN.
+         LA    R0,OPENL+4    SET GR0 TO COMPARE FOR OPEN REQUIRED.
+         L     R15,OPENL           SET GR15 -> SYSPRINT DCB.
+OPENB    TM    48(R15),X'10'       IS DCB ALREADY OPEN ?
+         BZ    *+8                 IF NOT OPEN THEN LEAVE.
+         LA    R1,4(R1)            INCREMENT GR1 TO SKIP OPEN SYSPRINT.
+         TM    SW,SWGET            ARE GETALTS REQUIRED ?
+         BZ    OPENA               IF NOT THEN NO OPEN REQUIRED.
+         L     R15,OPENL+4         SET GR15 -> SYSPUNCH DCB.
+         TM    48(R15),X'10'       IS SYSPUNCH DCB OPEN ?
+         BO    OPENA               IF SO THEN SKIP OPEN.
+         MVI   OPENL,X'0F'         SET TO ALLOW OPEN FOR SYSPUNCH.
+         LA    R0,OPENL+8    SET GR0 TO COMPARE FOR OPEN REQUIRED.
+OPENA    CLR   R1,R0               COMPARE FOR OPEN REQUIRED.
+         BNL   OPENC               IF REQUIRED DATA SETS OPEN SET DCB.
+         OPEN  MF=(E,(1))          OPEN FOR OUTPUT.
+OPENC    L     R1,OPENL            SET GR1 -> SYSPRINT DCB.
+         TM    48(R1),X'10'        IS SYSPRINT DCB OPEN ?
+         BZ    ERR04               IF NOT THEN ABEND.
+         L     R1,44(R1)           SET GR1 -> SYSPRINT DEB.
+         MVC   DEB+1(3),1(R1)      STORE TCB ADDRESS IN DEB.
+         MVC   DEB+20(1),20(R1)    STORE TASK PRIORITY IN DEB.
+         MVC   DEB+24(1),24(R1)    STORE TASK PROTECTION KEY IN DEB.
+         L     R0,UCBPTR           SET GR0 -> UCB.
+         STH   R0,DEB+34           STORE UCB ADDRESS IN MODEL DEB.
+         SPMODE SUPV,0,MF=(E,SPMODEL)   ENTER SUPERVISOR STATE  PROT 0.
+         OC    APP+1(3),APP+1      TEST FOR IGG019WF PRESENT       SUPV
+         BNZ   OPEND               IF PRESENT THEN LEAVE.          SUPV
+         L     R1,16               SET GR1 -> CVT.                 SUPV
+         L     R1,84(R1)           SET GR1 -> DCB FOR SYS1.SVCLIB. SUPV
+         LOAD  EPLOC=IGG019WF,DCB=(1)   LOAD IGG019WF EOE APPNDGE. SUPV
+         ST    R0,APP              STORE ADDRESS IN AVT.           SUPV
+         OI    SW,SWLOAD           SET ON APPENDAGE LOADED SWITCH. SUPV
+OPEND    L     R1,DCB+44           SET GR1 -> DYNAMIC DEB.         SUPV
+         LA    R1,0(R1)            CLEAR HIGH ORDER BITS.          SUPV
+         LTR   R1,R1               TEST FOR DYNAMIC DEB PRESENT.   SUPV
+         BNZ   OPENE               IF PRESENT THEN SKIP GETMAIN.   SUPV
+         LA    R0,DEBEND-DEB       SET GR0 = LENGTH OF DYNAMIC DEB.SUPV
+         GETMAIN R,LV=(0)          OBTAIN DYNAMIC SPACE FROM SP252.SUPV
+         ST    R1,DCB+44           STORE ADDRESS OF DYNAMIC DEB.   SUPV
+         MVI   DCB+44,X'0C'        INHIBIT ERROR RECOVERY.         SUPV
+OPENE    MVC   0(DEBEND-DEB,R1),DEB     STORE DYNAMIC DEB.         SUPV
+         SPMODE PROB,*,MF=(E,SPMODEL)   RESTORE PROB PROG STATE & PROT.
+         LR    R2,R3               SAVE RETURN ADDRESS.
+         XC    IOB+32(7),IOB+32    CLEAR CYLINDER AND HEAD NUMBER
+         MVI   IOB+39,2            SET TO SEARCH FOR RECORD NO. 2.
+         LA    R0,CPVOL            SET GR0 -> READ VOLUME LAB CHAN PROG
+         BAL   R3,SIO              LINK TO READ VOLUME LABEL.
+         TIME  DEC                 OBTAIN DATE AND TIME.
+         STM   R0,R1,DW            STORE DATE AND TIME.
+         MVC   HDGDATE,MASKDATE    STORE MASK TO EDIT DATE.
+         MVC   HDGTIME,MASKTIME    STORE MASK TO EDIT TIME.
+         ED    HDGDATE,DW+5        EDIT DATE INTO HEADING.
+         MVO   DW+5(3),DW(2)       STORE TIME FOR EDIT.
+         ED    HDGTIME,DW+5        EDIT TIME INTO HEADING.
+         L     R1,UCBPTR           SET GR1 -> UCB.
+         MVC   HDGDEV,13(R1)       STORE DEVICE ADDRESS.
+         BAL   R3,TIO              LINK TO WAIT FOR COMPLETION.
+         CLI   ECB,X'7F'           WAS COMPLETION NORMAL ?
+         BCR   7,R2                IF NOT THEN CANNOT READ FORMAT 4 DSC
+         MVC   IOB+35(5),VOL+11    STORE ADDRESS OF FORMAT 4 DSCB.
+         LA    R0,CPF4             SET GR3 -> READ FORMAT 4 DSCB C.PROG
+         BAL   R3,SIO              LINK TO EXECUTE CHANNEL PROGRAM.
+         MVC   HDGSER,VOL+4        STORE VOLUME SERIAL IN HEADER.
+         MVC   PCHSER,VOL+4        STORE VOLUME SERIAL IN GETALT CARD.
+         MVC   HDGOWNER,VOL+41     STORE OWNER NAME.
+         MVC   HDGINIT,CDASDR      STORE 'INITIALISED BY IEHDASDR'.
+         CLI   COUNT+5,0           IS KEY LENGTH ZERO ?
+         BE    *+10                IF SO THEN LEAVE.
+         MVC   HDGINIT,CDASDI      STORE 'INITIALISED BY IBCDASDI'.
+         SR    R9,R9               SET GR9 = 0
+         L     R1,UCBPTR           SET GR1 -> UCB.
+         IC    R9,19(R1)           SET GR9 = DEVICE CODE.
+         IC    R9,TAB(R9)          SET GR9 = INDEXITO START OF ALTS.
+         LTR   R9,R9               TEST FOR DEVICE WITHOUT ALTERNATES.
+         BZ    *+8                 IF ZERO THEN LEAVE.
+         LA    R9,TAB(R9)          SET GR9 -> ADDRESS OF 1ST ALT TRACK.
+         LR    R3,R2               RESTORE GR3.
+         B     TIO                 GO TO TEST COMPLETION.
+         SPACE 1                                                      *
+*                                                                     *
+*        SUB-ROUTINE TO EXECUTE A CHANNEL PROGRAM.                    *
+*                                                                     *
+         SPACE 1                                                      *
+SIO      ST    R0,IOB+16           STORE ADDRESS OF CHANNEL PROGRAM.
+SIOA     EXCP  IOB                 EXECUTE CHANNEL PROGRAM.
+         AP    EXCPCT,P1           INCREMENT EXCP COUNT.
+         BR    R3                  RETURN.
+         SPACE 1                                                      *
+*                                                                     *
+*        SUB-ROUTINE TO WAIT FOR COMPLETION OF A CHANNEL PROGRAM.     *
+*                                                                     *
+         SPACE 1                                                      *
+TIO      WAIT  1,ECB=ECB           WAIT FOR COMPLETION.
+         BR    R3                  RETURN.
+         SPACE 1                                                      *
+*                                                                     *
+*        SUB-ROUTINE TO EDIT A DASD ADDRESS TO PRINTABLE FORMAT.      *
+*                                                                     *
+         SPACE 1                                                      *
+HEXPRINT UNPK  1(9,R14),0(5,R15)   UNPACK ADDRESS.
+         TR    1(8,R14),TRTAB      TRANSLATE TO PRINTABLE FORMAT.
+         MVC   0(4,R14),1(R14)     SEPARATE CYLINDER AND HEAD ADDRESSES
+         MVI   4(R14),C'.'         STORE DELIMITER.
+         MVI   9(R14),C' '         CLEAR ODD CHARACTER.
+         BR    R3                  RETURN.
+         SPACE 1                                                      *
+*                                                                     *
+*        SUB-ROUTINE TO SET UP ERROR INFORMATION FOR PRINT OUT.       *
+*                                                                     *
+         SPACE 1                                                      *
+ERRSUB   UNPK  0(3,R14),ECB(2)     UNPACK COMPLETION CODE.
+         UNPK  3(5,R14),IOB+2(3)   UNPACK SENSE BYTES.
+         UNPK  8(9,R14),IOB+12(5)  UNPACK RIGHT HALF OF THE CSW.
+         TR    0(16,R14),TRTAB     TRANSLATE TO PRINTABLE FORMAT.
+         MVI   2(R14),C'.'         STORE DELIMITER.
+         MVI   7(R14),C'.'         STORE DELIMITER.
+         MVI   16(R14),C' '        CLEAR ODD CHARACTER.
+         BR    R3                  RETURN.
+         SPACE 1                                                      *
+*                                                                     *
+*        SUB-ROUTINE TO INCREMENT TO NEXT SEQUENTIAL TRACK ADDRESS.   *
+*                                                                     *
+         SPACE 1                                                      *
+INCRMENT LA    R1,4                SET GR1 = 4.
+         L     R15,DCB+44          SET GR15 -> DEB.
+         SR    R14,R14             SET GR14 = 0.
+         SR    R0,R0               SET GR0 = 0.
+INCRMNTA IC    R14,IOB+34(R1)      SET GR14 = VALUE.
+         LA    R14,1(R14)          INCREMENT VALUE (X'FF' NOT VALID)
+         STC   R14,IOB+34(R1)      STORE INCREMENTED VALUE.
+         IC    R0,41(R15,R1)       SET GR0 = MAXIMUM VALID VALUE.
+         CLR   R14,R0              TEST FOR VALID VALUE.
+         BNH   INCRMNTB            IF VALID THEN GO TO CHECK END.
+         SR    R14,R14             RE-ZERO GR14.
+         STC   R14,IOB+34(R1)      STORE ZERO VALUE.
+         BCT   R1,INCRMNTA         LOOP UNTIL VALID VALUE SET UP.
+INCRMNTB LTR   R9,R9               DOES DEVICE HAVE ALTERNATE TRACKS ?
+         BZ    INCRMNTC            IF NOT THEN GO TO TEST FOR END.
+         CLC   IOB+34(2),0(R9)     HAVE WE REACHED ALTERNATE TRACKS ?
+         B     INCRMNTD            GO TO TEST RESULT.
+INCRMNTC CLC   IOB+34(2),41(R15)   HAVE WE REACHED THE END ?
+INCRMNTD BCR   4,R3                IF NOT THEN RETURN.
+         OI    SW,SWENDUP          SET ENDUP PENDING.
+         BR    R3                  RETURN.
+         SPACE 1                                                      *
+*                                                                     *
+*        CLOSE DCB AND RESET SWITCHES.                                *
+*                                                                     *
+         SPACE 1                                                      *
+CLOSE    TM    SW,SW31M            IS ENTRY THROUGH RTP5031M ?
+         BO    CLOSEA              IF SO THEN SKIP RELEASING APPENDAGE.
+         SPMODE SUPV,0,MF=(E,SPMODEL)   ENTER SUPERVISOR STATE  PROT 0.
+         TM    SW,SWLOAD           WAS APPENDAGE LOADED ?          SUPV
+         BZ    CLOSEB              IF NOT THEN SKIP DELETE.        SUPV
+         DELETE EPLOC=IGG019WF     DELETE APPENDAGE                SUPV
+         XC    APP(4),APP          CLEAR APPENDAGE POINTER.        SUPV
+CLOSEB   L     R1,DCB+44           SET GR1 -> DEB.                 SUPV
+         LA    R1,0(R1)            CLEAR HIGH ORDER BYTE.          SUPV
+         LTR   R1,R1               TEST FOR DEB PRESENT.           SUPV
+         BZ    CLOSEC              IF NOT THEN NO RELEASE.         SUPV
+         LA    R0,DEBEND-DEB       SET GR0 = LENGTH OF DEB.        SUPV
+         SVC   10                  RELEASE DYNAMIC DEB FROM SP252. SUPV
+         XC    DCB+45(3),DCB+45    CLEAR DEB POINTER.              SUPV
+CLOSEC   SPMODE PROB,*,MF=(E,SPMODEL)   RESTORE PROG PROG STATE & PROT.
+         NI    SW,X'FF'-SWALT-SWPRI-SWDEV-SWGET-SWALL-SWLOAD RESET SWS.
+CLOSEA   NI    SW,X'FF'-SWENDUP    RESET ENDUP SWITCH.
+         CP    EXCPCT,P1           ANY EXCPS ?
+         BCR   4,R3                IF NOT THEN RETURN.
+         MVC   SUMEXCP,MASK1       STORE MASK TO EDIT EXCP COUNT.
+         MVC   SUMFILEM,MASK1      STORE MASK TO EDIT FILE MARK COUNT.
+         ED    SUMEXCP,EXCPCT      EDIT EXCP COUNT.
+         ED    SUMFILEM,FMCT       EDIT FILE MARK COUNT.
+         SP    EXCPCT,EXCPCT       CLEAR EXCP COUNT.
+         SP    FMCT,FMCT           CLEAR FILE MARK COUNT.
+         LA    R2,SUMLINE          SET GR2 -> I/O SUMMARY LINE.
+         SPACE 1                                                      *
+*                                                                     *
+*        SUB-ROUTINE TO WRITE OUTPUT TO THE PRINT DATA SET.           *
+*                                                                     *
+         SPACE 1                                                      *
+PUTSUB   LA    R0,3                SET GR0 = 3.
+         CLI   4(R2),C'-'          IS CONTROL SPACE 3 ?
+         BE    PUTSUBA             IF SO THEN USE.
+         BCTR  R0,R0               SET GR0 = 2.
+         CLI   4(R2),C'0'          IS CONTROL SPACE 2 ?
+         BE    PUTSUBA             IF SO THEN USE.
+         BCTR  R0,R0               SET GR0 = 1.
+         MVI   4(R2),C' '          STORE CONTROL SPACE 1.
+PUTSUBA  L     R1,LINECT           SET GR1 = RESIDUAL COUNT.
+         SR    R1,R0               SET GR1 = NEW RESIDUAL COUNT.
+         BP    PUTSUBB             IF PLUS THEN GO TO STORE.
+         STM   R2,R3,DW            SAVE RECORD ADDRESS AND RETURN ADDR.
+         LA    R2,HDG              SET GR2 -> HEADING.
+         BAL   R3,PUTSUBC          LINK TO WRITE HEADING.
+         L     R2,DW               SET GR2 -> RECORD.
+         MVC   DW(1),4(R2)         SAVE CONTROL CHARACTER.
+         MVI   4(R2),C'0'          SET CONTROL SPACE 2.
+         BAL   R3,PUTSUBC          LINK TO WRITE RECORD.
+         MVC   4(1,R2),DW          RESTORE CONTROL CHARACTER.
+         L     R3,DW+4             RESTORE GR3.
+         MVI   LINECT+L'LINECT-1,56     STORE NEW RESIDUAL COUNT.
+         BR    R3                  RETURN.
+PUTSUBB  ST    R1,LINECT           STORE NEW RESIDUAL COUNT.
+PUTSUBC  L     R1,OPENL            SET GR1 -> PRINT DCB.
+         TM    36(R1),X'80'        IS IT FIXED RECORD LENGTH ?
+         BO    PUTSUBD             IF SO THEN MUST SET UP LINE.
+         PUT   (R1),(R2)           WRITE LINE.
+         BR    R3                  RETURN.
+PUTSUBD  MVI   LINE,C' '           CLEAR FIRST CHARACTER OF LINE.
+         MVC   LINE+1(L'LINE-1),LINE    CLEAR LINE.
+         LH    R15,0(R2)           SET GR15 = LENGTH OF MESSAGE.
+         LA    R0,5                SET GR0 = 5.
+         SR    R15,R0              SET GR15 FOR EXECUTE.
+         BM    *+8                 IF MINUS THEN WRITE BLANK LINE.
+         EX    R15,PUTSUBE         MOVE MESSAGE TO LINE.
+         PUT   (1),LINE            WRITE LINE.
+         BR    R3                  RETURN.
+PUTSUBE  MVC   LINE(0),4(R2)       MODEL STATEMENT.
+         SPACE 1                                                      *
+*                                                                     *
+*        ERROR EXITS - SET UP ABEND CODE AND ABEND.                   *
+*                                                                     *
+         SPACE 1                                                      *
+         BAL   R1,ERR00                                              32
+         BAL   R1,ERR00                                              28
+         BAL   R1,ERR00                                              24
+         BAL   R1,ERR00                                              20
+ERR04    BAL   R1,ERR00            PRINT DATA SET NOT OPEN.          16
+ERR03    BAL   R1,ERR00            ERROR ON PUNCH DATA SET.          12
+ERR02    BAL   R1,ERR00            ERROR ON UCB ADDRESS.              8
+ERR01    BAL   R1,ERR00            ERROR ON PRINT DATA SET.           4
+ERR00    BAL   R0,*+4              SET GR0 FOR SUBTRACT.
+         SR    R1,R0               SET GR1 = ABEND CODE.
+         LCR   R1,R1               COMPLEMENT GR1 FOR POSITIVE CODE.
+         ABEND (1),DUMP            ABEND WITH USER CODE.
+         SPACE 1                                                      *
+*                                                                     *
+*        SUB-ROUTINE TO PRODUCE GETALT CONTROL STATEMENTS.            *
+*                                                                     *
+         SPACE 1                                                      *
+PCHSUB   L     R1,OPENL+4          SET GR1 -> SYSPUNCH DCB.
+         TM    48(R1),X'10'        IS DCB OPEN ?
+         BCR   8,R3                IF NOT THEN RETURN.
+         AP    GETALTCT,P1         INCREMENT GETALT COUNT.
+         UNPK  PCHSEQ,GETALTCT     STORE SEQUENCE NUMBER IN GETALT.
+         OI    PCHSEQ+L'PCHSEQ-1,X'F0'  REMOVE ZONE.
+         PUT   (1),PCHCARD         WRITE GETALT STATEMENT.
+         BR    R3                  RETURN.
+         END   RT5031M

@@ -1,0 +1,1514 @@
+BSPSETPF TITLE 'Set console PF keys'
+***********************************************************************
+*                                                                     *
+*  This program will search file PARMLIB for members with the name    *
+*  SETPFxx (where xx is the console ID), and will then modify the     *
+*  PFK stoarage areas in memory with information found in those       *
+*  members                                                            *
+*                                                                     *
+*  A member SETPFKxx, where xx is not a valid console id, will be     *
+*  ignored.  A console with id yy, where there is no member SETPFKyy  *
+*  will also be ignored.                                              *
+*                                                                     *
+*  These definitions are not permanent,  With other words, this       *
+*  program should be run on every IPL, preferably via a start         *
+*  command in SYS1.PARMLIB(COMMND00)                                  *
+*                                                                     *
+*  If the operator just changes one or more PFK definitions, all the *
+*  current active definitions will be permanently saved (I just       *
+*  haven't found out where, yet)                                      *
+*                                                                     *
+*                                                                     *
+*  JCL to assemble & Link this pgm: CBT.MVS38J.CNTL(SETPF$)           *
+*  JCL to run this program:         CBT.MVS38J.CNTL(SETPF#)           *
+*                                                                     *
+*  JCL Execution Parameters are specified via the                     *
+*  PARM statement on the EXEC card:                                   *
+*                                                                     *
+*       PARM=NOUPDATE:  (default) - PFKs will not be updated, the     *
+*                       SETPFKxx members in PARMLIB will only be      *
+*                       checked for correct syntax                    *
+*       PARM=UPDATE:    The SETPFKxx members will be syntax-checked,  *
+*                       and updaes to the in core PFK definition      *
+*                       will be made after the operator has replied   *
+*                       to message BSPSP80D                           *
+*       PARM=NOREPLYU:  The SETPFKxx members will be syntax-checked,  *
+*                       and updates to the in core PFK definition     *
+*                       will be made.  There will be no confirmation  *
+*                       request to the operator                       *
+*                                                                     *
+* When running with PARM=UPDATE or PARM=NOREPLYU then the program     *
+* needs to run authorized                                             *
+*                                                                     *
+*  Required DD statement: none                                        *
+*                                                                     *
+*  Optional DD statements:                                            *
+*           PARMLIB  -  PDS containing the SETPFKxx members to be     *
+*                       processed. Default: SYS1.PARMLIB              *
+*                                                                     *
+*           SYSPRINT -  Output queue for BSPSETPF messages.           *
+*                       Default: SYSOUT=X                             *
+*                       (for batch job only.  for STC we use WTOs)    *
+*                                                                     *
+*           SYSUDUMP -  Output queue for dumps (which, of course,     *
+*                       will never happen). Default: SYSOUT=A         *
+*                       (for batch job only)                          *
+*                                                                     *
+*           SYSMDUMP -  Output file for dumps. The default is         *
+*                       SYS1.BSPSETPF.SYSMDUMP                        *
+*                       (for STC only)                                *
+*                                                                     *
+*           SNAPDUMP -  Internal snap files for debugging             *
+*                                                                     *
+* SYS1.PARMLIB(SETPFxx) record layout:                                *
+* An asterisk (*) in colum 1 indicates a comment line, this line      *
+* will be ignored                                                     *
+*                                                                     *
+*  Colums            Description                                      *
+*  01 - 02           PFK number                                       *
+*  03                Processing flag: Y = Conversational, N nonconv.  *
+*  04                ignored, should be empty                         *
+*  05 - 71           (first part of) the command as the operator      *
+*                    would issue it.  Multiple commands are separated *
+*                    by semicolon.  Prompt position is specified      *
+*                    by an underscore                                 *
+*  72                Continuation column.  If non-blank then the      *
+*                    command extends to the next line of the member   *
+*                    The continuation must begin exactly at col 05    *
+*                    and must end on or before colum 45               *
+*                                                                     *
+* If a function key definition line is omitted, that PFK will not be  *
+* updated.  If a function key definition is provided with an empty    *
+* command area, that PFK will be deactivated                          *
+*                                                                     *
+***********************************************************************
+         PRINT OFF,NOGEN
+         GBLC  &LRECL
+         GBLC  &BLKSIZE
+         GBLC  &DEBUG
+         GBLC  &TUMAXLN
+         COPY  BSPGLBLS
+         COPY  BSPSGLBL
+&TUMAXLN SETC  '100'
+&LRECL   SETC  '133'                  , record length for sysprint
+&BLKSIZE SETC  '&LRECL.0'             , blocksize for sysprint
+&DEBUG   SETC  'NO'                   , debug code included
+         PRINT ON,NOGEN
+BSPSETPF BSPENTER BASE=(R11,R12),RENT=YES
+         TITLE 'Register Equates'
+DIRPTR   EQU   R4                     , pointer to directory entry
+         USING PDSDIRDS,DIRPTR        , tell assembler
+RECOFFST EQU   R7                     , record pointer within block
+RECPTR   EQU   R8                     , address of current record
+BASE01   EQU   R11                    , base register # 1
+BASE02   EQU   R12                    , base register # 2
+         USING SETPFKDS,RECPTR        , tell assembler
+         TITLE 'Main Processing'
+***********************************************************************
+* Main processing                                                     *
+***********************************************************************
+         PRINT ON,GEN
+         BAL   R14,SETINIT            , go for setup and init calls
+         BAL   R14,ALCPRINT           , go allocate SYSPRINT
+         BAL   R14,OPNPRINT           , go open SYSPRINT
+         BAL   R14,ALCUDUMP           , go allocate SYSUDUMP
+         AIF   ('&DEBUG' EQ 'NO').NOSNAP1
+         BAL   R14,ALCPDUMP           , go allocate SNAPDUMP
+         BAL   R14,OPNPDUMP           , go open SNAPDUMP
+.NOSNAP1 ANOP
+         BAL   R14,PROCPARM           , go analyse PARM statement
+         BAL   R14,REPTPARM           , report effective PARM
+         BAL   R14,ALCPALIB           , Allocate PARMLIB
+         BAL   R14,OPNPAPDS           , Open PARMLIB as a PDS
+         BAL   R14,OPNPADIR           , Open PARMLIB as a PS
+         BAL   R14,READJFCB           , Read Job File Control Block
+         LR    R6,R1                  , R6 points to IO buffer
+***********************************************************************
+* Read a directory block and test if the requested member (SETPFKxx)  *
+* can be in this block.  If not, loop until found                     *
+***********************************************************************
+         SPACE
+DIR0100  DS    0H                     , read directory block
+         DBGMSG TUPLDDNM,=CL8'RDDIRBLK'
+         READ  DIRDECB,SF,PARMDIR,DIRAREA,'S',MF=E
+         CHECK DIRDECB                , wait for I/O completion
+         LA    R4,DIRAREA+10          , point to area
+         CLC   =CL6'SETPFK',PDSKEY    , block reached already
+         BH    DIR0100                , then try next block
+         SPACE
+***********************************************************************
+*  If a SETPFKxx member exists, it is in this (and possibly the       *
+*  following) blocks.  There may also be more members SETPFKxx        *
+*  around.  We will now test the entries one by one                   *
+***********************************************************************
+         SPACE
+DIR0200  DS    0H                     , read directory record
+         DBGMSG TUPLDDNM,=CL8'RDDIRREC'
+         CLC   PDSMEMBR,=XL8'FFFFFFFFFFFFFFFF' EOD?
+         BE    EXIT                   , term at last member
+         CLC   =CL6'SETPFL',PDSMEMBR  , terminate, if we are
+         BNH   EXIT                   , past SETPFKxx
+         CLC   =CL6'SETPFK',PDSMEMBR  , SETPFKxx member ?
+         BE    PROCPFK                , Go process it
+EOMEM    DS    0H                     , end of member reached
+         IF    (TM,PROCFLAG,MEMFOUND,O) End of file on a member
+          MSGPUT MSG98I
+          L     R15,MEMCC             , get return code
+          CVD   R15,DBL               , make a number
+          UNPK  MSG98I1,DBL+5(3)      , make printable
+          OI    MSG98I1+L'MSG98I1-1,C'0'  last digit printable
+          BAL   R14,PUTMSG            , write last message
+          XC    MEMCC,MEMCC           , reset CC for the new member
+         ENDIF (TM,PROCFLAG,MEMFOUND,O) End of file on a member
+         CLC   PDSMEMBR,PDSKEY        , last member in block
+         BE    DIR0100                , then get next directory block
+         XR    R1,R1                  , clear workreg
+         NI    PDSC,X'1F'             , mask out high order 3 bits
+         ICM   R1,B'0001',PDSC        , number of data halfwords
+         SLL   R1,1                   , number of bytes
+         LA    DIRPTR,12(DIRPTR)      , point to userdata
+         AR    DIRPTR,R1              , point to next entry
+         B     DIR0200                , and process entry
+         TITLE  'Process a SETPFKxx member'
+PROCPFK  DS    0H                     , process SETPFKxx member
+         DBGMSG PDSMEMBR,=CL8'BSAMREAD'
+         OI    PROCFLAG,MEMFOUND      , indicate member found
+         MVC   SAVMEMBR,PDSMEMBR      , save member name and suffix
+         ZAP   LINENUM,=P'100'        , force page break for new membr
+         MSGPUT MSG21I                , insert message body
+         MVC   MSG21I1,SAVMEMBR       , insert member name
+         BAL   R14,PUTMSG             , issue message
+         LA    R1,PDSSUFFX            , point to suffix
+         LA    R0,2                   , set length
+         BAL   R14,NUMTEST            , test for numeric
+         LTR   R15,R15                , Is field numeric
+         BZ    SUFFOK                 , Bif member is okay
+         MSGPUT MSG03E                , point to error message
+         MVC   MSG03E1,PDSSUFFX       , insert suffix
+         BAL   R14,PUTMSG             , Display error message
+         SETMAXCC 4                   , indicate a warning level
+         B     EOMEM                  , and skip this member
+         SPACE
+***********************************************************************
+* The suffix is valid.  Try to find the member                        *
+***********************************************************************
+         SPACE
+SUFFOK   DS    0H
+         PACK  DBL,PDSSUFFX           , text    -> decimal
+         CVB   R2,DBL                 , decimal -> binary
+         FIND  PARMLIB,PDSMEMBR,D     , look for member in parmlib
+         LTR   R15,R15                , member in PDS?
+         BZ    FOUNDMEM               , BIF yes
+         MSGPUT MSG07E                , point to error message
+         MVC   MSG07E1,PDSMEMBR       , insert member name
+         BAL   R14,PUTMSG             , Display error message
+         SETMAXCC 8                   , indicate a warning level
+         B     EOMEM                  , go around again
+         SPACE
+***********************************************************************
+* Locate incore PFK table for our console id                          *
+***********************************************************************
+         SPACE
+FOUNDMEM DS    0H
+         LR    R1,R2
+         BAL   R14,GETCONS            , locate incore PFK area
+         B     CONSTAB(R15)           , found it?
+CONSTAB  B     CONSOK                 , R15 = 0
+         B     NOCONS                 , R15 = 4
+         B     NOPFKS                 , R15 = 8
+NOCONS   DS    0H                     , console ID not found
+         MSGPUT MSG05W                , point to error message
+         MVC   MSG05W1,PDSSUFFX       , insert suffix
+         BAL   R14,PUTMSG             , Display error message
+         SETMAXCC 4                   , Need to adjust MAXXCC?
+         B     EOMEM                  , and skip this member
+NOPFKS   DS    0H                     , console ID not found
+         MSGPUT MSG09W                , point to error message
+         MVC   MSG09W1,PDSSUFFX       ,             ...inserts
+         BAL   R14,PUTMSG             , Display error message
+         SETMAXCC 4                   , indicate a warning level
+         B     EOMEM                  , and skip this member
+CONSOK   DS    0H                     , the consol wass found
+         ST    R1,CONSPFKA            , save for later
+         SPACE
+***********************************************************************
+* Read a block from the member                                        *
+***********************************************************************
+         SPACE
+         XC    READDECB,READDECB
+READBLCK DS    0H                     , read one block from member
+         DBGMSG SAVMEMBR,=CL8'READBLCK'
+         PUSH  PRINT
+         PRINT ON,GEN
+         AIF   ('&DEBUG' EQ 'NO').NOSNAP2
+         B     DOSNAP1
+HDR1     DC    AL1(11),C'PARMLIB DCB'
+HDR2     DC    AL1(11),C' IO Buffer '
+HDR3     DC    AL1(11),C' READ DECB '
+DOSNAP1  DS    0H
+         LA    R1,PARMLIB             , beginning
+         ST    R1,SNAPLIST            ,
+         LA    R1,SNAPDLEN(R1)        , end end of PARMLIB DCB
+         ST    R1,SNAPLIST+4
+         LR    R1,R6                  , beginning
+         ST    R1,SNAPLIST+8
+         AH    R1,JFCBLKSI            , and end of IO buffer
+         ST    R1,SNAPLIST+12
+         LA    R1,READDECB            , beginning
+         ST    R1,SNAPLIST+16
+         LA    R1,READDCBE            , and end of READ DECB
+         ICM   R1,B'1000',=X'80'      , end of list
+         ST    R1,SNAPLIST+20
+         LA    R1,HDR1
+         ST    R1,HDRLIST
+         LA    R1,HDR2
+         ST    R1,HDRLIST+4
+         LA    R1,HDR3
+         ICM   R1,B'1000',=X'80'
+         ST    R1,HDRLIST+8
+         SNAP  DCB=SNAPDUMP,                                           +
+               LIST=SNAPLIST,                                          +
+               STRHDR=HDRLIST,                                         +
+               MF=(E,THESNAP)
+*             PDATA=(PSW,REGS,SPLS),                                  +
+*             SDATA=(DM,IO),                                          +
+.NOSNAP2 ANOP
+         READ  READDECB,SF,PARMLIB,(R6),MF=E
+         CHECK READDECB               , wait for IO completion
+         POP   PRINT
+         LH    R0,JFCBLKSI            , get ds blocksize
+         L     R1,READDECB+16         , point to iob
+         SH    R0,14(R1)              , subtract residual block length
+         STH   R0,BLOCKLEN            , save actual block length read
+         XR    RECOFFST,RECOFFST      , clear offset register
+         SPACE
+***********************************************************************
+* Get a record from the directory block                               *
+***********************************************************************
+         SPACE
+READREC  DS    0H                     , read a record
+         LA    RECPTR,0(RECOFFST,R6) get record at spec. offset
+         MSGPUT MSG08I                , set msg body
+         MVC   MSG08I1,0(RECPTR)      , insert card image
+         IF    (TM,PROCFLAG,ISJOB,O)
+          BAL  R14,PUTMSG             , show card image
+         ENDIF
+         LR    R1,RECPTR              , point to beginning of record
+         XR    R15,R15                , clear counter register
+         TITLE 'Process a record from SETPFKxx member'
+***********************************************************************
+* test for (and ignore) comments                                      *
+***********************************************************************
+         SPACE
+         CLI   SPFCOM,SPFCOMCH        , comment indicator
+         BE    NEXTCARD               , if so, get next card
+         SPACE
+***********************************************************************
+* Handle continuation records                                         *
+***********************************************************************
+         SPACE
+         TM    FLAG,NEEDCONT          , is this continuation card?
+         BZ    NEWREC                 , bif not
+         MVC   WORKSPC2,SPFPTXT2      , else insert text
+         NI    FLAG,255-NEEDCONT      , turn off flag
+         CLC   =CL4' ',SPFPFNUM       , leading part spaces?
+         BE    CARDFULL               , card is complete, go test it
+         OI    FLAG,INVCONT           , else indicate invalid contin.
+         B     NEXTCARD
+***********************************************************************
+* Test statement for syntax errors                                    *
+***********************************************************************
+NEWREC   DS    0H                     , start a new record
+         BLANK WORKSPAC               , get rid of any garbage
+         XC    WORKFLAG,WORKFLAG      , clear flag byte
+         MVC   PFNUMSAV,SPFPFNUM      , and into save slot
+         MVC   PRFLGSAV,SPFPRFLG      , save processing flag as well
+         MVC   WORKSPC1,SPFPTXT1      , insert first part of command
+         CLI   SPFCONT,C' '           , is there a continuation char
+         BE    CARDFULL               , bif not
+         OI    FLAG,NEEDCONT          , indicate continuation
+         B     NEXTCARD               , and get next card
+CARDFULL DS    0H                     , we have a complete card
+         LA    R1,PFNUMSAV            , point to PFK number
+         LA    R0,L'PFNUMSAV          , set length
+         BAL   R14,NUMTEST            , Call validation routine
+         LTR   R15,R15                , Is it numeric?
+         BZ    PFKNUMOK               , branch if yes
+         OI    FLAG,INVPFNUM          , set error flag
+         B     NEXTCARD               , and go around again
+PFKNUMOK DS    0H                     , Convert PFKNUM to binary
+         PACK  DBL,PFNUMSAV           , make packed decimal
+         CVB   R1,DBL                 , put binary into R1
+         STH   R1,PFKNO               , and save for later
+TESTLO   DS    0H                     , Test if PFNUM too low
+         CP    DBL,=P'0'              , PFNUM valid
+         BH    TESTHI                 , BIF not
+TESTHI   DS    0H                     , test if PFNUM too high
+         CP    DBL,=P'25'             , pfnum valid
+         BL    OKRANGE                , bif yes
+         OI    FLAG,INVRANG           , indicate invalid range
+         B     NEXTCARD               , and go around again
+OKRANGE  DS    0H                     , Range was okay, test CMD text
+         CLI   WORKSPC,C' '           , Blank entry?
+         BNE   PROCCMD                , process command if not
+         CLC   WORKSPC+1(L'WORKSPC-1),WORKSPC
+         BE    SETCMD                 , if blanks, process empty cmd
+PROCCMD  DS    0H                     , we have a non-blank CMD
+         OI    WORKFLAG,CMDACT        , indicate active ENTRY
+         CLI   PRFLGSAV,SPFPRCON      , conversation processing
+         BNE   TESTN                  , bif not
+         OI    WORKFLAG,CMDCNV        , set conversational flag
+         B     SETCMD
+TESTN    DS    0H                     , test if 'N' was specified
+         CLI   PRFLGSAV,SPFPRNCO      , is it 'N'
+         BE    SETCMD                 , okay, go on
+         OI    FLAG,INVCONV           , indicate invalid processing flg
+SETCMD   DS    0H                     , it is non-conv
+         LH    R0,PFKNO               , get function key number
+         LA    R1,WORKSPAC            , address of workspace
+         L     R15,CONSPFKA           , get address of PFK AREA
+         BAL   R14,UPDATPFK           , Update the PFK in memory
+         IF    (CH,R15,EQ,=H'0')      , was update okay?
+          OI   PARMFLAG,PARMNORU      , don't issue WTOR again
+         ELSEIF (CH,R15,EQ,=H'8')     , no slot available
+          OI   FLAG,NOPFSLOT          , indicate no PF Slot found
+         ELSEIF (CH,R15,EQ,=H'12')    , Operator rejected request
+          OI   FLAG,NOREPLYU          , indicate NOGO reply
+          OI   PARMFLAG,255-PARMSET   , turn of UPDATE flag
+          OI   PARMFLAG,PARMCHCK      , use NOUPDATE from now on
+         ENDIF
+         TITLE 'NEXTCARD - Read the next card'
+***********************************************************************
+* Before we read the next card we first issue all the error message   *
+* that are needed for the last card.  The error causes are setup      *
+* in byte FLAG.  There might be more than one error code set          *
+***********************************************************************
+NEXTCARD DS    0H                     , Get next statement from mbr
+         TM    FLAG,NEEDCONT          , continuation card needed?
+         BNZ   NEXTC100               , don't handle errors yet
+         CLI   FLAG,X'0'              , any flags set
+         BE    NEXTC100               , bif no error
+         SPACE 1
+***********************************************************************
+* We got the full card image now, and an error flag (or more) are     *
+* set in FLAG.  Report the card image, then report the error(s)       *
+***********************************************************************
+         SPACE 1
+         BAL   R14,PUTMSG             , Show BSPSP08I
+         MSGPUT MSG13E                , display error indicator msg
+         BAL   R14,PUTMSG             , on sysprint
+         TM    FLAG,INVPFNUM          , Invalid PFNUM?
+         BZ    NEXTC010               , bif not
+         MSGPUT MSG04E                , else point to catalog msg
+         MVC   MSG04E1,PFNUMSAV       , Put PFNUM into message
+         BAL   R14,PUTMSG             , and display it
+NEXTC010 DS    0H                     ,
+         TM    FLAG,INVCONT           , Invalid continuation?
+         BZ    NEXTC020               ,
+         MSGPUT MSG18E                , point to error message
+         BAL   R14,PUTMSG             , display message
+NEXTC020 DS    0H                     ,
+         TM    FLAG,INVCONV           , Invalid processing flag
+         BZ    NEXTC030               ,
+         MSGPUT MSG17W                , point to msg text
+         BAL   R14,PUTMSG             , show message
+NEXTC030 DS    0H                     ,
+         TM    FLAG,INVRANG           , Invalid range
+         BZ    NEXTC040               ,
+         MSGPUT MSG10E                , point to msg text
+         BAL   R14,PUTMSG             , show message
+NEXTC040 DS    0H                     ,
+         TM    FLAG,NOREPLYU          , Operator rejected request
+         BZ    NEXTC050               ,
+         MSGPUT MSG12E               , point to msg text
+         BAL   R14,PUTMSG             , show message
+NEXTC050 DS    0H                     ,
+         TM    FLAG,NOPFSLOT          , No PFK slot in memory
+         BZ    NEXTC060               ,
+         MSGPUT MSG19E                , insert msg text
+         BAL   R14,PUTMSG             , show message
+NEXTC060 DS    0H                     ,
+         MVI   FLAG,X'0'              , re-initialize flagbyte
+NEXTC100 DS    0H                     ,
+         LA    RECOFFST,80(RECOFFST)  , next card
+         CH    RECOFFST,BLOCKLEN      , end of block?
+         BE    READBLCK               , Then read next block
+         B     READREC                , else get next record
+         TITLE 'CLOSE - Leave with error code set'
+***********************************************************************
+* General "leave after error" routine                                 *
+***********************************************************************
+         SPACE 1
+EXIT12   DS    0H
+         SETMAXCC 12                  , Set retrun code
+         B     GOHOME
+EXIT     DS    0H
+         B     GOHOME
+GOHOME   DS    0H                     , return to OS
+         MSGPUT MSG99I                , insert message
+         L     R15,MAXCC              , get return code
+         CVD   R15,DBL                , make a number
+         UNPK  MSG99I1,DBL+5(3)       , make printable
+         OI    MSG99I1+L'MSG99I1-1,C'0'      last digit printable
+         BAL   R14,PUTMSG             , write last message
+         IF    (TM,PROCFLAG,HAVEBUFF,O)
+          L    R2,JFCBSAVE+12         , address of buffer
+          L    R0,JFCBSAVE+8          , length of buffer
+          FREEMAIN R,LV=(0),A=(2)
+         ENDIF
+         IF    (TM,PROCFLAG,PDIROPEN,O) close PARMDIR if open
+          DBGMSG =CL8'PARMDIR',=CL8'CLOSE'
+          LA   R3,PARMDIR             , point to DCB
+          MVC   OCLIST,THELIST
+          CLOSE ((R3),FREE),MF=(E,OCLIST)  , and close it
+          NI   PARMFLAG,255-PDIROPEN
+         ENDIF
+         IF    (TM,PROCFLAG,PARMOPEN,O) close PARMLIB if open
+          DBGMSG =CL8'PARMLIB',=CL8'CLOSE'
+          LA   R3,PARMLIB             , point to DCB
+          MVC   OCLIST,THELIST
+          CLOSE ((R3),FREE),MF=(E,OCLIST)  , and close it
+          NI   PARMFLAG,255-PARMOPEN
+         ENDIF (TM,PROCFLAG,PARMOPEN,O) close PARMDIR if open
+         IF    (TM,PROCFLAG,SNAPOPEN,O) close SNAPDIR if open
+          DBGMSG =CL8'SNAPDUMP',=CL8'CLOSE'
+          LA   R3,SNAPDUMP            , point to DCB
+          MVC   OCLIST,THELIST
+          CLOSE ((R3)),MF=(E,OCLIST)  , and close it
+          NI   PARMFLAG,255-SNAPOPEN
+         ENDIF
+         IF    (TM,PROCFLAG,PRNTOPEN,O) close PARMDIR if open
+          DBGMSG =CL8'SYSPRINT',=CL8'CLOSE'
+          LA   R3,SYSPRINT            , point to DCB
+          MVC   OCLIST,THELIST
+          CLOSE ((R3)),MF=(E,OCLIST)  , and close it
+          NI   PARMFLAG,255-PRNTOPEN
+         ENDIF
+         L     R15,MAXCC              , get return code
+         BSPRET RC=(15)               , and return with rc in r15
+         TITLE 'Subroutine NUMTEST - Test if valid zoned numeric field'
+***********************************************************************
+*                                                                     *
+* Registers on Entry:      R1  =   address of field to test           *
+*                          R0  =   Length to test                     *
+*                          R14 =   Return address                     *
+*                                                                     *
+* Registers on Exit:      R15 = 0 ===> Field is numeric               *
+*                         R15 = 4 ===> Field is NOT numeric           *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+NUMTEST  DS    0H                     , test vor valis zoned numeric
+         STM   R14,R3,NUMSAVE         , save register
+         LR    R3,R0                  , R0 = length, provided by caller
+         BCTR  R3,0                   , Decrement for excecute
+         LA    R15,0                  , set OK code
+         EX    R3,NUMTESTT            , test for numeric
+         BC    8,NUMTEST1             , if CC=0, all bytes okay
+         LA    R15,4                  , set error RC
+NUMTEST1 DS    0H                     , return wth RC in R15
+         ST    R15,NUMSAVE+4          , set caller's R15
+         LM    R14,R3,NUMSAVE         , restore register
+         BR    R14
+NUMTESTT TRT   0(*-*,R1),TESTNUMT     , Do the translate
+TESTNUMT DC    256XL1'01'             , Init table to 01s
+         ORG   TESTNUMT+C'0'          , Position to first valid num
+         DC    10XL1'00'              , set OK code
+         ORG   ,                      , reset location counter
+         TITLE 'Subroutine GETCONS - find PFK area of console'
+***********************************************************************
+*                                                                     *
+* Registers on Entry:  R1  = Console Id in binary                     *
+*                      R14 = Return address                           *
+*                                                                     *
+* Registers on exit:   R1 = address of in core PFK table              *
+*                                                                     *
+*                      R15 = 0: ==> Address is valid                  *
+*                      R15 = 4: ==> console id xx not in system       *
+*                      R15 = 8: ==> console id xx has no PFK support  *
+***********************************************************************
+         SPACE 1
+GETCONS  DS    0H                     , search for console
+         STM   R14,R6,GETSAVE         , we are doing mayhem with regs
+         L     R15,CVTPTR             , get address of CVT
+         USING CVT,R15                , tell assembler
+         L     R15,CVTCUCB            , Communication Module Block
+         USING UCM,R15                , tell assembler
+         LM    R3,R5,UCMVDATA         , R3 ---> first UCM module
+*                                     , R4 =    length of entry
+*                                     , R4 ---> last UCM entry
+         DROP  R15                    , no longer needed
+         LR    R6,R1                  , get console id
+GETCONSA DS    0H                     , outer search loop
+         BCT   R6,GETCONSB            , search up to this entry
+         B     GETCONSC               , found it, locate PFK slot
+GETCONSB DS    0H                     , bop till you drop
+         BXLE  R3,R4,GETCONSA         , loop until found
+         B     GETCONS4               , exit if not found
+GETCONSC DS    0H                     , Console found, R3 ---> UCMLIST
+         USING UCMLIST,R3             , tell assember
+         ICM   R3,B'1111',UCMXB       , get address of DCM
+         BZ    GETCONS8               , exit if none
+         USING DCM,R3                 , tell assembler
+         ICM   R3,B'1111',DCMADPFK    , get address of PFK area
+         BZ    GETCONS8               , get out if none
+         ST    R3,GETSAVE+12          , set caller's R1
+GETCONS0 DS    0H                     , console found and capable
+         LA    R15,0                  , set appropriate RC
+         B     GETCONSX               , and leave
+GETCONS4 DS    0H                     , console not in system
+         LA    R15,4                  , set appropriate RC
+         B     GETCONSX               , and leave
+GETCONS8 DS    0H                     , console found, no PFKS
+         LA    R15,8                  , set appropriate RC
+         B     GETCONSX               , and leave
+GETCONSX DS    0H                     , exit this routine
+         ST    R15,GETSAVE+4          , update caller's R15
+         LM    R14,R6,GETSAVE         , restore registers
+         BR    R14                    , return to caller
+         TITLE 'Subroutines: UPDATPFK - Update PFK slot in memory'
+**********************************************************************
+* This routine updates the PFK slot in memory, if PARM=UPDATE        *
+* or PARM=NOREPLYU has been specified.  If PARM=UPDATED was specified*
+* then message BSPSP  D will be issued requesting operator           *
+* confirmation of the PFK update.  This confirmation will be         *
+* requested only once                                                *
+*                                                                    *
+* Registers on entry: R0  = Pfk number                               *
+*                     R1  = Address of Workspace containing command  *
+*                     R14 = Return address                           *
+*                     R15 = Address of resident PFK area             *
+*                                                                    *
+* Registers on exit   R15 = Return code                              *
+*                            0: Update done successfully             *
+*                            4: no update because PARM=NOUPDATE      *
+*                               R1 = Address of current PFK entry    *
+*                            8: no update because no PFK slot        *
+*                           12: no update because invalid WTOR reply *
+*                                                                    *
+**********************************************************************
+         SPACE 1
+UPDATPFK DS    0H                     , update PFK in memory
+         STM   R14,R6,UPDTSAVE        , save registers
+         LR    R2,R0                  , get PFK number
+         LR    R6,R0                  , get PFK number
+         LR    R3,R15                 , point to resident PFK area
+         LR    R4,R1                  , point to workspace
+         USING RPFKDS,R3              , tell assembler
+UPDATEA  DS    0H                     , loop through PFK slots
+         BCT   R2,UPDATEC             , next iteration of loop
+         CLM   R6,B'0001',RPFKPFN     , is this our slot?
+         BNE   UPDATE08               , no, exit with RC=8
+         TM    PARMFLAG,PARMSET       , should we update?
+         BZ    UPDATE04               , no, exit with RC=4
+         TM    PARMFLAG,PARMNORU      , is a reply needed?
+         BNZ   UPDATEB                , bif not
+         BLANK WTORTEXT               , clear texct area
+         MVC   WTORTEXT(L'MSG16D),MSG16D insert message text
+         LA    R1,L'MSG16D+4
+         STH   R1,THEWTOR+8
+         WTOR  ,WTOREPLY,L'WTOREPLY,WTOECB,MF=(E,THEWTOR)
+         WAIT  ECB=WTOECB             , wait until operator replies
+         OC    WTOREPLY,=C' '         , convert to uppercase
+         CLC   WTOREPLY,=C'U'         , ACK by operator?
+         BNE   UPDATE12               , exit with RC=12
+UPDATEB  DS    0H                     , try to update now
+         BSPAUTH ON                   , become authorized
+         MODESET KEY=ZERO             , become BIG BOSS
+         MVC   RPFKCMD,0(R4)          , insert workspace
+         MODESET KEY=NZERO            , back to LITTLE BOSS
+         BSPAUTH OFF                  , no longer authorized
+         B     UPDATE00               , exit with RC=0
+UPDATEC  DS    0H                     , next entry in table
+         LA    R3,RPFKLEN(R3)         , by adding entry length
+         CLI   RPFKPFN,RPFKLAST       , End of table reached?
+         BE    UPDATE08               , exit with RC=8
+         B     UPDATEA                , else go araound again
+UPDATE00 DS    0H                     , Exit with RC=0
+         LA    R15,0                  , set RC
+         B     UPDATEX                , and exit
+UPDATE04 DS    0H                     , Exit with RC=4
+         ST    R3,UPDTSAVE+12         , update caller's R1
+         LA    R15,4              , set RC
+         B     UPDATEX                , and exit
+UPDATE08 DS    0H                     , Exit with RC=8
+         LA    R15,8              , set RC
+         B     UPDATEX                , and exit
+UPDATE12 DS    0H                     , Exit with RC=12
+         LA    R15,12             , set RC
+         B     UPDATEX                , and exit
+UPDATEX  DS    0H                     , leave
+         ST    R15,UPDTSAVE+4         , set caller's R15
+         LM    R14,R6,UPDTSAVE        , restore registers
+         BR    R14                , return to caller
+         TITLE 'Subroutines: SETINIT - Initialize some variables'
+***********************************************************************
+* Setup and Initialization                                            *
+*                                                                     *
+* Registers on Entry:  R14 = Return address                           *
+*                                                                     *
+* Registers on Exit:   unchanged                                      *
+*                                                                     *
+***********************************************************************
+SETINIT  DS    0H
+         STM   R14,R1,SETISAVE        , save registers
+         BLANK PARMAREA               , clear parm text area
+         ZAP   LINENUM,=P'100'        , force page break
+         ZAP   PAGENUM,=P'0'          , init page number
+         XC    FLAG,FLAG              , init flag byte
+         XC    MAXCC,MAXCC            , clear RC area
+         XC    LASTCC,LASTCC          , clear RC area
+         XC    MEMCC,MEMCC            , clear RC area
+         XC    PARMFLAG,PARMFLAG      , clear parm flag
+         XC    PROCFLAG,PROCFLAG      , clear parm flag
+         XC    JFCBAREA,JFCBAREA      , clear JFCB
+         TESTENV                      , STC? BATCH? TSO?
+         IF    (CH,R1,EQ,=H'0')       , is this a batch job
+          OI   PROCFLAG,ISJOB         , remember in process option flag
+         ELSEIF (CH,R1,EQ,=H'4')      , is this an STC
+          OI   PROCFLAG,ISSTC         , put indicator to flag
+         ELSE                         , it is not supported
+          BLANK MSGTEXT
+          MSGPUT MSG14E               ,  insert message text
+          BAL  R14,PUTMSG             , issue message
+          B    EXIT12                 , get out with RC=12
+         ENDIF
+         LM    R14,R1,SETISAVE        , restore registers
+         BR    R14                    , and return to caller
+         TITLE 'Subroutines: PUTMSG - Display an error message'
+***********************************************************************
+* Routine to display an error message. The error message is assumed   *
+* to be stored in the MSGTEXT area (and is at most 124 bytes long)    *
+* The messages will be written to SYSPRINT DD if available and open.  *
+* If not, the messages will be isssued via WTO                        *
+*                                                                     *
+* Registers on Entry: R14 = Return address                            *
+***********************************************************************
+         SPACE 1
+PUTMSG   DS    0H                     , output message on sysprint
+         STM   R14,R3,PUTMSAVE        , save registers
+         IF    (TM,PROCFLAG,PRNTOPEN,O) SYSPRINT available?
+          IF   (CP,LINENUM,GT,=PL2'55') end of page reached?
+           MVC PRNTLINE,HEAD001       , Put in page header
+           ZAP LINENUM,=P'12'         , reinit line number
+           AP  PAGENUM,=P'1'          , increment page number
+           MVC HEAD0011,=X'40202120'  , insert edit mask
+           ED  HEAD0011-1(4),PAGENUM  , beautify page number
+           PUT SYSPRINT,PRNTLINE      , write page header
+           PUT SYSPRINT,HEAD0C1       , Insert LOGO1
+           PUT SYSPRINT,HEAD0C2       , Insert LOGO2
+           PUT SYSPRINT,HEAD0C3       , Insert LOGO3
+           PUT SYSPRINT,HEAD0C4       , Insert LOGO4
+           PUT SYSPRINT,HEAD0C5       , Insert LOGO5
+           PUT SYSPRINT,HEAD0C6       , Insert LOGO6
+          ENDIF
+          BLANK PRNTTEXT              , erase any garbage
+          MVC   PRNTTEXT(L'MSGTEXT),MSGTEXT
+          PUT   SYSPRINT,PRNTLINE
+         ELSE                         , no SYSPRINT, use WTO instead
+          WTO  MF=(E,THEWTO)
+         ENDIF
+         XR    R15,R15                , clear RC
+         ST    R15,PUTMSAVE+4         , set caller's RC
+         LM    R14,R3,PUTMSAVE        , restore return address
+         BR    R14                    , and return
+         TITLE 'Allocate SYSUDUMP for JOB if needed'
+***********************************************************************
+* Allocate SYSUDUMP DD if not already present                         *
+***********************************************************************
+         SPACE
+ALCUDUMP DS    0H                     , allocate SYSUDUMP
+         STM   R14,R1,ALCUSAVE        , save registers
+         MVC   TEMPDDN,TUSDDDNM       , insert DDNAME into msg text
+         MVC   SVC99WA(TUSDLEN),TUSDPTR move text units to WS
+         LA    R1,SVC99WA+TUSDDDN-TUSDPTR  point to DDNAME
+         ST    R1,SVC99P1             , put into TU list
+         LA    R1,SVC99WA+TUSDCLS-TUSDPTR  , point to CLASS parm
+         ICM   R1,B'1000',=XL1'80'    , indicate last parm
+         ST    R1,SVC99P2             , put into TU list
+         LA    R1,SVC99WA             , point to work area
+         BAL   R14,DOSVC99            , go and do it
+         IF    (LTR,R15,R15,NZ)       , Error on DYNALLOC?
+          WTO  MF=(E,THEWTO)          , tell the user
+          B    EXIT12                 , and end with RC=12
+         ENDIF (LTR,R15,R15,NZ)       , Error on DYNALLOC
+         LM    R14,R1,ALCUSAVE        , restore registers
+         BR    R14                    , return to caller
+***********************************************************************
+* SYSUDUMP DYNALLOC parameters                                        *
+***********************************************************************
+         SPACE
+TUSDPTR  DS    0F                     , text unit pointers
+         DC    A(TUSDDDN)             , address of DDNAME
+         DC    X'80'                  , end of list indicator
+         DC    AL3(TUSDCLS)           , address of SYSOUT CLASS info
+TUSDDDN  DC    AL2(DALDDNAM)          , key for DDNAME
+         DC    AL2(1)                 , number of entries
+         DC    AL2(8)                 , length od 1 entry
+TUSDDDNM DC    CL8'SYSUDUMP'          , contens of entry
+TUSDCLS  DC    AL2(DALSYSOU)          , key for SYSOUT
+         DC    AL2(1)                 , number of entries
+         DC    AL2(1)                 , length of 1 entry
+         DC    C'A'                   , sysout class
+TUSDLEN  EQU   *-TUSDPTR
+         TITLE 'Subroutines: DOSVC99 - Perform DYNALLOC functions'
+***********************************************************************
+* Allocate a file to the current JOB/STC using SVC99.                 *
+*                                                                     *
+* Registers on entry:  R1 --->  Text Unit parameter list              *
+*      field TEMPDDN:  DDNAME to be allocated                         *
+*                                                                     *
+* Registers on exit:   R15 = Retrun code                              *
+*                        0 : Allocation successful                    *
+*                  nonzero : RC from DYNALLOC call                    *
+*      field MSGTEXT: error message text                              *
+***********************************************************************
+DOSVC99  DS    0H                     , perform DYNALLOC functions
+         STM   R14,R3,DOSVSAVE        , save registers
+         LR    R3,R1                  , point to Text Unit Pointerlist
+         DBGMSG TEMPDDN,=CL8'DYNALLOC'
+         DEVTYPE TEMPDDN,DEVTYPE      , Test for DD card
+         IF    (LTR,R15,R15,NZ)       , if no DD card
+          LA   R2,REQBLK              , point to request block
+          USING S99RB,R2              , tell assembler
+          XC   REQBLK,REQBLK          , clear RB
+          MVI  S99RBLN,REQBLKLN       , set up length
+          MVI  S99VERB,S99VRBAL       , indicate ALLOC function
+          ST   R3,S99TXTPP            , put into Request block
+          LA   R3,RBPTR               , Point to RB pointer
+          USING S99RBP,R3             , tell assembler
+          ST   R2,S99RBPTR            , st RB address into RB PTR
+          OI   S99RBPTR,S99RBPND      , turn on high order bit
+          LA   R1,RBPTR               , get addres of RB pointer
+          DYNALLOC                    , issue SVC 99
+          ST   R15,DOSVSAVE+4         , set caller's R15
+          XR   R15,R15                , clear R15
+          ICM  R15,B'0011',S99ERROR   , get error code
+          ST   R15,DOSVSAVE+8         , place into caller's R0
+          MSGPUT MSG01E               , insert message text
+          MVC  MSG01E1,TEMPDDN        , insert DDNAME into message
+          X2CHRTRN MSG01E2,DOSVSAVE+06,LEN=2
+          X2CHRTRN MSG01E3,DOSVSAVE+10,LEN=2
+         ELSE
+          ST   R15,DOSVSAVE+4         , set caller's R15
+          MSGPUT MSG20I               , set up message text
+         ENDIF
+         LM    R14,R3,DOSVSAVE        , restore return address
+         BR    R14                    , and retrun to caller
+         DROP  R2,R3                  , not needed any more
+         TITLE 'Allocate SNAPDUMP'
+***********************************************************************
+* Allocate SNAPDUMP DD if not already present                         *
+***********************************************************************
+         SPACE
+ALCPDUMP DS    0H                     , allocate SNAPDUMP
+         STM   R14,R1,ALCSSAVE        , save registers
+*        IF    (TM,PROCFLAG,ISJOB,O)  , Is this a batch job?
+          MVC  TEMPDDN,TUSNDDNM       , insert DDNAME into msg text
+          MVC  SVC99WA(TUSNLEN),TUSNPTR move text units to WS
+          LA   R1,SVC99WA+TUSNDDN-TUSNPTR  point to DDNAME
+          ST   R1,SVC99P1             , put into TU list
+          LA   R1,SVC99WA+TUSNCLS-TUSNPTR  , point to CLASS parm
+          ICM  R1,B'1000',=XL1'80'    , indicate last parm
+          ST   R1,SVC99P2             , put into TU list
+          LA   R1,SVC99WA             , point to work area
+          BAL  R14,DOSVC99            , go and do it
+          IF   (LTR,R15,R15,NZ)       , Error on DYNALLOC?
+           WTO MF=(E,THEWTO)          , tell the user
+           B   EXIT12                 , and end with RC=12
+          ENDIF (LTR,R15,R15,NZ)      , Error on DYNALLOC
+*        ENDIF (TM,PROCFLAG,ISJOB)    , Is this a batch job?
+         LM    R14,R1,ALCSSAVE        , restore registers
+         BR    R14                    , return to caller
+         SPACE 2
+***********************************************************************
+* SNAPDUMP DYNALLOC parameters                                        *
+***********************************************************************
+         SPACE
+TUSNPTR  DS    0F                     , text unit pointers
+         DC    A(TUSNDDN)             , address of DDNAME
+         DC    X'80'                  , end of list indicator
+         DC    AL3(TUSNCLS)           , address of SYSOUT CLASS info
+TUSNDDN  DC    AL2(DALDDNAM)          , key for DDNAME
+         DC    AL2(1)                 , number of entries
+         DC    AL2(8)                 , length od 1 entry
+TUSNDDNM DC    CL8'SNAPDUMP'          , contens of entry
+TUSNCLS  DC    AL2(DALSYSOU)          , key for SYSOUT
+         DC    AL2(1)                 , number of entries
+         DC    AL2(1)                 , length of 1 entry
+         DC    C'A'                   , sysout class
+TUSNLEN  EQU   *-TUSNPTR
+         TITLE 'Allocate SYSPRINT for JOB if needed'
+***********************************************************************
+* Allocate SYSPRINT DD if not already present                         *
+***********************************************************************
+         SPACE
+ALCPRINT DS    0H                     , allocate SYSPRINT DD
+         STM   R14,R1,ALCPSAVE        , save the registers
+         IF    (TM,PROCFLAG,ISJOB,O)  , Is this a batch job?
+          MVC  TEMPDDN,TUSPDDNM       , insert DDNAME into msg text
+          MVC  SVC99WA(TUSPLEN),TUSPPTR move text units to WS
+          LA   R1,SVC99WA+TUSPDDN-TUSPPTR  point to DDNAME
+          ST   R1,SVC99P1             , put into TU list
+          LA   R1,SVC99WA+TUSPCLS-TUSPPTR  , point to CLASS parm
+          ICM  R1,B'1000',=XL1'80'    , indicate last parm
+          ST   R1,SVC99P2             , put into TU list
+          LA   R1,SVC99WA             , point to work area
+          BAL  R14,DOSVC99            , go and do it
+          IF   (LTR,R15,R15,NZ)       , Error on DYNALLOC?
+           WTO MF=(E,THEWTO)          , tell the user
+           B   EXIT12                 , and end with RC=12
+          ENDIF (LTR,R15,R15,NZ)      , Error on DYNALLOC?
+         ENDIF (TM,PROCFLAG,ISJOB)    , Is this a batch job?
+         LM    R14,R1,ALCPSAVE        , restore the registers
+         BR    R14                    , and return to caller
+         SPACE 2
+***********************************************************************
+* SYSPRINT DYNALLOC parameters                                        *
+***********************************************************************
+         SPACE
+TUSPPTR  DS    0F                     , text unit pointers
+         DC    A(TUSPDDN)             , address of DDNAME
+         DC    X'80'                  , end of list indicator
+         DC    AL3(TUSPCLS)           , address of SYSOUT CLASS info
+TUSPDDN  DC    AL2(DALDDNAM)          , key for DDNAME
+         DC    AL2(1)                 , number of entries
+         DC    AL2(8)                 , length od 1 entry
+TUSPDDNM DC    CL8'SYSPRINT'          , contens of entry
+TUSPCLS  DC    AL2(DALSYSOU)          , key for SYSOUT
+         DC    AL2(1)                 , number of entries
+         DC    AL2(1)                 , length of 1 entry
+         DC    C'X'                   , sysout class
+TUSPLEN  EQU   *-TUSPPTR
+         TITLE 'Subroutines: OPNPRINT - Open SYSPRINT'
+***********************************************************************
+* Open SYSPRINT DD for output processing (for a job)                  *
+***********************************************************************
+         SPACE
+OPNPRINT DS    0H                     , open SYSPRINT
+         STM   R14,R1,OPNPSAVE        , save registers
+         IF    (TM,PROCFLAG,ISJOB,O)  , Is this a batch job?
+          MVC  SYSPRINT,SYSPRDCB      , move DCB to reentrant storage
+          LA   R1,SYSPRINT            , point to SYSPRINT DCB
+          BAL  R14,OPENFILE           , go open the file
+          IF   (LTR,R15,R15,Z)        , if successful
+           OI  PROCFLAG,PRNTOPEN      , indicate that SYSPRINT is open
+          ENDIF (LTR,R15,R15,Z)       , if successful
+         ENDIF (TM,PROCFLAG,ISJOB)    , Is this a batch job?
+         LM    R14,R1,OPNPSAVE        , restore registers
+         BR    R14                    , return to caller
+         PUSH  PRINT
+         PRINT NOGEN
+SYSPRDCB DCB   DDNAME=SYSPRINT,       , ddname for this file           -
+               DSORG=PS,              , file is sequential             -
+               LRECL=&LRECL,          , record length                  -
+               BLKSIZE=&BLKSIZE,      , and blocksize                  -
+               MACRF=(PM),            , will be opened for output      -
+               RECFM=FBA              , fixed block, ansi cntlchars
+SYSPRLEN EQU   *-SYSPRDCB             , length of DCB
+         TITLE 'Subroutines: OPNSNAPD - Open SNAPDUMP'
+***********************************************************************
+* Open SNAPDUMP for SNAP SVC processing                               *
+***********************************************************************
+         SPACE
+OPNPDUMP DS    0H                     , open SYSPRINT
+         STM   R14,R1,OPNSSAVE        , save registers
+*        IF    (TM,PROCFLAG,ISJOB,O)  , Is this a batch job?
+          MVC  SNAPDUMP,SNAPDDCB      , move DCB to reentrant storage
+          LA   R1,SNAPDUMP            , point to SYSPRINT DCB
+          BAL  R14,OPENFILE           , go open the file
+          IF   (LTR,R15,R15,Z)        , if successful
+           OI  PROCFLAG,SNAPOPEN      , indicate that SYSPRINT is open
+          ENDIF (LTR,R15,R15,Z)       , if successful
+*        ENDIF (TM,PROCFLAG,ISJOB)    , Is this a batch job?
+         LM    R14,R1,OPNSSAVE        , restore registers
+         BR    R14                    , return to caller
+         PUSH  PRINT
+         PRINT NOGEN
+SNAPDDCB DCB   DDNAME=SNAPDUMP,       , ddname for this file           -
+               DSORG=PS,              , file is sequential             -
+               LRECL=125,             , record length                  -
+               BLKSIZE=1632,          , and blocksize                  -
+               MACRF=W,               , will be opened for output      -
+               RECFM=VBA              , fixed block, ansi cntlchars
+SNAPDLEN EQU   *-SNAPDDCB             , length of DCB
+         POP   PRINT
+         TITLE 'Subroutine OPENFILE - Open files as needed'
+***********************************************************************
+* Open a file, report any errors ifopen fails                         *
+*                                                                     *
+* Registers on entry:  R1  = address of DCB to be opened              *
+*                      R14 = Return address                           *
+*                                                                     *
+* Registers on exit:   R15 = Returncode                               *
+*                        0 ==> OPEN successful                        *
+*                        8 ==> OPEN failed                            *
+***********************************************************************
+         SPACE 1
+OPENFILE DS    0H                     , Open routine
+         STM   14,3,OPENSAVE          , save registers
+         LR    R3,R1                  , Point to DCB
+         USING IHADCB,R3              , tell assembler
+         DBGMSG DCBDDNAM,=CL8'OPEN'
+         MSGPUT MSG02E                , insert message body
+         MVC   MSG02E1,DCBDDNAM       , insert DD name into msg
+         MVC   OCLIST,THELIST         , Set up open/close list
+         IF    (CLC,DCBDDNAM,EQ,TUSPDDNM),OR,     SYSPRINT?            +
+               (CLC,DCBDDNAM,EQ,TUSNDDNM)         SNAPDUMP
+          OPEN ((R3),OUTPUT),MF=(E,OCLIST)
+         ELSE
+          OPEN ((R3),INPUT),MF=(E,OCLIST)
+         ENDIF
+         IF    (TM,DCBOFLGS,DCBOFOPN,O) if open was successfull
+          XR   R15,R15                , clear return code
+         ELSE                         , when open failed
+          BAL R14,PUTMSG              , issue the message
+          LA  R15,8                   , load error RC
+         ENDIF (TM,DCBOFLGS,DCBOFOPN,O) if open was okay
+         ST    R15,OPENSAVE+4         , set caller's R15
+         LM    14,3,OPENSAVE          , restore registers
+         BR    R14                    , and return to caller
+         DROP  R3                 , not needed outside this module
+         TITLE 'Analyze JCL PARM value'
+***********************************************************************
+* Analyse the JCL EXEC parameter                                      *
+***********************************************************************
+PROCPARM DS    0H                     , analyse PARM statement
+         STM   R14,R1,PROCSAVE        , Save registers
+         LM    R14,R1,PROCSAVE
+         L     R1,0(0,R1)             , Address of passed parm
+         LH    R15,0(0,R1)            , R15 = Length of parameters
+         LA    R1,2(0,R1)             , R1  = Address of parameter
+         IF    (LTR,R15,R15,Z)        , if no parameter was given
+          OI   PARMFLAG,PARMCHCK      , set default of NOUPDATE
+         ELSEIF (CH,R15,GT,=H'8')     , if parm string too long
+          OI   PARMFLAG,PARMLONG      , indicate in flag
+          LA   R15,8                  , load maximum allowed length
+         ENDIF (LTR,R15,R15,Z)        , if no parameter was given
+         BCTR  R15,0                  , minus one for EX
+         MVC   PARMAREA(*-*),0(R1)    , move in parameters
+         EX    R15,*-6                , via EX
+         OC    PARMAREA,=CL8' '       , Convert to upper case
+         LA    R15,1(R15)             , real length
+         IF    (CH,R15,EQ,=H'8'),AND,(CLC,PARMAREA,EQ,=C'NOUPDATE')
+          OI   PARMFLAG,PARMCHCK      , indicate PARM=NOUPDATE
+         ELSEIF (CH,R15,EQ,=H'8'),AND,(CLC,PARMAREA,EQ,=C'NOREPLYU')
+          OI   PARMFLAG,PARMNORU      , indicate in action flag
+          OI   PARMFLAG,PARMSET       , turn on SET flag
+         ELSEIF (CH,R15,EQ,=H'6'),AND,(CLC,PARMAREA,EQ,=C'UPDATE')
+          OI   PARMFLAG,PARMSET       , by setting bit flag
+         ELSE
+          OI   PARMFLAG,PARMINV       , indicate invalid parm
+         ENDIF
+         LM    R14,R1,PROCSAVE        , restore registers
+         BR    R14                    , return to caller
+         TITLE 'Allocate and open PARMLIB'
+***********************************************************************
+* Allocate PARMLIB DD if not already present                          *
+***********************************************************************
+         SPACE
+ALCPALIB DS    0H                     , allocate PARMLIB DD
+         STM   R14,R12,ALCPASAV       , save registers
+         MVC   TEMPDDN,TUPLDDNM       , insert DDNAME into msg text
+         MVC   SVC99WA(TUPLLEN),TUPLPTR move text units to WS
+         LA    R1,SVC99WA+TUPLDDN-TUPLPTR  point to DDNAME
+         ST    R1,SVC99P1             , put into TU list
+         LA    R1,SVC99WA+TUPLDSN-TUPLPTR  , point to DSN parm
+         ST    R1,SVC99P2             , put into TU list
+         LA    R1,SVC99WA+TUPLSTAT-TUPLPTR  , point to DISP parm
+         ICM   R1,B'1000',=XL1'80'    , indicate last parm
+         ST    R1,SVC99P3             , put into TU list
+         LA    R1,SVC99WA             , point to work area
+         BAL   R14,DOSVC99            , go and do it
+         IF    (LTR,R15,R15,NZ)       , Error on DYNALLOC?
+          BAL  R14,PUTMSG             , tell the user
+          B    EXIT12                 , and end with RC=12
+         ENDIF (LTR,R15,R15,NZ)       , Error on DYNALLOC
+         LM    R14,R12,ALCPASAV       , restore registers
+         BR    R14                    , return to caller
+         SPACE 2
+***********************************************************************
+* PARMLIB DYNALLOC parameters                                         *
+***********************************************************************
+         SPACE
+TUPLPTR  DS    0F                     , text unit pointers
+         DC    A(TUPLDDN)             , address of DDNAME
+         DC    A(TUPLDSN)             , address of DSNAME
+         DC    X'80'                  , end of list indicator
+         DC    AL3(TUPLSTAT)          , address of STATUS
+TUPLDDN  DC    AL2(DALDDNAM)          , key for DDNAME
+         DC    AL2(1)                 , number of entries
+         DC    AL2(8)                 , length od 1 entry
+TUPLDDNM DC    CL8'PARMLIB '        '          , contens of entry
+TUPLDSN  DC    AL2(DALDSNAM)          , key for DDNAME
+         DC    AL2(1)                 , number of entries
+         DC    AL2(44)                , length od 1 entry
+         DC    CL44'SYS1.PARMLIB'     , contens of entry
+TUPLSTAT DC    AL2(DALSTATS)          , key for STATUS (initial DISP)
+         DC    AL2(1)                 , number of entries
+         DC    AL2(1)                 , length od 1 entry
+         DC    X'08'                  , X'08' = OLD
+*                                     , X'04' = NEW
+*                                     , X'02' = MOD
+*                                     , X'01' = OLD
+TUPLLEN  EQU   *-TUPLPTR
+         TITLE 'Subroutines: OPNPAPDS - Open PARMLIB as a PDS'
+***********************************************************************
+* Open PARMLIB as PDS                                                 *
+***********************************************************************
+         SPACE 1
+OPNPAPDS DS    0H                     , open PARMLIB as a PDS
+         STM   R14,R1,OPNPASAV        , save registers
+         MVC   PARMLIB,PARMLDCB       , move DCB to reentrant storage
+         LA    R1,PARMLIB             , point to DCB
+         USING IHADCB,R1
+         LA    R15,JFCBAREA           , point to JFCB input area
+         ICM   R15,B'1000',=X'87'     , indicate JFCB exit
+         ST    R15,EXLST              , put into exit list
+         LA    R15,EXLST              , get address of list
+         STCM  R15,B'0111',DCBEXLSA   , and put into DCB
+         DROP  R1
+         BAL   R14,OPENFILE           , go open the file
+         IF    (LTR,R15,R15,Z)        , if successful
+           OI  PROCFLAG,PARMOPEN      , indicate that PARMLIB is open
+         ELSE                         , when open failed
+           BAL R14,PUTMSG             , show the error message
+           B   EXIT12                 , exit with RC=12
+         ENDIF (LTR,R15,R15,Z)        , if successful
+         LM    R14,R1,OPNPASAV        , restore registers
+         BR    R14
+         PUSH  PRINT
+         PRINT NOGEN
+PARMLDCB DCB   DDNAME=PARMLIB,        , ddname for this file           -
+               DSORG=PO,              , file is partitioned            -
+               MACRF=R,               , will be opened for input       -
+               EODAD=EOMEM            , return on eof
+PARMLLEN EQU   *-PARMLDCB             , length of DCB
+         POP   PRINT
+         TITLE 'Subroutines: OPNPADIR - Open PARMLIB as a PS'
+***********************************************************************
+* Open PARMLIB as PS (for reading the directory)                      *
+***********************************************************************
+         SPACE 1
+OPNPADIR DS    0H                     , open PARMDIR
+         STM   R14,R1,OPNPDSAV        , save registers
+         MVC   PARMDIR,PARMDDCB       , move DCB to reentrant storage
+         LA    R1,PARMDIR             , point to PARMDIR DCB
+         BAL   R14,OPENFILE           , go open the file
+         IF    (LTR,R15,R15,Z)        , if open was successfull
+           OI  PROCFLAG,PDIROPEN      , indicate PARMLIB is open
+         ELSE                         , when open failed
+           BAL R14,PUTMSG             , show error message
+           B   EXIT12                 , exit with RC=12
+         ENDIF (LTR,R15,R15,Z)        , if open was successfull
+         LM    R14,R1,OPNPDSAV        , restore registers
+         BR    R14                    , return to caller
+         PUSH  PRINT
+         PRINT NOGEN
+PARMDDCB DCB   DDNAME=PARMLIB,        , ddname for this file           -
+               DSORG=PS,              , file is sequential             -
+               LRECL=256,             , record length                  -
+               BLKSIZE=256,           , and blocksize                  -
+               KEYLEN=8,              , in order to get record key     -
+               MACRF=R,               , will be opened for input       -
+               RECFM=F                , fixed block
+PARMDLEN EQU   *-PARMDDCB             , length of DCB
+         POP   PRINT
+         TITLE 'Subroutines: READJFCB: Get Job File Control Block'
+***********************************************************************
+* Read JFCB of PARMLIB to get block size                              *
+***********************************************************************
+         SPACE 1
+READJFCB DS    0H                     , Read JFCB into memory
+         STM   R14,R1,JFCBSAVE        , save registers
+         DBGMSG TUPLDDNM,=CL8'RDJFCB'
+         MVC   OCLIST,THELIST         , init open/close list
+         RDJFCB (PARMLIB),MF=(E,OCLIST) now get the JFCB
+         IF    (LTR,R15,R15,NZ)       , RDJFCB failed
+          MSGPUT MSG06E               , point to error message
+          BAL  R14,PUTMSG             , show the message
+          B    EXIT12                 , and exit with RC=12
+         ELSE
+          LH   R0,JFCBLKSI            , block length from JFCB
+          ST   R0,JFCBSAVE+8          , save in caller's R0
+          GETMAIN R,LV=(0)            , get area from MVS
+          ST   R1,JFCBSAVE+12         , put into caller's R1
+          OI   PROCFLAG,HAVEBUFF      , indicate we have a buffer
+          MSGPUT MSG22I               , insert body part of message
+          MVC  MSG22I1,JFCBDSNM       , insert dsname
+          BAL  R14,PUTMSG             , show message
+          MSGPUT MSG23I               , insert body part of message
+          MVC  MSG23I1,JFCBVOLS       , insert dsname
+          BAL  R14,PUTMSG             , show message
+         ENDIF
+         LM    R14,R1,JFCBSAVE        , rstore registers
+         BR    R14                    , and back to caller
+         TITLE 'Subroutines: REPTPARM - Report PARM setting'
+***********************************************************************
+* Fill in messages BSPSP9xI and report PARM setting                   *
+* If no parm is given, or an invalid parm, use the default of         *
+* PARM=NOUPDATE                                                       *
+***********************************************************************
+REPTPARM DS    0H                     , report PARM settings
+         STM   R14,R1,REPTSAVE        , save the registers
+         MSGPUT MSG91I                , setup MSG91I
+         MVC   MSG91I1,PARMAREA       , insert variable part
+         BAL   R14,PUTMSG             , show message
+         IF    (TM,PARMFLAG,PARMLONG,O) Parm too long
+          MSGPUT MSG95W               , insert message
+          SETMAXCC 4                  , insert return code
+          BAL  R14,PUTMSG             , and display message text
+         ENDIF (TM,PARMFLAG,PARMLONG,O) Parm too long
+         IF    (TM,PARMFLAG,PARMSET,O)  PARM=UPDATE?
+          MSGPUT MSG93I               , or PARM=NOREPLYU
+          BAL  R14,PUTMSG             , and display message text
+         ELSEIF (TM,PARMFLAG,PARMCHCK,O) PARM=CHECK
+          MSGPUT MSG92I               , insert message
+          BAL  R14,PUTMSG             , and display message text
+         ELSE
+          MSGPUT MSG94W               , point to warning message
+          BAL  R14,PUTMSG             , display message
+          OI   PARMFLAG,PARMCHCK      , turn of TEST FLAG
+         ENDIF                        , and do PARM=CHECK process
+         LM    R14,R1,REPTSAVE        , restore the registers
+         BR    R14                    , and return to caller
+         TITLE 'Constant - L-Form macro instructions skeletons'
+THELIST  OPEN  (,),MF=L               , Open close RDJFCB list
+AWTO     WTO   ' ',MF=L
+AWTOL    EQU   *-AWTO
+         TITLE 'Literal Pool'
+         LTORG
+         TITLE 'Reentrant Storage - Message Display variables'
+WORKAREA DSECT
+***********************************************************************
+* The description of a few variables has been placed here because     *
+* IFOX00 doesn't easily allow certain forward references in the EQU   *
+* statement.  't easily allow certain forward references in the EQU   *
+***********************************************************************
+         READ  DIRDECB,SF,,,'S',MF=L
+         PUSH  PRINT
+         PRINT GEN
+         READ  READDECB,SF,,,'S',MF=L
+READDCBE EQU   *
+         POP   PRINT
+THEWTO   WTO   '----+----1----+----2----+----3----+----4----+----5----+-
+               ----6----+----7----+----8----+----9----+----0----+----1--
+               ---+----2----',MF=L
+*HEWTOL  EQU   *-AWTO
+*THEWTO   DS    CL(AWTOLEN)            , reentrant storage for WTOs
+MSGTEXT  EQU   THEWTO+4,124           , area for message texts
+THEWTOR  WTOR  '---------1---------2---------3---------4---------5------
+               ----6---------7---------8---------9---------0---------1--
+               --------2-',,,,MF=L
+*WTORLEN EQU   *-AWTOR
+*THEWTOR  DS    CL(AWTORLEN)
+WTORTEXT EQU   THEWTOR+12,121
+PRNTLINE DS    0CL(&LRECL)            , line to SYSPRINT
+PRNTCC   DS    CL1                    , control character
+PRNTTEXT DS    CL(&LRECL-1)           , text to be printed
+BSPSETPF CSECT
+         TITLE 'Constants - Report Header Lines'
+**********************************************************************
+*  BSPSETPF Version 1.0
+*
+*          ×l      _,,,---,,_
+*    ZZZzz /,:.-':''  . -.  ;-;;,
+*         ×,4-  ) )-,_. ,( (  :'-
+*        '---''(_/--'  :-')_)
+*
+*  Placed into the Hercules Domain
+*  by Volker Bandke, BSP GmbH'
+*
+*  Volume: MVSRES   Dataset: SYS1.PARMLIB
+**********************************************************************
+         SPACE 1
+HEAD001  DS    0CL(&LRECL)
+         DC    C'1BSPSETPF Version &BSPVER..&BSPMOD'
+         FILL  HEAD001                ,
+         ORG   HEAD001+&LRECL-8
+         DC    C'PAGE '
+HEAD0011 EQU   PRNTLINE+&LRECL-5,3
+         ORG   ,                      ,
+HEAD0C1  DS    0CL(&LRECL)
+         DC    CL60'0'
+         DC    C'         ×l      _,,,---,,_'
+         FILL  HEAD0C1
+HEAD0C2  DS    0CL(&LRECL)
+         DC    CL60' '
+         DC    C'   ZZZzz /,:.-'':''    -.  ;-;;,'
+         FILL  HEAD0C2
+HEAD0C3  DS    0CL(&LRECL)
+         DC    CL60' '
+         DC    C'        ×,4-  ) )-,_. ,( (  :''-'''
+         FILL  HEAD0C3
+HEAD0C4  DS    0CL(&LRECL)
+         DC    CL60' '
+         DC    C'       ''---''''(_/--''  :-'')_)'
+         FILL  HEAD0C4
+HEAD0C5  DS    0CL(&LRECL)
+         DC    CL60'0'
+         DC    C' Placed into the Hercules Domain'
+         FILL  HEAD0C5
+HEAD0C6  DS    0CL(&LRECL)
+         DC    CL60' '
+         DC    C' by Volker Bandke, BSP GmbH'
+         FILL  HEAD0C6
+         DS    0CL(&LRECL)
+         TITLE 'Constants - Error and status messages'
+**********************************************************************
+*   BSPSP01E - xxxxxxxx DD statement not allocated
+*   BSPSP02E - Open failed for DD xxxxxxxx
+*   BSPSP03E - Suffix xx is invalid console id.  This member skipped
+*   BSPSP04E - Invalid function key number
+*   BSPSP05W - Console id xx not present. This member ignored
+*   BSPSP06E - RDJFCB failed for DD xxxxxxxx
+*   BSPSP07E - Find failed for member mmmmmmm
+*   BSPSP08I - control statement image
+*   BSPSP09W - Console id xx does not support function keys.
+*   BSPSP10E - PFK number xx out of range, this key ignored.
+*   BSPSP11I - PARM=NOREPLYU specified.  PFK tables will be updated
+*   BSPSP12E - Operator rejectected update request.  PARM=NOUPDATE set
+*   BSPSP13E - Error found processing above statement
+*   BSPSP14E - Environment not BATCH or STC
+*   BSPSP16D - Reply 'U' to update PFKtables
+*   BSPSP17W - Invalid processing flag, assuming 'Y'
+*   BSPSP18E - Invalid continuation'
+*   BSPSP19E - No empty slot found for function key'
+*   BSPSP91I - Parm passed: xxxx'
+*   BSPSP92I - PARMLIB members will be checked only
+*   BSPSP93I - PFK definitions will be updated in memory
+*   BSPSP94W - Invalid PARM, PARM=CHECK assumed
+*   BSPSP99W - PARM longer than 8 bytes, trailer ignored
+*   BSPSP99I - End of processing
+**********************************************************************
+*        DC    C'-----+----1----+----2----+----3----+----4----+----5---
+MSG01E   DC    C'BSPSP01E - Allocation failed for XXXXXXXX, RC=XXXX, S9+
+               9ERROR=XXXX'
+MSG01E1  EQU   MSGTEXT+33,8
+MSG01E2  EQU   MSGTEXT+46,4
+MSG01E3  EQU   MSGTEXT+61,4
+MSG02E   DC    C'BSPSP02E - Open failed for DD statement XXXXXXXX'
+MSG02E1  EQU   MSGTEXT+40,8
+MSG03E   DC    C'BSPSP03E - Suffix xx is invalid console id. Skipped'
+MSG03E1  EQU   MSGTEXT+18,2
+         DC    C' is invalid console id.  This member skipped'
+MSG04E   DC    C'BSPSP04E - PF Key number XX is invalid.  Ignored'
+MSG04E1  EQU   MSGTEXT+25,2
+MSG05W   DC    C'BSPSP05W - Console id xx not present in system'
+MSG05W1  EQU   MSGTEXT+22,2           ,
+MSG06E   DC    C'BSPSP06E - RDJFCB failed for PARMLIB, function termina-
+               ted'
+MSG06E1  EQU   MSGTEXT+29,8
+MSG07E   DC    C'BSPSP07E - Find failed for member xxxxxxxx. Ignored'
+MSG07E1  EQU   MSGTEXT+34,8
+MSG08I   DC    C'BSPSP08I - ----+----1----+----2----+----3----+----4----
+               -+----5----+----6----+----7--'
+MSG08I1  EQU   MSGTEXT+11,72          ,
+MSG09W   DC    C'BSPSP09E - Console id XX does not support function keys
+               s.  This member skipped'
+MSG09W1  EQU   MSGTEXT+22,2           ,
+MSG10E   DC    C'BSPSP10E - PFK Number XX is out of range.  Ignored'
+MSG10E1  EQU   MSGTEXT+22,2          ,
+MSG11I   DC    C'BSPSP11I - PARM=NOREPLYU specified.  Resident PFK tabl-
+               es will be updated'
+MSG12E   DC    C'BSPSP12E - Operator rejected update request.  PARM=NOU-
+               PDATE assumed'
+MSG13E   DC    C'BSPSP13E - Error encountered processing statement'
+MSG14E   DC    C'BSPSP14E - Environment not BATCH or STC'
+*        DC    C'-----+----1----+----2----+----3----+----4----+----5---
+MSG15I   DC    C'BSPSP15I - Debug: File XXXXXXXX, Function ffffffff'
+MSG15I1  EQU   MSGTEXT+23,8
+MSG15I2  EQU   MSGTEXT+42,8
+MSG16D   DC    C'BSPSP16D - Reply ''U'' to update function key tables, +
+               ''C'' to cancel request'
+*              +----3----+----4----'
+MSG17W   DC    C'BSPSP17W - Invalid processing flag, assuming ''Y'''
+MSG18E   DC    C'BSPSP18E - Invalid continuation'
+MSG19E   DC    C'BSPSP19E - No slot found in memory for cmd'
+MSG20I   DC    C'BSPSP20I - DD already allocated, no allocation done'
+MSG21I   DC    C'BSPSP21I - Member being processed: mmmmmmmm'
+MSG21I1  EQU   MSGTEXT+35,8
+*        DC    C'-----+----1----+----2----+----3----+----4----+----5---
+MSG22I   DC    C'BSPSP22I - Dataset processed:                         +
+                                   '
+MSG22I1  EQU   MSGTEXT+30,44
+*        DC    C'-----+----1----+----2----+----3----+----4----+----5---
+MSG23I   DC    C'BSPSP23I - on volume vvvvvv'
+MSG23I1  EQU   MSGTEXT+21,06
+MSG91I   DC    C'BSPSP91I - Parms passed: xxxxxxxx'
+MSG91I1  EQU   MSGTEXT+25,8
+MSG92I   DC    C'BSPSP92I - SETPFKxx member will be checked, but not up-
+               dated'
+MSG93I   DC    C'BSPSP93I - PFK definitions will be updated in memory'
+MSG94W   DC    C'BSPSP94W - Invalid parm, PARM=CHECK assumed'
+MSG95W   DC    C'BSPSP95W - Parm was too long, truncated'
+*        DC    C'-----+----1----+----2----+----3----+----4----+----5---
+MSG98I   DC    C'BSPSP98I - Member processed, LASTCC=xxxx'
+MSG98I1  EQU   MSGTEXT+36,4
+MSG99I   DC    C'BSPSP99I - End of processing, MAXRC=xxxx'
+MSG99I1  EQU   MSGTEXT+36,4
+         TITLE 'Variables - PFK Definition Workspace'
+***********************************************************************
+* Workspace for setting up PFK definition in memory.                  *
+***********************************************************************
+         SPACE 1
+WORKAREA DSECT
+WORKSPAC DS    0CL109                 , at most 108 days
+WORKFLAG DS    X                      , processing control flag
+CMDACT   EQU   B'10000000'            , X'80' - Key is active
+CMDCNV   EQU   B'00100000'            , X'20' - Key is conversational
+WORKSPC  DS    0CL105
+WORKSPC1 DS    CL67                   , first part of command
+WORKSPC2 DS    CL38                   , second part from continuation
+         DS    CL3                    , 3 bytes at end are reserved
+DBL      DS    D                        A WORK AREA
+CONID    DS    H                        REQUESTED CONSOLE
+PFKNO    DS    H                        REQUESTED PFK NUMBER
+SVC99WA  DS    CL(&TUMAXLN)           , parameter area for SVC99
+SVC99P1  EQU   SVC99WA+0,4            , SVC 9 parmater 1
+SVC99P2  EQU   SVC99WA+4,4            , SVC 9 parmater 2
+SVC99P3  EQU   SVC99WA+8,4            , SVC 9 parmater 3
+         SPACE 2
+         TITLE 'Variables - Dynalloc request block'
+***********************************************************************
+* SVC 99 Request Block                                                *
+***********************************************************************
+         SPACE
+         PUSH  PRINT
+         PRINT NOGEN
+         IEFZB4D0                     , dynalloc dsects
+         IEFZB4D2                     , and equates
+WORKAREA DSECT
+         POP   PRINT
+RBPTR    DS    F                      , request block pointer
+REQBLK   DS    CL(S99RBEND-S99RB)     , Request block
+REQBLKLN EQU   L'REQBLK               , length of request block
+         SPACE
+         TITLE 'Subroutine Save Areas'
+***********************************************************************
+* Subroutine save areas                                               *
+***********************************************************************
+ALCMSAVE DS    4F                     , ALCMDUMP save area R14 - R1
+ALCPASAV DS    4F                     , ALCPALIB save area R14 - R1
+ALCPSAVE DS    4F                     , ALCPRINT save area R14 - R1
+ALCSSAVE DS    4F                     , ALCSDUMP save area R14 - R1
+ALCUSAVE DS    4F                     , ALCUDUMP save area R14 - R1
+GETSAVE  DS    9F                     , GETCONS  save area R14 - R6
+JFCBSAVE DS    4F                     , READJFCB save area R14 - R1
+NUMSAVE  DS    6F                     , NUMTEST  save area R14 - R3
+OPNPASAV DS    4F                     , OPNPAPDS save area R14 - R1
+OPNPDSAV DS    4F                     , OPNPADIR save area R14 - R1
+OPNPSAVE DS    4F                     , OPNPRINT save area R14 - R1
+OPNSSAVE DS    4F                     , OPNSNAPD save area R14 - R1
+PROCSAVE DS    4F                     , PROCPARM save area R14 - R1
+REPTSAVE DS    4F                     , REPTPARM save area R14 - R1
+SETISAVE DS    4F                     , SETINIT  save area R14 - R1
+DOSVSAVE DS    6F                     , DOSVC99  save area R14 - R3
+OPENSAVE DS    6F                     , OPENFILE save area R14 - R3
+PUTMSAVE DS    6F                     , PUTMSG   save area R14 - R3
+UPDTSAVE DS    9F                     , UPDTPFK  save area R14 - R6
+         AIF   ('&DEBUG' EQ 'NO').NOSNAP3
+         PUSH  PRINT
+         PRINT GEN
+THESNAP  SNAP  DCB=,SDATA=,PDATA=,LIST=,STRHDR=,MF=L
+         POP   PRINT
+.NOSNAP3 ANOP
+         TITLE 'Miscellaneous Variables'
+LASTCC   DC    F'0'                   , returncode given to caller
+MAXCC    DC    F'0'                   , returncode given to caller
+MEMCC    DC    F'0'                   , returncode for this member
+CONSPFKA DC    F'0'                   , console PFK area address
+DEVTYPE  DC    6F'0'                  , for devtype macro
+EXLST    DS    F                      ,DCB Exit List
+WTOECB   DC    F'0'                   , ECB we are waiting for
+WTOREPLY DC    C' '                   , reply we are waiting for
+PFNUMSAV DS    H                      , PFK number save area
+PRFLGSAV DS    X                      , Procesing flag save area
+PAGENUM  DC    PL2'0'                 , Page number in report
+LINENUM  DC    PL2'100'               , Line number on page
+FLAG     DC    XL1'00'                , status flag
+INVPFNUM EQU   B'10000000'            , X'80' - Invalid PFK number
+INVCONV  EQU   B'01000000'            , X'40' - Invalid CONV setting
+INVCONT  EQU   B'00100000'            , X'20' - Invalid continuation
+INVRANG  EQU   B'00010000'            , X'10' - Invalid pfknum range
+NEEDCONT EQU   B'00001000'            , X'08' - Continuation requested
+NOPFSLOT EQU   B'00000100'            , X'04' - No PFK slot found
+NOREPLYU EQU   B'00000010'            , X'02' - OPerator rejected req
+         DS    0F                     , align JFCB area
+JFCBAREA DS    0CL176                 , we nedd JFCB info
+         IEFJFCBN ,                   ,
+DIRAREA  DS    0CL264' '              , Area for reading PDS dir info
+PDSKEY   DC    CL8' '                 ,
+PDSCOUNT DC    XL2'00'                ,
+         FILL  DIRAREA                ,
+BLOCKLEN DC    H'0'                   ,
+PARMFLAG DC    XL1'0'                 , Flag byte for PARM date
+PARMSET  EQU   B'10000000'            , X'80' - set keys
+PARMNORU EQU   B'01000000'            , X'40' - don't issue WTOR
+PARMCHCK EQU   B'00100000'            , X'20' - Check SETPFKxx
+PARMLONG EQU   B'00000100'            , X'04' - Invalid parms given
+PARMINV  EQU   B'00000010'            , X'02' - Invalid parms given
+PARMNONE EQU   B'00000001'            , X'01' - No parms given
+PROCFLAG DS    XL1                    , Processing control flag
+MEMFOUND EQU   B'10000000'            , running as a TSO user
+ISJOB    EQU   B'01000000'            , running as a batch job
+ISSTC    EQU   B'00100000'            , running as a started task
+PRNTOPEN EQU   B'00010000'            , SYSPRINT is open
+PARMOPEN EQU   B'00001000'            , PARMLIB is open
+PDIROPEN EQU   B'00000100'            , PARMDIR is open
+SNAPOPEN EQU   B'00000010'            , We have an IO buffer
+HAVEBUFF EQU   B'00000001'            , We have an IO buffer
+OCLIST   OPEN  (,),MF=L               , OPEN/CLOSE parameter list
+SNAPLIST DS    20F
+HDRLIST  DS    10F
+SAVMEMBR DS    CL8
+PARMAREA DS    CL8
+TEMPDDN  DS    CL8                    , slot for saving DDNAMES
+         DS    0D
+SNAPDUMP DS    CL(SNAPDLEN)           , area for SNAPDUMP DCB
+         DS    0D
+SYSPRINT DS    CL(SYSPRLEN)           , area for SYSPRINT DCB
+         DS    0D
+PARMLIB  DS    CL(PARMLLEN)           , area for PARMLIB  DCB
+         DS    0D
+PARMDIR  DS    CL(PARMDLEN)           , area for PARMDIR  DCB
+         TITLE 'Constants - Literal pool'
+         LTORG
+         TITLE 'DSECTS: DSDIRDS - Directory record rayout'
+PDSDIRDS DSECT                        , directory record
+PDSMEMBR DS    0CL8                   , Member name
+PDSPREFX DS    CL6                    , Prefix, 6 characters
+PDSSUFFX DS    CL2                    , Suffix, 2 characters
+PDSTTR   DS    CL3                    , location in file
+PDSC     DS    CL1                    , data count
+PDSUSER  EQU   *                      , user data
+         TITLE 'DSECTS: SETPFKDS - SETPFKxx member record layout'
+SETPFKDS DSECT                        , SETPFKxx record layout
+SPFCOM   DS    0CL1                   , field with commetn indicator
+SPFCOMCH EQU   C'*'                   , comment character
+SPFPFNUM DS    CL2                    , PFK Number, PIC 99
+SPFPRFLG DS    CL1                    , Processing flag
+SPFPRCON EQU   C'Y'                   , Conversation processing
+SPFPRNCO EQU   C'N'                   , Non-Conversation processing
+         DS    C                      , reserved
+SPFPTXT1 DS    CL67                   , command text
+         ORG   SPFPTXT1               , reposition
+SPFPTXT2 DS    CL41                   , command text of continuation
+         ORG                          , restore position
+SPFCONT  DS    C                      , continuation field
+         TITLE 'DSECTS: RPFKDS - Resident PFKAREA entry layout'
+RPFKDS   DSECT                        , SETPFKxx record layout
+RPFKPFN  DS    FL1                    , PFK Number
+RPFKLAST EQU   100                    , Indicator for end of table
+RPFKCMD  DS    0CL109                 , Command area
+RPFKFLG  DS    XL1                    , Processing flag
+RPFKTEXT DS    CL108                  , PFK command text
+RPFKLEN  EQU   *-RPFKPFN              , length of entry
+         PRINT NOGEN
+         CVT   SYS=AOS1,DSECT=YES     , create CVT DSECT
+         IEECUCM SYS=AOS1,FORMAT=NEW  , Unit Control Module definition
+DCM      DSECT
+         IEECRDCM DSECT=YES           , resident Display Console Module
+         PRINT ON,GEN
+         DCBD  DSORG=(PO,PS),DEVD=DA  , DCB layout
+         BSPEND                       , of module

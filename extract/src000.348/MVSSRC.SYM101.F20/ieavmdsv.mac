@@ -1,0 +1,1720 @@
+         TITLE 'IEAVMDSV - COMMTASK DEVICE SERVICE ROUTINE'
+IEAVMDSV CSECT
+* A  508548,508598                                             @YA00064
+* MINSERV(C) - CHANGE TO DEQUEUE LOGIC                         @ZA00854
+* DEVINACT (A) FOR NOP EXCP CONDITION                          @ZA03882
+* DEVCRDR (A) FOR NOP EXCP CONDITION                           @ZA03882
+* MINMORE1 (C), DEQMLWA1(C) INVALID BRANCH                     @ZA05336
+* DEQMLWA1(C), MINMORE1(C)                                     @ZA05685
+* /* MINMORE1 (C)                                              @ZA06484
+* DEVCLOSE (C,A) - FOR NOP CLOSE CONDITION                     @ZA05367
+* MINMORE2 (C,A) - APPROX 383500 TO FORCE START-AT-TOP         @ZA08469
+* WWBRTN(C,A) WQE THRESHOLD - APPROX. 509552                   @ZA11392
+* /* START OF SPECIFICATIONS ****
+*
+*01*  MODULE-NAME = IEAVMDSV
+*
+*01*  DESCRIPTIVE-NAME = COMMTASK DEVICE SERVICE ROUTINE
+*
+*01*  COPYRIGHT = NONE
+*
+*01*  STATUS = RELEASE 3
+*
+*01*  FUNCTION = IEAVMDSV CONSISTS OF THREE EXTERNAL SUBROUTINES WHICH
+*     CAN BE INVOKED VIA AN INPUT CODE: DEVSERVA, DEVSERVB, AND
+*     DQCLNUP.  IN ADDITION DEVSERVA AND DEVSERVB CALL AN INTERNAL
+*     SUBROUTINE DEQ.
+*
+*     DEVSERVA PASSES CONTROL TO THE APPROPRIATE DEVICE
+*     PROCESSOR FOR A CONSOLE WITH OUTPUT PENDING OR AN OPEN OR CLOSE
+*     PENDING.
+*
+*     DEVSERVB PASSES CONTROL TO THE APPROPRIATE DEVICE PROCESSOR FOR A
+*     CONSOLE WITH AN I/O COMPLETION OR ATTENTION PENDING.
+*
+*     AT THE REQUEST OF THE DEVICE PROCESSOR, DEVSERVA AND DEVSERVB
+*     WILL PASS CONTROL TO SUBROUTINE DEQ TO CLEAN UP THE CONSOLE'S
+*     OUTPUT QUEUE.   DEQ HARDCOPIES WQES, FREES ELIGIBLE WQES
+*     AND FREES EMPTY CQE BLOCKS.
+*
+*     DQCLNUP SERVICES THE SYSTEM OUTPUT QUEUE (THE WQE QUEUE)
+*     FOR WQES WHICH DO NOT HAVE CQE ENTRIES AND WOULD NOT BE
+*     CLEANED UP BY DEQ.  IT HARDCOPIES AND FREES ELIGIBLE WQES.
+*
+*02*     OPERATION = DEVSERVA SEARCHES THE UCMES BEGINNING AT THE UCME
+*        ADDRESS PASSED TO IT. IF AN OUTPUT, OPEN OR CLOSE PENDING IS
+*        FOUND IN THE UCME IT INVOKES THE DEVICE PROCESSOR BY ISSUEING
+*        SVC 72.  IF THE DEVICE PROCESSOR INDICATES ITS OUTPUT QUEUE
+*        NEEDS CLEANUP, DEQ IS CALLED.  AFTER SVC 72 IS INVOKED FOR ONE
+*        UCME, DEVSERVA RETURNS TO IEAVMQWR TO SERVICE ANY POSSIBLE
+*        HIGHER PRIORITY REQUESTS.  THE UCME ADDRESS PASSED TO IT IS
+*        UPDATED TO THE ADDRESS OF THE NEXT UCME OR THE FIRST UCME IF
+*        ALL HAVE BEEN PROCESSED.
+*
+*        DEVSERVB SERVICES A PARTICULAR UCME WHOSE ADDRESS IS PASSED
+*        TO IT.  IF THE UCME HAS AN I/O COMPLETION OR ATTENTION PENDING
+*        SVC 72 IS ISSUED TO INVOKE THE DEVICE PROCESSOR.  ON RETURN
+*        IF THE CONSOLE'S OUTPUT QUEUE NEEDS CLEANUP, DEQ IS CALLED.
+*        THEN DEVSERVB RETURNS TO IEAVMQWR AT THE RETURN ADDRESS.
+*
+*        DQCLNUP AND DEQ PROCESS WQES BY INVOKING SEVERAL INTERNAL
+*        SUBROUTINES:
+*
+*        MINSERV - FREES ELIGIBLE MINORS FROM A MLWTO CHAIN EVEN
+*           THOUGH THE ENTIRE CHAIN CANNOT BE FREED YET.
+*
+*        DSVHC - HARDCOPIES BOTH A NORMAL WQE OR A MLWTO CHAIN.
+*
+*        PURGEWQE - FREES AND DECHAINS A NORMAL WQE OR AN ENTIRE
+*           MLWTO CHAIN.
+*
+*        FREEWQE - DOES THE FREECELL FOR A NORMAL, MAJOR OR MINOR WQE.
+*           DOES A FREEMAIN WHEN A CELLPOOL EXTENT IS EMPTY.
+*
+*        WWBRTN - CALLED AFTER A MAJOR, MINOR OR NORMAL WQE IS FREED.
+*           IF THE CURRENT COUNT OF WQES IS BELOW THE LIMIT, SEARCHES
+*           THE WWB CHAIN AND POSTS ANY WAITING WTO ISSUER.
+*           THE IEAVMQWR SILENCE BIT IS TURNED OFF SO IEAVMQWR @ZA11392
+*           CAN ISSUE WQE THRESHOLD MESSAGES.                  @ZA11392
+*
+*        FREEWTLB - FREES THE BUFFER USED FOR THE PARAMETER LIST TO WTL
+*           WHEN HARDCOPY IS THE SYSTEM LOG.
+*
+*        DSVLOG - CHECKS THE STATUS OF THE SYSTEM LOG AND ISSUES A
+*           WTL OR ISSUES SVC 72 TO SWITCH HARDCOPY WHEN THE LOG IS
+*           INOPERATIVE.
+*
+*        OBTLOCKS - REOBTAINS THE LOCAL AND CMS LOCKS AFTER AN SVC.
+*
+*        FRLOCKS - RELEASES THE CMS AND LOCAL LOCKS BEFORE AN SVC.
+*
+*        POSTMAJ - POSTS A MLWTO ISSUER THAT IS WAITING FOR A MINOR
+*           AFTER A MINOR HAS BEEN FREED OR MARKED REUSABLE.
+*
+*01*   NOTES = NONE
+*
+*02*     DEPENDENCIES = PROCESSING OF AN ATTENTION FROM A 2740 REQUIRES
+*        A PREPARE IN PROCESS ON THE DEVICE. OPEN PENDING IS IGNORED ON
+*        A 2740 WITH A PREPARE IN PROCESS. ATTENTION FROM A 2540 IS
+*        IGNORED. THE CALLER OF THE MODULE MUST HOLD THE CMS AND LOCAL
+*        LOCKS.
+*
+*03*        CHARACTER-CODE-DEPENDENCIES = CHARACTER CODE INDEPENDENT
+*
+*02*     RESTRICTIONS = NONE
+*
+*02*     REGISTER-CONVENTIONS = SEE LABEL DSVREGS
+*
+*02*     PATCH-LABEL = DSVMAIN (RESERVED FOR FUTURE USE).
+*
+*01*   MODULE-TYPE = PROCEDURE.
+*
+*02*     PROCESSOR = ASSEMBLER-370R
+*
+*02*     MODULE-SIZE = 2400 BYTES
+*
+*02*     ATTRIBUTES = PAGED-LPA, MASTER SCHEDULER REGION, ZERO PROTECT
+*        KEY, REUSABLE, SUPERVISOR MODE
+*
+*01*  ENTRY-POINT = IEAVMDSV
+*
+*02*     PURPOSE = TO ROUTE CONTROL TO THE DEVICE PROCESSORS FOR OUTPUT
+*        PENDING, I/O COMPLETION, OPEN PENDING, CLOSE PENDING, OR
+*        ATTENTION PENDING AND/OR TO CLEANUP THE WQE AND CQE QUEUES.
+*
+*02*     LINKAGE = BRANCH AND LINK FROM IEAVMQWR AND IEAVMWSV
+*
+*02*     INPUT = REGISTERS SET AS FOLLOWS:
+*           R1 = INPUT CODE
+*                0 - DEVSERVA
+*                4 - DEVSERVB
+*                8 - DQCLNUP
+*           R2 = UCME ADDR
+*           R3 = DEVSERVA AND DQCLNUP - ADDRESS OF NEXT UCME TO BE
+*                PROCESSED BY DEVSERVA
+*           R4 = UCM PREFIX ADDRESS
+*           R6 = DEVSERVB - ECB ADDR POSTED FOR I/O COMPLETION
+*           R11 = DEVSERVB - UCME ADDR FOR CONSOLE THAT RECEIVED
+*                 I/O COMPLETION OR ATTENTION
+*           R14 = RETURN ADDR
+*           R15 = ENTRY POINT ADDRESS
+*
+*02*     OUTPUT = NONE
+*
+*02*     REGISTERS-SAVED = R4 - R14 ARE SAVED IN UCMSVB0
+*
+*02*     REGISTER-USAGE = SEE LABEL DSVREGS
+*
+*02*     REGISTERS-RESTORED = R4 - R14 ARE RESTORED FROM UCMSVB0
+*
+*01*  EXIT-NORMAL = DEVOUT
+*
+*02*     CONDITIONS = NO MORE WORK TO DO, BRANCH TO RETURN ADDR IN R14
+*
+*02*     OUTPUT = R2, R4-R14 SAME AS ORIGINAL
+*
+*02*     RETURN-CODES = NONE.
+*
+*01*  EXIT-NORMAL = DEVOUT
+*
+*02*     CONDITIONS = SVC 72 HAS BEEN ISSUED BY DEVSERVA FOR AN OUTPUT,
+*        OPEN OR CLOSE PENDING, BRANCH TO RETURN ADDRESS IN R14
+*
+*02*     OUTPUT = R2, R4-R14 SAME AS ORIGINAL
+*                 R3 = ADDRESS OF NEXT UCME TO BE PROCESSED BY
+*                      DEVSERVA
+*                 R0, R1, R15 = NOT PRESERVED
+*
+*02*     RETURN-CODES = NONE.
+*
+*01*  EXIT-NORMAL = DEVOUT
+*
+*02*     CONDITIONS = THE DEVICE WITH AN ATTENION PENDING IS BUSY,
+*        BRANCH TO LABEL WRABXLE IN MODULE IEAVMQWR
+*
+*02*     OUTPUT = R2-R13 = SAME AS ORIGINAL
+*                 R0, R1, R15 = NOT PRESERVED
+*                 R14 = ADDRESS OF WRABXLE
+*
+*02*     RETURN-CODES = NONE.
+*
+*01*  EXIT-ERROR = NONE
+*
+*01*  EXTERNAL-REFERENCES = SEE BELOW
+*
+*02*     ROUTINES = IEECMQCN IN MODULE IEAVMWSV - TO CREATE A CQE ENTRY
+*        ON THE HARDCOPY CONSOLE'S OUTPUT QUEUE FOR A WQE TO BE
+*        HARDCOPIED, BRANCH AND LINK ON R9
+*
+*        SVC 72 - TO INVOKE A DEVICE PROCESSOR FOR A CONSOLE
+*
+*        CVT0PT01 - BRANCH ENTRY TO POST TO POST A WAITING WTO ISSUER,
+*        BRANCH AND LINK ON R14
+*
+*02*     DATA-AREAS = NONE
+*
+*02*     CONTROL-BLOCKS = WQE,W,D,  UCM,R,W,  UCB,R,  CQE,W,D, @ZA11392
+*        CVT,R,  SCVT,R,  WWB,W,  ASVT,R,  PSA,R,  BASEA,R
+*
+*01*  TABLES = NONE
+*
+*01*  MACROS = WTL, GETMAIN, FREEMAIN, SETLOCK, FREECELL
+*
+*02*     SERIALIZATION = THE CMS AND LOCAL LOCKS ARE HELD TO SERIALIZE
+*        USE OF THE UCM, WQE AND CQE CHAINS.
+*
+*01*  CHANGE-ACTIVITY = ZA03621, ZA03882, ZA05336, OZ05685, OZ06484,
+*                       ZA05367,ZA08469,ZA11392
+*
+*01*  MESSAGES = NONE
+*
+*01*  ABEND-CODES = NONE
+*
+**** END OF SPECIFICATIONS ***/
+         EJECT
+*
+* MODULE EQUATES
+*
+ZERO     EQU   0
+ONE      EQU   1
+FOUR     EQU   4                   RETURN CODE FROM DSVHC        Y02893
+EIGHT    EQU   8                                               @ZA11392
+TWENTY   EQU   20                  RETURN CODE FROM FREECELL     Y02752
+F2       EQU   2                   .2
+F3       EQU   3                   .3
+F4       EQU   4                   .4
+F8       EQU   8                   .8
+F126     EQU   126                 .MAXIMUM MESSAGE LENGTH
+C7       EQU   7                   .MASK TO STORE 3 BYTE ADDRESS
+OPCONSOL EQU   72                  .INITIATE/POST CONSOLE I/O
+C255     EQU   255                 .MASK TO REVERSE BITS
+MULT4    EQU   2                   USED TO MULTIPLY ASID BY 4    Y02752
+*                                  VIA A SHIFT                   Y02752
+THRDWD   EQU   8                   USED AS AN OFFSET             Y02752
+THIRTY1  EQU   31                  USED TO SET HIGH ORDER BIT    Y02752
+WTLBSIZE EQU   130                 SIZE OF WTL BUFFER            Y02756
+WTLBSPL  EQU   250                 WTL BUFFER SUBPOOL            Y02756
+THREE    EQU   3                   OFFSET                        Y02756
+SIXTEEN  EQU   16                  16                            Y02756
+TWENTY4  EQU   24                  24                            Y02756
+TWENTY8  EQU   28                  28                            Y02756
+         SPACE 3
+DSVREGS  DS    0H                  REGISTER USAGE                Y02893
+*
+* REGISTER EQUATES
+*
+R0       EQU   0                   .WORKREG
+R1       EQU   1                   .WORKREG
+R2       EQU   2                   .UCM BASE REG
+R3       EQU   3                   .NUMBER OF ACTIVE CQE ENTRIES
+R4       EQU   4                   .ADDRESS OF CURRENT CQE ENTRY
+R5       EQU   5                   .ADDRESS OF MAJOR WQE
+R6       EQU   6                   .WORKREG
+R7       EQU   7                   .UCM PREFIX BASE REG
+R8       EQU   8                   .RETURN REG FOR DEVSERV
+R9       EQU   9                   .RETURN REG FOR DEQ
+R10      EQU   10                  .MODULE BASE REG
+R11      EQU   11                  .UCM ENTRY ADDRESS
+R12      EQU   12                  .WQE BASE REG
+R13      EQU   13                  .WORKREG
+R14      EQU   14                  .RETURN REG FOR MODULE
+R15      EQU   15                  .WORKREG
+         EJECT
+         EXTRN IEECMQCN            ROUTINE IN IEAVMWSV TO QUEUE  Y02893
+*                                  A WQE ONTO A SPECIFIED        Y02893
+*                                  CONSOLE'S OUTPUT QUEUE        Y02893
+         EXTRN WRABXLE             ENTRY POINT IN IEAVMQWR TO    Y02893
+*                                  CONTINUE SEARCHING UCMES FOR  Y02893
+*                                  ATTENTION PENDING             Y02893
+         SPACE 3                                                 Y02893
+         USING UCMPRFX,R4          ADDRESSABILITY TO UCM PREFIX  Y02893
+         STM   R4,R14,UCMSVB0      .SAVE REGISTERS 4 - 14
+         BALR  R10,ZERO            .SET UP BASE
+         USING *,R10               ADDRESSABILITY TO MODULE      Y02893
+DSVBASE  EQU   *                   .BASE LOCATION                SRB662
+         MODID ,                                                 Y02893
+         LA    R8,DEVOUT           .SET UP RETURN REG
+         LR    R7,R4               COPY UCM PREFIX ADDR          Y02893
+         DROP  R4                  .UCM PREFIX BASE
+         USING UCMPRFX,R7          ADDRESSABILITY TO UCM PREFIX  Y02893
+         USING UCM,R2              ADDRESSABILITY TO UCM BASE    Y02893
+         USING WQE,R12             ADDRESSABILITY TO WQE         Y02893
+         B     *+F4(R1)            .BRANCH ON CODE IN REG 1
+         B     DEVSERVA            .ENTERED FOR OUTPUT
+         B     DEVSERVB            .ENTERED FOR OTHER DEVICE PROCESSING
+         B     DQCLNUP             .ENTERED FOR CLEANUP
+         EJECT
+*
+* DEVSERVA SUBROUTINE
+*
+* DEVSERVA RECEIVES CONTROL WHEN THERE IS MORE OUTPUT TO BE
+* PROCESSED.  WHEN IT IS FIRST ENTERED, IT WILL SEARCH FROM THE
+* FIRST UCM ENTRY FOR A UCM ENTRY OF AN ACTIVE CONSOLE WHOSE OUTPUT
+* QUEUE CAN BE PROCESSED FOR EITHER OUTPUT PENDING OR OPEN/CLOSE
+* PENDING.  WHEN IT IS SUBSEQUENTLY ENTERED FROM THE ROUTER, THE
+* SEARCH WILL START WITH THE NEXT ENTRY AFTER THE LAST UCM ENTRY
+* PROCESSED.  THE SEARCH ENDS WHEN AN OUTPUT QUEUE IS FOUND THAT
+* CAN BE PROCESSED, OR WHEN THE LAST UCM ENTRY HAS BEEN INSPECTED.
+* IF AN OUTPUT QUEUE IS FOUND, CONTROL IS PASSED TO DEVSERV TO
+* INTERFACE WITH THE APPROPRIATE DEVICE SUPPORT ROUTINE.
+         SPACE 3
+DEVSERVA DS    0H                                                Y02893
+         USING UCMLIST,R3
+         LM    R4,R5,UCMVEZ        .LOAD BXLE REGS FOR ENTRIES
+         LA    R8,DEVTSTCN         .SET UP RETURN REG
+DEVTSTCN TM    UCMATR,UCMUF        .Q. IS THE DEVICE ACTIVE
+         BO    DEVACT              .YES - BRANCH
+DEVINACT TM    UCMSTS,UCMTA        .Q. IS THERE AN OPEN PENDING
+         BZ    DEVNEXT1            .NO - TEST FOR Q CLEANUP      Y02756
+         TM    UCMSTS,UCMBF        .DEVICE BUSY?               @ZA03882
+         BO    DEVNEXT             .YES, GET NEXT UCME         @ZA03882
+***************************************************************@ZA03882
+* OPEN PENDING AND DEVICE BUSY WILL BE SET TOGETHER            @ZA03882
+* IF A NOP EXCP HAS BEEN ISSUED FOR THE DEVICE                 @ZA03882
+***************************************************************@ZA03882
+         L     R6,UCMUCB           .GET UCB ADDRESS
+         USING UCBSECT,R6
+         TM    UCBSTAT,UCBALOC     .Q. IS THE DEVICE ALLOCATED
+         BO    DEVNEXT             .YES - GET NEXT ENTRY
+         B     DEVGO               .NO - PREPARE TO GO TO DEVICE
+*                                  SUPPORT PROCESSOR
+DEVACT   L     R6,UCMUCB           .GET UCB ADDRESS
+         TM    UCBTBYT3,UCB3COMM   .Q. IS THIS DEVICE A 2740
+         DROP  R6                  .UCB BASE
+         BNO   DEVCLOSE            .NO - PERFORM NORMAL TESTS
+IEC2700  TM    UCMDEVC,UCMDEVB     .Q. IS A PREPARE IN PROCESS
+         BNO   DEVCLOSE            .NO - PERFORM NORMAL TESTS
+DEVGOON  TM    UCMSTS,UCMPF+UCMCF  .Q. IS OUTPUT OR CLOSE PENDING
+         BZ    DEVNEXT1            .NO - PROCESS NEXT ENTRY
+         B     DEVGO               .YES - GO TO OP CONSOLE
+DEVCLOSE TM    UCMSTS,UCMCF+UCMTA  .Q. IS CLOSE/OPEN PENDING
+         BZ    DEVBUSY             .NO-TEST FOR BUSY           @ZA05367
+         TM    UCMSTS,UCMCF        .CLOSE PENDING              @ZA05367
+         BNO   DEVGO               .NO, GO OP CONSOLE          @ZA05367
+         TM    UCMSTS,UCMBF        .DEVICE BUSY                @ZA05367
+         BO    DEVNEXT1            .YES, TEST FOR DEQ          @ZA05367
+         B     DEVGO               .GO CLOSE CONSOLE           @ZA05367
+DEVBUSY  TM    UCMSTS,UCMBF        .Q. IS THE DEVICE BUSY
+         BO    DEVNEXT1            .YES - DO NOT GO TO OP CONSOLE
+DEVFULL  TM    UCMDEVC,UCMDEVA     .Q. IS THE SCREEN FULL
+         BNO   DEVGOOD             .NO - GO TO OP CONSOLE
+         TM    UCMSDS5,UCMSDS5C    .Q. IS OUT-OF-LINE MSG ON QUEUE
+         BNO   DEVNEXT1            .NO - DO NOT GO TO OP CONSOLE
+DEVGOOD  TM    UCMSTS,UCMPF        .Q. IS THERE OUTPUT TO BE DONE
+         BZ    DEVNEXT1            .NO - CHECK NEXT ENTRY
+DEVGO    LR    R11,R3              .GET ADDR OF UCM ENTRY
+         BAL   R8,DEVSERV          .GO TO OP CONSOLE SUPPORT
+         LA    R8,DEVOUT           .RESTORE RETURN REG
+DEVNEXT  EQU   *
+         BXLE  R3,R4,ZERO(R8)      .GET NEXT ENTRY ADDRESS
+         L     R3,UCMVEA           .LAST ENTRY -REINITIALIZE REG3
+*                                  TO PT TO FIRST ENTRY
+DEVOUT   LM    R4,R14,UCMSVB0      .RESTORE REGS
+         BR    R14                 .RETURN
+DEVNEXT1 EQU   *
+         TM    UCMSTS,UCMTB        .Q. ANY DEQUEUE WORK TO DO
+         BNO   DEVNEXT             .NO - CHECK NEXT ENTRY
+         LR    R11,R3              .SET PARM REG TO UCM ENTRY ADDR
+         BAL   R8,DEVDEQ           .GO TO DEQUEUE ROUTINE
+         LA    R8,DEVTSTCN         .TOP FO DEVICE CHECK
+         B     DEVNEXT             .BR TO CHECK NEXT CONSOLE ENTRY
+         DROP  R3                  .UCM ENTRY BASE
+         EJECT
+*
+* DEVSERVB SUBROUTINE
+*
+* DEVSERVB RECEIVES CONTROL WHEN AN ATTENTION OR I/O ECB HAS BEEN
+* POSTED.  AFTER SATISFACTORILY TESTING CONSOLE CONDITIONS, CONTROL
+* IS PASSED TO DEVSERV TO INTERFACE WITH THE APPROPRIATE DEVICE
+* SUPPORT PROCESSOR.
+         SPACE 3
+DEVSERVB DS    0H                                                Y02893
+         USING UCMLIST,R11
+         TM    UCMATR,UCMUF        .Q. IS THE DEVICE ACTIVE
+         BO    DEVACTB             .YES - DO NOT GO TO OP CONSOLE
+         NI    UCMSTS,C255-UCMAF   .TURN OFF ATTENTION FLAG
+         TM    UCMSTS,UCMTA+UCMBF  .OPEN PENDING AND BUSY      @ZA03882
+         BO    DEVOPCN             .YES, GO TO OP CONSOLE      @ZA03882
+***************************************************************@ZA03882
+* IF A NOP EXCP HAS BEEN ISSUED THE DEVICE WILL NOT BE         @ZA03882
+* ACTIVE BUT OPEN PENDING AND DEVICE BUSY WILL BE SET.         @ZA03882
+***************************************************************@ZA03882
+         TM    UCMDEVC,UCMDEVE     .Q. WAS THERE AN I/O COMPLETE
+         BZ    DEVOUT              .NO - PREPARE TO EXIT
+         L     R8,UCMLSTP          .YES - GET PTR TO EIL
+         USING UCMEIL,R8
+*                                  .NOTE THAT R6 STILL CONTAINS THE
+*                                  INDEX INTO EILIOL AS IN QWR
+         L     R6,UCMIECBA(R6)     .GET PTR TO I/O ECB
+         DROP  R8                  .EIL BASE
+         XC    ZERO(F4,R6),ZERO(R6) .CLEAR I/O ECB
+         B     DEVOUT              .RETURN
+DEVACTB  L     R6,UCMUCB           .GET ADDR OF UCB
+         USING UCBSECT,R6
+         TM    UCBTBYT3,UCB3COMM   .Q. IS THIS DEVICE A 2740
+         DROP  R6                  .UCB BASE
+         BZ    DEVATTN             .NO - GO TO OP CONSOLE
+         TM    UCMDEVC,UCMDEVB     .Q. IS THERE A PREPARE IN PROCESS
+         BZ    DEVIOCOM            .NO - BR TO CHECK FOR I/O COMPLETE
+DEVOPCN  BAL   R8,DEVSERV          .BR TO INTERFACE WITH DSP
+         B     DEVOUT              .RETURN
+DEVATTN  EQU   *
+         TM    UCMSTS,UCMAF+UCMBF  .Q. IS AN ATTENTION PENDING WHILE
+*                                  CONSOLE IS BUSY
+         BNO   DEVOPCN             .NO - GO TO OP CONSOLE
+         CLC   UCMNAME(F8),PROC2540 .Q. IS DEVICE A CARD READER
+         BE    DEVCRDR             .YES - IGNORE ATTN INTERRUPT
+DEVIOCOM TM    UCMDEVC,UCMDEVE     .Q. IS THERE AN I/O COMPLETION
+         BO    DEVOPCN             .YES - GO TO OP CONSOLE
+DEVBXLE  EQU   *
+         MVC   UCMSVL0(F4),ADBXLE  .MOVE ADDR TO CHECK ENTRIES FOR
+*                                  ATTENTION INTERRUPTS TO REG 14 SAVE
+         B     DEVOUT              .RETURN
+DEVCRDR  EQU   *
+         NI    UCMSTS,C255-UCMAF   .TURN OFF ATTN PENDING FLAG
+         B     DEVBXLE             .BR TO CHANGE RETURN REG
+         EJECT
+*
+* DEVSERV SUBROUTINE
+*
+* DEVSERV IS ENTERED FROM DEVERVA OR DEVSERVB TO BRANCH TO THE
+* APPROPRIATE DEVICE SUPPORT ROUTINE.  UPON RETURN, IF ENTRIES ON
+* THE CONSOLE OUTPUT QUEUE HAVE BEEN PROCESSED AND MARKED AS NO
+* LONGER NEEDED, CONTROL IS PASSED TO THE DEQ SUBROUTINE.
+         SPACE 3
+DEVSERV  DS    0H                  SERVICE DEVICE PROCESSORS     Y02893
+         MVC   UCM3WD(F8),UCMNAME  MOVE NAME OF RTN TO PARMLIST  Y02893
+         ST    R11,UCM5WD          .STORE ADDR OF UCM ENTRY IN
+*                                  PARM LIST
+         ST    R2,UCM6WD           .STORE ADDR OF UCM IN PARM LIST
+         LA    R1,UCM3WD           .LOAD ADDR OF NAME IN REG 1
+         SPACE ,                                                 Y02893
+*
+* ISSUE SVC 72 TO GO TO DEVICE PROCESSOR                         Y02751
+* THE LOCAL AND CMS LOCKS MUST FIRST BE RELEASED THEN            Y02751
+* REOBTAINED.                                                    Y02751
+*
+         BAL   R9,FRLOCKS          FREE LOCKS                    Y02751
+         SPACE 2                                                 Y02751
+         SVC   OPCONSOL            .SVC 72 - GO TO OUTPUT CONSOLE
+         SPACE 2                                                 Y02751
+         BAL   R9,OBTLOCKS         REOBTAIN LOCKS                Y02751
+         SPACE 2                                                 Y02751
+DEVDEQ   TM    UCMSTS,UCMTB        .Q. IS DEQUEUE NEEDED
+         BCR   F8,R8               .NO - RETURN
+         B     DEQ                 YES - GO TO DEQ ROUTINE       Y02756
+*                                  DEQ WILL RETURN ON R8         Y02756
+         DROP  R11                 .UCM ENTRY BASE
+         EJECT
+***********************************************************************
+*                                                                     *
+* DQCLNUP SUBROUTINE                                                  *
+*                                                                     *
+* DQCLNUP IS CALLED FROM IEAVMQWR WHEN THE ATTENTION ECB IS POSTED    *
+* BY WRITE TO LOG OR WHEN FLAG UCMSYSI IS ON INDICATING THE SYSTEM    *
+* OUTPUT QUEUE NEEDS TO BE CLEANED UP.  IT EXAMINES EACH WQE ON       *
+* THE SYSTEM OUTPUT QUEUE.  WQES THAT ARE NO LONGER NEEDED ARE        *
+* HARDCOPIED IF NECESSARY AND THEN FREED.  EXIT IS TO DEVSERVA.       *
+*                                                                     *
+* INPUT = NONE                                                        *
+*                                                                     *
+* OUTPUT = NONE                                                       *
+*                                                                     *
+* REGISTER-USAGE = R12 - PTR TO MAJOR/NORMAL WQE                      *
+*                  R5  - PTR TO MINOR WQES                            *
+*                  R3  - SET TO PTR TO 1ST UCME AT EXIT TO DEVSERVA   *
+*                  R14 - LINK TO DSVHC, PURGEWQE, MINSERV, FREEWTLB   *
+*                  R15 - RETURN CODE FROM DSVHC                       *
+*                                                                     *
+* SAVE-AREA-USAGE = NONE                                              *
+*                                                                     *
+***********************************************************************
+         SPACE 3
+DQCLNUP  DS    0H                                                Y02893
+         L     R12,UCMWTOQ         .GET FIRST WQE PTR ON SYSTEM QUEUE
+         SPACE ,                                                 Y02893
+CLEANLP  LA    R12,ZERO(R12)       .CLEAR HIGH ORDER BYTE
+         LTR   R12,R12             .Q. IS THIS THE LAST WQE
+         BZ    DQDEVA              YES - ALL DONE                YM2519
+         TM    WQEXA,WQESUSP       PROCESSING TEMPORARILY        Y02757
+*                                  SUSPENDED                     Y02757
+         BO    CLEANXT             YES, DO NOT PROCESS WQE       Y02757
+         TM    WQEAVAIL,WQEBUFE    .Q. HAS WQE BEEN SERVICED
+         BZ    CLEANXT             .NO - GET NEXT WQE
+         CLI   WQEUSE,ZERO         .Q. IS USE COUNT ZERO
+         BNE   CLEANXT             .NO - GET NEXT WQE
+         SPACE ,                                                 Y02756
+         TM    WQEXA,WQEQFHC       QUEUE FOR HARDCOPY            Y02756
+         BZ    CLEANML             NO, CHECK FOR MLWTO           Y02756
+         BAL   R14,DSVHC           ATTEMPT TO HARDCOPY           Y02756
+         LTR   R15,R15             WAS HARDCOPY SUCCESSFUL       Y02756
+         BNZ   CLEANXT             NO, RC > 0 GET NEXT WQE       Y02756
+         CLI   WQEUSE,ZERO         IS USE COUNT STILL ZERO       Y02756
+         BNE   CLEANXT             NO, GET NEXT WQE              Y02756
+         SPACE ,                                                 Y02756
+CLEANML  EQU   *                   MLWTO CHECK                   Y02756
+         CLI   WMJMMLW,ZERO        .Q. IS WQE A MLWTO
+         BE    CLEANLP1            .NO - BR TO CHECK FOR ORE
+         EJECT ,                                                 Y02756
+**************************************************************** Y02756
+*                                                                Y02756
+* THIS SECTION OF CODE SUPPORTS MLWTO'S DELETED BY THE           Y02756
+* SUBSYSTEM OR INSTALLATION EXIT AND MLWTO'S QUEUED ONLY FOR     Y02756
+* MONITORING TSO TERMINALS.  THESE MLWTO'S DO NOT HAVE CQE       Y02756
+* ENTRIES AND WILL NOT BE CLEANED UP BY DEQ PROCESSING.          Y02756
+* IF THE MLWTO CHAIN HAS AN END LINE, THE ENTIRE CHAIN CAN BE    Y02756
+* CLEANED UP.  OTHERWISE, ONLY EXISTING MINORS ARE CLEANED UP.   Y02756
+*                                                                Y02756
+**************************************************************** Y02756
+         SPACE ,                                                 Y02756
+         TM    WMJMLTY1,WMJMLTYD   IS MAJOR ALSO THE END LINE    Y02756
+         BO    CLEANFR             YES, CHAIN CAN BE FREED       Y02756
+         TM    WMJMMLW,WMJMMLWH    IS FIRST MINOR A DUMMY        Y02756
+         BO    CLEANXT             YES, NO MINORS TO FREE        Y02756
+         L     R5,WMJMMIN          GET PTR TO FIRST MINOR        Y02756
+         SPACE ,                                                 Y02756
+CLEANLP2 EQU   *                   LOOP THROUGH MINORS LOOKING   Y02756
+*                                  FOR AN END LINE               Y02756
+         DROP  R12                 DROP MAJOR BASE               Y02756
+         USING WQE,R5              ADDRESSABILITY TO MINORS      Y02756
+         LTR   R5,R5               ANY MORE MINORS TO CHECK      Y02756
+         BZ    CLEANMIN            NO, TRY TO FREE MINORS        Y02756
+         CLI   WMNMTL1,ZERO        IS MINOR TEXT LENGTH 0        Y02756
+         BE    CLEANFR             YES, MINOR IS AN END LINE,    Y02756
+*                                  CHAIN CAN BE FREED            Y02756
+         TM    WMNMLT1,WMNMLT1D    DOES MINOR HAVE AN END LINE   Y02756
+         BO    CLEANFR             YES, CHAIN CAN BE FREED       Y02756
+         SPACE ,                                                 Y02756
+         L     R5,WMNMEXT          GET ADDR OF NEXT MINOR        Y02756
+         LA    R5,ZERO(R5)         CLEAR HIGH ORDER BYTE         Y02756
+         B     CLEANLP2            GO TEST NEXT MINOR            Y02756
+         DROP  R5                  DROP MINOR BASE               Y02756
+         USING WQE,R12             ADDRESSABILITY TO MAJOR OR    Y02756
+*                                  NORMAL WQE                    Y02756
+         SPACE ,                                                 Y02756
+CLEANMIN EQU   *                   FREE MINORS                   Y02756
+         BAL   R14,MINSERV         FREE MINORS IF POSSIBLE       Y02756
+         B     CLEANXT             GET NEXT WQE                  Y02756
+         SPACE ,                                                 Y02756
+CLEANLP1 EQU   *                   ORE CHECK                     Y02893
+         TM    WQEXA,WQEORE        .Q. DOES WQE HAVE AN ORE      Y02893
+         BO    CLEANXT             .YES - GET NEXT WQE
+         SPACE ,                                                 Y02893
+CLEANFR  EQU   *                   OK TO FREE                    Y02893
+         BAL   R14,PURGEWQE        FREE NORMAL WQE OR MAJOR AND  Y02893
+*                                  MINOR CHAIN                   Y02893
+*                                  PURGEWQE SETS R12 TO ADDR OF  Y02893
+*                                  PREVIOUS WQE                  Y02893
+         SPACE ,                                                 Y02756
+CLEANXT  L     R12,WQELKP          .GET NEXT WQE PTR
+         B     CLEANLP             .BR TO CHECK WQE
+         SPACE 2                                                 YM2519
+DQDEVA   EQU   *                   SET UP TO SERVICE CONSOLES    YM2519
+         BAL   R14,FREEWTLB        FREE WTL BUFFER IF ANY        Y02756
+         L     R3,UCMVEA           POINT TO FIRST UCM ENTRY      YM2519
+         B     DEVSERVA            GO SERVICE OUTPUT             YM2519
+         EJECT
+***********************************************************************
+*                                                                     *
+* DEQ ROUTINE                                                         *
+*                                                                     *
+* DEQ RECEIVES CONTROL WHEN DEVSERV NEEDS CONSOLE OUTPUT QUEUES       *
+* SERVICED.  DEQ INSPECTS THE CONSOLE OUTPUT QUEUE FOR WQE POINTERS   *
+* MARKED AS NO LONGER NEEDED.  EACH WQE POINTER SO FLAGGED IS MARKED  *
+* AS A NULL ENTRY AND THE USE COUNT OF THE WQE IS DECREMENTED BY ONE. *
+* THE WQE IS HARDCOPIED IF NECESSARY.  IF THE USE COUNT REACHES ZERO  *
+* (THAT IS, ALL SPECIFIED CONSOLES HAVE RECEIVED THE MESSAGE) AND     *
+* THERE IS NO ORE, THE WQE IS FREED.  IF A WQE IS A MLWTO WHOSE       *
+* CHAIN NEEDS SERVICING, THE CHAIN IS HARDCOPIED AND MINORS THAT ARE  *
+* NO LONGER NEEDED ARE FREED.  IF A CQE BLOCK CONTAINS ONLY NULL      *
+* ENTRIES, IT IS DEQUEUED FROM THE CONSOLE OUTPUT QUEUE AND FREED.    *
+* RETURN IS MADE WHEN THE LAST WQE POINTER ON THE CONSOLE OUTPUT      *
+* QUEUE HAS BEEN EXAMINED.                                            *
+*                                                                     *
+* INPUT  R11 - PTR TO UCME                                            *
+*        R8 - RETURN ADDR                                             *
+*                                                                     *
+* REGISTER-USAGE = R3 - ACTIVE ENTRY COUNTER                          *
+*                  R4 - CURRENT CQE ENTRY PTR                         *
+*                  R5 - CQE BLOCK FORWARD PTR, WORKREG                *
+*                  R6 - CQE BLOCK BACK PTR                            *
+*                  R0 - SUBPOOL AND LENGTH FOR FREEMAIN, WORKREG      *
+*                  R1 - PTR TO BLOCK TO BE FREED FOR FREEMAIN         *
+*                  R12 - PTR TO WQE                                   *
+*                  R14 - LINK TO DSVHC, PURGEWQE,MINSERV, FREEWTLB    *
+*                  R15 - RETURN CODE FROM DSVHC                       *
+*                                                                     *
+* SAVE-AREA-USAGE = R3-R6 ARE SAVED IN UCMSVM0 AT ENTRY AND           *
+*                   RESTORED AT EXIT                                  *
+*                                                                     *
+*                   R3-R7 ARE SAVED IN UCMSAVE4 AROUND THE FREEMAIN   *
+*                                                                     *
+***********************************************************************
+         SPACE 3
+         USING UCMLIST,R11
+DEQ      DS    0H                                                Y02893
+         NI    UCMSTS,C255-UCMTB   .TURN OFF DEQ NEEDED FLAG IN UCME
+         STM   R3,R6,UCMSVM0       .SAVE REGS 3-6
+         SR    R3,R3               .INITIALIZE COUNT OF ACTIVE ENTRIES
+         LA    R6,UCMOUTQ          .INITIALIZE LINK PTR
+         L     R4,UCMOUTQ          .GET FIRST CQE PTR
+         LTR   R4,R4               .Q. IS THERE AN OUTPUT QUEUE
+         BZ    DEQENDQ             .NO - PREPARE TO LEAVE
+DEQLOOP  EQU   *
+         USING CQE,R4
+         TM    CQEFLAG,CQEAVAIL+CQEENTR DOES CQE CONTAIN A VALID Y02756
+*                                    WQE POINTER                 Y02756
+         BZ    DEQTEST             NO, SKIP PROCESSING OF WQE    Y02756
+         SPACE ,                                                 Y02756
+         L     R12,CQEWQE          GET PTR TO WQE                Y02756
+         LA    R12,ZERO(R12)       CLEAR HIGH ORDER BYTE         Y02756
+         TM    WQEXA,WQESUSP       PROCESSING TEMPORARILY        Y02757
+*                                     SUSPENDED                  Y02757
+         BO    DEQLOOP1            YES, DO NOT PROCESS THE WQE   Y02757
+*                                     FOR THIS CQE               Y02757
+         TM    WQEXA,WQEQFHC       QUEUE FOR HARDCOPY            Y02756
+         BZ    MLWTLEND            NO, SKIP ATTEMPT TO HARDCOPY  Y02756
+         SPACE ,                                                 Y02756
+         BAL   R14,DSVHC           ATTEMPT TO HARDCOPY           Y02756
+         LTR   R15,R15             HARDCOPY SUCCESSFUL           Y02756
+         BZ    MLWTLEND            YES, SERVICE WQE              Y02756
+         SPACE ,                                                 Y02756
+* HARDCOPY WAS NOT DONE                                          Y02756
+         SPACE ,                                                 Y02756
+         TM    WQEAVAIL,WQEBUFC    WQE READY FOR HARDCOPY        Y02756
+         BZ    DEQPRGT             NO, GO TEST FOR PURGE         Y02756
+         SPACE ,                                                 Y02756
+* NON-ZERO RETURN CODE FROM DSVHC WHEN WQE IS READY FOR HARDCOPY Y02756
+* MEANS HARDCOPY IS THE SYSTEM LOG AND IT IS NOT YET             Y02756
+* INITIALIZED.  WQE CANNOT BE SERVICED.                          Y02756
+         SPACE ,                                                 Y02756
+         OI    UCMSTS,UCMTB        COME TO DEQ AGAIN             Y02756
+         B     DEQLOOP2            CONTINUE CQE LOOP             Y02756
+         SPACE ,                                                 Y02756
+DEQPRGT  EQU   *                   TEST FOR WQE PURGE            Y02756
+         TM    WQEXA,WQEPURGE      WQE BEING PURGED              Y02756
+         BO    MLWTLEND            YES, SERVICE THIS CQE       @YM08273
+         TM    CQEFLAG,CQEAVAIL    ENTRY NO LONGER NEEDED      @YM08273
+         BO    DEQNLN              BRANCH TO CLEANUP           @YM08273
+         B     DEQLOOP2            CONTINUE CQE LOOP           @YM08273
+         SPACE 2                                                 Y02893
+* THE FOLLOWING CODE IS FOR BOTH NORMAL & MLWTO WQE'S.  IF THE END
+* OF THE CQE BLOCK IS REACHED, AND THERE ARE NO ACTIVE ENTRIES IN
+* THE BLOCK, THE CQE BLOCK WILL BE DEQUEUED & FREED BEFORE CHECKING
+* FOR AN ADDITIONAL BLOCK.  WHEN THE END OF THE CONSOLE QUEUE IS
+* REACHED. A RETURN EXIT IS TAKEN ON REGISTER 9.
+         SPACE
+MLWTLEND EQU   *
+         TM    CQEFLAG,CQEAVAIL    .Q. CQE ENTRY NO LONGER NEEDED
+         BO    DEQNLN              .YES - BRANCH
+         TM    CQEFLAG,CQEMAJOR    .Q. IS THIS ENTRY FOR MLWTO
+         BNO   DEQLOOP1            .NO - BR TO CHECK FOR ACTIVE
+         L     R12,CQEWQE          .GET POINTER TO MAJOR WQE     Y02756
+         LA    R12,ZERO(R12)       .CLEAR HIGH ORDER BYTE        Y02756
+         TM    WMJMMLW,WMJMMLWG    .Q. POSSIBLE MINORS TO DECHAIN
+         BZ    DEQLOOP1            NO, CONTINUE TESTS            Y02893
+         BAL   R14,MINSERV         SERVICE MINOR CHAIN           Y02893
+         SPACE ,                                                 Y02893
+DEQLOOP1 EQU   *
+         TM    CQEFLAG,CQEENTR     .Q. DOES AN ENTRY EXIST
+         BZ    DEQTEST             .NO -  BR TO TEST FOR END OF QUEUE
+DEQLOOP2 EQU   *
+         LA    R3,ONE(R3)          .YES - ADD ONE TO COUNT OF ACTIVE
+*                                  CQE ENTRIES FOR CQE BLOCK
+DEQTEST  TM    CQEFLAG,CQEEOB      .Q. PTS TO NEXT BLOCK OR END OF Q
+         BO    DEQPT               .POINTS TO NEXT CQE BLOCK
+         BM    DEQENDQ             .END OF CONSOLE QUEUE
+DEQINC   LA    R4,F4(R4)           .GET NEXT CQE ENTRY PTR
+         B     DEQLOOP             .BR TO CHECK ENTRY
+DEQPT    L     R5,CQEWQE           .GET PTR TO NEXT CQE BLOCK
+         LA    R5,ZERO(R5)         .CLEAR HIGH ORDER BYTE
+         LTR   R3,R3               .Q. ANY ACTIVE ENTRIES IN CQE BLOCK
+         BZ    DEQLINK             .NO - BR TO FREE BLOCK
+         LR    R6,R4               .ADDRESS OF LAST CQE ENTRY
+         B     DEQNXT              .BR TO TEST FOR ONLY BLOCK OR
+*                                  GET NEXT
+DEQLINK  L     R1,CQEWQE-CQE(R6)   .GET ADDRESS OF CQE BLOCK
+         LA    R1,ZERO(R1)         .CLEAR HIGH ORDER BYTE
+         STCM  R5,C7,CQEWQEA-CQE(R6) .LINK NEXT BLOCK TO PREVIOUS
+*                                  CQE BLOCK
+         SPACE ,                                                 Y02752
+* USE THE BRANCH ENTRY TO FREEMAIN TO FREE A CQE BLOCK           Y02752
+         SPACE ,                                                 Y02752
+         STM   R3,R7,UCMSAVE4      SAVE REGS NEEDED FOR FREEMAIN Y02752
+         L     R4,UCMPXA           GET COMMTASKS TCB ADDR        Y02752
+         L     R7,UCMASCB          GET ASCB ADDR OF COMMTASK     Y02752
+         SPACE ,                                                 Y02752
+         FREEMAIN R,LV=CQESIZE,SP=CQESP,A=(1),BRANCH=YES         Y02752C
+                                   FREE CQE SPACE                Y02752
+         SPACE ,                                                 Y02752
+         LM    R3,R7,UCMSAVE4      RESTORE REGS                  Y02752
+         SPACE ,                                                 Y02752
+DEQNXT   EQU   *
+         LTR   R5,R5               .Q. LAST CQE BLOCK
+         BZ    DEQENDQ             .YES - PREPARE TO RETURN
+         LR    R4,R5               .NO - SET REG 4 TO PT TO CQE ENTRY
+         B     DEQLOOP             .BR TO CHECK ENTRY
+         SPACE ,                                                 Y02756
+DEQENDQ  DS    0H                  PREPARE TO RETURN             Y02756
+         BAL   R14,FREEWTLB        FREE WTL BUFFER IF ANY        Y02756
+         LM    R3,R6,UCMSVM0       .RESTORE REGS
+         BR    R8                  .RETURN TO ADDRESS SET UP BY  Y02893
+*                                  DEVSERVA OR DEVSERVB          Y02893
+         EJECT
+* THE FOLLOWING CODE IS FOR A CQE ENTRY THAT IS TO BE PURGED (THE
+* DEVICE PROCESSOR HAS PROCESSED THE WQE WHOSE ADDR IS CONTAINED Y02893
+* IN THIS CQE ENTRY).  THE CQE ENTRY IS MADE A NULL ENTRY, THE   Y02893
+* USE COUNT IN THE WQE IS DECREMENTED, THE WQE IS HARDCOPIED     Y02893
+* IF NECESSARY AND FREED IF NO LONGER NEEDED.                    Y02893
+         SPACE
+DEQNLN   EQU   *
+         L     R12,CQEWQE          .GET ADDRESS OF WQE
+         LA    R12,ZERO(R12)       .ZERO HIGH ORDER BYTE
+         SPACE
+* WHEN THE CQE ENTRY FOR EITHER A NORMAL OR MLWTO WQE IS TO BE
+* PURGED, THE ENTRY IS MADE A NULL ENTRY AND THE USE COUNT IN THE
+* WQE IS DECREMENTED BY ONE.
+         SPACE
+         NI    CQEFLAG,CQEEOB      .CLEAR ENTRY FLAGS
+         C     R4,UCMWLAST         .Q. LAST CQE ENTRY SERVICED
+         BNE   DEQDECT             .NO - BR
+         XC    UCMWLAST(F4),UCMWLAST .CLEAR UCMWLAST
+DEQDECT  SR    R5,R5               .CLEAR REGISTER
+         IC    R5,WQEUSE           .INSERT THE WQE USE COUNT
+         BCTR  R5,ZERO             .DECREMENT USE COUNT BY ONE
+         STC   R5,WQEUSE           .INSERT BACK INTO WQE
+         SPACE 2                                                 Y02756
+* FOR A MLWTO, ASSURE THAT THE USE COUNTS IN THE MINORS ARE NOT  Y02756
+* GREATER THAN THE USE COUNT IN THE MAJOR.  THIS SUPPORT IS      Y02756
+* NECESSARY FOR THE CONTROL COMMAND WHICH MAY CANCEL THE DISPLAY Y02756
+* OF AN INCOMPLETE MLWTO.  IF ANOTHER MINOR WAS ADDED BEFORE THE Y02756
+* USE COUNT IN THE MAJOR IS DECREMENTED, THE USE COUNT IN THE    Y02756
+* ADDED MINOR WILL BE INCORRECT.  THE ADDED MINOR'S USE COUNT    Y02756
+* WILL NEVER GO TO ZERO.  THUS IT WILL NOT BE ABLE TO BE FREED   Y02756
+* OR REUSED AND MAY CAUSE AN INTERLOCK.                          Y02756
+         SPACE ,                                                 Y02756
+         CLI   WMJMMLW,ZERO        MAJOR WQE                     Y02756
+         BE    DEQFRTST            NO, SKIP CHECK OF USE COUNTS  Y02756
+         TM    WMJMMLW,WMJMMLWH    FIRST MINOR A DUMMY           Y02756
+         BO    DEQFRTST            YES, ALL DONE                 Y02756
+         L     R5,WMJMMIN          GET ADDR OF FIRST MINOR       Y02756
+         DROP  R12                 GIVE UP MAJOR BASE            Y02756
+         USING WQE,R5              ADDRESSABILITY TO MINORS      Y02756
+         SPACE ,                                                 Y02756
+DEQMINLP DS    0H                  LOOP THROUGH MINORS           Y02756
+         LTR   R5,R5               IS THERE A MINOR              Y02756
+         BZ    DEQFRTST            NO, ALL DONE                  Y02756
+         TM    WMNMML1,WMNMML1F    ABEND'S MINOR                 Y02756
+         BO    DEQFRTST            YES, ALL DONE                 Y02756
+         SR    R0,R0               CLEAR WORK REGISTER           Y02756
+         IC    R0,WMJMUC-WMJM(R12) GET MAJOR'S USE COUNT         Y02756
+         CLC   WMNMUC1(ONE),WMJMUC-WMJM(R12) IS USE COUNT IN 1ST Y02756
+*                                     MINOR GREATER THAN USE     Y02756
+*                                     COUNT IN MAJOR             Y02756
+         BNH   DEQMIN2             NO, OK - CHECK 2ND MINOR      Y02756
+         STC   R0,WMNMUC1          YES, COPY MAJOR'S USE COUNT   Y02756
+*                                     TO FIRST MINOR             Y02756
+         SPACE ,                                                 Y02756
+DEQMIN2  DS    0H                  CHECK USE COUNT OF 2ND MINOR  Y02756
+         TM    WMNMML2,WMNMML2H    IS LINE 2 AVAILABLE           Y02756
+         BO    DEQNXTMN            YES, SKIP IT                  Y02756
+         CLC   WMNMUC2(ONE),WMJMUC-WMJM(R12) IS USE COUNT IN 2ND Y02756
+*                                     MINOR GREATER THAN USE     Y02756
+*                                     COUNT IN MAJOR             Y02756
+         BNH   DEQNXTMN            NO, OK - CHECK NEXT MINOR     Y02756
+         STC   R0,WMNMUC2          YES, COPY MAJOR'S USE COUNT   Y02756
+*                                     TO FIRST MINOR             Y02756
+         SPACE ,                                                 Y02756
+DEQNXTMN DS    0H                  GET NEXT MINOR                Y02756
+         L     R5,WMNMUC2          LOAD ADDR OF NEXT MINOR       Y02756
+         LA    R5,ZERO(R5)         CLEAR USE COUNT               Y02756
+         B     DEQMINLP            PROCESS NEXT MINOR            Y02756
+         DROP  R5                  GIVE UP MINOR BASE            Y02756
+         USING WQE,R12             RESTORE ADDRESSABILITY TO     Y02756
+*                                     NORMAL OR MAJOR WQE        Y02756
+         SPACE ,                                                 Y02756
+         SPACE ,                                                 Y02756
+DEQFRTST EQU   *                   SEE IF WQE CAN BE FREED       Y02756
+         SR    R5,R5               CLEAR WORK REGISTER           Y02756
+         IC    R5,WQEUSE           GET WQE USE COUNT             Y02756
+         LTR   R5,R5               .Q. IS THE USE COUNT ZERO
+         BP    DEQTEST             .NO - BR TO TEST FOR END OF QUEUE
+         CLI   WMJMMLW,ZERO        MLWTO                         Y02893
+         BNE   DEQFREE1            YES, SKIP ORE TEST            Y02893
+         TM    WQEXA,WQEORE        .Q. DOES WQE HAVE ORE         Y02893
+         BO    DEQTEST             .YES - DON'T FREE IT          Y02893
+         SPACE ,                                                 Y02893
+DEQFREE1 EQU   *                   FREE WQE                      Y02893
+         BAL   R14,PURGEWQE        FREE NORMAL WQE OR MAJOR AND  Y02893
+*                                  MINOR CHAIN                   Y02893
+         B     DEQTEST             TEST FOR END OF CONSOLES'S    Y02893
+*                                  QUEUE                         Y02893
+         EJECT ,                                                 Y02893
+***********************************************************************
+*                                                                Y02756
+* MINSERV SUBROUTINE                                             Y02756
+*                                                                Y02756
+* THIS SUBROUTINE HANDLES A MLWTO CHAIN THAT NEEDS TO BE         Y02756
+* SERVICED.  IF THE USE COUNT IN BOTH PARTS OF THE MINOR WQE     Y02756
+* IS ZERO, IF THE MAJOR WAS QUEUED FOR TPUT AND BOTH PARTS OF    Y02756
+* THE MINOR ARE ALSO QUEUED FOR TPUT,                            Y02756
+* AND IT IS NOT A DUMMY MINOR, THE MINOR WQE WILL BE             Y02756
+* FREED AND DEQUEUED OFF THE MAJOR WQE CHAIN.                    Y02756
+* THE LAST MINOR IS NOT FREED BUT IS MARKED REUSABLE INSTEAD.    Y02756
+* IF THE MLWTO ISSUER IS WAITING FOR A MINOR, THE WAITING TASK   Y02756
+* IS POSTED.  IF THE MLWTO ISSUER IS NOT WAITING AND A MINOR     Y02756
+* IS FREED, THEN ANOTHER WAITING WTO ISSUER IS POSTED.           Y02756
+*                                                                Y02756
+* INPUT = R12 - PTR TO MAJOR WQE                                 Y02756
+*         R14 - RETURN POINT                                     Y02756
+*                                                                Y02756
+* REGISTER-USAGE = R5 - PTR TO MINOR WQES                        Y02756
+*                  R9 - PTR TO NEXT MINOR WQE/ LINK TO FREEWQE,  Y02756
+*                       POSTMAJ, WWBRTN                          Y02756
+*                                                                Y02756
+* SAVE-AREA-USAGE = NONE                                         Y02756
+*                                                                Y02756
+***********************************************************************
+         SPACE
+MINSERV  DS    0H                  SERVICE MINOR CHAIN           Y02756
+         USING WQE,R12             ADDRESSABILITY TO MAJOR       Y02756
+         NI    WMJMMLW,C255-WMJMMLWG .TURN OFF SERVICE CHAIN FLAG
+         SPACE ,                                                 Y02756
+DEQMLWA1 EQU   *
+         L     R5,WMJMMIN          .GET PTR TO FIRST MINOR WQE   Y02756
+         DROP  R12                 DROP MAJOR BASE               Y02756
+         USING WQE,R5              ADDRESSABILITY TO MINORS      Y02756
+         CLI   WMNMUC1,ZERO        .Q. FIRST USE COUNT ZERO
+         BZ    DEQCONTA            TEST QUEUED FOR TPUT        @ZA00854
+         TM    WMNMLT1,WMNMLT1D    END INDICATOR SET ?         @ZA05685
+         BZR   R14                 NO, RETURN TO CALLER        @ZA00854
+         OI    UCMSTS,UCMPF        TURN ON OUTPUT PENDING      @ZA00854
+         NI    UCMSDS5,C255-UCMSDS5A RESET MLWTO NEEDED        @ZA00854
+         BR    R14                 RETURN TO CALLER            @ZA05336
+DEQCONTA TM    WMJMBUF-WMJM(R12),WMJMBUFF IS MAJOR QUEUED        Y02756
+*                                  FOR TPUT                      Y02756
+         BZ    MINMORE1            NO, SKIP MINOR TPUT TEST      Y02756
+         TM    WMNMST1,WMNMTPD1    IS 1ST LINE QUEUED FOR TPUT   Y02756
+         BZR   R14                 NO, DON'T FREE MINOR          Y02756
+         SPACE ,                                                 Y02756
+MINMORE1 EQU   *                   CHECK FOR END OF CHAIN        Y02756
+         NC    WMNMNX1(F3),WMNMNX1 .Q. END OF MINOR CHAIN
+         BZ    DEQMLOUT            .YES - BR TO POST ECB
+         CLI   WMNMUC2,ZERO        .Q. SECOND USE COUNT ZERO
+         BZ    DEQCONTB            TEST QUEUED FOR TPUT        @ZA00854
+         TM    WMNMLT2,WMNMLT2D    END INDICATOR SET ?         @ZA06484
+         BZR   R14                 NO, RETURN TO CALLER        @ZA00854
+         OI    UCMSTS,UCMPF        TURN ON OUTPUT PENDING      @ZA00854
+         NI    UCMSDS5,C255-UCMSDS5A RESET MLWTO NEEDED        @ZA00854
+         BR    R14                 RETURN TO CALLER            @ZA05336
+DEQCONTB TM    WMJMBUF-WMJM(R12),WMJMBUFF IS MAJOR QUEUED        Y02756
+*                                  FOR TPUT                      Y02756
+         BZ    MINMORE2            NO, SKIP MINOR TPUT TEST      Y02756
+         TM    WMNMST2,WMNMTPD2    IS 2ND LINE QUEUED FOR TPUT   Y02756
+         BZR   R14                 NO, DON'T FREE MINOR          Y02756
+         SPACE ,                                                 Y02756
+MINMORE2 EQU   *                   CHECK FOR END OF MINOR CHAIN  Y02756
+         NC    WMNMNX2(F3),WMNMNX2 .Q. END OF MINOR CHAIN
+         BZ    DEQMLOUT            .YES - BR TO POST ECB
+         L     R9,WMNMUC2          .GET PTR TO NEXT MINOR WQE    Y02756
+         TM    WMNMML1-WMNM(R9),WMNMML1F .Q. ABEND'S MINOR       Y02756
+         BOR   R14                 .YES - DO NOT FREE LAST REAL  Y02756
+*                                  MINOR. CHAIN HAS BEEN ENDED
+*                                  BY ABEND. SVC 35 WILL NOT RE-USE
+*                                  THIS CHAIN.
+***********************************************************************
+*                                                              @ZA08469
+*  THE FOLLOWING CODE HAS BEEN ADDED TO PREVENT A MINOR WQE    @ZA08469
+*  FROM BEING REUSED BY SVC 35 BEFORE IT HAS BEEN TOTALLY      @ZA08469
+*  PROCESSED BY THE DSPS.                                      @ZA08469
+*                                                              @ZA08469
+***********************************************************************
+         CLI   WMNMUC1-WMNM(R9),ZERO  USE COUNT IN NEXT ZERO?  @ZA08469
+         BZ    MFREE               YES, BYPASS SETTING OF FLAG @ZA08469
+         OI    CQEFLAG,CQEATTOP    TURN ON START-AT-TOP        @ZA08469
+MFREE    MVC   WMJMMIN+ONE-WQE(F3,R12),WMNMNX2 HOOK NEXT MINOR   Y02756
+*                                  TO MAJOR                      Y02756
+         SPACE ,                                                 Y02756
+         BAL   R9,FREEWQE          FREE THE MINOR                Y02756
+         SPACE ,                                                 Y02756
+         DROP  R5                  DROP MINOR BASE               Y02756
+         USING WQE,R12             ADDRESSABILITY TO MAJOR       Y02756
+         TM    WMJMECBF,WMJMWAIT   IS ISSUER WAITING FOR A MINOR Y02756
+         BZ    MINWWBP             NO, POST OTHER WAITING WTO    Y02756
+*                                    ISSUER IF ANY               Y02756
+         BAL   R9,POSTMAJ          YES, POST RB ADDR IN MAJOR    Y02756
+         B     DEQMLWA1            GO TEST NEXT MINOR            Y02756
+         SPACE 2                                                 Y02756
+MINWWBP  EQU   *                   WQE WAS FREED, MAJOR IS NOT   Y02756
+*                                    WAITING FOR A MINOR         Y02756
+         BAL   R9,WWBRTN           POST WAITING WTO ISSUER IF    Y02756
+*                                    ANY
+         B     DEQMLWA1            GO TEST NEXT MINOR            Y02756
+         SPACE 3                                                 Y02756
+DEQMLOUT EQU  *                    LAST MINOR IS AVAILABLE       Y02756
+         SPACE
+* IF ONLY ONE MINOR IS QUEUED OFF THE MAJOR, THE MINOR IS SET
+* REUSABLE, AND A BRANCH TO POST INDICATES THAT A BUFFER IS NOW
+* AVAILABLE.
+         SPACE
+         USING WQE,R5              MINOR WQE BASE                Y02756
+         OI    WMNMML2-WMNM(R5),WMNMML2H INDIC LINE 2 AVAIL      Y02756
+*                                  IN MINOR                      Y02756
+         OI    WMJMMLW,WMJMMLWH    .SET MINOR REUSABLE IN MAJOR -
+*                                  INDICATES MINOR HAS NO TEXT AND
+*                                  CAN BE USED
+         NI    WMNMST1,C255-WMNMTPD1 TURN OFF Q'D FOR TPUT FLAG @Y02756
+         NI    WMNMST2,C255-WMNMTPD2 TURN OFF Q'D FOR TPUT FLAG @Y02756
+         TM    WMJMECBF,WMJMWAIT   IS ISSUER WAITING FOR A MINOR Y02756
+         BZR   R14                 NO, RETURN TO CALLER          Y02756
+         BAL   R9,POSTMAJ          POST RB ADDR IN MAJOR         Y02756
+         SPACE ,                                                 Y02756
+MINSOUT  EQU   *                   EXIT                          Y02756
+         BR    R14                 RETURN TO CALLER              Y02756
+         EJECT
+DSVHC    DS    0H                  HARDCOPY ROUTINE              Y02756
+         SPACE ,                                                 Y02756
+**************************************************************** Y02756
+*                                                                Y02756
+* DSVHC SUBROUTINE                                               Y02756
+*                                                                Y02756
+* THIS SUBROUTINE PERFORMS THE HARDCOPY OF A NORMAL WQE OR A     Y02756
+* MAJOR WQE AND ITS CHAIN.  IF HARDCOPY IS THE SYSTEM LOG, THE   Y02756
+* WTL SVC IS ISSUED FOR EACH TEXT LINE.  IF HARDCOPY IS A        Y02756
+* CONSOLE, ROUTINE IEECMQCN IS BRANCHED TO IN ORDER TO CREATE    Y02756
+* A CQE ENTRY FOR THE WQE ON THE HARDCOPY CONSOLE'S QUEUE.       Y02756
+* A RETURN CODE IS SET INDICATING WHETHER OR NOT                 Y02756
+* HARDCOPY WAS SUCCESSFUL.                                       Y02756
+*                                                                Y02756
+* INPUT   R12 = ADDR OF WQE                                      Y02756
+*         R14 = RETURN ADDRESS                                   Y02756
+*                                                                Y02756
+* OUTPUT  R15 = RETURN CODE                                      Y02756
+*               0 - HARDCOPY SUCCESSFUL                          Y02756
+*               4 - HARDCOPY NOT SUCCESSFUL                      Y02756
+*                                                                Y02756
+* REGISTER-USAGE = R1 - WORK REGISTER                            Y02756
+*                  R5 - PTR TO MINOR WQES                        Y02756
+*                  R9 - LINK TO DSVLOG                           Y02756
+*                  R0 - RETURN CODE FROM DSVLOG                  Y02756
+*                                                                Y02756
+* SAVE-AREA-USAGE = R0-R15 ARE SAVED IN UCMSAVE4                 Y02756
+*                   AROUND THE CALL TO IEECMQCN                  Y02756
+*                                                                Y02756
+**************************************************************** Y02756
+         SPACE ,                                                 Y02756
+         SR    R15,R15             INIT RETURN CODE TO 0         Y02756
+         TM    WQEXA,WQEQDFHC      ALREADY QUEUED FOR HC         Y02756
+         BOR   R14                 YES, RETURN                   Y02756
+         SPACE ,                                                 Y02756
+         TM    UCMSFLG1,UCMSYSG    IS HARDCOPY DEVICE SYSLOG     Y02756
+         BO    DSVHCWTL            YES, GO DO WTLS               Y02756
+         SPACE ,                                                 Y02756
+DSVHCQCN EQU   *                   ENTRY AFTER CONSOLE SWITCH    Y02756
+         L     R1,UCMHCUCM         GET ADDR OF HARDCOPY CONSOLE  Y02756
+*                                  UCME                          Y02756
+         LTR   R1,R1               IS THERE A HARDCOPY CONSOLE   Y02756
+         BNZ   DSVHCQ              YES, GO QUEUE WQE             Y02756
+         SPACE ,                                                 Y02756
+         NI    WQEXA,C255-WQEQFHC  TURN OFF QUEUE TO HC FLAG     Y02756
+         BR    R14                 RETURN TO CALLER              Y02756
+         SPACE ,                                                 Y02756
+DSVHCQ   EQU   *                   QUEUE TO HC CONSOLE           Y02756
+         TM    WQEAVAIL,WQEBUFC    WQE READY FOR HARDCOPY        Y02756
+         BO    DSVHCQ1             YES, QUEUE WQE TO HC CONSOLE  Y02756
+         LA    R15,FOUR            NO, SET RETURN CODE 4 - HC    Y02756
+*                                    NOT SUCCESSFUL              Y02756
+         BR    R14                 RETURN TO CALLER              Y02756
+         SPACE ,                                                 Y02756
+DSVHCQ1  EQU   *                   QUEUE WQE TO HC CONSOLE       Y02756
+         OI    WQEXA,WQEQDFHC      TURN ON QUEUED TO HC FLAG     Y02756
+         SPACE ,                                                 Y02756
+         STM   R0,R15,UCMSAVE4     SAVE REGS IN UCM - BASE = R2  Y02756
+         SPACE ,                                                 Y02756
+* SET UP REGISTERS REQUIRED FOR BRANCH ENTRY TO IEECMQCN         Y02756
+         SPACE ,                                                 Y02756
+         LR    R4,R7               SET UP UCM PREFIX BASE        Y02756
+         LR    R6,R12              SET UP WQE ADDR               Y02756
+         LR    R11,R1              ADDR OF HC CONSOLE UCME       Y02756
+* R2 ALREADY CONTAINS ADDR OF UCM                                Y02756
+         SPACE ,                                                 Y02756
+         L     R1,ADQCN            GET ENTRY POINT OF CONSOLE    Y02756
+*                                  QUEUE ROUTINE                 Y02756
+         BALR  R9,R1               R9 = RETURN REGISTER          Y02756
+         LM    R0,R15,UCMSAVE4     RESTORE REGISTERS FROM UCM    Y02756
+         OI    UCMSFLG2,UCMSYSJ    .TURN ON HARDCOPY TO BE DONE FLAG
+*                                  IN UCM PREFIX
+         BR    R14                 .RETURN
+         SPACE 5
+DSVHCWTL DS    0H                  WTL PROCESSING                Y02756
+         SPACE ,                                                 Y02756
+*   PROCESSING WHEN HARDCOPY IS THE SYSTEM LOG                   Y02756
+         SPACE ,                                                 Y02756
+         TM    WQEAVAIL,WQEBUFC    IS WQE READY FOR HARDCOPY     Y02756
+         BO    DSVHCW1             YES, CONTINUE                 Y02756
+         LA    R15,FOUR            NO, SET RETURN CODE = 4 - HC  Y02756
+*                                     NOT SUCCESSFUL             Y02756
+         BR    R14                 RETURN TO CALLER              Y02756
+         SPACE ,                                                 Y02756
+DSVHCW1  DS    0H                                                Y02756
+         L     R1,UCMLOGAD         GET PTR TO WTL BUFFER         Y02756
+         LTR   R1,R1               IS THERE A WTL BUFFER         Y02756
+         BNZ   DSVHCW2             YES, SKIP GETMAIN             Y02756
+         SPACE ,                                                 Y02756
+*   USE BRANCH ENTRY TO GETMAIN TO GET 130 BYTES FROM SUBPOOL    Y02756
+*   250 FOR WTL PARAMETER LIST                                   Y02756
+         SPACE ,                                                 Y02756
+         STM   R2,R15,UCMSAVE4+THRDWD SAVE REGS ACROSS GETMAIN   Y02756
+         L     R4,UCMPXA           GET COMMTASK TCB ADDRESS      Y02756
+         L     R7,UCMASCB          GET COMMTASK ASCB ADDRESS     Y02756
+         GETMAIN R,LV=WTLBSIZE,SP=WTLBSPL,BRANCH=YES             Y02756
+         LM    R2,R15,UCMSAVE4+THRDWD RELOAD REGS                Y02756
+         ST    R1,UCMLOGAD         SAVE PTR TO WTL BUFFER        Y02756
+         SPACE ,                                                 Y02756
+DSVHCW2  DS    0H                                                Y02756
+         XC    ZERO(WTLBSIZE,R1),ZERO(R1) CLEAR WTL BUFFER       Y02756
+         CLI   WMJMMLW,ZERO        IS WQE A MLWTO                Y02756
+         BNE   DSVHCWM             YES, GO PROCESS A MLWTO WTL   Y02756
+         SPACE ,                                                 Y02756
+*   SET UP WTL PARAMETER LIST FOR A NORMAL WTO                   Y02756
+         SPACE ,                                                 Y02756
+         MVC   FOUR(F126,R1),WQERR MOVE 126 BYTES OF THE MESSAGE Y02756
+*                                     TEXT BEGINNING WITH THE    Y02756
+*                                     HARDCOPY HEADER TO THE WTL Y02756
+*                                     BUFFER                     Y02756
+         SR    R9,R9               CLEAR LENGTH REGISTER         Y02756
+         IC    R9,WQENBR+THREE     GET TEXT LENGTH EXCLUDING     Y02756
+*                                     LENGTH OF HARDCOPY HEADER  Y02756
+         LA    R9,WQETXT-WQERR+FOUR(R9) ADD LENGTH OF HC HEADER  Y02756
+*                                      PLUS 4 FOR LENGTH OF      Y02756
+*                                      BUFFER HEADER             Y02756
+         CH    R9,WTLMAXLN         IS LENGTH GREATER THAN MAX    Y02756
+         BNH   DSVHCW3             NO, OK                        Y02756
+         LH    R9,WTLMAXLN         YES, TRUNCATE TO MAXIMUM      Y02756
+*                                     ACCEPTED BY WTL            Y02756
+DSVHCW3  DS    0H                  STORE LENGTH IN BUFFER        Y02756
+         STCM  R9,THREE,ZERO(R1)   PUT LENGTH IN FIRST TWO       Y02756
+*                                     BYTES OF WTL BUFFER        Y02756
+         BAL   R9,DSVLOG           CALL LOG ROUTINE TO ISSUE WTL Y02756
+         LTR   R0,R0               WAS WTL SUCCESSFUL            Y02756
+         BNZ   DSVHCWER            NO, TEST ERROR CONDITIONS     Y02756
+         OI    WQEXA,WQEQDFHC      YES, INDICATE QUEUED FOR HC   Y02756
+         BR    R14                 RETURN TO CALLER              Y02756
+         SPACE ,                                                 Y02756
+*   WTL PROCESSING FOR A MLWTO                                   Y02756
+         SPACE ,                                                 Y02756
+DSVHCWM  DS    0H                  WTL PROCESSING FOR A MLWTO    Y02756
+         TM    WMJMMLW,WMJMMLWE    WAS WTL ALREADY ISSUED?       Y02756
+         BO    DSVHCWM1            YES, CHECK FOR END            Y02756
+         MVC   FOUR(WMJMHCID-WMJMRR,R1),WMJMRR MOVE THE MSG TEXT Y02756
+*                                     BEGINNING WITH THE         Y02756
+*                                     HARDCOPY HEADER TO THE WTL Y02756
+*                                     BUFFER (LENGTH IS LESS     Y02756
+*                                     THAN 126)                  Y02756
+         SR    R9,R9               CLEAR LENGTH REGISTER         Y02756
+         IC    R9,WMJMTXTL+ONE     GET LENGTH OF TEXT EXCLUDING  Y02756
+*                                     LENGTH OF HARDCOPY HEADER  Y02756
+         LA    R9,WMJMTXT-WMJMRR+FOUR(R9) ADD LENGTH OF HARDCOPY Y02756
+*                                     HEADER PLUS 4 FOR LENGTH   Y02756
+*                                     OF WTL BUFFER HEADER       Y02756
+         STCM  R9,THREE,ZERO(R1)   PUT LENGTH IN FIRST TWO BYTES Y02756
+*                                     OF WTL BUFFER              Y02756
+         BAL   R9,DSVLOG           CALL LOG ROUTINE TO ISSUE WTL Y02756
+         LTR   R0,R0               WAS WTL SUCCESSFUL            Y02756
+         BNZ   DSVHCWER            NO, PROCESS ERROR CONDITIONS  Y02756
+         OI    WMJMMLW,WMJMMLWE    INDICATE WTL ISSUED FOR MAJOR Y02756
+DSVHCWM1 DS    0H                  CHECK FOR END LINE IN MAJOR   Y02756
+         TM    WMJMLTYP,WMJMLTYD   END LINE IN MAJOR             Y02756
+         BZ    DSVHCWM2            NO, LOOK FOR MINORS           Y02756
+         OI    WMJMDSP,WMJMDSPD    INDICATE WHOLE CHAIN HAS BEEN Y02756
+*                                     QUEUED FOR HC              Y02756
+         BR    R14                 RETURN TO CALLER              Y02756
+         SPACE ,                                                 Y02756
+DSVHCWM2 DS    0H                  LOOK FOR MINORS               Y02756
+         TM    WMJMMLW,WMJMMLWH    IS FIRST MINOR A DUMMY        Y02756
+         BOR   R14                 YES, RETURN TO CALLER         Y02756
+         L     R5,WMJMMIN          GET PTR TO FIRST MINOR        Y02756
+         SPACE ,                                                 Y02756
+*   LOOP TO WRITE MINORS TO THE SYSTEM LOG                       Y02756
+         SPACE ,                                                 Y02756
+DSVHCWM3 DS    0H                                                Y02756
+         LTR   R5,R5               IS THERE A MINOR              Y02756
+         BZR   R14                 NO, RETURN TO CALLER          Y02756
+         DROP  R12                 GIVE UP MAJOR BASE            Y02756
+         USING WQE,R5              MINOR WQE BASE                Y02756
+         CLI   WMNMTL1,ZERO        IS MINOR TEXT LENGTH ZERO     Y02756
+         BNE   DSVHCWM4            NO, CONTINUE TESTS            Y02756
+         OI    WMNMML1,WMNMML1E    YES, END LINE FOUND, INDICATE Y02756
+*                                     MINOR QUEUED FOR HC        Y02756
+DSVHCWM7 DS    0H                                                Y02756
+         OI    WMJMDSP-WMJM(R12),WMJMDSPD INDICATE IN MAJOR THAT Y02756
+*                                         WHOLE CHAIN HAS BEEN   Y02756
+*                                         HARDCOPIED             Y02756
+         BR    R14                 RETURN TO CALLER              Y02756
+         SPACE ,                                                 Y02756
+DSVHCWM4 DS    0H                                                Y02756
+         TM    WMNMML1,WMNMML1E    WAS WTL ALREADY ISSUED        Y02756
+         BO    DSVHCWM6            YES, SKIP THIS MINOR          Y02756
+         SPACE ,                                                 Y02756
+*   SET UP WTL BUFFER FOR A MINOR                                Y02756
+         SPACE ,                                                 Y02756
+         L     R1,UCMLOGAD         GET PTR TO WTL BUFFER         Y02756
+         XC    ZERO(WTLBSIZE,R1),ZERO(R1) CLEAR WTL BUFFER       Y02756
+         MVC   FOUR(WMNMST1-WMNMHCT1,R1),WMNMHCT1 MOVE TEXT      Y02756
+*                                    BEGINNING WITH HC HEADER    Y02756
+         SR    R9,R9               CLEAR LENGTH REGISTER         Y02756
+         IC    R9,WMNMTL1          GET TEXT LENGTH EXCLUDING     Y02756
+*                                     LENGTH OF HC HEADER        Y02756
+         LA    R9,WMNMTXT1-WMNMHCT1+FOUR(R9) ADD LENGTH OF       Y02756
+*                                     HARDCOPY HEADER PLUS 4 FOR Y02756
+*                                     LENGTH OF WTL BUFFER       Y02756
+*                                     HEADER                     Y02756
+         STCM  R9,THREE,ZERO(R1)   PUT LENGTH IN FIRST TWO BYTES Y02756
+*                                     OF WTL BUFFER              Y02756
+         BAL   R9,DSVLOG           CALL LOG ROUTINE TO ISSUE WTL Y02756
+         LA    R1,EIGHT            SET UP COMPARE OF RETURN CODE Y02756
+         CR    R0,R1               WAS HC SWITCHED               Y02756
+         SPACE ,                                                 Y02756
+*   NOTE:  ONCE THE MAJOR HAS BEEN LOGGED, THERE IS NO NEED      Y02756
+*          TO CHECK IF THE LOG IS INITIALIZED WHEN ATTEMPTING    Y02756
+*          TO LOG A MINOR.                                       Y02756
+*                                                                Y02756
+*          A PARTIALLY LOGGED MLWTO WILL NOT BE HARDCOPIED ON    Y02756
+*          THE NEW HARDCOPY DEVICE                               Y02756
+         SPACE ,                                                 Y02756
+         BE    DSVHCWM7            YES, HC WAS SWITCHED,ALL      Y02756
+*                                     DONE                       Y02756
+         SPACE ,                                                 Y02756
+         OI    WMNMML1,WMNMML1E    NO, INDICATE WTL WAS ISSUED   Y02756
+         SPACE ,                                                 Y02756
+DSVHCWM6 DS    0H                  CHECK FOR END                 Y02756
+         TM    WMNMLT1,WMNMLT1D    END LINE IN MINOR             Y02756
+         BO    DSVHCWM7            YES, ALL DONE                 Y02756
+         L     R5,WMNMUC1          NO, GET ADDR OF NEXT MINOR    Y02756
+         LA    R5,ZERO(R5)         CLEAR USE COUNT               Y02756
+         B     DSVHCWM3            PROCESS NEXT MINOR            Y02756
+         SPACE ,                                                 Y02756
+DSVHCWER DS    0H                  PROCESS ERROR RETURN CODES    Y02756
+*                                     FROM DSVLOG SUBROUTINE     Y02756
+         LA    R1,FOUR             SET UP TO COMPARE FOR RC 4    Y02756
+         CR    R0,R1               WTL DEFERRED                  Y02756
+         BNE   DSVHCQCN            NO, HC HAS BEEN SWITCHED TO A Y02756
+*                                     CONSOLE OR HARDCOPY IS NO  Y02756
+*                                     LONGER IN THE SYSTEM, GO   Y02756
+*                                     PROCESS AS FOR HC TO A     Y02756
+*                                     CONSOLE                    Y02756
+         LA    R15,FOUR            YES, SET RETURN CODE FOR      Y02756
+*                                     CALLER - HC NOT SUCCESSFUL Y02756
+         BR    R14                 RETURN TO CALLER              Y02756
+         DROP  R5                  GIVE UP MINOR BASE            Y02756
+         USING WQE,R12             RESTORE ADDRESSABILITY TO     Y02756
+*                                     MAJOR OR NORMAL
+         EJECT ,                                                 Y02893
+PURGEWQE DS    0H                  FREES A NORMAL WQE OR A MAJOR Y02893
+*                                  AND ITS MINOR CHAIN           Y02893
+         SPACE ,                                                 Y02893
+**************************************************************** Y02893
+*                                                                Y02893
+* PURGEWQE IS A SUBROUTINE WHICH DEQUEUES AND FREES A NORMAL WQE Y02893
+* OR A MAJOR WQE AND ITS MINOR CHAIN.   IT IS CALLED BY          Y02893
+* SUBROUTINES DEQ AND DQCLNUP WHEN A WQE IS NO LONGER NEEDED.    Y02893
+*                                                                Y02893
+* INPUT   R12 = ADDR OF WQE TO BE FREED                          Y02893
+*         R14 = RETURN ADDR                                      Y02893
+*                                                                Y02893
+* OUTPUT  R12 = ADDR OF PREVIOUS WQE                             Y02893
+*                                                                Y02893
+* REGISTER-USAGE = R13 - PTR TO PREVIOUS WQE                     Y02756
+*                  R5  - PTR TO NEXT WQE/ PTR TO MINOR WQES      Y02756
+*                  R0  - WORK REG                                Y02756
+*                  R9  - LINK TO FREEWQE, WWBRTN AND POSTMAJ     Y02756
+*                                                                Y02756
+* SAVE-AREA-USAGE = NONE                                         Y02756
+*                                                                Y02893
+**************************************************************** Y02893
+         SPACE ,                                                 Y02893
+         CLI   WMJMMLW,ZERO        MLWTO                         Y02893
+         BNE   DEQMINF             YES, FREE MINORS FIRST        Y02893
+         SPACE ,                                                 Y02893
+* SEARCH THE SYSTEM QUEUE TO FIND THE WQE WHICH IS THE ONE TO    Y02893
+* BE DEQUEUED AND FREED, KEEPING A BACK PTR.                     Y02893
+         SPACE ,                                                 Y02893
+PRGNORM  EQU   *                   PURGE NORMAL OR MAJOR         Y02756
+         LA    R13,UCMWTOQ         GET ADDRESS OF WQE QUEUE      Y02893
+*                                  ANCHOR                        Y02893
+         LA    R12,ZERO(R12)       .CLEAR HIGH ORDER BYTE
+         SPACE ,                                                 Y02752
+DEQWQELP L     R5,WQELKP-WQE(R13)  .GET NEXT WQE PTR ON SYSTEM Q
+         LA    R5,ZERO(R5)         .CLEAR HIGH ORDER BYTE
+         CR    R12,R5              .Q. IS THIS THE WQE TO BE DEQUEUED
+         BE    DEQWQFR             .YES - BR TO DEQUEUE AND FREE IT
+         LTR   R5,R5               END OF WQE CHAIN?           @YA00064
+         BZR   R14                 YES-RETURN                  @ZM30642
+         LR    R13,R5              .UPDATE BACK PTR
+         B     DEQWQELP            .BR TO SEARCH AGAIN
+         SPACE
+* DEQUEUE THE WQE FROM THE SYSTEM OUTPUT QUEUE.                  Y02752
+         SPACE
+DEQWQFR  MVC   WQELKPA-WQE(F3,R13),WQELKPA .DEQ THE WQE OFF SYSTEM
+*                                  OUTPUT QUEUE
+         C     R12,UCMWQEND        .Q. WAS THIS THE LAST WQE
+         BNE   DEQDYN              .NO - BR
+         ST    R13,UCMWQEND        .YES - PUT ADDRESS OF PREVIOUS WQE
+*                                  INTO QUEUE END
+         L     R0,UCMWTOQ          .GET TOP OF SYSTEM OUTPUT QUEUE
+         LTR   R0,R0               .Q. IS THERE A SYSTEM OUTPUT QUEUE
+         BP    DEQDYN              .YES - BR
+         ST    R0,UCMWQEND         .NO - CLEAR OUT PTR TO LAST WQE
+         SPACE ,                                                 Y02752
+DEQDYN   EQU   *
+         LR    R5,R12              SET UP WQE PTR FOR FREEWQE    Y02756
+         BAL   R9,FREEWQE          FREE MAJOR OR MORNAL WQE      Y02752
+         BAL   R9,WWBRTN           POST ANY WAITING WTO ISSUER   Y02752
+         LR    R12,R13             SET UP PTR TO PREVIOUS WQE    Y02752
+         BR    R14                 RETURN TO CALLER              Y02752
+         SPACE ,                                                 Y02752
+* THE FOLLOWING CODE FREES THE MINORS OF A MLWTO CHAIN THAT IS   Y02756
+* NO LONGER NEEDED.  IF THE MAJOR IS QUEUED FOR TPUT, BOTH LINES Y02756
+* OF THE MINOR MUST ALSO BE QUEUED FOR TPUT.    IF THE MLWTO     Y02756
+* ISSUER IS WAITING FOR A MINOR, THE WAITING TASK IS POSTED.     Y02756
+* IF THE MLWTO ISSUER IS NOT WAITING, THEN ANY OTHER WAITING     Y02756
+* WTO ISSUER IS POSTED WHEN THE NUMBER OF WQES IS BELOW THE      Y02756
+* LIMIT.                                                         Y02756
+         SPACE ,                                                 Y02756
+DEQMINF  EQU   *                   TRY TO FREE MINORS            Y02756
+         L     R5,WMJMMIN          GET PTR TO FIRST MINOR        Y02756
+         DROP  R12                 DROP MAJOR BASE               Y02756
+         USING WQE,R5              MINOR BASE                    Y02756
+         SPACE ,                                                 Y02756
+DEQMLW2  EQU   *                   LOOP THROUGH MINORS           Y02756
+         LA    R5,ZERO(R5)         CLEAR USE COUNT               Y02756
+         LTR   R5,R5               ANY MORE TO FREE              Y02756
+         BZ    PRGNORM             NO, GO FREE MAJOR             Y02756
+         TM    WMNMML1,WMNMML1F    ABEND'S MINOR                 Y02756
+         BO    PRGNORM             YES, GO FREE MAJOR            Y02756
+         SPACE ,                                                 Y02756
+         TM    WMJMBUF-WMJM(R12),WMJMBUFF MAJOR QUEUED FOR TPUT  Y02756
+         BZ    PRGDEQM             NO, SKIP MINOR TPUT TESTS     Y02756
+         TM    WMNMST1,WMNMTPD1    1ST LINE QUEUED FOR TPUT      Y02756
+         BZR   R14                 NO, REMAINING CHAIN CANNOT    Y92756
+*                                    BE FREED, RETURN TO CALLER  Y02756
+         NC    WMNMNX1(F3),WMNMNX1 END OF MINOR CHAIN            Y02756
+         BZ    PRGDEQM             YES, SKIP 2ND LINE TPUT TEST  Y02756
+         TM    WMNMST2,WMNMTPD2    2ND LINE QUEUED FOR TPUT      Y02756
+         BZR   R14                 NO, REMAINING CHAIN CANNOT    Y02756
+*                                    BE FREED, RETURN TO CALLER  Y02756
+         SPACE ,                                                 Y02756
+PRGDEQM  EQU   *                   HOOK NEXT MINOR TO MAJOR      Y02756
+         MVC   WMJMMIN+ONE-WMJM(F3,R12),WMNMNX2 DECHAIN MINOR    Y02756
+         BAL   R9,FREEWQE          FREE THE MINOR                Y02756
+         TM    WMJMECBF-WMJM(R12),WMJMWAIT IS THE MAJOR WAITING  Y02756
+         BO    PRGPMAJ             YES, GO POST MAJOR            Y02756
+         BAL   R9,WWBRTN           NO, POST ANY OTHER WAITING    Y02756
+*                                    WTO ISSUER                  Y02756
+         B     DEQMINF             GO PROCESS NEXT MINOR         Y02756
+         SPACE ,                                                 Y02756
+PRGPMAJ  EQU   *                   POST WAITING MAJOR            Y02756
+         BAL   R9,POSTMAJ          POST WAITING MAJOR            Y02756
+         B     DEQMINF             GO PROCESS NEXT MINOR         Y02756
+         EJECT ,                                                 Y02756
+**************************************************************** Y02756
+*                                                                Y02756
+* FREEWQE SUBROUTINE                                             Y02756
+*                                                                Y02756
+* THIS SUBROUTINE IS CALLED WHEN A MAJOR, MINOR, OR NORMAL WQE   Y02756
+* IS NO LONGER NEEDED.  THE COUNT OF WQES IS DECREMENTED.        Y02756
+* THE WQE IS FREED VIA THE BRANCH ENTRY TO FREECELL.  IF THE     Y02756
+* LAST CELL OF AN EXTENT IS FREED, A FREEMAIN IS DONE TO FREE    Y02756
+* THE CELL POOL EXTENT.                                          Y02756
+*                                                                Y02756
+* INPUT = R5 - PTR TO WQE TO BE FREED                            Y02756
+*         R9 - RETURN POINT                                      Y02756
+*                                                                Y02756
+* REGISTER-USAGE = NONE THAT ARE NOT SAVED FIRST.                Y02756
+*                                                                Y02756
+* SAVE-AREA-USAGE = R0-R15 ARE SAVED IN UCMSAVE4 AT ENTRY AND    Y02756
+*                   RESTORED AT EXIT                             Y02756
+*                                                                Y02756
+**************************************************************** Y02756
+         SPACE ,                                                 Y02756
+FREEWQE  DS    0H                  FREES A WQE                   Y02752
+         STM   R0,R15,UCMSAVE4     SAVE REGS                     Y02752
+         LA    R9,UCMSAVE4         SET UP ADDR OF SAVE AREA      Y02752
+         SPACE ,                                                 Y02752
+         LH    R1,UCMWQNR          GET CURRENT WQE COUNT         Y02893
+         BCTR  R1,ZERO             DECREMENT COUNT BY ONE        Y02893
+         STH   R1,UCMWQNR          STORE NEW COUNT               Y02893
+         SPACE ,                                                 Y02756
+* FREE THE WQE VIA THE BRANCH ENTRY TO FREECELL                  Y02752
+         SPACE ,                                                 Y02752
+         L     R0,UCMWQECP         WQE CELL POOL ID              Y02752
+         LR    R1,R5               ADDR OF CELL TO BE FREED      Y02752
+         SPACE ,                                                 Y02752
+* REGS 0-4, 14 AND 15 ARE DESTROYED BY FREECELL                  Y02752
+* R9 MUST BE UNCHANGED IN ORDER TO RESTORE REGS                  Y02752
+         SPACE ,                                                 Y02752
+         FREECELL CPID=(0),CELL=(1),BRANCH=YES,SAVE=NO           Y02752
+         SPACE ,                                                 Y02752
+* THE BUILD CELL POOL FOR THE WQES IS DONE WITH THE AUTODELETE   Y02752
+* OPTION.  IF THE CELL JUST RETURNED TO THE EXTENT WAS THE ONLY  Y02752
+* REMAINING ALLOCATED CELL, THEN THE EXTENT IS REMOVED BUT NOT   Y02752
+* FREEMAINED AND A RETURN CODE = 20 IS SENT.  THE SUBPOOL AND    Y02752
+* LENGTH OF THE EXTENT ARE RETURNED IN R0 AND ITS ADDRESS IS     Y02752
+* RETURNED IN R1.  THE FREEMAIN IS DONE HERE.                    Y02752
+         SPACE ,                                                 Y02752
+         LA    R3,TWENTY           SET UP TO TEST FOR RC=20      Y02752
+         CR    R15,R3              WAS EXTENT REMOVED            Y02752
+         BNE   DEQDYN1             NO, SKIP FREEMAIN             Y02752
+         SPACE ,                                                 Y02752
+         L     R2,THRDWD(R9)       RESTORE UCM BASE ADDR         Y02756
+         L     R4,UCMPXA           GET COMMTASK TCB ADDR         Y02752
+         L     R7,UCMASCB          GET ASCB ADDR OF COMMTASK     Y02752
+         FREEMAIN R,LV=(0),A=(1),BRANCH=YES FREE CELLPOOL EXTENT Y02752
+         SPACE ,                                                 Y02752
+DEQDYN1  EQU   *                   EXIT                          Y02752
+         LM    R0,R15,ZERO(R9)     RESTORE REGS AFTER FREECELL   Y02752
+         BR    R9                  RETURN TO CALLER              Y02752
+         EJECT ,                                                 Y02756
+**************************************************************** Y02752
+*                                                                Y02752
+* WWBRTN SUBROUTINE                                              Y02752
+*                                                                Y02752
+* THE FOLLOWING CODE COMPARES THE CURRENT COUNT OF WQES TO THE   Y02752
+* WQE LIMIT.  IF THE COUNT IS BELOW THE LIMIT, THE WWB CHAIN     Y02752
+* IS SEARCHED FOR THE FIRST ECB THAT HAS NOT BEEN POSTED.  EACH  Y02752
+* WWB REPRESENTS AN ISSUER OF WTO THAT IS WAITING FOR A WQE.  IT Y02752
+* CONTAINS THE ECB TO BE POSTED WHEN A WQE BECOMES AVAILABLE.    Y02752
+* THE BRANCH ENTRY TO POST FOR A XMPOST IS USED.                 Y02752
+*                                                                Y02752
+* INPUT = R9 - RETURN POINT                                      Y02752
+*                                                                Y02752
+* OUTPUT = NONE                                                  Y02752
+*                                                                Y02752
+* REGISTER-USAGE = R1 - WORK REGISTER                            Y02752
+*                  R5 - WWB BASE                                 Y02752
+*                                                                Y02752
+* SAVE-AREA-USAGE = UCMSAVE4 IS USED TO SAVE R0-R15              Y02752
+*                   AROUND BRANCH ENTRY TO XMPOST                Y02752
+*                                                                Y02752
+**************************************************************** Y02752
+         SPACE ,                                                 Y02752
+WWBRTN   DS    0H                  NOTIFY A WAITING WTO ISSUER   Y02752
+*                                    THAT A WQE IS AVAILABLE     Y02752
+         LH    R1,UCMWQNR          GET CURRENT WQE COUNT         Y02752
+         CH    R1,UCMWQLM          IS NEW COUNT BELOW LIMIT      Y02893
+         BNL   WWBRET              NO, DON'T POST              @ZA11392
+         SPACE ,                                                 Y02752
+         USING WWB,R5              ADDRESSABILITY TO WWB CHAIN   Y02752
+         L     R5,UCMWECBH         GET PTR TO START OF WWB CHAIN Y02752
+         LA    R1,UCMWECBH         SET UP TO COMPARE FOR         Y02752
+*                                  END OF WWB CHAIN              Y02752
+         SPACE ,                                                 Y02752
+DEQWWBL  EQU   *                   LOOP THROUGH WWBS             Y02752
+         CR    R5,R1               ANY MORE WWBS                 Y02752
+         BE    WWBRET              NO, NONE WAITING, DON'T POST@ZA11392
+         TM    WWBFLAGS,WWBPOSTD   HAS ECB BEEN POSTED           Y02752
+         BZ    DEQWWBP             NO, POST THIS ONE             Y02752
+         L     R5,WWBFWDPT         GET PTR TO NEXT WWB           Y02752
+         B     DEQWWBL             CHECK NEXT WWB                Y02752
+         SPACE 2                                                 Y02752
+DEQWWBP  EQU   *                   POST ECB IN WWB               Y02752
+         STM   R0,R15,UCMSAVE4     SAVE REGS USED BY POST        Y02752
+         LA    R9,UCMSAVE4         SET UP SAVE AREA ADDR         Y02752
+         SPACE ,                                                 Y02752
+* BRANCH ENTRY TO XMPOST DESTROYS ALL REGS EXCEPT 9 AND 14       Y02752
+         SPACE ,                                                 Y02752
+         LA    R11,WWBECB          ADDR OF ECB TO BE POSTED    @YM00434
+         ICM   R11,F8,CX80         INDICATE XMPOST             @YM00434
+         L     R13,WWBASCB         ASCB ADDR OF WAITING USER     Y02752
+         LA    R10,ZERO            POST COMPLETION CODE          Y02752
+         SPACE ,                                                 Y02752
+* NOTE:  BASE HAS JUST BEEN DESTROYED, WILL BE RESTORED AFTER    Y02752
+* POST                                                           Y02752
+         SPACE ,                                                 Y02752
+         L     R15,CVTPTR          ADDR OF CVT                   Y02752
+         USING CVT,R15             ADDRESSABILITY TO CVT         Y02752
+         L     R12,UCMWAKUP        ERROR RETURN POINT IS IN      Y02756
+*                                     IEAVMFRR                   Y02756
+         L     R15,CVT0PT01        ENTRY POINT TO POST           Y02752
+         DROP  R15                 ADDRESSABILITY TO CVT NO      Y02752
+*                                  LONGER NEEDED                 Y02752
+         SPACE ,                                                 Y02752
+         BALR  R14,R15             BRANCH TO POST                Y02752
+         SPACE 2                                                 Y02752
+         LM    R0,R15,ZERO(R9)     RESTORE REGS USED BY POST     Y02752
+         OI    WWBFLAGS,WWBPOSTD   INDICATE ECB HAS BEEN POSTED  Y02752
+         BR    R9                  RETURN TO CALLER              Y02752
+         SPACE
+***********************************************************************
+*                                                                     *
+* A WQE IS AVAILABLE. LET IEAVMQWR KNOW THAT IT CAN ISSUE ANY  @ZA11392
+* WTO THRESHOLD MESSAGES.                                      @ZA11392
+*                                                                     *
+***********************************************************************
+         SPACE
+WWBRET   EQU   *
+         LA    R0,EIGHT            USED TO FIND EXTENSION PTR  @ZA11392
+         LR    R1,R2               TEMPORARY COPY OF UCM PTR   @ZA11392
+         SR    R1,R0               POINT TO PREFIX             @ZA11392
+         L     R1,ZERO(R1)         R1 NOW POINTS TO EXTENSION  @ZA11392
+         USING UCM2EXT,R1          ADDRESSABILITY TO EXTENSION @ZA11392
+         L     R1,UCM2FEXT         ADDRESS OF FIXED EXTENSION  @ZA11392
+         USING UCMFEXTA,R1         ADDRESSABILITY TO FIXED EXTENSION   X
+                                                               @ZA11392
+         NI    UCMFFLG1,C255-UCMFMSGN TURN IEAVMQWR SILENCE BIT OFF    X
+                                                               @ZA11392
+         DROP  R1                                              @ZA11392
+         BR    R9                  RETURN TO CALLER            @ZA11392
+         EJECT
+**************************************************************** Y02756
+*                                                                Y02756
+* FREEWTLB SUBROUTINE                                            Y02756
+*                                                                Y02756
+* FUNCTION = FREES THE WTL BUFFER, IF ANY, OBTAINED BY DSVHC     Y02756
+*            SUBROUTINE USED TO WRITE HARDCOPY MESSAGES TO THE   Y02756
+*            SYSTEM LOG.                                         Y02756
+*                                                                Y02756
+* INPUT = R14 - RETURN ADDR                                      Y02756
+*                                                                Y02756
+* OUTPUT = NONE                                                  Y02756
+*                                                                Y02756
+* REGISTER-USAGE = R1                                            Y02756
+*                                                                Y02756
+* SAVE-AREA-USAGE = R3-R7, R14-R15 STORED IN UCMSAVE4            Y02756
+*                   AROUND FREEMAIN                              Y02756
+*                                                                Y02756
+**************************************************************** Y02756
+         SPACE ,                                                 Y02756
+FREEWTLB DS    0H                  FREE WTL BUFFER               Y02756
+         L     R1,UCMLOGAD         GET PTR TO WTL BUFFER         Y02756
+         LTR   R1,R1               IS THERE A WTL BUFFER         Y02756
+         BZR   R14                 NO, RETURN TO CALLER          Y02756
+         SPACE ,                                                 Y02756
+* SET UP FREEMAIN PARAMETERS FOR BRANCH ENTRY                    Y02756
+         SPACE ,                                                 Y02756
+         STM   R3,R7,UCMSAVE4      SAVE REGS NEEDED FOR FREEMAIN Y02756
+         STM   R14,R15,UCMSAVE4+THRDWD SAVE REGS NEEDED FOR      Y02756
+*                                     FREEMAIN                   Y02756
+         L     R4,UCMPXA           GET COMMTASKS TCB ADDR        Y02756
+         L     R7,UCMASCB          GET COMMTASKS ASCB ADDR       Y02756
+         SPACE ,                                                 Y02756
+         FREEMAIN R,LV=WTLBSIZE,SP=WTLBSPL,A=(1),BRANCH=YES      Y02756
+         SPACE ,                                                 Y02756
+         LM    R3,R7,UCMSAVE4      RESTORE REGS                  Y02756
+         LM    R14,R15,UCMSAVE4+THRDWD RESTORE REGS              Y02756
+         XC    UCMLOGAD,UCMLOGAD   CLEAR WTL BUFFER PTR          Y02756
+         BR    R14                 RETURN                        Y02756
+         EJECT ,                                                 Y02756
+**************************************************************** Y02756
+*                                                                Y02756
+* DSVLOG SUBROUTINE                                              Y02756
+*                                                                Y02756
+* THIS SUBROUTINE DETERMINES THE STATUS OF THE SYSTEM LOG.  IF   Y02756
+* THE LOG IS USABLE, THE CMS AND LOCAL LOCKS ARE FREED AND A     Y02756
+* WTL IS ISSUED USING THE PARAMETER LIST PASSED TO IT IN REG 1.  Y02756
+* IF THE LOG IS INOPERATIVE, SVC 72 IS ISSUED TO SWITCH          Y02756
+* HARDCOPY TO ANOTHER DEVICE.  IF THE LOG IS NOT YET INITIALIZED Y02756
+* THE WTL IS DEFERED.  A RETURN CODE IS SET INDICATING WHAT      Y02756
+* ACTION WAS TAKEN.                                              Y02756
+*                                                                Y02756
+* INPUT = R1 - PTR TO WTL BUFFER                                 Y02756
+*         R9 - RETURN ADDRESS                                    Y02756
+*                                                                Y02756
+* OUTPUT = R0 = RETURN CODE                                      Y02756
+*              0 - WTL DONE                                      Y02756
+*              4 - WTL NOT DONE, LOG IS NOT INITIALIZED          Y02756
+*              8 - WTL NOT DONE, HARDCOPY SWITCHED               Y02756
+*                                                                Y02756
+* REGISTER-USAGE = R0,R1,R5,R9,R14,R15                           Y02756
+*                                                                Y02756
+* SAVE-AREA-USAGE = R1,R5,R9,R14,R15 ARE SAVED IN UCMSAVE4+16    Y02756
+*                   THRU 30 AT ENTRY AND RESTORED AT EXIT        Y02756
+*                                                                Y02756
+**************************************************************** Y02756
+         SPACE ,                                                 Y02756
+DSVLOG   DS    0H                                                Y02756
+         SPACE ,                                                 Y02756
+*   SAVE WORK REGISTERS USED IN THIS SUBROUTINE                  Y02756
+         SPACE ,                                                 Y02756
+         ST    R1,UCMSAVE4+SIXTEEN      SAVE REG                 Y02756
+         ST    R5,UCMSAVE4+TWENTY       SAVE REG                 Y02756
+         ST    R9,UCMSAVE4+TWENTY4      SAVE REG                 Y02756
+         STM   R14,R15,UCMSAVE4+TWENTY8 SAVE REGS                Y02756
+         SPACE ,                                                 Y02756
+*   ADDRESS BASEA FOR SYSTEM LOG STATUS                          Y02756
+         SPACE ,                                                 Y02756
+         L     R5,CVTPTR           GET CVT ADDR                  Y02756
+         USING CVT,R5              ADDRESSABILITY TO CVT         Y02756
+         L     R5,CVTMSER          GET ADDR OF MASTER SCHEDULER  Y02756
+*                                     RESIDENT DATA AREA - BASEA Y02756
+         DROP  R5                  GIVE UP CVT ADDRESSABILITY    Y02756
+         USING BASE,R5             ADDRESSABILITY TO BASEA       Y02756
+         SPACE ,                                                 Y02756
+*   DETERMINE SYSTEM LOG STATUS                                  Y02756
+         SPACE ,                                                 Y02756
+         TM    MSLOGST,MSLOGTHD    IS THE LOG INOPERATIVE?       Y02756
+         BO    DSVLOGSW            YES, SWITCH HARDCOPY          Y02756
+         TM    BALOG,BALOGINT      IS LOG INITIALIZED YET?       Y02756
+         BO    DSVLOGDO            YES, DO WTL                   Y02756
+         DROP  R5                  GIVE UP BASEA ADDRESSABILITY  Y02756
+         LA    R0,FOUR             NO, SET RETURN CODE = 4 -     Y02756
+*                                     WTL DEFERRED               Y02756
+         B     DSVLOGRT            RETURN TO CALLER              Y02756
+         SPACE ,                                                 Y02756
+DSVLOGDO DS    0H                  DO WTL                        Y02756
+         SPACE ,                                                 Y02756
+*   WRITE MESSAGE TO THE SYSTEM LOG VIA WTL SVC                  Y02756
+         SPACE ,                                                 Y02756
+         BAL   R9,FRLOCKS          FREE CMS AND LOCAL LOCKS      Y02756
+*                                     PRIOR TO ISSUEING SVC      Y02756
+         WTL   MF=(E,(1))          WRITE HARDCOPY MESSAGE TO           C
+                                      THE SYSTEM LOG             Y02756
+         BAL   R9,OBTLOCKS         REOBTAIN LOCAL AND CMS LOCKS  Y02756
+         XR    R0,R0               SET RETURN CODE = 0 - WTL     Y02756
+*                                     DONE                       Y02756
+         B     DSVLOGRT            RETURN TO CALLER              Y02756
+         SPACE ,                                                 Y02756
+*   ISSUE SVC 72 TO SWITCH HARDCOPY FROM THE SYSTEM LOG TO       Y02756
+*   ANOTHER DEVICE                                               Y02756
+         SPACE ,                                                 Y02756
+DSVLOGSW DS    0H                  SWITCH HARDCOPY               Y02756
+         MVC   UCM3WD(F8),EXTNAM   PUT NAME OF SWITCH ROUTINE    Y02756
+*                                     INTO SVC 72 PARM LIST      Y02756
+         MVI   UCM5WD,F2           CODE TO SWITCH HARDCOPY       Y02756
+         LA    R1,UCM3WD           POINT REG 1 TO PARM LIST      Y02756
+         ST    R2,UCM6WD           SET UCMBASE                 @YM6836P
+         BAL   R9,FRLOCKS          FREE CMS AND LOCAL LOCKS      Y02756
+*                                     PRIOR TO ISSUEING SVC      Y02756
+         SVC   OPCONSOL            SWITCH HARDCOPY               Y02756
+         BAL   R9,OBTLOCKS         REOBTAIN LOCKS                Y02756
+         LA    R0,EIGHT            SET RETURN CODE - HARDCOPY    Y02756
+*                                     SWITCHED                   Y02756
+         SPACE ,                                                 Y02756
+DSVLOGRT DS    0H                  RETURN TO CALLER              Y02756
+         L     R1,UCMSAVE4+SIXTEEN RESTORE REG TO VALUE AT ENTRY Y02756
+         L     R5,UCMSAVE4+TWENTY  RESTORE REG TO VALUE AT ENTRY Y02756
+         L     R9,UCMSAVE4+TWENTY4 RESTORE REG TO VALUE AT ENTRY Y02756
+         LM    R14,R15,UCMSAVE4+TWENTY8 RESTORE REGS TO VALUES   Y02756
+*                                      AT ENTRY                  Y02756
+         BR    R9                  RETURN TO CALLER              Y02756
+         EJECT ,
+**************************************************************** Y02751
+*                                                                Y02751
+* OBTLOCKS SUBROUTINE                                            Y02751
+*                                                                Y02751
+* FUNCTION = OBTAIN THE LOCAL AND CMS LOCKS, REESTABLISH THE     Y02751
+*            RECOVERY EXIT                                       Y02751
+*                                                                Y02751
+* INPUT = R9 - RETURN ADDR                                       Y02751
+*                                                                Y02751
+* OUTPUT = NONE                                                  Y02751
+*                                                                Y02751
+* REGISTER-USAGE = NONE                                          Y02751
+*                                                                Y02751
+* SAVE-AREA-USAGE = R11 - R14 ARE SAVED IN UCMSAVE4 AROUND       Y02751
+*                   SETLOCK                                      Y02751
+*                                                                Y02751
+**************************************************************** Y02751
+         SPACE ,                                                 Y02751
+OBTLOCKS DS    0H                  OBTAIN LOCKS                  Y02751
+         STM   R11,R14,UCMSAVE4    SAVE REGISTERS DESTROYED BY   Y02751
+*                                     SETLOCK                    Y02751
+         SPACE 2                                                 Y02751
+         SETLOCK OBTAIN,TYPE=LOCAL,MODE=UNCOND,                        C
+               RELATED=(UCM,IEAVMDSV(FRLOCKS))                   Y02751
+         SPACE ,                                                 Y02751
+         SETLOCK OBTAIN,TYPE=CMS,MODE=UNCOND,                          C
+               RELATED=(UCM,IEAVMDSV(FRLOCKS))                   Y02751
+         SPACE 2                                                 Y02751
+         SETFRR A,FRRAD=UCMFRRAD,PARMAD=(R12),WRKREGS=(R11,R12)  Y02755
+         USING PARMLIST,R12        ADDRESSABILITY TO PARM AREA   Y02755
+         MVC   PARMID,=CL4'CTSK'   PUT MODULE ID INTO PARM AREA  Y02755
+         DROP  R12
+         SPACE 2                                                 Y02751
+         LM    R11,R14,UCMSAVE4    RESTORE REGISTERS DESTROYED   Y02751
+*                                     BY SETLOCK                 Y02751
+         BR    R9                  RETURN TO CALLER              Y02751
+         EJECT ,                                                 Y02751
+**************************************************************** Y02751
+*                                                                Y02751
+* FRLOCKS SUBROUTINE                                             Y02751
+*                                                                Y02751
+* FUNCTION = DELETES THE RECOVERY EXIT, FREES THE CMS AND LOCAL  Y02751
+*            LOCKS                                               Y02751
+*                                                                Y02751
+* INPUT = R9 - RETURN ADDR                                       Y02751
+*                                                                Y02751
+* OUTPUT = NONE                                                  Y02751
+*                                                                Y02751
+* REGISTER-USAGE = NONE                                          Y02751
+*                                                                Y02751
+* SAVE-AREA-USAGE = R11 - R14 ARE SAVED IN UCMSAVE4 AROUND       Y02751
+*                   SETLOCK                                      Y02751
+*                                                                Y02751
+**************************************************************** Y02751
+         SPACE ,                                                 Y02751
+FRLOCKS  DS    0H                  FREE LOCKS                    Y02751
+         STM   R11,R14,UCMSAVE4    SAVE REGISTERS DESTROYED BY   Y02751
+*                                     SETLOCK                    Y02751
+         SPACE 2                                                 Y02751
+         SETFRR D,WRKREGS=(R11,R12)                              Y02755
+         SPACE 2                                                 Y02751
+         SETLOCK RELEASE,TYPE=CMS,                                     C
+               RELATED=(UCM,IEAVMQWR(WRLOCK),IEAVMDSV(OBTLOCKS)) Y02751
+         SPACE ,                                                 Y02751
+         SETLOCK RELEASE,TYPE=LOCAL,                                   C
+               RELATED=(UCM,IEAVMQWR(WRLOCK),IEAVMDSV(OBTLOCKS)) Y02751
+         SPACE 2                                                 Y02751
+         LM    R11,R14,UCMSAVE4    RESTORE REGISTERS DESTROYED   Y02751
+*                                     BY SETLOCK                 Y02751
+         BR    R9                  RETURN TO CALLER              Y02751
+         EJECT ,                                                 Y02756
+**************************************************************** Y02756
+*                                                                Y02756
+* POSTMAJ SUBROUTINE                                             Y02756
+*                                                                Y02756
+* THIS SUBROUTINE POSTS A MLWTO ISSUER THAT IS WAITING FOR A     Y02756
+* MINOR.  IT IS CALLED WHEN A MINOR IS FREED OR MADE REUSABLE    Y02756
+* THE RB ADDR OF THE MLWTO ISSUER IS STORED IN THE MAJOR.        Y02756
+* XMPOST WITHOUT ECB IS USED SINCE THE MAJOR MAY BE DELETED      Y02756
+* BEFORE THE POST COMPLETES.  THE MAJOR IS MARKED 'NO LONGER     Y02756
+* WAITING'.                                                      Y02756
+*                                                                Y02756
+* INPUT = R9 - RETURN POINT                                      Y02756
+*                                                                Y02756
+* OUTPUT = NONE                                                  Y02756
+*                                                                Y02756
+* REGISTER-USAGE = NONE THAT ARE NOT SAVED FIRST.                Y02756
+*                                                                Y02756
+* SAVE-AREA-USAGE = R0-R15 ARE SAVED IN UCMSAVE4 AT ENTRY        Y02756
+*                   AND REST0RED AT EXIT.                        Y02756
+*                                                                Y02756
+**************************************************************** Y02756
+         SPACE ,                                                 Y02756
+POSTMAJ  DS    0H                  NOTIFY MLWTO ISSUER THAT A    Y02756
+*                                    MINOR IS AVAILABLE          Y02756
+         STM   R0,R15,UCMSAVE4     SAVE REGISTERS                Y02756
+         LA    R9,UCMSAVE4         SET UP SAVE AREA ADDR         Y02756
+         SPACE ,                                                 Y02756
+*  SET UP PARAMETERS FOR BRANCH ENTRY TO XMPOST WITHOUT ECB      Y02756
+         SPACE ,                                                 Y02756
+         LA    R11,ONE             SET ECB REG                   Y02756
+         SLL   R11,THIRTY1         HIGH ORDER BIT OF ECB REG     Y02756
+*                                    IS 1, ECB REG IS 0          Y02756
+         SPACE ,                                                 Y02756
+*  CONVERT ASID TO ASCB ADDR AND PUT IN R13                      Y02756
+         SPACE ,                                                 Y02756
+         USING CVT,R3              ADDRESSABILITY TO CVT         Y02756
+         L     R3,CVTPTR           GET CVT ADDR                  Y02756
+         L     R4,CVTASVT          GET ADDR OF ASVT              Y02756
+         USING ASVT,R4             ADDRESSABILITY TO ASVT        Y02756
+         LA    R13,ASVTENTY        GET ADDR OF 1ST ASVT ENTRY    Y02756
+         DROP  R4                  DROP ADDRESSABILITY TO ASVT   Y02756
+         USING WQE,R12             MAJOR WQE BASE                Y02756
+         XR    R4,R4               CLEAR REG TO CONTAIN ASID     Y02756
+         ICM   R4,F3,WMJMASID      GET ASID OF WAITING TASK      Y02756
+         BCTR  R4,ZERO             DECREMENT FOR 1 ORIGIN        Y02756
+         SLA   R4,MULT4            MULTIPLY ASID BY 4            Y02756
+         AR    R13,R4              GET ADDR OF ASVT ENTRY        Y02756
+         L     R13,ZERO(R13)       GET ASCB ADDR FROM ASVT       Y02756
+*                                    ENTRY                       Y02756
+         SPACE ,                                                 Y02756
+*  BASE REGISTER IS DESTROYED                                    Y02756
+         SPACE ,                                                 Y02756
+         L     R10,WMJMAECB        RB ADDR OF WAITING TASK       Y02756
+         SPACE ,                                                 Y02756
+*  PTR TO WQE IS DESTROYED                                       Y02756
+         SPACE ,                                                 Y02756
+         L     R12,UCMWAKUP        ERROR RETURN POINT IS IN      Y02756
+*                                     IEAVMFRR                   Y02756
+         L     R15,CVT0PT01        ENTRY POINT TO POST           Y02756
+         BALR  R14,R15             BRANCH TO POST                Y02756
+         SPACE ,                                                 Y02756
+         DROP  R3                  DROP ADDRESSABILIY TO CVT     Y02756
+         LM    R0,R15,ZERO(R9)     RESTORE REGISTERS             Y02756
+         NI    WMJMECBF,C255-WMJMWAIT INDICATE ISSUER IS NOT     Y02756
+*                                    WAITING                     Y02756
+         BR    R9                  RETURN TO CALLER              Y02756
+         EJECT ,                                                 Y02893
+*   CONSTANTS AND PATCH AREA                                     Y02893
+         SPACE ,                                                 Y02893
+ADBXLE   DC    A(WRABXLE)          .RETURN ADDR FOR ATTENTION HANDLING
+ADQCN    DC    A(IEECMQCN)         .ADDR OF CONSOLE QUEUE MANAGER
+         SPACE
+WTLMAXLN DC    H'130'              MAXIMUM LENGTH OF WTL TEXT    Y02756
+*                                     INCLUDING 4 FOR WTL HEADER Y02756
+EXTNAM   DC    CL8'IGC0407B'       .NAME OF CONSOLE SWITCH ROUTINE
+CX80     DC    X'80'               .CODE FOR INTERREGION POST
+PROC2540 DC    CL8'IGC0207B'       .NAME OF 2540 DEVICE SUPPORT
+*                                  PROCESSOR
+         SPACE 3
+DSVEND   EQU   *
+DSVMNLEN EQU   (DSVEND-IEAVMDSV)/10
+DSVMAIN1 DS    0H                  HALF WORK BOUNDARY            Y02756
+DSVMAIN  DS    CL(DSVMNLEN)        .MAINTENANCE AREA
+         EJECT ,                                                 Y02756
+         IHAWQE
+         EJECT
+         IEECUCM FORMAT=NEW
+         EJECT
+UCBSECT  DSECT
+         IEFUCBOB
+         EJECT
+         CVT   DSECT=YES,PREFIX=NO
+         EJECT
+         IHASCVT
+         EJECT
+         IHACTM FTPT
+         EJECT
+         IHACTM CQE
+         EJECT
+         IHACTM WWB
+         EJECT
+         IHAASVT                   REQUIRED FOR GETMAIN/FREEMAIN Y02752
+         EJECT
+         IHAPSA                    REQUIRED FOR SETLOCK          Y02751
+         EJECT
+         IHAFRRS
+         EJECT
+         IEEBASEA
+         END

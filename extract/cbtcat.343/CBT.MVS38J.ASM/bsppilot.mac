@@ -1,0 +1,530 @@
+BSPPILOT TITLE 'Task for MVS Autopilot'
+***********************************************************************
+*                                                                     *
+*  Most of the time this program will do nothing. It will sit and wait*
+*  until it gets woken up via MODIFY or STOP command.  It will also   *
+*  wake up regularly via an alarm clock to avoid S522 abends          *
+*                                                                     *
+***********************************************************************
+         PRINT OFF,NOGEN
+CSCLDS   DSECT
+         IEZCOM                       , CSCL layout
+CIBDS    DSECT                        , CIB layout
+         IEZCIB
+         PRINT ON,NOGEN
+BSPPILOT BSPENTER BASE=(R11,R12),RENT=NO
+         TITLE 'Register Equates'
+CIBCBAR  EQU   R9                     , Command Schedule Comm List
+         USING CIBDS,CIBCBAR          , tell assembler
+CSCLCBAR EQU   R10                    , Command Schedule Comm List
+         USING CSCLDS,CSCLCBAR        , tell assembler
+         MVC   TIMRWAIT,INITWAIT      , set wait time
+         BAL   R14,GETPARMS           , read JCL PARM
+         BAL   R14,INITWTO            , Say hello
+         BAL   R14,XTRACTIT           , get CIB info from MVS
+         BAL   R14,CHECKSTC           , Test if this is STC
+         DO    WHILE=(TM,PROCFLAG,GETOUT,Z) loop till GETOUT flag set
+          IF   (TM,PROCFLAG,RESETCIB,O) need to reset CIB?
+           BAL R14,SETMAXRQ           , set maximum number of MODIFYs
+          ENDIF                       , loop until stopped
+          BAL  R14,WAITECBS           , wait for the ECB list
+          BAL  R14,TESTPOST           , Test who/what woken us up
+          BAL  R14,PROCECB            , process the ECB that was posted
+         ENDDO                        , end of loop
+         BAL   R14,SHUTCANC           , cancel shutdown sequence
+         IF    (TM,PARMFLAG,PARMNWTO,Z) should WTO be issued
+           WTO 'BSPPILOT - Program ended due to operator request'
+         ENDIF
+         BSPRET RC=0                  , return to caller
+         TITLE 'Subroutines - DOMODIFY: Process the MODIFY commands'
+***********************************************************************
+* Process the commands the user has entered via the MODIFY OS cmd
+***********************************************************************
+         SPACE 1
+DOMODIFY DS    0H                     , a MODIFY command was issued
+         STM   R14,R1,DOMOSAVE        , save the registers
+         LH    R15,CIBDATLN           , length of data from operator
+         BCTR  R15,0                  , minus 1 for EX
+         LA    R1,CIBDATA             , point to operator data
+         BLANK PARMAREA               , init receiving area
+         MVC   PARMAREA(*-*),0(R1)    , copy data to out storage
+         EX    R15,*-6                , do the actual copy
+         IF    (CLC,=C'STOP ',EQ,PARMAREA),OR,                         +
+               (CLC,=C'END ',EQ,PARMAREA)
+          OI   PROCFLAG,GETOUT        , indicate end of loop
+         ELSEIF (CLC,=C'CAT ',EQ,PARMAREA)
+          BAL   R14,INITWTO           , show splash screen
+         ELSEIF (CLC,=C'COOKIE ',EQ,PARMAREA)
+          ATTACH  EP=BSPFCOOK         , show fortune cookie
+         ELSEIF (CLC,=C'APFLIST ',EQ,PARMAREA)
+          ATTACH  EP=BSPAPFLS         , show APF datasets
+         ELSEIF (CLC,=C'TEST ',EQ,PARMAREA)
+          BAL  R14,TESTMSGS           , show WTO/WTOR for R2D2
+         ELSEIF (CLC,=C'SCRIPT=',EQ,PARMAREA)
+          LA   R0,7                   , Length of keyword SCRIPT=
+          BAL  R14,RUNSCRPT       , run a script
+         ELSEIF (CLC,=C'RUN=',EQ,PARMAREA)
+          LA   R0,4                   , Length of Keyword RUN=
+          BAL  R14,RUNSCRPT           , run a script
+         ELSEIF (CLC,=C'SHUTDOWN ',EQ,PARMAREA)
+          IF    (TM,PROCFLAG,SHUTDOWN,Z)    SHUTDOWN not yet active
+           WTO  'BSPPILOT - Shutdown was requested',DESC=11
+           ST   R1,SHTWTOID           , save WTOID
+           OI   PROCFLAG,SHUTDOWN     , indicate SHUTDOWN in progress
+           LA   R0,0                  , no keyword
+           LA   R15,7                 , length of command (-1)
+           BAL  R14,RUNSCRPT          , run the script
+          ENDIF
+         ELSEIF (CLC,=C'SHUTFAST ',EQ,PARMAREA)
+          IF    (TM,PROCFLAG,SHUTDOWN,Z)    SHUTDOWN not yet active
+           WTO  'BSPPILOT - Fast Shutdown was requested',DESC=11
+           ST   R1,SHTWTOID           , save ID of WTO
+           OI   PROCFLAG,SHUTDOWN     , indicate shutdown in progress
+           LA   R0,0                  , no keyword
+           LA   R15,7                 , length of command (-1)
+           BAL  R14,RUNSCRPT          , run the script
+          ENDIF
+         ELSEIF (CLC,=C'SHUTCANC ',EQ,PARMAREA)
+          BAL   R14,SHUTCANC
+         ELSEIF (CLC,=C'SETPF ',EQ,PARMAREA)
+          LINK  EP=BSPSETPF,PARAM=NOREPLYU
+         ELSE
+           WTO   'BSPPILOT - Modify command not recognized'
+         ENDIF
+         BAL   R14,DELETCIB           , remove processed CIB
+         OI    PROCFLAG,RESETCIB      , indicate CIB needs reset
+         LM    R14,R1,DOMOSAVE        , restore the registers
+         BR    R14                    , return to caller
+DOMOSAVE DS    4F                     , DOMODIFY Save area: R14 - R1
+         TITLE 'Subroutines - TESTMSGS: Send WTOS for testing R2D2'
+***********************************************************************
+* Send standardized messages to allow testing of the R2D2 routine     *
+***********************************************************************
+         SPACE 1
+TESTMSGS DS    0H                     , send messages to R2D2
+         STM   R14,R1,TSTMSAVE        , save return address
+          IF   (TM,PROCFLAG,WTORACTV,Z) If no WTOR currently active
+          OI   PROCFLAG,WTORACTV      , indicate WTOR is active
+          WTOR 'BSPTEST0 - Reply C to continue. U to ignore',          +
+               WTOREPLY,L'WTOREPLY,WTORECB
+          ST   R1,WTOID               , save message ID
+          MVC  TIMRWAIT,WTORWAIT      , wait at most 30 seconds
+          WTO  'BSPTEST1 - The message above is for testing the auto-pil
+               lot, and will be cancelled automatically'
+          WTO  'BSPTEST2 - The next message is $HASP000, which should be
+               e suppressed'
+          WTO  '$HASP000 Message generated by Autopilot'
+          WTO  'BSPTEST3 - Last generated test message'
+         ELSE
+          WTO  'BSPPILOT - Test messages not generated, WTOR already act
+               ive'
+         ENDIF
+         LM    R14,R1,TSTMSAVE        , restore registers
+         BR    R14                    , return to caller
+TSTMSAVE DS    4F
+         TITLE 'Subroutines - RUNSCRPT: Run a script'
+***********************************************************************
+* Runs a named script.                                                *
+* Registers on entry: R0 ---> Length of keyword passed                *
+*                     R14 =   Return address                          *
+*                     R15 =   Length modify parm - 1                  *
+***********************************************************************
+         SPACE 1
+RUNSCRPT DS    0H                     , run a script
+         STM   R14,R1,RUNSSAVE        , save return address
+         IF    (TM,PROCFLAG,RUNSCACT,Z) BSPRUNSC not yet active
+          BLANK RUNSCPR2              , set to blanks
+          IF   (SR,R15,R0,NM)         , If length of Key value is plus
+           IF  (CH,R15,GT,=H'7')
+            LA R15,7                  , set maximum length
+           ENDIF
+           LA  R1,PARMAREA            , point to MODIFY parm
+           AR  R1,R0                  , add length of keyword
+           MVC RUNSCPR2(*-*),0(R1)    , R1 ---> Scriptname
+           EX  R15,*-6                , insert script parmlist
+           MVC RUN0011,RUNSCPR2       , and into msg
+           LA  R15,1(R15)             , get real length
+           STH R15,RUNSCPR1           , set length of script name
+           CNOP 0,4
+RUN0010    WTO  'BSPPILOT - Running script yyyyyyyy'
+RUN0011    EQU  RUN0010+8+26,8
+           OI   PROCFLAG,RUNSCACT     , disallow BSPRINSC processing
+           ATTACH EP=BSPRUNSC,PARAM=RUNSCPRM,ECB=RUNSCECB
+           ST  R1,TCBADDR             , save TCB address
+           STC  R15,ONEBYTE           , save RC
+           IF  (CLI,ONEBYTE,NE,0)     , error happened?
+            XR R15,R15                , Clear workreg
+            IC R15,ONEBYTE            , Load return code
+            CVD R15,DOUBLE            , make a number
+            UNPK RUN0021,DOUBLE+6(2)  , make printable
+            OI  RUN0021+2,C'0'        , ditto
+            MVI RUN0021,C' '          , ditto
+            CNOP 0,4
+RUN0020     WTO 'BSPPILOT - Script finished with RC=XXX. '
+RUN0021     EQU RUN0020+8+35,3
+           ENDIF
+          ELSE
+           WTO  'BSPPILOT - No script name given, request ignored'
+          ENDIF
+         ELSE
+          WTO  'BSPPILOT - Script processor already active',           +
+               '           This request ignored'
+         ENDIF
+         LM    R14,R1,RUNSSAVE        , restore registers
+         BR    R14
+RUNSSAVE DS    4F
+         TITLE 'Subroutines: TIMERXIT - STIMER Exit Routine'
+***********************************************************************
+* This exit routine is invoked whenever the STIMER pops.  It will then*
+* post the TIMER ECB, that way waking up the Autopilot proper         *
+***********************************************************************
+         SPACE 1
+TIMERXIT DS    0H                     , STIMER Exit Routine
+XOFFSET  EQU   TIMERXIT-BSPPILOT      , Used for calculating base
+         STM   R14,R12,12(R13)        , save caller's registers
+         LR    R11,R15                , save entry point address
+         LA    R15,XOFFSET            , get offset from first base
+         SR    R11,R15                , calculate 1 base of main pgm
+         LR    R3,R13                 , Higher SA
+         LA    R13,TIMERSA            , out SA
+         ST    R3,4(0,R13)            , Higher SA into lower SA
+         ST    R13,8(0,R3)            , lower SA into Higher SA
+         LA    R3,TIMERECB            , address of ECB
+         POST  (R3)                   , post it
+         L     R13,4(0,R13)           , restore higher SA
+         LM    R14,R12,12(R13)        , restore registers
+         BR    R14                    , return to caller
+TIMERSA  DC    18F'0'
+         TITLE 'Subroutines: GETPARMS - Get JCL Paramters'
+***********************************************************************
+* This routines reads the JCL parameters and sets PARMFLAg accordingly*
+***********************************************************************
+GETPARMS DS    0H
+         STM   R14,R1,GETPSAVE        , save return address
+         BLANK PARMAREA               , clear parm text area
+         XC    PARMFLAG,PARMFLAG      , clear parm flag
+         XC    PROCFLAG,PROCFLAG      , clear processing flag
+         L     R1,0(0,R1)             , Address of passed parm
+         LH    R15,0(0,R1)            , Length of Parameter
+         LA    R1,2(0,R1)             , address of parameter
+         IF    (LTR,R15,R15,Z)        , No parm present?
+          OI   PARMFLAG,PARMCWTO      , then at least allow the cat
+         ELSE                         , some parm was provided
+          BCTR R15,0                  , decrement for EXecute
+          MVC  PARMAREA(*-*),0(R1)    , move in parameters
+          EX   R15,*-6                , move in the parm text
+          OC   PARMAREA,=CL100' '     , Convert to upper case
+          IF   (CLC,=C'NOWTO ',EQ,PARMAREA) Silent mode, indicate
+           OI  PARMFLAG,PARMNWTO      , by setting bit flag
+           OI  PROCFLAG,MSGDOMED      , indicate no DOM needed
+          ELSEIF (CLC,=C'CATWTO ',EQ,PARMAREA) Splash screen?
+           OI  PARMFLAG,PARMCWTO      , Allow the little cat
+           OI  PARMFLAG,PARMNWTO      , Disallow everything else
+          ELSE
+           OI  PARMFLAG,PARMCWTO      , Allow splash
+          ENDIF
+         ENDIF
+         LM    R14,R1,GETPSAVE        , restore return address
+         BR    R14                    , and return to caller
+GETPSAVE DS    4F
+         TITLE 'Subroutine: INITWTO - Display splash message'
+***********************************************************************
+* This routine shows the splash screen,  When the timer pops, the     *
+* splash screen will be domed                                         *
+***********************************************************************
+INITWTO  DS    0H                     , Display splash screen
+         STM   R14,R1,INITSAVE        , save registers
+         MVC   TIMRWAIT,INITWAIT      , set initial wait time
+         IF    (TM,PARMFLAG,PARMCWTO,O) Should the cat be shown?
+          WTO  '                                 ',                    +
+               '         ×l      _,,,---,,_      ',                    +
+               '   ZZZzz /,:.-'':''    -.  ;-;;,   ',                  +
+               '        ×,4-  ) )-,_. ,( (  :''-'' ',                  +
+               '       ''---''''(_/--''  :-'')_)      ',               +
+               '                                 ',                    +
+               ' Don''t disturb me, I am snooz ... errr working',      +
+               '                                 ',                    +
+               DESC=11
+          ST   R1,MSGID               , save message ID
+          NI   PROCFLAG,255-MSGDOMED  , Message is visible
+         ENDIF                        ,
+         LM    R14,R1,INITSAVE        , restore return address
+         BR    R14                    , return to caller
+INITSAVE DS    4F                     , save area
+         TITLE 'Subroutines: XTRACTIT - Get CIB Info from MVS'
+***********************************************************************
+* Use EXTRACT to get CIB information from MVS                         *
+***********************************************************************
+         SPACE 1
+XTRACTIT DS    0H                     , get CIB info from MVS
+         STM   R14,R1,XTRASAVE        , save return address
+         EXTRACT CSCLADDR,FIELDS=COMM , get the CSCLADDR from MVS
+         LM    R14,R1,XTRASAVE        , restore return address
+         BR    R14                    , return to caller
+XTRASAVE DS    4F                     , save area
+         TITLE 'Subroutines: CHECKSTC - Check if STC, delete CIB'
+***********************************************************************
+* Check if a started task, and if so, delete initial CIB              *
+***********************************************************************
+         SPACE 1
+CHECKSTC DS    0H                     , Set max number of MOFIFY cmds
+         STM   R14,R1,CHECSAVE        , save return address
+         L     CSCLCBAR,CSCLADDR      , get address of CSCL
+         L     CIBCBAR,COMCIBPT       , get address of CIB
+         IF    (LTR,CIBCBAR,CIBCBAR,NZ) Is there a CIB?
+          BAL  R14,DELETCIB           , delete START CIB of STC
+          OI   PROCFLAG,RESETCIB      , indicate reset required
+         ENDIF
+         LM    R14,R1,CHECSAVE        , restore return address
+         BR    R14                    , return to caller
+CHECSAVE DS    4F
+         TITLE 'Subroutines: DELETCIB - Delete first CIB on chain'
+***********************************************************************
+* Delete the first CIB from the chain                                 *
+***********************************************************************
+         SPACE 1
+DELETCIB DS    0H                     , Delete first CIB on chain
+         STM   R14,R1,DELESAVE        , save registers
+         L     CSCLCBAR,CSCLADDR      , get address of CSCL
+         L     CIBCBAR,COMCIBPT       , get address of CIB
+         QEDIT ORIGIN=COMCIBPT,BLOCK=(CIBCBAR) free CIB
+         LM    R14,R1,DELESAVE        , restore return address
+         BR    R14                    , return to caller
+DELESAVE DS    4F                     , save area
+         TITLE 'Subroutines: SETMAXRQ - Set max number of MODIFY cmds'
+***********************************************************************
+* Set maximum number of concurrent MODIFY requests                    *
+***********************************************************************
+         SPACE 1
+SETMAXRQ DS    0H                     , Set max number of MOFIFY cmds
+         STM   R14,R1,SETMSAVE        , save return address
+         L     CSCLCBAR,CSCLADDR      , get address of CSCL
+         QEDIT ORIGIN=COMCIBPT,CIBCTR=1 only 1 MODIFY at a time
+         LM    R14,R1,SETMSAVE        , restore return address
+         BR    R14                    , return to caller
+SETMSAVE DS    4F                     , save area
+         TITLE 'Subroutines: TESTPOST - Has CIB been posted'
+***********************************************************************
+* This routines tests which of the ECBs in the ECBlist has been       *
+* posted, and why                                                     *
+* Registers on Entry:  R14 = Return address                           *
+* Registers on Exit :  R15 = Return code                              *
+*                        0 : MODIFY command                           *
+*                        4 : STOP command                             *
+*                        8 : TIMER ECB posted or WTOR ECB posted      *
+*                       12 : BSPRUNSC ECB posted                      *
+***********************************************************************
+TESTPOST DS    0H                     , Test ECBLISt and posted ECB
+         STM   R14,R1,TESTSAVE        , save return address
+         L     CSCLCBAR,CSCLADDR      , get address of CSCL
+         L     R1,COMECBPT            , address of ECB
+         NI    PROCFLAG,255-RESETCIB  , turn off reset flag
+         IF    (TM,0(R1),ECBPOST,O)   , if CIB ECB was posted
+          BAL  R14,CMDCHECK           , Check if MODIFY or POST
+          OI   PROCFLAG,RESETCIB      , inicate CIB needs a reset
+         ELSEIF (TM,TIMERECB,ECBPOST,O)
+          IF   (TM,PROCFLAG,WTORACTV,O) Is a WTOR active?
+           L   R1,WTOID               , get ID of WTOR
+           DOM MSG=(1),REPLY=YES      , and kill it
+           NI  PROCFLAG,255-WTORACTV  , turn off flag
+           XC  WTOID,WTOID            , clear ID
+           WTO 'BSPPILOT - Message cancelled due to Timeout'
+          ENDIF
+          LA   R15,8                  , return with RC=8,
+         ELSEIF (TM,WTORECB,ECBPOST,O) Reply given to WTOR?
+          NI   PROCFLAG,255-WTORACTV  , turn off flag
+          XC   WTOID,WTOID            , clear ID
+          LA   R15,8                  , return with RC=8,
+         ELSEIF (TM,RUNSCECB,ECBPOST,O) if TIMER ECB was posted
+          LA   R15,12                 , indicate RUNSC ECB posted
+         ELSE
+          WTO  'BSPPILOT - ECB posted but not part of ECBLIST'
+          ABEND 3,DUMP
+         ENDIF
+         ST    R15,TESTSAVE+4         , set caller's R15
+         LM    R14,R1,TESTSAVE        , restore return address
+         BR    R14                    , return to caller
+TESTSAVE DS    4F                     , save area
+         TITLE 'Subroutines: CMDCHECK - Test type of command'
+***********************************************************************
+* Test type of command,  could be STOP command (p) or MODIFY (f)      *
+* Registers on Entry: R14 = Return address                            *
+* Registers on Exit : R15 = Return code                               *
+*                       0 = MODIFY command                            *
+*                       4 = STOP   command                            *
+***********************************************************************
+         SPACE 1
+CMDCHECK DS    0H                     , Test type of command
+         STM   R14,R1,CMDCSAVE        , save return address
+         L     CSCLCBAR,CSCLADDR      , get address of CSCL
+         L     CIBCBAR,COMCIBPT       , get address of CIB
+         IF    (CLI,CIBVERB,EQ,CIBMODFY) MODIFY Command?
+          IF   (TM,PARMFLAG,PARMNWTO,Z)  Do we want WTOs?
+           WTO 'BSPPILOT - Modify command accepted'
+          ENDIF
+          LA   R15,0                  , indicate MODIFY
+         ELSEIF (CLI,CIBVERB,EQ,CIBSTOP)
+          IF   (TM,PARMFLAG,PARMNWTO,Z)  Do we want WTOs?
+           WTO 'BSPPILOT - Stop command accepted'
+          ENDIF
+          LA   R15,4                  , indicate STOP
+         ELSE
+          WTO   'BSPPILOT - Neither STOP nor MODIFY command'
+          ABEND 2,DUMP                , abend, with dump
+         ENDIF
+         ST    R15,CMDCSAVE+4         , set caller's R15
+         LM    R14,R1,CMDCSAVE        , restore register
+         BR    R14                    , return to caller
+CMDCSAVE DS    4F                     , save area
+         TITLE 'Subroutines - WAITECBS: Wait for for list of ECBS'
+***********************************************************************
+* Setup the list of ECBs, and wait.  Regardless which ECB got posted  *
+* remove the spalsh screen (if any)                                   *
+***********************************************************************
+         SPACE 1
+WAITECBS DS    0H                     , Wait for list of ECBs
+         STM   R14,R1,WAITSAVE        , Save Registers
+         XC    TIMERECB,TIMERECB      , clear ECB
+         XC    RUNSCECB,RUNSCECB      , clear ECB
+         XC    WTORECB,WTORECB        , clear ECB
+         LA    R1,TIMERECB            , get address of timer ECB
+         ST    R1,TIMECBA             , and save it
+         LA    R1,WTORECB             , address if WTOR ECB
+         ST    R1,WTOECBA             , put into ECB List
+         L     CSCLCBAR,CSCLADDR      , get address of CSCL
+         L     R1,COMECBPT            , address of ECB
+         ST    R1,CIBECBA             , into wait list
+         LA    R1,RUNSCECB            , address of BSPRUNSC ECB
+         ICM   R1,B'1000',=X'80'      , insicate last ECB
+         ST    R1,RSECBA              , Put into ECB List
+         STIMER REAL,TIMERXIT,DINTVL=TIMRWAIT
+         WAIT  1,ECBLIST=ECBLIST      , wait on ECBLIST
+         MVC   TIMRWAIT,WAITTIME      , set normal wait time
+         IF    (TM,PROCFLAG,MSGDOMED,Z) message still visible
+          OI   PROCFLAG,MSGDOMED      , indicate it has been domed
+          L    R1,MSGID               , get message ID
+          DOM  MSG=(1)                , and delete it
+         ENDIF
+         LM    R14,R1,WAITSAVE        , restore registers
+         BR    R14                    , return to caller
+WAITSAVE DS    4F                     , WAITSAVE Save area R14 - R1
+         TITLE 'Subroutines - PROCECB : Process the posted ECB'
+***********************************************************************
+* An ECB has been posted.  Do the appropriate action                  *
+***********************************************************************
+PROCECB  DS    0H                     , Process the posted ECB
+         STM   R14,R1,PROCSAVE        , Save Registers
+         IF    (CH,R15,EQ,=H'0')      , Was it a MODIFY command
+          BAL  R14,DOMODIFY           , process inout command
+         ELSEIF (CH,R15,EQ,=H'4')     , STOP command
+          OI   PROCFLAG,GETOUT        , Leave the loop
+         ELSEIF (CH,R15,EQ,=H'8')     , TIMER ECB posted
+          NI   PROCFLAG,255-RESETCIB  , No reset of CIB needed
+         ELSEIF (CH,R15,EQ,=H'12')    , BSPRUNSC ECB posted?
+          BAL  R14,DORUNSC            , show BSPRUNSC completion code
+         ELSE                         , this must be invalid
+          CVD  R15,DOUBLE             , Make a number
+          BLANK PROC011               , initialize
+          UNPK PROC011,DOUBLE+6(2)    , make zoned
+          OI   PROC011+L'PROC011-1,C'0' and printable
+PROC010   WTO 'BSPPILOT - Invalid return code (XXXX) from TESTPOST'
+PROC011   EQU PROC010+8+32,4
+          ABEND 4,DUMP
+         ENDIF
+         LM    R14,R1,PROCSAVE        , restore the registers
+         BR    R14                    , return to caller
+PROCSAVE DS    4F                     , PROCECB  Save area: R14 - R1
+         TITLE 'Subroutines - DORUNSC : Process RUNSC ECB'
+***********************************************************************
+* The RUNSC ECB has been posted.  Detach the task, and report CC      *
+***********************************************************************
+DORUNSC  DS    0H                     , Process the RUNSC ECB
+         STM   R14,R1,DORUSAVE        , save registers
+         DETACH TCBADDR               , and detach task
+         XR    R1,R1                  , Clear workreg
+         IF    (ICM,R1,B'0111',RUNSCECB+1,NZ) Any error?
+          L    R1,RUNSCECB            , get contents of ECB
+          N    R1,=X'00FFF000'        , mask out user code
+          SRL  R1,12                  , R1 = '00000FFF'
+          ST   R1,FULLW               , put into work area
+          X2CHRTRN DORU011,FULLW+2,LEN=2 Make 4 bytes printable
+          MVI  DORU011,C'S'           , first byte overlayed by 'S'
+          L    R1,RUNSCECB            , get contents of ECB
+          N    R1,=X'00000FFF'        , mask out system code
+          CVD  R1,DOUBLE              , make a decimal number
+          UNPK DORU012,DOUBLE+5(3)    , place into message
+          OI   DORU012+L'DORU012-1,C'0' make last character printable
+          CNOP  0,4
+DORU010   WTO  'BSPPILOT - Script processor ended, SXXX, Uxxxx'
+DORU011   EQU  DORU010+8+35,4
+DORU012   EQU  DORU010+8+42,4
+         ENDIF
+         NI    PROCFLAG,255-RUNSCACT  , allow BSPRUNSC processing now
+         BAL   R14,SHUTCANC           , remove shutdown msg if any
+         LM    R14,R1,DORUSAVE        , restore registers
+         BR    R14                    , retrun to caller
+DORUSAVE DS    4F
+         TITLE 'Subroutines - SHUTCANC: Cancel Shutdown Sequence'
+***********************************************************************
+* The shutdown TCB will be detached unconditionally                   *
+***********************************************************************
+SHUTCANC DS    0H                     , Cancel shutdown
+         STM   R14,R1,SHUTSAVE        , save registers
+         IF    (TM,PROCFLAG,SHUTDOWN+RUNSCACT,O)
+           WTO 'BSPPILOT - Shutdown sequence terminated'
+           NI  PROCFLAG,255-SHUTDOWN-RUNSCACT
+           DETACH TCBADDR             , stop BSPRUNSC
+           L   R1,SHTWTOID            , Get ID of shutdown WTO
+           IF  (LTR,R1,R1,NZ)         , if any
+            XC SHTWTOID,SHTWTOID      , clear field
+            DOM MSG=(1)               , unhighlight shutdown msg
+           ENDIF                      , is there a MSGID
+         ENDIF                        , is shutdown in progress
+         LM    R14,R1,SHUTSAVE        , restore registers
+         BR    R14                    , return to caller
+SHUTSAVE DS    4F                     , SHUTCANC Save Area: R14 - R1
+         TITLE 'Constants'
+WTORWAIT DC    C'00003000'            , 30 seconds wait time
+INITWAIT DC    C'00001000'            , 10 seconds wait time
+WAITTIME DC    C'00100000'            , 10 minutes wait time
+         DS    0F
+EXECPARM DC    AL2(4),C'EXEC'
+         DS    0F
+NOREPLYU DC    AL2(8),C'NOREPLYU'
+         TITLE 'Variables'
+TIMRWAIT DS    D
+DOUBLE   DS    D                      , general purpose doubleword
+FULLW    DS    F                      , general Purpose fullword
+CSCLADDR DS    F                      , Reply area for EXTRACT
+TIMERECB DS    F                      , number of ECBs in list
+WTORECB  DS    F                      , number of ECBs in list
+RUNSCECB DS    F                      , RUNSC ECB
+ECBLIST  DS    0F                     , list of ECBs we are waiting for
+WTOECBA  DS    F
+TIMECBA  DS    F                      , posted on STIMER WAIT
+CIBECBA  DS    F                      , posted on MODIFY/STOP
+RSECBA   DS    F                      , RUNSC subtask ECB
+MSGID    DS    F                      , ID of initial message
+WTOID    DS    F                      , ID of WTOR to be cancelled
+SHTWTOID DS    F                      , ID of shutdown WTO
+TCBADDR  DS    F                      , address of BSPRUNSC TCB
+RUNSCPRM DS    0F                     , parameters for BSPRUNSC
+RUNSCPR1 DS    AL2                    , length of parm
+RUNSCPR2 DS    CL8                    , name of script
+ECBPOST  EQU   B'01000000'            , X'40': ECB was posted
+PROCFLAG DS    X                      , processing flag
+INITDONE EQU   B'10000000'            , initialization is done
+MSGDOMED EQU   B'01000000'            , Initial message deleted
+WTORACTV EQU   B'00100000'            , WTOR on screen
+RESETCIB EQU   B'00010000'            , Reset of CIB required
+GETOUT   EQU   B'00001000'            , End of program requested
+RUNSCACT EQU   B'00000100'            , BSPRUNSC is active
+SHUTDOWN EQU   B'00000010'            , SHUTDOWN in progress
+PARMFLAG DS    X                      , JCL PARM flag
+PARMNWTO EQU   B'10000000'            , X'80': PARM=NOWTO specified
+PARMCWTO EQU   B'01000000'            , X'04': PARM=CATWTO specified
+PARMINV  EQU   B'00000001'            , X'01': invalid PARM field
+PARMAREA DS    CL100                  , for JCL parameters
+WTOREPLY DS    0C                     , reply area for WTOR
+ONEBYTE  DS    C                      , Work area for RC
+         BSPEND                       , of module

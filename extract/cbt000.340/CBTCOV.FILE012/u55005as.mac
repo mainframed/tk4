@@ -1,0 +1,803 @@
+*      IDENTIFICATION DIVISION.
+*      PROGRAM-ID. SSU07FLK.
+*
+*
+*       FUNCTION - TO LIST THE VOLUME TABLES OF CONTENTS OF ALL
+*              ONLINE 2311/2314 PACKS AND OPTIONALLY SCRATCH RUBBISH
+*              DATA SETS.
+*              ALSO TO RECORD THE PHYSICAL LOCATION OF 2314 VOLUMES
+*              AND PUNCH CARDS TO ASSIST RECOVERY OF LOST SYSOUT.
+*
+*        EXEC CARD PARAMETERS...     OPT=CPKNESQ  -LETTERS IN ANY
+*                                              COMBINATION-
+*                                             C - CHECK WHETHER CATLGD
+*      THE C OPTION (CHECK WHETHER CATALOGUED) CAUSES A LOCATE TO BE
+*      ISSUED FOR EACH DATA SET. THIS OPTION ADDS SUBSTANTIALLY TO
+*      EXECUTION TIME.
+*                                             P - PICTURE REQUIRED
+*                                             E - EDITED PRINTOUT
+*                                             K - CONSOLE ID LIST
+*                                             N - NOLIST
+*                                             S - SCRATCH RUBBISH
+*      RUBBISH SCRATCHED IS DEFINED AS BEGINNING WITH '**SYSUT', 'TEMP'
+*      AND SYSTEM TEMPORARY DATA SETS - ONLY SCRATCHED IF OPT=S...
+*      SYSTEM TEMPORARY IS DEFINED AS BEGINNING 'SYS6' OR 'SYS7', R
+*      AS 18TH CHARACTER AND 'S000' NOT THE FIRST 4 CHARACTERS OF THE
+*      FIFTH QUALIFIER.
+*       IF THE ATTEMPT TO SCRATCH FAILS A MESSAGE IS PRINTED CONTAINING
+*      THE RETURN CODE AS IN SYSTEM PROGRAMMERS GUIDE - E.G NOT SCR 3
+*      INDICATES RETENTION CYCLE NOT EXPIRED.
+*      RETENTION DATES ARE NEVER OVERRIDDEN.
+*                                             Q - SCRATCH SYSIN
+*                                             X - SCRATCH SYSOUT
+*      PROGRAM WILL NOT SCRATCH ITS OWN SYSIN/SYSOUT
+*                                             D - DEBUG. LISTS DSCB
+*                                                  CCHHR'S AND DUMPS
+*                                                  ON AN ERROR. USER
+*                                                  0100 IS COMPLETION
+*                                                  CODE.
+*
+*                                    LCT= LINES PER PAGE
+*
+*
+*      DD CARDS..   //SYSPRINT DD SYSOUT=A - PRINTED OUTPUT
+*                   //SYSPUNCH DD SYSOUT=B - IF RESCUE CARDS REQUIRED.
+*                   //PICTURE - POINTING TO ANY 2314 VOLUME ON THE
+*                               SYSTEM  E.G  DD VOLUME=REF=SYS1.LINKLIB
+*                                               UNIT=2314,DISP=OLD
+*                               IT IS USED BY EXCP IN GETTING SENSE
+*                               BYTES AND LABEL INFORMATION, REQD ONLY
+*                               WHEN OPT=P SPECIFIED.
+*                           NO OTHERS REQUIRED EXCEPT TO FORCE THE
+*                           MOUNTING OF SPECIFIC PACKS E.G.
+*                           //DDANY DD UNIT=2311,VOLUME=...,DISP=OLD
+*
+*      IF SYSPUNCH OPENS SUCCESSFULLY, A CARD IS PUNCHED FOR EACH
+*      SYSOUT DS ENCOUNTERED EXCEPT ITS OWN. IF ANY OF THESE DATA SETS
+*      HAS A RECORD LENGTH OF 80 BYTES ITS ULTIMATE DESTINATION IS
+*      ASSUMED TO BE THE PUNCH, HENCE CLASS B.
+*
+*      PRINTER RECORD IS 133 BYTES WITH ASA CONTROL CHARACTER.
+*      DEFAULT BLOCKIZE IS 1330 BYTES
+*
+*      PUNCH IS 80 BYTES, DEFAULT BLOCKIZE 1040 BYTES.
+*
+*      EACH RUN OF THE PROGRAM IS GIVEN A UNIQUE RUN NUMBER STARTING
+*      AT 1. AN ENTRY IS CREATED IN THE SYSTEM CATALOGUE FOR A DATA
+*      SET CALLED 'FLASH' AND THE VOLUME SERIAL ON WHICH IT IS
+*      SUPPOSED TO RESIDE IS REALLY THE TOTAL NUMBER OF RUNS
+*       (IN EBCDIC)
+*
+* ERROR HANDLING...
+*      MISSING //PICTURE DD IS PARTIALLY CIRCUMVENTED WITH NO ERROR
+*      MESSAGE - CHECKS UCB FOR STORED SENSE BYTES INSTEAD OF USING
+*      EXCP.
+*      INVALID PARAMETERS IN THE EXEC CARD ARE IGNORED.
+*      ANY ERRORS WHILE READING THE VTOC CAUSE A MESSAGE
+*                 ILC00N R15=... TO BE PRODUCED AND PROGRAM SKIPS
+*      TO THE NEXT VOLUME. N IS EXPECTED DSCB FORMAT AND R15=... GIVES
+*      THE RETURN CODE FROM 'OBTAIN'
+*
+* EDITED PRINTOUT GIVES ONLY SCRATCHED DATA SETS AND FREE SPACE.
+*
+*      DOS PACKS ARE PRINTABLE WITH THIS PROGRAM
+*
+*                   * OCTOBER 1969 *
+*
+         EJECT
+         MACRO
+&N       MOVE  &FROM
+         GBLC  &TO
+         LCLA  &LEN
+&LEN     SETA  L'&FROM
+&N       MVC   &TO.(&LEN.),&FROM
+         BAL   12,PRTEXT
+         MEND
+         GBLC  &TO
+*
+$PDS     DSECT
+         USING *,10
+$PDSLINK DS    F
+$PDSCARD DS    CL8
+$PDSFILE DS    CL44
+$PDSREQ  EQU   *-$PDS
+$PDSREG  EQU   10                       DEFINE REGISTER
+*                        *** REGISTER USAGE ***
+*                   R0 AND R1 - VARIOUS
+*                   R2        - UNUSED
+*                   R3        - BASE REG
+*                   R4        - LINE COUNT
+*                   R5        - SECOND BASE REG
+*                   R6        - UCB ADDRESS AND COUNT OF DSCBS PER TRK
+*                   R7        - INDEXES THROUGH UCB LIST
+*                   R8        - ARITHMETIC
+*                   R9        - ARITHMETIC AND SUBROUTINE RETURN
+*                   R10       - POINTS TO POSITION IN OUTPUT AREA ON
+*                               ENTRY TO DTPT (DATE PRINT) SUBROUTINE.
+*                               ALSO INDEXES THROUGH F3 EXTENTS
+*                   R11       - ARITHMETIC ... EXTENT PROCESSING
+*                   R12       - SUBROUTINE LINKAGE
+*                   R13       - SAVE AREA
+*                   R14 AND R15 - STANDARD OS USAGE
+*
+SSU07FLK ENTER ENT=FLICKER
+         L     5,ADATA
+         USING DATASET,5
+&TO      SETC  'EXTS'
+         ST    1,PARM
+         L     8,0(0,1)            CHECK PARM
+         CLC   0(2,8),=H'5'                 LENGTH
+         BNE   DESCRIPT            NOT KNOWN
+         CLC   2(5,8),=C'NOPDS'    IS IT THE ONE WE WANT?
+         BNE   DESCRIPT            NO
+         OI    PDSF,1              SET FLAG
+         B     DESCRIPT  TO PRINT INTRODUCTORY PAGE
+*
+DESCREND EQU   *
+         CLI   NOCBR+1,X'F0'       CHECK CATALOG LOOKUP REQD
+         BE    SKIPCAT        NO
+         GETMAIN R,LV=272          GET WORK AREA
+         ST    1,CATENTRY+12       STORE IN CAMLST EXPANSION
+SKIPCAT  EQU   *
+         TIOT
+         LA    7,24(,1)
+         B     ISVAL
+NX       SR    6,6
+         IC    6,0(,7)
+         AR    7,6
+ISVAL    CLC   =F'0',0(7)
+         BE           PHASE2
+         CLC   =CL8'JOBLIB',4(7)
+         BE    NX
+         CLC   =CL8'STEPLIB',4(7)
+         BE    NX
+         CLC   =CL8'SYSPRINT',4(7)
+         BE    NX
+         LH    6,18(,7)                LOCATE UCB
+         CLI   18(6),X'20'    DIRECT ACCESS
+         BNE   NX
+         TM    3(6),X'80'     ONLINE
+         BZ    NX
+         TM    6(6),X'40'
+         BO    NX             NOT READY
+         TM    3(6),X'10'         UNLOADED
+         BO    NX
+         MVI   DEVTYP+5,X'40'      BLANK ID LETTER
+         CLI   19(6),X'01'    2311
+         BNE   NOT2311
+         MVC   DIV,TEN
+         MVC   DEVTYP(4),=C'2311'
+         MVC   VST+2(4),SC2311
+         B     UCBOK
+NOT2311  CLI   19(6),X'08'        IS IT A 2314
+         BNE   NOT2314
+         MVC   DIV,TWENTY
+         MVC   VST+2(4),SC2314
+         MVC   DEVTYP(4),=C'2314'
+         B     UCBOK
+NOT2314  CLI   19(6),X'09'             IS 3330
+         BNE   NX
+         MVC   DIV,NINETEEN
+         MVC   VST+2(4),=X'30502009'   DEVICE TYPE
+         MVC   DEVTYP(4),=C'3330'
+*
+UCBOK    EQU   *
+         MVC   LINE+21(6),28(6)    VOLUME SERIAL TO HEADING
+         MVC   VOL(6),28(6)             AND TO CAMLST
+         MVC   LINE+9(3),13(6)     UNIT NAME
+         MVC   LINE+45(9),LINE+55  MOVE BLANKS OVER CONT MESSAGE
+*                        *** GET DATE AND TIME ***
+         TIME  DEC
+         ST    0,CLOK
+         ST    1,DAY
+         MVC   LINE+80(7),ED1
+         MVC   LINE+90(9),ED2
+         ED    LINE+80(7),DAY+1
+         ED    LINE+90(9),CLOK
+         LA    4,1
+*                        *** PRINT HEADINGS - R4=1 GIVES PAGE END COND.
+         BAL   12,PRT2
+         MVC   LINE+45(9),=C'CONTINUED'
+*
+*                        *** OBTAIN VTOC ADDRESS FROM THE UCB ***
+         L     9,36(6)    VTOC ADDRESS
+        SRL   9,8
+         STC   9,CCHHVTOC+4
+         SRL   9,8
+         SR    8,8
+         D     8,DIV
+         STH   8,CCHHVTOC+2       STORE HH
+         STH   9,CCHHVTOC
+         MVC   CCHHR(5),CCHHVTOC  TRANSFER VTOC ADDRESS
+         OBTAIN DSCB
+         MVI   ERMSG+6,C'4'
+         LTR   15,15
+         BNZ   ERROR
+         CLI   WORK+44,C'4'       CHECK FORMAT 4
+         BNE   ERROR
+         MVC   EXTS+1(24),=C'VOLUME TABLE OF CONTENTS'
+         LA    10,WORK+105
+         BAL   9,EXTPRT           PRINT VTOC EXTENT
+NOPRTVTC EQU   *
+         TM    WORK+58,X'80'
+         BZ    F4A                CHECK VTOC INTEGRITY
+         MOVE   INTEG
+F4A      EQU   *
+*                        *** ADDRESS OF HIGHEST F1 DSCB STOPS SCAN ***
+         MVC   LASTF1,WORK+45
+*                        *** DSCB'S PER TRACK ***
+         MVC   TCAP+1(1),WORK+74
+         LH    6,TCAP
+         S     6,ONE
+*                        *** STORE ADDRESS OF F5 DSCB FOR LATER USE ***
+         L     9,CCHHR+1
+         A     9,ONE
+         MVC   F5CCHHR,CCHHR
+         ST    9,F5CCHHR+1
+*                        *** OBTAIN NEXT DSCB ***
+FIND     L     8,CCHHR+1
+         A     8,ONE
+         ST    8,CCHHR+1
+         CLI   NODUMP+1,0
+         BNE   NODSCBAD
+         SR    8,8
+         IC    8,CCHHR+1
+         CVD   8,DATE
+         UNPK  EXTS+18(3),DATE+6(2)
+         OI    EXTS+20,X'F0'
+         IC    8,CCHHR+3
+         CVD   8,DATE
+         UNPK  EXTS+22(3),DATE+6(2)
+         OI    EXTS+24,X'F0'
+         IC    8,CCHHR+4
+         CVD   8,DATE
+         UNPK  EXTS+26(3),DATE+6(2)
+         OI    EXTS+28,X'F0'
+         MVI   EXTS+22,X'40'
+         BAL   12,PRTEXT
+NODSCBAD EQU   *
+         OBTAIN DSCB
+         MVI   ERMSG+6,C'1'
+         C     15,=F'8'
+         BE    CHK
+** NOTE *****            *** READING A FORMAT ZERO DSCB GIVES THIS
+*                            ERROR
+         LTR   15,15
+         BNZ   ERROR
+*                        *** CHECK FOR F1 ***
+         CLI   WORK+44,C'1'
+         BE    F1
+CHK      EQU   *
+         CLC   CCHHR,LASTF1
+         BNL   READ5    END IF CCHHR GREATER THAN HIGHEST F1
+         BCT   6,FIND   MORE DSCBS UNLESS ALL TRACK READ
+         LH    6,TCAP             RESET DSCB COUNT
+         L     8,CCHHR+1
+         A     8,=F'256'      ADD 1 TO HH
+         IC    8,ZERO         RESET R
+         ST    8,CCHHR+1
+*      CHECK FOR END OF CYLINDER
+         CLC   CCHHR+2(2),DIV+2
+         BL    FIND
+         A     8,ONECYL
+         N     8,HHZERO
+         ST    8,CCHHR+1
+         B     FIND
+         EJECT
+*
+*                        *** PROCESS FORMAT 5 ***
+*
+READ5    EQU   *
+         BAL   12,PRT2        CLEAR LINE
+         BAL   12,PRTEXT      PRINT EXTS
+         MVI   SCIND,X'40'
+         MVC   CCHHR,F5CCHHR
+READ5CHK EQU   *
+         OBTAIN DSCB               GET FORMAT 5
+         MVI   ERMSG+6,C'5'
+         LTR   15,15
+         BNZ   ERROR
+         CLI   WORK+44,C'5'
+         BNZ   ERROR
+N1       LA    9,WORK+4
+N1A      CLC   0(2,9),ZERO    CHECK NO MORE EXTENTS
+         BE    VTOCEND
+         MVC   FREE,2(9)      TRANSFER FREE CYL AND TRACKS
+         LH    11,FREE
+         CVD   11,DATE
+         AP    FREECYL,DATE+6(2)
+         MVC   CYL(8),ED3
+         ED    CYL(5),DATE+6
+         SR    11,11
+         IC    11,FREE+2
+         CVD   11,DATE
+         AP    FREETRK,DATE+6(2)
+         MVC   TRK(8),ED4
+         ED    TRK(5),DATE+6
+         MVC   EXTS+30(10),=C'FREE SPACE'
+         MVC   FREE(2),0(9)        ALIGN
+         ST    9,INDEX
+         LH    9,FREE
+         SR    8,8
+         D     8,DIV               TRACKS PER CYL
+         STH   8,EXT+4             STORE HH
+         STH   9,EXT+2             STORE CC
+         BAL   9,EXP
+         L     9,INDEX
+N2       LA    9,5(9)
+         C     9,A3           CHECK FOR FIRST 8 DONE
+         BNE   N3
+         LA    9,1(9)
+N3       C     9,A4           CHECK END THIS DSCB
+         BNE   N1A
+         MVC   CCHHR,WORK+135
+         CLC   CCHHR,ZERO         IS THERE ANOTHER FORMAT 5
+         BNE   READ5CHK
+*
+VTOCEND  EQU   *
+         MVC   EXTS+46(32),EDTOT
+         ED    EXTS+62(4),FREECYL
+         ED    EXTS+70(4),FREETRK
+         MVI   EXTS,C'0'
+         BAL   12,PRTEXT      PRINT EXTS
+         SP    FREECYL,FREECYL
+         SP    FREETRK,FREETRK
+         MVC   EXTS(13),END
+         BAL   14,PUT1
+         L     10,CHAINED
+         LTR   10,10
+         BZ    NX
+         ST    10,SORTLIST
+         LA    1,SORTLIST
+         GOTO  TAGSORT
+         LA    1,CHAINED
+         ST    1,PDSLIST
+         MVC   CHAINED,SORTLIST
+         GOTO  SSM41MAC
+         XC    CHAINED,CHAINED
+         B     NX
+         EJECT
+*
+*                        *** PROCESS FORMAT 1 DSCB ***
+F1       MVC   EXTS+1(44),WORK        MOVE DSNAME TO OUTPUT
+         CLI   WORK+59,3           CHECK IF MORE THAN THREE EXTENTS
+         BNH   F1H        NO FORMAT 3
+MOVE     MVC   F3CCHHR(5),WORK+135   TRANSFER ADDRESS OF EXTENSION DSCB
+OBTAIN   EQU   *
+         OBTAIN F2OR3
+         MVI   ERMSG+6,C'3'
+         LTR   15,15
+         BNZ   ERROR
+         CLI   WORK2+44,C'3'
+         BE    F1H
+         MVC   F3CCHHR(5),WORK2+135
+         B     OBTAIN
+F1H      EQU   *
+         CLC   WORK(4),=C'SYS6'
+         BE    SYSTEST        GO TO CHECK FOR SYSIN OR SYSOUT
+         CLC   WORK(4),=C'SYS7'
+         BE    SYSTEST
+NOLST    BC    0,CHK
+NOLST2   EQU   *
+*                        *** CREATION AND EXPIRY DATES ***
+         MVC   DSDT+1(3),WORK+53
+         LA    10,EXTS+45
+         BAL   9,DTPT
+         MVC   DSDT+1(3),WORK+56
+         LA    10,EXTS+52
+         BAL   9,DTPT
+         LA    8,RECFM+2
+         TM    RM,X'80'            FIXED
+         BNO   REC2                  *
+         MVI   0(8),C'F'             *
+REC2     TM    RM,X'40'            VARIABLE
+         BNO   REC3                  *
+         MVI   0(8),C'V'             *
+REC3     TM    RM,X'C0'            UNDEFINED
+         BNO   REC4                  *
+         MVI   0(8),C'U'             *
+REC4     LA    8,1(8)
+         TM    RM,X'20'            TRACK OVERFLOW
+         BNO   REC5                  *
+         MVI   0(8),C'T'             *
+         LA    8,1(8)                *
+REC5     TM    RM,X'10'            BLOCKED
+         BNO   REC6                  *
+         MVI   0(8),C'B'             *
+         LA    8,1(8)                *
+REC6     TM    RM,X'08'            STANDARD
+         BNO   REC7                  *
+         MVI   0(8),C'S'             *
+         LA    8,1(8)                *
+REC7     TM    RM,X'04'            ASA CONTROL CHARACTER
+         BNO   REC8                  *
+         MVI   0(8),C'A'             *
+         LA    8,1(8)                *
+REC8     TM    RM,X'02'            MACHINE CONTROL CHARACTER
+         BNO   REC9                  *
+         MVI   0(8),C'M'             *
+REC9     LH    8,WORK+86           DS1BLKL
+         CVD   8,DATE               *
+         MVC   RECFM+6(6),ED5       *
+         ED    RECFM+6(6),DATE+5    *
+         LH    8,WORK+88           DS1LRECL
+         CVD   8,DATE               *
+         MVC   RECFM+13(6),ED5      *
+         ED    RECFM+13(6),DATE+5   *
+NOCBR    B     NOCAT
+         LOCATE CATENTRY
+         LTR   15,15
+         BNZ   NOCAT
+         MVI   OPDS-1,C'C'     INDICATE CATALOGUED DATA SET
+NOCAT    EQU   *
+         MVI   OPDS,C'I'
+         TM    DS,X'80'
+         BO    F1F
+         MVI   OPDS,C'D'
+         TM    DS,X'20'
+         BO    F1F
+         MVI   OPDS,C'S'
+         TM    DS,X'40'
+         BO    F1F
+         MVI   OPDS,C'P'
+         TM    DS,X'02'
+         BZ    F1U
+*                                      TACK ON PDS LIST FOR PHASE TWO
+         TM    PDSF,1              IS THE FLAG SET?
+         BO    F1F                 YES - GO
+         L     10,PDSLIST
+         GAIN $PDS
+         MVC   $PDSCARD,4(7)
+         MVC   $PDSFILE,WORK
+         ST    10,PDSLIST              STORE OLD POINTER
+         B     F1F
+F1U      EQU   *
+         MVI   OPDS,C'U'
+F1F      EQU   *
+         TM    DS,X'01'
+         BZ    F1G
+         MVI   OPDS+1,C'N'
+F1G      EQU   *
+F1A      LA    10,WORK+105
+         CLC   2(4,10),ZERO       TEST CCHH ZERO
+         BNE   F1J
+         MVC   EXTS+69(5),DUMMY - IF ZERO, DSCB IS A DUMMY FOR GDG USE
+         BAL   12,PRTEXT
+         B     CHK
+F1J      EQU   *
+         TM    DS,X'42'       CHECK IF SEQ OR PDS
+         BZ    F1K      BRANCH IF NEITHER
+*                        *** SPACE ACTUALLY USED ***
+         LH    11,LSTAR
+         ST    10,REG10
+         SR    10,10
+         LA    11,1(11)
+         D     10,DIV
+         CVD   10,DATE
+         MVC   SP2(8),ED4
+         ED    SP2(4),DATE+6
+         CVD   11,DATE
+         MVC   SP1(8),ED3
+         ED    SP1(4),DATE+6
+         L     10,REG10
+F1K      EQU   *
+         BAL   9,EXTPRT
+         LA    10,10(10)
+         CLI   0(10),X'00'
+         BE    CHK
+         BAL   9,EXTPRT
+         LA    10,10(10)
+         CLI   0(10),0
+         BE    CHK
+         BAL   9,EXTPRT
+        CLI    WORK+59,3
+         BNH   CHK
+         LA    10,WORK2+4
+F1B      CLI   0(10),0
+         BE    CHK
+         BAL   9,EXTPRT
+         LA    10,10(10)
+         C     10,A1
+         BNE   F1C
+         LA    10,1(10)
+F1C      C     10,A2
+         BNE   F1B
+         B     CHK
+*
+*
+PHASE2   L     1,=V(LPDCORE1)
+         L     14,4(0,1)
+         L     14,0(0,14)
+         LTR   14,14
+         BZ    ENDALL
+         FREEMAIN E,MF=(E,(1))
+*
+ENDALL   CLOSE PRINT                   THE END
+         LEAVE
+*
+         EJECT
+SYSTEST  EQU   *
+*
+*  FOLLOWING DECISION TABLE USED - S IN POSITION 18 = SYSOUT
+*                                  R IN 18 AND S IN 5TH QUAL = SYSIN
+*                                  R IN 18 AND NOT S IN 5TH  = OTHER
+*
+         CLC   WORK+17(5),=C'SF448' CHECK READER L5FTOVERS
+         BE    NOLST                   YES RUBBISH
+         CLI   WORK+17,C'S'        CHECK FOR SYSOUT
+         BE    SYSIN1
+         CLI   WORK+17,C'R'        CHECK SYSIN AND SYSTEM CREATED
+         BNE   NOLST               PECULIAR - RETURN
+         LA    9,4                 TO FIND FOUR FULL STOPS
+         LA    8,WORK               *
+TEST2    CLI   0(8),C'.'            *
+         BE    TEST3               BRANCH WHEN FOUND
+TEST2A   DS    0H
+         LA    8,1(8)               *
+         C     8,A3                CHECK 44 CHARACTERS INSPECTED
+         BNE   TEST2                *
+         B     NOLST               SOMETHING ODD - SKIP SCRATCH
+TEST3    BCT   9,TEST2A
+         CLC   1(4,8),=C'S000'     CHECK FOR SYSIN
+         BNE   NOLST                   NO
+         MVC   SCMS+2(5),=C'SYSIN'     SET SYSIN NOTE
+         B     NOLST               RETURN
+SYSIN1   EQU   *
+         MVC   SCMS+2(6),=C'SYSOUT'
+         B     NOLST
+*
+* THIS SECTION PRINTS THE INTRODUCTORY PAGE AND OBTAINS THE RUN NUMBER
+DESCRIPT EQU   *
+         OPEN  (PRINT,(OUTPUT))
+         LA    4,48
+         MVC   EXTS(50),INTRO
+*
+         BAL   12,PRTEXT
+         MOVE  INTA
+         MOVE  INTM
+         MOVE  INTG
+         MOVE  INTB
+         MOVE  INTC
+         MOVE  INTD
+         MOVE  INTE
+         MOVE  INTF
+         MOVE  INTL
+         MOVE  INTH
+         MOVE  INTI
+         MOVE  INTJ
+      MOVE  INTK
+         B     DESCREND  RETURN TO MAIN LINE
+         EJECT
+*
+*                      *** ROUTINE TO PRINT ERROR MESSAGES ***
+ERROR    EQU   *
+         MVC   EXTS(16),ERMSG
+         CVD   15,DATE
+         ED    EXTS+12(4),DATE+6
+          BAL   12,PRTEXT
+NODUMP   B     NX
+         L     1,DUMPCODE
+         SVC   13
+*
+*
+         EJECT
+* ROUTINE TO PRINT SPACE IN A SINGLE EXTENT POINTED TO BY REG 10
+EXTPRT   MVC   EXT(10),0(10)
+         LH    12,EXT+6
+         TM    EXT,X'81'
+         BO    EXCYLBDY
+         TM    EXT,X'02'
+         BZ    EX3
+         MVI   OPDS+1,C'O'
+         B     EX2
+EX3      TM    EXT,X'04'
+         BZ    EX2
+         MVI   OPDS+1,C'I'
+EX2      LH    11,EXT+8
+         LA    11,1(11)
+         SH    11,EXT+4
+        BP    CVD
+         A     11,DIV  ADD TRACKS PER CYL
+         S     12,ONE
+CVD      CVD   11,DATE
+         MVC   TRK(8),ED4
+         ED    TRK(5),DATE+6
+         B     EX4
+EXCYLBDY A     12,ONE
+EX4      SH    12,EXT+2
+         BZ    EXP
+         CVD   12,DATE
+         MVC   CYL(8),ED3
+         ED    CYL(5),DATE+6
+EXP      EQU   *
+         MVC   SCLOC(1),SCIND
+         LH    11,EXT+2           PRINT START LOCATION OF
+         CVD   11,DATE              THIS EXTENT AS CCC/HH
+         UNPK  TRK+10(3),DATE+6(2)   *
+         LH    11,EXT+4
+         CVD   11,DATE              *
+         UNPK  TRK+13(3),DATE+6(2)
+         OI    TRK+12,X'F0'         *
+         OI    TRK+15,X'F0'         *
+         MVI   TRK+13,C'/'          *
+         BAL   12,PRTEXT
+         BR    9
+*
+*                   *** PRINT SUBROUTINE ***
+*
+PRTEXT   LA    0,EXTS         OUTPUT AREA
+PRT      BAL   14,PUT2
+PRT2     EQU   *
+         MVI   EXTS,C' '
+         MVC   EXTS+1(132),EXTS
+         BCTR  4,12           LINE COUNT
+         LH    4,LINES
+         AP    PAGENO,PK1
+         MVC   LINE+114(4),ED3
+         ED    LINE+114(4),PAGENO
+         LA    0,LINE
+         BAL   14,PUT2
+         MVI   EXTS,C' '
+         MVC   EXTS+1(132),EXTS
+         MVC   EXTS+4(18),DEVLINE
+         BAL   14,PUT1
+SKIPID   B     NOLABINF
+         BCTR  4,0            ONE EXTRA LINE
+         MVC   EXTS+1(132),EXTS
+         MVC   EXTS+30(36),VOLUSID
+      BAL   14,PUT1
+         MVI   SKIPID+1,X'F0'
+NOLABINF EQU   *
+         LA    0,COLHDNG
+         BAL   14,PUT2
+         MVC   EXTS+1(132),EXTS
+         MVC   EXTS+80(15),COLHDNG2
+         BAL   14,PUT1
+         MVC   EXTS+1(120),EXTS
+         BAL   14,PUT1
+         BR    12
+*
+PUT1     LA    0,EXTS
+PUT2     LA    1,PRINT
+         L     15,48(0,1)
+         BR    15
+*
+DTPT     SR    11,11               PUT YEAR INTO CHARACTER FORM
+         IC    11,DSDT+1            *
+         CVD   11,DATE              *
+         UNPK  0(3,10),DATE+6(2)    *
+         OI    2(10),X'F0'          *
+         LH    11,DSDT+2           SAME FOR DAY
+         CVD   11,DATE              *
+         UNPK  3(3,10),DATE+6(2)    *
+         OI    5(10),X'F0'          *
+         MVI   0(10),C' '          BLANK EXTRA DIGIT
+         BR    9                   RETURN
+*                        END OF ROUTINE
+PRTEXIT  DS    0H
+         USING *,15
+         LH    2,PRINT+62
+         LTR   2,2
+         BCR   7,14
+         LH    2,=H'1330'
+         STH   2,PRINT+62
+         BR    14
+PDSLIST  DC    A(CHAINED)
+CHAINED  DC    A(0,PRINT,PAGENO)
+SORTLIST DC   A(0,*+4,12,44)
+         EJECT
+ADATA    DC    A(DATASET)
+DATASET EQU *
+DSCB     CAMLST SEEK,CCHHR,VOL,WORK
+CATENTRY CAMLST NAME,WORK,,WORK2   WORK2 IS DUMMY - REPLACED BY GETMAIN
+F2OR3    CAMLST SEEK,F3CCHHR,VOL,WORK2
+*
+COLHDNG  DC    CL133'0     DATA SET NAME                          CREATX
+               E EXPDT  ORG     SPACE        START      SPACE       REC-
+               FM BLKSIZE LRECL'
+COLHDNG2 DC    C'CC/HH      USED'
+DEVLINE  DC    CL18'DEVICE TYPE'
+DEVTYP   EQU   DEVLINE+12
+DUMMY    DC    C'DUMMY'
+ED1      DC    X'4021204B202020'   EDITS INTO YY.DDD
+ED2      DC    X'4021204B20204B2020'
+EDTOT    DC    C'TOTAL FREE SPACE'
+ED3      DC    X'4020212040C3E8D3'      ... CYL
+ED4      DC    X'4020212040E3D9D2'      ... TRK
+ED5      DC    X'402020202120'
+END      DC    C'- END OF VTOC'
+ERMSG    DC    C' ILC000 R15=',X'40202120'
+EXTS     DC    CL133' '
+OPDS     EQU   EXTS+60
+CYL      EQU   EXTS+62
+TRK      EQU   EXTS+70
+SP1      EQU   EXTS+86
+SP2      EQU   EXTS+93
+RECFM    EQU   EXTS+101
+SCLOC    EQU   EXTS+121
+SCMS     EQU   EXTS+122
+FREECYL  DC    P'+000'
+FREETRK  DC    P'+000'
+INTRO    DC    C'1 DIRECT ACCESS VOLUME - VTOC LISTING  VERSION 3.3'
+INTA     DC    C'0 NOTE. IN ORG COLUMN ONE...'
+INTM     DC    C'  C - CATALOGUED'
+INTG     DC    C'-        IN ORG COLUMN TWO...'
+INTB     DC    C'  P - PARTITIONED'
+INTC     DC    C'  S - SEQUENTIAL'
+INTD     DC    C'  D - DIRECT'
+INTE      DC    C'  I - INDEXED'
+INTF     DC    C'  U - UNDEFINED'
+INTL     DC    C'-        IN ORG COLUMN THREE...'
+INTH     DC    C'  N - UNMOVEABLE'
+INTI     DC    C'  I - INDEPENDENT INDEX AREA'
+INTJ     DC    C'  O - INDEPENDENT OVERFLOW AREA'
+INTK     DC    C'- THE FREE SPACE LIST INCLUDES ANY SPACE RELEASED BY T'
+               HE SCRATCHING OF A PREVIOUS DATA SET'
+INTEG    DC    C' THE FORMAT 5 DSCB DOES NOT EXIST OR DOES NOT REFLECT X
+               TRUE VOLUME STATUS'
+LASTF1   DC    X'0000000000'
+LINE     DC    CL110'1   UNIT ...  VOLUME ......  LISTING OF VTOC'
+         DC    CL23'PAGE'
+*
+PAGENO   DC    P'+000'
+PK1      DC    P'+1'
+SCIND    DC    C' '
+SC2311   DC    X'30002001'
+SC2314   DC    X'30C02008'
+VOLUSID  DC    C'VOL LABEL ......  USER ID ..........'
+ZERO     DC    XL5'0000000000'
+EXT      DC    5H'0'
+TCAP     DC    H'0'
+PDSF     DC    X'00'
+A1       DC    A(WORK2+44)
+A2       DC    A(WORK2+135)
+A3       DC    A(WORK+44)
+A4       DC    A(WORK+135)
+CCHHVTOC DC    D'0'
+DATE     DC    D'0'
+DAY      DC    F'0'
+DIV      DC    F'0'     TRACKS PER CYL STORED HERE
+DSDT     DC    F'0'          CREATE AND EXPDT STORED FOR PRINTING
+DUMPCODE DC    X'80'
+         DC    AL3(100)
+HHZERO   DC    X'FF0000FF'
+INDEX    DC    F'0'
+ONE      DC    F'1'
+ONECYL   DC    X'01000000'
+PARM     DC    F'0'
+REG10    DC    F'0'
+TEN      DC    F'10'
+NINETEEN DC    F'19'
+TWENTY   DC    F'20'
+XL2      DC    X'85',AL3(PRTEXIT)
+LINES    DC    H'54'
+VST      DC    H'1'
+** NOTE *****       THIS PARAMETER DIFFERENT FOR 2314
+         DC    X'30002001'
+VOL      DC    CL6' '
+         DC    H'0'
+*
+** N.B ****** MANY OF THESE CONSTANTS ARE CAREFULLY ALIGNED ON CURIOUS
+**            BOUNDARIES, SO BEWARE OF SHUFFLING THEM .
+*
+CLOK     DC    F'0'
+FREE     DC    XL3'000000'
+CCHHR    DC    XL5'0000000000'
+F3CCHHR  DC    XL5'0000000000'
+         DS    0F,XL3
+F5CCHHR  DC    XL5'0000000000'
+*
+*
+       LTORG
+*
+PRINT    DCB   DDNAME=SYSPRINT,DSORG=PS,LRECL=133,MACRF=(PM),          X
+               EXLST=XL2,RECFM=FBA
+*
+WORK     DS    44D
+WORK2    DS    44D
+OLDVOL   EQU   WORK+6
+DS       EQU   WORK+82
+RM       EQU   WORK+84             DS1RECFM
+LSTAR    EQU   WORK+98
+*
+        END

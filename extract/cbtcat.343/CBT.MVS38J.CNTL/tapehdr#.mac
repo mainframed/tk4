@@ -1,0 +1,17 @@
+//HERC01  JOB  (SETUP),
+//             'Run TAPEHDR',
+//             CLASS=A,
+//             MSGCLASS=X,
+//             MSGLEVEL=(1,1),
+//             NOTIFY=HERC01
+//********************************************************************
+//*
+//* Name: CBT.MVS38J.CNTL(TAPEHDR#)
+//*
+//* Desc: Testrun of TAPEHDR modules
+//*
+//********************************************************************
+//TAPEHDR EXEC PGM=TAPEHDR
+//SYSPRINT DD  SYSOUT=*
+//TAPEIN   DD  DISP=SHR,DSN=TAPEIN,UNIT=TAPE,VOL=SER=TAPEIN,
+//             LABEL=(,BLP)

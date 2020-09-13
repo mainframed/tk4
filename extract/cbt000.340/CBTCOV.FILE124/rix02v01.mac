@@ -1,0 +1,539 @@
+RIX      TITLE 'RACF EXIT ICHRIX02 - RACINIT POST-PROCESSING ROUTINE'
+***********************************************************************
+*    NAME:        RACF EXIT ICHRIX02   *TEST*         DATE: 05/04/80  *
+*    PURPOSE:                                                         *
+*        THIS EXIT WILL PROCESS THE "CREATE" RACINIT.  WE WILL        *
+*        EXTRACT THE USER'S GROUP AUTHORITY WITH INTERNAL RACF        *
+*        MACROS AND INSERT THE AUTHORITY INTO AN AREA AND STORE       *
+*        THE AREAS ADDRESS IN ACEEIEP.  THE AREA IS IN SUBPOOL        *
+*        255 SO THAT ABENDS WILL NOT FREE THE AREA BEFORE RACINIT     *
+*        "DELETE" DOES ITS FREEMAIN.                                  *
+*                                                                     *
+*    TRACING:                                                         *
+*        1. THE CLASS NAME "OPTA" IS DEFINED IN THE CLASS NAME        *
+*           AS BIT POSITION 31.                                       *
+*        2. THE COMMAND " SETROPTS AUDIT OPTA " WILL CONTROL THE      *
+*           USE OF GTF TRACING.                                       *
+*        3. THE INSTRUCTION USED TO TEST FOR GTF TRACING IS:          *
+*                    TM   RCVTCAUD+3,X'01'                            *
+*        4. THE COMMAND " SETROPTS STATISTICS OPTA " WILL CONTROL THE *
+*           USE OF WTO TRACING.                                       *
+*        5. THE INSTRUCTION USED TO TEST FOR WTO TRACING IS:          *
+*                    TM   RCVTCSTA+3,X'01'                            *
+*    TESTING:                                                         *
+*        1. A DRIVER IS USED TO CALL THIS ROUTINE.                    *
+*        2. THE DRIVED WILL PASS THE PROPER PARM LIST.                *
+*        3. THE PARM LIST FIRST ENTRY IS NORMALLY THE NUMER OF        *
+*           WORDS IN THE PARM LIST.                                   *
+*           A. IF THE FIRST BYTE OF THE FIRST WORD IS X'FF' THEN      *
+*              THE FIRST WORD CONTAIN A PSEUDO CVT ADDRESS.           *
+*           B. IF THE FIRST BYTE OF THE FIRST WORD IS NOT X'FF'       *
+*              THEN PROCEED AS NORMAL.                                *
+*        4. AFTER TESTING THE FIRST WORD, EITHER THE REAL CVT ADDRESS *
+*           OR A PSEUDO CVT ADDRESS PASSED BY THE DRIVER IS STORED    *
+*           AND LATER USED FOR ALL CONTROL BLOCK PROCESSING.          *
+*        5. THIS TECHNIQUE ALLOWS FOR PASSING (CVT, RCVT, ASCB, ASXB, *
+*           ACEE).                                                    *
+*                                                                     *
+*                                                                     *
+***********************************************************************
+         EJECT
+ICHRIX02 CSECT
+*
+*        SETUP SAVEAREA AND SAVE CALLER'S REGS
+*
+         USING ICHRIX02,R15
+         B     ICHRIX                     BRANCH AROUND I.D.
+         DC    C'ICHRIX02'                CSECT NAME
+         DC    C'&SYSDATE'                ASSEMBLY DATE
+         DC    C'&SYSTIME'                ASSEMBLY TIME
+         USING SAVEAREA,R13
+ICHRIX   STM   R14,R12,SAVER14            SAVE REGS
+         LR    R12,R15                    SET UP BASE REGISTER
+         USING ICHRIX02,R12
+         USING RCVT,R1
+         DROP  R15
+         LR    R11,R1                     SETUP PARAMETER REGISTER
+         USING IX02PARM,R11               ADDRESSABILITY
+         L     R1,IX02FLG1                ADDRESS OF FLAG1
+         TM    0(R1),X'C0'                IS IT CREATE ENTRY
+         BZ    CREATE                     YES,
+GOAWAY   LM    R14,R12,SAVER14            RESTORE REGS
+         SR    R15,R15                    CLEAR REG 15.
+         BR    R14                        GET OUT FAST
+         SPACE 2
+CREATE   DS    0H
+         L     R1,IX02USID                ADDRESS OF USERID & LENGTH
+         CLI   0(R1),X'00'                IS IT ZERO
+         BE    GOAWAY                     YES,
+         GETMAIN R,LV=WORKSIZE,SP=0       GET SAVEAREA + WORKAREA
+         ST    R1,SAVENEW-SAVEAREA(,R13)  FORWARD POINTER TO OLD AREA
+         ST    R13,SAVEOLD-SAVEAREA(,R1)  BACKWARD POINTER TO NEW AREA
+         LR    R13,R1                     SETUP SAVEAREA POINTER
+         EJECT
+*
+*        SET UP CVT ADDRESS
+*
+         MVC   CVTADR,X'10'               CVT ADDRESS
+         CLI   0(R11),X'FF'               DRIVER CALLING
+         BNE   CVTOK                      NO, USE REAL CVT ADDRESS
+         MVC   CVTADR+1(3),1(R11)         USE PASSED CVT ADDRESS
+CVTOK    DS    0H
+         L     R1,CVTADR                  CVT ADDRESS
+         L     R1,0(,R1)                  CVTTCBP
+         L     R1,12(,R1)                 CURRENT ASCB
+ASCBJBNI ICM   R10,7,172+1(R1)            ASCBJBNS
+         BNZ   *+4+4                      IF NOT ZERO WE GOT JOBNAME
+ASCBJBNS ICM   R10,7,176+1(R1)            ASCBJBNS
+         SPACE
+         LM    R3,R9,4(R11)               PICK UP PARAMETER ADD VECTOR
+         L     R4,IX02ACEE         ADDRESS OF THE ACEE
+         USING ACEE,R4             ADDRESSABILITY
+         MVC   GROUP,ACEEGRPL      SAVE THE GROUP NAME & LENGTH
+         MVC   USER,ACEEUSRL       SAVE THE USERID & LENGTH
+         CLI   USER,X'00'                 USERID PRESENT
+         BE    QUICKOUT                   NO, GET OUT
+         CLC   USER(2),=X'015C'           DEFAULT USERID PRESENT
+         BE    QUICKOUT                   YES, GET OUT
+         CLI   GROUP,X'00'                GROUP PRESENT
+         BE    QUICKOUT                   NO, GET OUT
+         CLC   GROUP(2),=X'015C'          DEFAULT GROUP PRESENT
+         BE    QUICKOUT                   YES, GET OUT
+         EJECT
+*
+*        SET UP DESIRED RETURN CODE AS FOLLOWS:
+*        (R15)=8 IF RACF IS ACTIVE AND HIGH LEVEL INDEX = USERID:
+*                THIS IS THE SO CALLED FAST PATH.
+*        (R15)=8 IF RACF IS NOT ACTIVE AND ISSUE A WTO.
+*
+         L     R1,CVTADR                  GET CVT ADDRESS
+         ICM   R1,7,992+1(R1)             GET CVTRAC ADDRESS
+         TM    53(R1),X'80'               IS RACF ACTIVE
+         BNZ   NORACF                     NO
+         TM    153(R1),X'80'              HAS RVARY INACT BEEN ISSUED
+         BNZ   NORACF                     BRANCH IF RVARY WAS ISSUED
+         SPACE
+         EJECT
+RACFUP   DS    0H                     RACF IS UP - CHECK FOR FAST PATH
+*
+*        GENERATE A GTF USER RECORD OF THE RACHECK PARAMETERS
+*
+         L     R1,CVTADR                  GET CVT ADDRESS
+         ICM   R1,7,992+1(R1)             GET CVTRAC ADDRESS
+         TM    RCVTCAUD+3,X'01'           TEST BIT POS 31. OPTA
+         BNO   NOGTF01                    NOT ON, BYPASS GTF
+         XC    GTFREC01,GTFREC01          CLEAN OUT THE RECORD
+         MVC   GTFJOBNM,0(R10)            JOBNAME TO GTF RECORD
+         MVC   GTFFLAG1,0(R3)             FLAG1 TO GTF RECORD
+         MVC   GTFUSRID,USERID            USERID TO GTF RECORD
+         MVC   GTFOPSWD,0(R5)             OLD PASSWORD TO GTF RECORD
+         MVC   GTFPROCN,0(R6)             PROC TO GTF RECORD
+         LTR   R7,R7                      TEST FOR INSTALLATION DATA
+         BZ    *+10
+         MVC   GTFINSTD,0(R7)             INSTALLATION DATA TO RECORD
+         MVC   GTFGROUP,GROUP+1           GROUP TO GTF RECORD
+         MVC   GTFNPSWD,0(R9)             NEW PASSWORD TO GTF RECORD
+         MVC   GTFLIST(GTFLISTL),GTFPROTO MOVE IN PROTOTYPE LIST
+         LA    R0,GTFREC01                ADD OF GTF USER RECORD
+         GTRACE DATA=(R0),ID=1,PAGEIN=YES,MF=(E,GTFLIST)
+NOGTF01  DS    0H
+         EJECT
+***********************************************************************
+*                                                                     *
+*     THE FOLLOWING ROUTINE USES NON-SUPPORTED RACF MACROS            *
+*     TO EXTRACT THE USER'S GROUP AUTHORITY AND STORE THE             *
+*     INFORMATION INTO A GETMAIN AREA.  THE GETMAIN AREA              *
+*     ADDRESS IS THEN STORED INTO ACEEIEP.                            *
+*                                                                     *
+***********************************************************************
+         L     R0,GETPARM          GETMAIN SUBPOOL AND LENGTH
+         GETMAIN R,LV=(0)          GET THE PARM AREA
+         ST    R1,ACEEIEP          AREA ADDRESS INTO THE ACEE
+         LR    R14,R1
+         USING IEPDSECT,R14        ADDRESSABILITY
+         XC    IEPDSECT(256),IEPDSECT CLEAR THE AREA
+         MVC   IEPGLV,GETPARM      SAVE THE SUBPOOL AND LENGTH
+         SPACE 2
+         LA    R5,USERID           USERID ONLY
+         LA    R6,GROUP            GROUP LENGTH & NAME
+         MVI   WK1AREA,C' '        CLEAR WORK AREA TO BLANKS
+         MVC   WK1AREA+1(30),WK1AREA
+         MVC   RACTST1D(TST1SIZ),RACTST1C INITIALIZE TEST
+         MVC   RACACT1D(ACT1SIZ),RACACT1C INITIALIZE ACTION
+         MVC   RACLOC1D(LOC1SIZ),RACLOC1C INITIALIZE LOCATE
+         SPACE
+         ICHETEST FLDATA=(,(R5)),MF=(E,RACTST1D)
+         SPACE
+         ICHEACTN TESTS=(RACTST1D),MF=(E,RACACT1D)
+         SPACE
+         ICHEINTY LOCATE,ENTRY=(R6),                                   X
+               OPTIONS=(FLDEF,TESTC,TESTM,ACTION),                     X
+               WKAREA=WK1AREA,ACTIONS=(RACACT1D),MF=(E,RACLOC1D)
+         SPACE
+         L     R14,ACEEIEP         RELOAD PARM AREA ADDRESS
+         LTR   R15,R15             TEST RETURN CODE
+         BZ    CKAUTH02            ZERO, OK
+         OI    IEPFLAG1,X'40'      FLAG1 = MACRO ERROR
+         B     LOCERR              LOCATE ERROR
+         SPACE
+CKAUTH02 LH    R0,WK1GPAL          TEST GROUP AUTH SIZE
+         LTR   R0,R0               TEST SIZE
+         BNZ   CKAUTH03            NON-ZERO, OK
+         OI    IEPFLAG1,X'20'      FLAG1 = AUTH EXTRACT ERROR
+         B     LOCERR              LOCATE ERROR
+         SPACE
+CKAUTH03 OI    IEPFLAG1,X'80'      FLAG1 = EVERYTHING OK
+         MVC   IEPAUTH,WK1GRPA    MOVE USER'S GROUP AUTH TO ACEE
+         SPACE
+         MVI   WK2AREA,C' '        CLEAR WORK AREA TO BLANKS
+         MVC   WK2AREA+1(255),WK1AREA
+         MVC   WK2AREA+256(256),WK1AREA
+         MVC   RACAC2AD(ACT2ASIZ),RACAC2AC INITIALIZE ACTION
+         MVC   RACAC2BD(ACT2BSIZ),RACAC2BC INITIALIZE ACTION
+         MVC   RACAC2CD(ACT2CSIZ),RACAC2CC INITIALIZE ACTION
+         MVC   RACAC2DD(ACT2DSIZ),RACAC2DC INITIALIZE ACTION
+         MVC   RACLOC2D(LOC2SIZ),RACLOC2C INITIALIZE LOCATE
+         SPACE
+         LA    R6,USER             USER LENGTH & NAME
+         ICHEINTY LOCATE,ENTRY=(R6),                                   X
+               OPTIONS=(FLDEF,TESTC,TESTM,ACTION),                     X
+               WKAREA=WK2AREA,                                         X
+               ACTIONS=(RACAC2AD,RACAC2BD,RACAC2CD,RACAC2DD),          X
+               MF=(E,RACLOC2D)
+         SPACE
+         LTR   R15,R15             TEST RETURN CODE
+         BZ    CKCLASS             ZERO, OK
+         OI    IEPFLAG1,X'04'      FLAG1 = MACRO ERROR
+         B     LOCERR              LOCATE ERROR
+CKCLASS  DS    0H
+         OI    IEPFLAG1,X'08'      FLAG1 = EVERYTHING OK
+         L     R2,16               ADDRESS OF REAL CVT
+         L     R2,992(R2)          ADDRESS OF RCVT
+         L     R2,188(R2)          ADDRESS OF CDE TABLE
+         ST    R2,CDEADR           ADDRESS OF CVT
+         USING CDETABLE,R2
+         XC    CLASMASK,CLASMASK   CLEAR BIT MASK OF CLASSES
+         CLC   WK2DATA1,=X'0000'   COMPARE # CLASSES
+         BE    CKGROUPS            NONE,
+         LH    R0,WK2DATA1         LOAD # CLASSES
+         LA    R1,WK2DATA3         ADDRESS OF 1ST CLASS
+         CLC   0(8,R1),=CL8'USER'  USER CLASS
+         BNE   CKCLASS1            NO,
+         OI    IEPCAU,X'80'        SET USER CLAUTH
+         B     NXTCLS              CHECK NEXT CLASS
+CKCLASS1 L     R2,CDEADR           LOAD ADDRESS OF CDE TABLE
+CKCLASS2 CLC   CDESIZE,=X'0000'    COMPARE CDE SIZE
+         BE    NXTCLS              ZERO, END OF TABLE
+         CLC   CDENAME,0(R1)       COMPARE CLASS NAMES
+         BE    CKCLASS3            EQUAL,
+         AH    R2,CDESIZE          BUMP TO NEXT TABLE ENTRY
+         B     CKCLASS2            AND COMPARE
+CKCLASS3 OC    CLASMASK,CDEPOS     OR IN THE POSITION MASK
+NXTCLS   LA    R1,8(,R1)           BUMP TO NEXT CLAUTH NAME
+         BCT   R0,CKCLASS1         COMPARE TO CDE TABLE
+         XC    CLASMASK,=X'FFFFFFFF' REVERSE ALL THE BITS
+         MVC   IEPCAUTH,CLASMASK   SAVE THE CLAUTH BIT MASK
+         DROP  R2
+CKGROUPS MVC   IEP#GRP,WK2DATA2    MOVE # CONNECTED GROUPS
+         CLC   IEP#GRP,=X'0000'    COMPARE # CONN GROUPS
+         BE    CKGROUP9            NONE,
+         LH    R2,WK2SIZE3         SIZE OF ALL CLASSES
+         LA    R1,WK2DATA3         ADDRESS OF ALL CLASSES
+         LA    R1,2(R1,R2)         CALC. ADDRESS OF ALL GROUPS
+         LA    R2,IEPGROUP         ADDRESS FOR GROUP NAMES
+         LH    R0,WK2DATA2         LOAD # GROUPS
+         CH    R0,=H'30'           COMPARE TO MAX GROUPS
+         BNH   CKGROUP1            NOT OVER MAX
+         OI    IEPFLAG1,X'02'      SHOW MAX ERROR
+         MVC   IEP#GRP,=X'0000'    ZERO # GROUPS
+         B     CKGROUP9            END OF GROUP WORK
+CKGROUP1 MVC   0(8,R2),0(R1)       MOVE ONE GROUP NAME
+         LA    R1,8(,R1)           BUMP TO NEXT GROUP NAME
+         LA    R2,8(,R2)           BUMP TO NEXT GROUP NAME
+         BCT   R0,CKGROUP1         MOVE ALL THE GROUP NAMES
+CKGROUP9 DS    0H
+         DROP  R14
+         EJECT
+*
+*        WTO THE JOBNAME, GROUP, USERID AND AUTHORITY
+*
+         L     R1,CVTADR                  GET CVT ADDRESS
+         ICM   R1,7,992+1(R1)             GET CVTRAC ADDRESS
+         TM    RCVTCSTA+3,X'01'           TEST BIT POS 31. OPTA
+         BNO   NOWTO01                    NOT ON, BYPASS WTO
+         MVC   WTOLIST(WTOLISTL),WTOPROTO INITIALIZE WTO AREA
+         MVC   MSG1(MSG1LGTH),MSG1PRTO    INITIALIZE MESSAGE
+         MVC   MSG1JOBN,0(R10)            MOVE IN THE JOBNAME
+         MVC   MSG1GRPN,ACEEGRPN          MOVE IN THE GROUP NAME
+         MVC   MSG1USRN,ACEEUSRI          MOVE IN THE USERID
+         LA    R1,=C'JOIN'                JOIN AUTH
+         TM    WK1GRPA,X'80'              JOIN AUTH
+         BO    DOAUTH                     YES,
+         LA    R1,=C'CONN'                CONN AUTH
+         TM    WK1GRPA,X'40'              CONN AUTH
+         BO    DOAUTH                     YES,
+         LA    R1,=C'CREA'                CREA AUTH
+         TM    WK1GRPA,X'20'              CREA AUTH
+         BO    DOAUTH                     YES,
+         LA    R1,=C'USE '                USE  AUTH
+         TM    WK1GRPA,X'10'              USE  AUTH
+         BO    DOAUTH                     YES,
+         LA    R1,=C'????'                ???? AUTH
+DOAUTH   MVC   MSG1AUTH,0(R1)             SHOW AUTH
+         MVC   WTOLIST+4(MSG1LGTH),MSG1   MESSAGE TO WTO
+         WTO   MF=(E,WTOLIST)             WRITE IT OUT
+NOWTO01  DS    0H
+         LA    R15,0
+         B     PLUGR15
+         EJECT
+*
+*        WTO THE JOBNAME, GROUP, USERID, RETURN CODE AND AUTH DATA
+*
+LOCERR   L     R1,CVTADR                  GET CVT ADDRESS
+         ICM   R1,7,992+1(R1)             GET CVTRAC ADDRESS
+         TM    RCVTCSTA+3,X'01'           TEST BIT POS 31. OPTA
+         BNO   NOWTO02                    NOT ON, BYPASS WTO
+         MVC   WTOLIST(WTOLISTL),WTOPROTO INITIALIZE WTO AREA
+         MVC   MSG2(MSG2LGTH),MSG2PRTO    INITIALIZE MESSAGE
+         MVC   MSG2JOBN,0(R10)            MOVE IN THE JOBNAME
+         MVC   MSG2GRPN,ACEEGRPN          MOVE IN THE GROUP NAME
+         MVC   MSG2USRN,ACEEUSRI          MOVE IN THE USERID
+         UNPK  WORK(3),RETCODE+3(2)       STEP 1 TO CONVERT HEX TO CHAR
+         TR    WORK(2),HEXTAB-240         STEP 2 TO CONVERT HEX TO CHAR
+         MVC   MSG2RETC,WORK              MOVE IN RETURN CODE
+         UNPK  WORK(7),WK1GPAL(4)         STEP 1 TO CONVERT HEX TO CHAR
+         TR    WORK(6),HEXTAB-240         STEP 2 TO CONVERT HEX TO CHAR
+         MVC   MSG2DATA,WORK              MOVE IN DATA
+         MVC   WTOLIST+4(MSG2LGTH),MSG2   MESSAGE TO WTO
+         WTO   MF=(E,WTOLIST)             WRITE IT OUT
+NOWTO02  DS    0H
+         LA    R15,0                      SHOW NORMAL RETURN CODE
+         B     PLUGR15                    RETURN
+         EJECT
+NORACF   DS    0H
+         WTO   'RACINIT   *** WARNING ***   RACF NOT ACTIVE     ',     X
+               ROUTCDE=(9,11)
+         B     QUICKOUT                   RACF IS NOT ACTIVE
+         EJECT
+QUICKOUT DS    0H
+         LA    R15,0                      SHOW NORMAL RETURN CODE
+PLUGR15  DS    0H
+         LR    R1,R13            SAVE NEW SAVEAREA ADR FOR FREEMAIN
+         L     R13,SAVEOLD                OLD SAVEAREA
+         ST    R15,SAVER15       PLUG (R15) FOR RESTORE (R14-R12)
+*
+*        FREEMAIN NEW SAVEAREA AND RETURN TO CALLER
+*
+         FREEMAIN R,A=(1),LV=WORKSIZE,SP=0   FREE UP NEW SAVEAREA
+         XC    SAVENEW,SAVENEW            BREAK CHAIN
+         LM    R14,R12,SAVER14            RESTORE REGS
+         BR    R14                        BACK TO MOTHER
+         DROP  ,                          DROP EVERYTHING
+         EJECT
+*
+*        PARAMETER LISTS ECT.
+*
+GTFPROTO GTRACE LNG=256,ID=1,MF=L
+GTFLISTL EQU   *-GTFPROTO              LENGTH OF PROTOTYPE GTRACE LIST
+WTOPROTO WTO   '                                                       X
+                                                                       X
+                         ',                                            X
+               MF=L,ROUTCDE=(9,11)
+WTOLISTL EQU   *-WTOPROTO              LENGTH OF PROTOTYPE WTO LIST
+MSG1PRTO EQU   *
+         DC    C'RACINIT JOB='
+         DC    CL8' '
+         DC    C',GROUP='
+         DC    CL8' '
+         DC    C',USERID='
+         DC    CL8' '
+         DC    C',AUTH='
+         DC    CL4' '
+MSG1LGTH EQU   *-MSG1PRTO
+MSG2PRTO EQU   *
+         DC    C'RACINIT JOB='
+         DC    CL8' '
+         DC    C',GROUP='
+         DC    CL8' '
+         DC    C',USERID='
+         DC    CL8' '
+         DC    C',RETURN='
+         DC    CL2' '
+         DC    C',DATA='
+         DC    CL6' '
+MSG2LGTH EQU   *-MSG2PRTO
+RACLOC1C ICHEINTY LOCATE,TYPE='GRP',ACTIONS=(,,,,,),TESTS=(,,),MF=L,   X
+               ENTRY=0,WKAREA=0
+LOC1SIZ  EQU   *-RACLOC1C
+RACLOC2C ICHEINTY LOCATE,TYPE='USR',ACTIONS=(,,,),MF=L,                X
+               ENTRY=0,WKAREA=0
+LOC2SIZ  EQU   *-RACLOC2C
+RACTST1C ICHETEST FIELD=USERID,FLDATA=(8,0),MF=L
+TST1SIZ  EQU   *-RACTST1C
+RACACT1C ICHEACTN FIELD=USERACS,TESTS=(),MF=L
+ACT1SIZ  EQU   *-RACACT1C
+RACAC2AC ICHEACTN FIELD=CLCNT,MF=L
+ACT2ASIZ EQU   *-RACAC2AC
+RACAC2BC ICHEACTN FIELD=CONGRPCT,MF=L
+ACT2BSIZ EQU   *-RACAC2BC
+RACAC2CC ICHEACTN FIELD=CLNAME,MF=L
+ACT2CSIZ EQU   *-RACAC2CC
+RACAC2DC ICHEACTN FIELD=CONGRPNM,MF=L
+ACT2DSIZ EQU   *-RACAC2DC
+HEXTAB   DC    X'F0F1F2F3F4F5F6F7F8F9C1C2C3C4C5C6'
+         DS    0F
+GETPARM  DC    AL1(255),AL3(256)   SUBPOOL(255) - LENGTH(256)
+         LTORG
+         EJECT
+IX02PARM DSECT
+IX02WORD DS    F                   ADDRESS OF PARM COUNT IN LIST
+IX02FLG1 DS    F                   ADDRESS OF FLAG BYTE 1
+IX02USID DS    F                   ADDRESS OF USERID
+IX02PSWD DS    F                   ADDRESS OF PASSWORD
+IX02PRNM DS    F                   ADDRESS OF STARTED PROC NAME
+IX02INST DS    F                   ADDRESS OF INSTALL PARMS FOR USER
+IX02GRPN DS    F                   ADDRESS OF GROUP NAME
+IX02NPAS DS    F                   ADDRESS OF NEW PASSWORD
+IX02ACEE DS    F                   ADDRESS OF ACEE
+IX02PGNM DS    F                   ADDRESS OF PROGRAMMER NAME
+IX02ACCT DS    F                   ADDRESS OF ACCOUNTING INFO
+IX02OIDC DS    F                   ADDRESS OF OIDCARD
+IX02TMID DS    F                   ADDRESS OF TERMID
+IX02WKAR DS    F                   ADDRESS OF WORK AREA
+IX02ABND DS    F                   ADDRESS OF ABEND CODE
+IX02RETC DS    F                   ADDRESS OF RETURN CODE
+IX02FLG2 DS    F                   ADDRESS OF FLAG BYTE 2
+IX02TDTA DS    F                   ADDRESS OF TERMINAL DATA
+IX02UDTA DS    F                   ADDRESS OF USER DATA
+IX02TLEV DS    F                   ADDRESS OF TERMINAL LEVEL
+IX02JBNM DS    F                   ADDRESS OF JOBNAME
+IX02APNM DS    F                   ADDRESS OF APPL NAME
+IX02SPOL DS    F                   ADDRESS OF SUBPOOL
+IX02ACE2 DS    F                   ADDRESS OF ACEE POINTER
+IX02ADTA DS    F                   ADDRESS OF APPL DATA
+IX02ALEV DS    F                   ADDRESS OF APPL LEVEL
+         EJECT
+         IEPMACRO
+         EJECT
+CDETABLE DSECT
+CDESIZE  DS    CL2                 SIZE OF ENTRY
+CDEID#   DS    CL1                 ID NUMBER
+CDENAME  DS    CL8                 CLASS NAME
+         DS    CL13                OTHER STUFF
+CDEPOS   DS    CL4                 CLASS BIT POSITION
+         DS    CL4
+         EJECT
+SAVEAREA DSECT
+SAVEPLI  DS    F
+SAVEOLD  DS    F
+SAVENEW  DS    F
+SAVER14  DS    F
+SAVER15  DS    F
+SAVER0   DS    F
+SAVER1   DS    F
+SAVER2   DS    F
+SAVER3   DS    F
+SAVER4   DS    F
+SAVER5   DS    F
+SAVER6   DS    F
+SAVER7   DS    F
+SAVER8   DS    F
+SAVER9   DS    F
+SAVER10  DS    F
+SAVER11  DS    F
+SAVER12  DS    F
+SAVESIZE EQU   *-SAVEAREA
+WORKAREA EQU   *                          START OF WORKAREA
+GTFLIST  GTRACE LNG=256,ID=1,MF=L
+WTOLIST  WTO   '                                                       X
+                                                                       X
+                         ',                                            X
+               MF=L,ROUTCDE=(9,11)
+MSG1     EQU   *
+         DC    C'RACINIT JOB='
+MSG1JOBN DC    CL8' '
+         DC    C',GROUP='
+MSG1GRPN DC    CL8' '
+         DC    C',USERID='
+MSG1USRN DC    CL8' '
+         DC    C',AUTH='
+MSG1AUTH DC    CL4' '
+MSG2     EQU   *
+         DC    C'RACINIT JOB='
+MSG2JOBN DC    CL8' '
+         DC    C',GROUP='
+MSG2GRPN DC    CL8' '
+         DC    C',USERID='
+MSG2USRN DC    CL8' '
+         DC    C',RETURN='
+MSG2RETC DC    CL2' '
+         DC    C',DATA='
+MSG2DATA DC    CL6' '
+GTFREC01 DS    XL256                      GTF USER RECORD TYPE 1
+         ORG   GTFREC01                   OVERLAY THE DIFFERENT FIELDS
+GTFJOBNM DS    CL8                        JOBNAME
+GTFFLAG1 DS    X                          FLAG BYTE 1
+GTFUSRID DS    CL9                        LENGTH & USERID
+GTFOPSWD DS    CL9                        LENGTH & PASSWORD
+GTFPROCN DS    CL8                        STARTED PROC NAME
+GTFINSTD DS    CL4                        INSTALLATION DATA
+GTFGROUP DS    CL9                        LENGTH & GROUP
+GTFNPSWD DS    CL9                        LENGTH & NEW PASSWORD
+         DS    CL200                      LENGTH & NEW PASSWORD
+         ORG
+RACLOC1D ICHEINTY LOCATE,TYPE='GRP',ACTIONS=(,,,,,),TESTS=(,,),MF=L,   X
+               ENTRY=0,WKAREA=0
+RACLOC2D ICHEINTY LOCATE,TYPE='USR',ACTIONS=(,,,),MF=L,                X
+               ENTRY=0,WKAREA=0
+RACTST1D ICHETEST FIELD=USERID,FLDATA=(8,0),MF=L
+RACACT1D ICHEACTN FIELD=USERACS,TESTS=(),MF=L
+RACAC2AD ICHEACTN FIELD=CLCNT,MF=L
+RACAC2BD ICHEACTN FIELD=CONGRPCT,MF=L
+RACAC2CD ICHEACTN FIELD=CLNAME,MF=L
+RACAC2DD ICHEACTN FIELD=CONGRPNM,MF=L
+WK1AREA  DS    0CL31
+         DS    CL26
+WK1SIZE  DS    CL2                 LENGTH OF ALL EXTRACTED DATA
+WK1GPAL  DS    CL2                 LENGTH OF GROUP AUTHORITY
+WK1GRPA  DS    CL1                 USER'S GROUP AUTHORITY
+WK2AREA  DS    0C                  START OF 512 BYTE WORK AREA
+         DS    CL26
+         DS    CL2                 LENGTH OF ALL EXTRACTED DATA
+WK2SIZE1 DS    CL2                 SIZE OF # CLASSES
+WK2DATA1 DS    CL2                 # CLASSES
+WK2SIZE2 DS    CL2                 SIZE OF # GROUPS
+WK2DATA2 DS    CL2                 # GROUPS
+WK2SIZE3 DS    CL2                 SIZE OF ALL ENTRIES
+WK2DATA3 DS    0CL8                ENTRIES
+         DS    CL218               PADDING FOR ALL CLASSES
+         DS    CL256               AND ALL GROUPS
+RETCODE  DS    F                   RETURN CODE FORM MACRO
+WORK     DS    CL8                 HEX TO CHAR WORK AREA
+GROUP    DS    CL9                 GROUP NAME & LENGTH
+USER     DS    0CL9                USERID & LENGTH
+         DS    CL1                 USERID LENGTH
+USERID   DS    CL8                 USERID
+CLASMASK DS    F                   BIT MASK OF CLAUTH
+CVTADR   DS    F                   ADDRESS OF CVT
+CDEADR   DS    F                   ADDRESS OF CDE TABLE
+WORKSIZE EQU   *-SAVEAREA
+         EJECT
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         ICHPRCVT
+         IHAACEE
+         END

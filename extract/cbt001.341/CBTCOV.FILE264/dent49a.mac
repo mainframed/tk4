@@ -1,0 +1,832 @@
+ /* COPYRIGHT 1983 BY THOMAS GLEN SMITH */
+ DENT49A: PROC(CMDDATA,MSGDATA,RHRC,SUBQ_HDR,SUBRTNES,OPERATORS,
+   KEYWORDS,SPCHARS,PRECEDENCE,MAINPARM) OPTIONS(REENTRANT);
+ /**********************************************************************
+ * THIS IS THE MAINLINE PARSING SUBROUTINE                             *
+ **********************************************************************/
+   DFT RANGE(*) FIXED BIN VALUE(FIXED BIN(31,0));
+   DCL NULL BUILTIN;
+   DCL (CMDDATA,MSGDATA) CHAR(*) VAR;
+   DCL RHRC FIXED BIN(31,0);
+   DCL KEYWORDS(*) CHAR(*) VAR;
+   DCL OPERATORS(*) CHAR(*) VAR;
+   DCL PRECEDENCE(2,*) FIXED BIN(15,0);
+   DCL SPCHARS CHAR(*) VAR;
+   % INCLUDE DENTSEL;
+   HALT;
+   DCL SETCAPS ENTRY;
+   DCL PREFIX ENTRY(CHAR(*), CHAR(*))
+     RETURNS(FIXED BIN(15,0));
+   DCL POLISH ENTRY RETURNS(PTR);
+   DCL TPTR PTR;
+
+   /********************************************************************
+   * START OF INITIALIZATION CODE                                      *
+   ********************************************************************/
+
+   RHRC=0;
+   MTOKHDR,MCURTOK=NULL;
+   MSCANIX=1;
+   SELPTR,SRCH_PTR=NULL;
+
+   /********************************************************************
+   * START OF MAINLINE CODE                                            *
+   ********************************************************************/
+   ON CONDITION(BADSTMT) BEGIN;
+     RHRC=4;
+     IF MSGDATA=''
+       THEN MSGDATA='INVALID STATEMENT';
+     GOTO CLEANUP;
+     END;
+   CALL SETCAPS(CMDDATA); /* FOR NOW, HANDLE ONLY UPPER CASE */
+
+   /* THE FIRST THING TO DO IS TO FIND AND SCAN ALL SUBQUERIES. */
+
+   DO UNTIL(MCURTOK->TYPE=NO_MORE_TOKENS);
+     CALL MYSCAN(CMDDATA,MAINPARM,OPERATORS,KEYWORDS,SPCHARS);
+       /* GET NEXT TOKEN */
+     IF MCURTOK=MTOKHDR
+       THEN SELECT(MCURTOK->TOKSTR);
+         WHEN('ORDER') DO; /* IT IS ORDER SUBCOMMAND */
+           CALL ORDER_PARSE;
+           RETURN;
+           END;
+         WHEN('UPDATE') DO; /* IT IS UPDATE SUBCOMMAND */
+           CALL UPDATE_PARSE;
+           RETURN;
+           END;
+         WHEN('LOCATE') DO; /* IT IS LOCATE SUBCOMMAND */
+           CALL LOCATE_PARSE;
+           RETURN;
+           END;
+         WHEN('REMOVE') DO; /* IT IS REMOVE SUBCOMMAND */
+           CALL REMOVE_PARSE;
+           RETURN;
+           END;
+         OTHERWISE;
+         END; /* SELECT */
+     IF MCURTOK->TOKSTR='SELECT'
+       THEN CALL SELSUB(MSCANIX,MCURTOK); /* GO PROCESS SUBQUERY. */
+     END;
+
+   /* NOW PARSE ALL OF THE SELECTS ON THE SUBQUERY QUEUE */
+
+   DO SELPTR=SUBQ_FIRST REPEAT SUBQ_NEXT WHILE(SELPTR^=NULL);
+     CURTOK=TOKHDR;
+     CALL SELECT; /* GO PARSE SUBQUERY */
+     END;
+
+   /* DONE WITH PRE-EXECUTION PARSING */
+
+   RETURN;
+ CLEANUP:
+   /* NOW CLEAN UP ANY STORAGE ALLOCATED DURING THE SUBCOMMAND */
+   RETURN; /* ADD CLEAN-UP CODE LATER */
+
+ DBD_CLAUSE: PROC;
+ /**********************************************************************
+ * CALLED TO PROCESS A DBD_CLAUSE.                                     *
+ **********************************************************************/
+   IF SELECT_DBD
+     THEN DO; /* IT IS DUPLICATE DBD KEYWORD */
+       MSGDATA='ERROR - DBD KEYWORD MAY ONLY APPEAR ONCE.';
+       SIGNAL CONDITION(BADSTMT);
+       END;
+   SELECT_DBD='1'B;
+   SCAN; /* GET TO END OF CLAUSE, HOPEFULLY. */
+   END DBD_CLAUSE;
+
+ DROP_CLAUSE: PROC;
+ /**********************************************************************
+ * CALLED TO PROCESS A DROP_CLAUSE.                                    *
+ **********************************************************************/
+   IF DROP_LIST_PTR^=NULL
+     THEN DO; /* IT IS DUPLICATE DBD KEYWORD */
+       MSGDATA='ERROR - DROP KEYWORD MAY ONLY APPEAR ONCE.';
+       SIGNAL CONDITION(BADSTMT);
+       END;
+   IF ^SELECT_ALL_FIELDS
+     THEN DO;
+       MSGDATA='ERROR - SELECT LIST M/B * IF DROP IS USED';
+       SIGNAL CONDITION(BADSTMT);
+       END;
+   SCAN; /* GET FIRST TOKEN AFTER DROP */
+   CALL SELECT_LIST(DROP_LIST_PTR,CMDDATA,SCANPARM);
+   END DROP_CLAUSE;
+
+ EXPRESSION: PROC RETURNS(PTR);;
+ /**********************************************************************
+ * CALLED TO PROCESS AN EXPRESSION.  IT WILL RETURN A PTR TO THE       *
+ * QUEUE OF TOKENS DESRIBING THE POLISH NOTATION EQUIVALENT OF THE     *
+ * EXPRESSION PARSED FROM THE COMMAND LINE.                            *
+ **********************************************************************/
+   DCL (RET,T) PTR;
+   RET=POLISH(CURTOK,PRECEDENCE,MSGDATA,CURTOK);
+   IF MSGDATA^=''
+     THEN SIGNAL CONDITION(BADSTMT);
+   RETURN(RET);
+   END EXPRESSION;
+
+ FROM_CLAUSE: PROC;
+ /**********************************************************************
+ * CALLED TO PROCESS A FROM CLAUSE.                                    *
+ **********************************************************************/
+   DCL LAST PTR; /* WILL HOLD PTR TO LAST FROM_FIELD STRUCTURE */
+   DCL PCNT FIXED BIN(15,0) INIT(0);
+   IF FROM_LIST_PTR^=NULL
+     THEN DO; /* IT IS DUPLICATE FROM KEYWORD */
+       MSGDATA='ERROR - FROM CLAUSE MAY ONLY APPEAR ONCE.';
+       SIGNAL CONDITION(BADSTMT);
+       END;
+   SCAN; /* GET FIRST TOKEN AFTER FROM KEYWORD */
+   DO WHILE(CURTOK->TYPE^=NO_MORE_TOKENS);
+     IF TOKSTR='(' & TYPE^=QUOTED_STRING
+       THEN DO; /* SHOULD BE OF FORM (SELECTDDD) */
+         PCNT=1; /* EXPECT RIGHT PARENTHESIS */
+         SCAN; /* SKIP LEFT PAREN */
+         END;
+     IF TYPE^=OPERAND
+       THEN LEAVE; /* END OF FROM-CLAUSE */
+     ALLOCATE FROM_FIELD;
+     CALL SINGLE_QUEUE(FROM_LIST_PTR,LAST,FROFPTR);
+       /* GO QUEUE FROM_CLAUSE NAME OFF FROM_LIST_PTR */
+     FROM_NAME=TOKSTR;
+     SHORT_FROM_NAME='';
+     FROM_RHP=NULL;
+     STRING(FROM_FLAGS)='0'B;
+     FROM_RES2='';
+     FROM_RECPTR=NULL;
+     SCAN; /* GET NEXT TOKEN */
+     IF PCNT=1
+       THEN DO; /* IT HAD BETTER BE A RIGHT PAREN */
+         IF ^(TOKSTR=')' & TYPE^=QUOTED_STRING)
+           THEN DO;
+             MSGDATA='INVALID FROM SPECIFICATION';
+             SIGNAL CONDITION(BADSTMT);
+             END;
+         PCNT=0;
+         SCAN; /* GET PAST RIGHT PAREN */
+         END;
+     IF TOKSTR='-'
+       THEN DO; /* EXPECT A SHORT_HAND NAME NEXT */
+         SCAN; /* GET NEXT TOKEN */
+         IF TYPE^=OPERAND
+           THEN DO;
+             MSGDATA='VALUE = '''××TOKSTR××
+               ''' WHEN SHORTHAND-FROM-NAME EXPECTED';
+             SIGNAL CONDITION(BADSTMT);
+             END;
+         SHORT_FROM_NAME=TOKSTR;
+         SCAN; /* GET NEXT TOKEN */
+         END;
+     IF CURTOK->TYPE=NO_MORE_TOKENS
+       THEN LEAVE;
+     IF CURTOK->TOKSTR^=','
+       THEN LEAVE; /* END OF FROM-CLAUSE */
+     SCAN; /* GET NEXT TOKEN AFTER COMMA */
+     IF CURTOK->TYPE^=OPERAND &
+       ^(CURTOK->TOKSTR='(' & CURTOK->TYPE^=QUOTED_STRING)
+       THEN DO;
+         MSGDATA='END OF FROM CLAUSE ENCOUNTERED WHEN MORE NAMES'××
+           ' WERE EXPECTED';
+         SIGNAL CONDITION(BADSTMT);
+         END;
+     END;
+   END FROM_CLAUSE;
+
+ GROUP_BY_CLAUSE: PROC;
+ /**********************************************************************
+ * CALLED TO PROCESS A GROUP-BY CLAUSE.                                *
+ **********************************************************************/
+   IF GROUP_BY_PTR^=NULL
+     THEN DO; /* IT IS DUPLICATE GROUP BY KEYWORD */
+       MSGDATA='ERROR - GROUP BY CLAUSE MAY ONLY APPEAR ONCE.';
+       SIGNAL CONDITION(BADSTMT);
+       END;
+   SCAN; /* GET FIRST TOKEN AFTER GROUP KEYWORD */
+   IF TOKSTR='BY'
+     THEN SCAN; /* SKIP OVER BY KEYWORD */
+   ALLOCATE GROUP_BY_BLOCK;
+   GROUP_SPEC_PTR=SEQ_SPEC; /* GO EVALUATE LIST */
+   IF TOKSTR^='HAVING'
+     THEN GROUP_SEARCH_CONDITION=NULL; /* NO HAVING CLAUSE */
+     ELSE DO;
+       SCAN;
+       CALL SEARCH_CONDITION;
+       GROUP_SEARCH_CONDITION=SRCH_PTR;
+       SRCH_PTR=NULL;
+       END;
+   GROUP_BUFPTR=NULL;
+   END GROUP_BY_CLAUSE;
+
+ LOCATE_PARSE: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN THE CURRENT SUBCOMMAND IS LOCATE. IT WILL PLACE A DUMMY *
+ * SELECT_HTEXT CONTROL BLOCK ON THE SUBQ_HDR QUEUE, AND WILL PARSE    *
+ * THE REMOVE SUBCOMMAND.                                              *
+ *                                                                     *
+ **********************************************************************/
+   DCL LAST PTR;
+   SELPTR=SELNEW; /* GO ALLOC AND INIT NEW SELECT_HTEXT BLOCK */
+   SCANIX=MSCANIX;
+   DO UNTIL(TYPE=NO_MORE_TOKENS);
+     SCAN;
+     END;
+   SCANIX=0;
+   CURTOK=TOKHDR;
+   CALL LOCATE_PARSE_FROM; /* GO PROCESS FROM-SPEC */
+   DO WHILE(TYPE^=NO_MORE_TOKENS);
+     SELECT(TOKSTR);
+       WHEN('NEXT') DO;
+         SELECT_ALL_FIELDS='1'B;
+         SCAN;
+         END;
+       WHEN('WHERE') CALL WHERE_CLAUSE;
+       OTHERWISE SIGNAL CONDITION(BADSTMT);
+       END; /* SELECT */
+     END;
+   IF TYPE^=NO_MORE_TOKENS
+     THEN SIGNAL CONDITION(BADSTMT);
+   END LOCATE_PARSE;
+
+ LOCATE_PARSE_FROM: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN THE CURRENT SUBCOMMAND IS LOCATE OR REMOVE TO SET UP    *
+ * FROM SPECIFICATION.                                                 *
+ *                                                                     *
+ **********************************************************************/
+   ALLOCATE FROM_FIELD;
+   FROM_NEXT_FIELD=NULL;
+   FROM_LIST_PTR=FROFPTR;
+   FROM_NAME='';
+   SHORT_FROM_NAME='';
+   FROM_RHP=NULL;
+   STRING(FROM_FLAGS)='0'B;
+   FROM_RES2='';
+   FROM_RECPTR=NULL;
+   END LOCATE_PARSE_FROM;
+
+ ORDER_BY_CLAUSE: PROC(KEY);
+ /**********************************************************************
+ * CALLED TO PROCESS AN ORDER_BY CLAUSE.                               *
+ **********************************************************************/
+   DCL KEY CHAR(*) VAR;
+   DCL LAST PTR;
+   IF ORDER_BY_PTR^=NULL
+     THEN DO; /* IT IS DUPLICATE ORDER KEYWORD */
+       MSGDATA='ERROR - ORDER-BY CLAUSE MAY ONLY APPEAR ONCE.';
+       SIGNAL CONDITION(BADSTMT);
+       END;
+   SELECT(KEY);
+     WHEN('MERGE')  MERGE_FLAG='1'B;
+     WHEN('SET')    SET_FLAG='1'B;
+     WHEN('UPDATE') UPDATE_FLAG='1'B;
+     OTHERWISE;
+     END; /* SELECT */
+   IF KEY^='BY'
+     THEN SCAN; /* GET FIRST TOKEN AFTER ORDER KEYWORD */
+   IF TOKSTR^='BY'
+     THEN RETURN; /* IT IS KEYWORD-ONLY CLAUSE */
+   SCAN; /* SKIP OVER BY KEYWORD */
+   ORDER_BY_PTR=SEQ_SPEC; /* GO EVALUATE SEQUENCE SPECIFICATION */
+   END ORDER_BY_CLAUSE;
+
+ ORDER_PARSE: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN THE CURRENT SUBCOMMAND IS ORDER.  IT WILL PLACE A DUMMY *
+ * SELECT_HTEXT CONTROL BLOCK ON THE SUBQ_HDR QUEUE, AND WILL PARSE    *
+ * THE ORDER-BY SUBCOMMAND, QUEUEING AN ORDER-BY LIST FROM THE         *
+ * ORDER_BY_PTR FIELD IN THE DUMMY SELECT_HTEXT CONTROL BLOCK.         *
+ *                                                                     *
+ **********************************************************************/
+   DCL LAST PTR;
+   SELPTR=SELNEW; /* GO ALLOC AND INIT NEW SELECT_HTEXT BLOCK */
+   CALL MYSCAN(CMDDATA,MAINPARM,OPERATORS,KEYWORDS,SPCHARS);
+   IF MCURTOK->TOKSTR='BY'
+     THEN CALL MYSCAN(CMDDATA,MAINPARM,OPERATORS,KEYWORDS,SPCHARS);
+   DO WHILE(MCURTOK->TYPE^=NO_MORE_TOKENS);
+     IF MCURTOK->TYPE^=OPERAND
+       THEN SIGNAL CONDITION(BADSTMT);
+     ALLOCATE ORDER_BY_SPEC;
+     ORDER_NAME=MCURTOK;
+     ORDER_ASCENDING='1'B; /* DEFAULT TO ASCENDING */
+     CALL MYSCAN(CMDDATA,MAINPARM,OPERATORS,KEYWORDS,SPCHARS);
+     IF MCURTOK->TOKSTR='ASC' × MCURTOK->TOKSTR='DESC'
+       THEN DO;
+         IF MCURTOK->TOKSTR='DESC'
+           THEN ORDER_ASCENDING='0'B;
+         CALL MYSCAN(CMDDATA,MAINPARM,OPERATORS,KEYWORDS,SPCHARS);
+         END;
+     CALL SINGLE_QUEUE(ORDER_BY_PTR,LAST,OSPPTR);
+     IF MCURTOK->TOKSTR^=','
+       THEN LEAVE; /* BAD ORDER SUBCOMMAND */
+     CALL MYSCAN(CMDDATA,MAINPARM,OPERATORS,KEYWORDS,SPCHARS);
+     END;
+   IF MCURTOK->TYPE^=NO_MORE_TOKENS
+     THEN SIGNAL CONDITION(BADSTMT);
+   END ORDER_PARSE;
+
+ REMOVE_PARSE: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN THE CURRENT SUBCOMMAND IS REMOVE. IT WILL PLACE A DUMMY *
+ * SELECT_HTEXT CONTROL BLOCK ON THE SUBQ_HDR QUEUE, AND WILL PARSE    *
+ * THE REMOVE SUBCOMMAND.                                              *
+ *                                                                     *
+ **********************************************************************/
+   DCL LAST PTR;
+   SELPTR=SELNEW; /* GO ALLOC AND INIT NEW SELECT_HTEXT BLOCK */
+   SCANIX=MSCANIX;
+   DO UNTIL(TYPE=NO_MORE_TOKENS);
+     SCAN;
+     END;
+   SCANIX=0;
+   CURTOK=TOKHDR;
+   CALL LOCATE_PARSE_FROM; /* GO PROCESS FROM-SPEC */
+   DO WHILE(TYPE^=NO_MORE_TOKENS);
+     SELECT(TOKSTR);
+       WHEN('WHERE') CALL WHERE_CLAUSE;
+       OTHERWISE SIGNAL CONDITION(BADSTMT);
+       END; /* SELECT */
+     END;
+   IF TYPE^=NO_MORE_TOKENS
+     THEN SIGNAL CONDITION(BADSTMT);
+   END REMOVE_PARSE;
+
+ RENAME_CLAUSE: PROC;
+ /**********************************************************************
+ * CALLED TO PROCESS A RENAME_CLAUSE.                                  *
+ **********************************************************************/
+   DCL LAST PTR;
+
+   IF RENAME_LIST_PTR^=NULL
+     THEN DO; /* IT IS DUPLICATE RENAME KEYWORD */
+       MSGDATA='ERROR - RENAME KEYWORD MAY ONLY APPEAR ONCE.';
+       SIGNAL CONDITION(BADSTMT);
+       END;
+   SCAN; /* GET FIRST TOKEN AFTER DROP */
+   DO UNTIL(TYPE=NO_MORE_TOKENS);
+     ALLOCATE RENAME_ITEM;
+     CALL SINGLE_QUEUE(RENAME_LIST_PTR,LAST,RENPTR);
+     RENAME_OLD=CURTOK;
+     SCAN; /* GET NEXT TOKEN */
+     IF ^(TOKSTR='=' & TYPE^=QUOTED_STRING)
+     THEN DO;
+       MSGDATA='''='' EXPECTED IN RENAME CLAUSE.';
+       SIGNAL CONDITION(BADSTMT);
+       END;
+     SCAN; /* GET NEXT TOKEN */
+     RENAME_NEW=CURTOK;
+     SCAN; /* GET NEXT TOKEN */
+     IF ^(TOKSTR=',' & TYPE^=QUOTED_STRING)
+       THEN LEAVE;
+     SCAN; /* GET NEXT TOKEN */
+     END;
+   END RENAME_CLAUSE;
+
+ SEARCH_CONDITION: PROC;
+ /**********************************************************************
+ * CALLED TO PROCESS A SEARCH_CONDITION.  IT WILL SET PTR SRCH_PTR TO  *
+ * POINT TO A NEW SEARCH_CONDITION CONTROL BLOCK.*
+ **********************************************************************/
+   DCL LAST PTR;
+   ALLOCATE SEARCH_CONDITION_BLOCK;
+   STRING(SEARCH_FLAGS)='0'B;
+   SEARCH_EXP(*)=NULL;
+   SEARCH_EXP(1)=EXPRESSION;
+   IF CURTOK->TYPE=NO_MORE_TOKENS
+     THEN SIMPLE='1'B;
+     ELSE DO;
+       IF TOKSTR='NOT'
+         THEN DO;
+           NOT='1'B;
+           SCAN; /* GET NEXT TOKEN */
+           END;
+       SELECT(TOKSTR);
+         WHEN('BETWEEN') DO;
+           BETWEEN='1'B;
+           SEARCH_EXP(2)=EXPRESSION;
+           IF TOKSTR=','
+             THEN SCAN;
+           SEARCH_EXP(3)=EXPRESSION;
+           END;
+         WHEN('IN') DO;
+           IN='1'B;
+           SCAN;
+           IF ^(TOKSTR='(' & TYPE^=QUOTED_STRING)
+             THEN SIGNAL CONDITION(BADSTMT);
+           SCAN; /* SKIP PAST ( */
+           CALL SELECT_LIST(SEARCH_EXP(2),CMDDATA,SCANPARM);
+             /* GO PROCESS SELECT_LIST */
+           IF ^(TOKSTR=')' & TYPE^=QUOTED_STRING)
+             THEN SIGNAL CONDITION(BADSTMT);
+           SCAN;
+           END;
+         WHEN('IS') DO;
+           IS='1'B;
+           SCAN;
+           IF TOKSTR='NOT'
+             THEN DO;
+               NOT='1'B;
+               SCAN;
+               END;
+           IF TOKSTR^='NULL'
+             THEN DO;
+               MSGDATA='KEYWORD NULL NOT FOUND WHEN EXPRECTED';
+               SIGNAL CONDITION(BADSTMT);
+               END;
+           SCAN;
+           END;
+         WHEN('LIKE') DO;
+           LIKE='1'B;
+           SCAN;
+           IF TYPE^=QUOTED_STRING
+             THEN DO;
+               MSGDATA='SEARCH CONDITION LIKE REQUIRES QUOTED STRING';
+               SIGNAL CONDITION(BADSTMT);
+               END;
+           SEARCH_EXP(2)=CURTOK;
+           SCAN;
+           END;
+         OTHERWISE SIMPLE='1'B;  /* END OF SEARCH-CONDITION */
+         END; /* SELECT */
+       END;
+   END SEARCH_CONDITION;
+
+ SELECT: PROC;
+ /**********************************************************************
+ * CALLED TO PARSE A SELECT SUBQUERY.                                  *
+ **********************************************************************/
+   /* NOW START MAINLINE FOR SELECT STATEMENT */
+   CALL SELECT_CLAUSE; /* GO PROCESS SELECT CLAUSE */
+   DO WHILE(TYPE^=NO_MORE_TOKENS & RHRC=0);
+     SELECT(TOKSTR);
+       WHEN('FROM')  CALL FROM_CLAUSE;
+       WHEN('WHERE') CALL WHERE_CLAUSE;
+       WHEN('GROUP') CALL GROUP_BY_CLAUSE;
+       WHEN('ORDER','BY','MERGE','SET','UPDATE')
+         CALL ORDER_BY_CLAUSE(TOKSTR);
+       WHEN('TO')    CALL TO_CLAUSE;
+       WHEN('DBD')   CALL DBD_CLAUSE;
+       WHEN('DROP')  CALL DROP_CLAUSE;
+       WHEN('RENAME')  CALL RENAME_CLAUSE;
+       WHEN('DISPLAY') DO;
+         SELECT_DISPLAY='1'B;
+         SCAN;
+         END;
+       OTHERWISE DO;
+         MSGDATA='UNIDENTIFIED KEYWORD = '××TOKSTR;
+         RHRC=4;
+         END;
+       END; /* SELECT */
+     IF ^END_CLAUSE(CURTOK)
+       THEN DO;
+         MSGDATA='UNIDENTIFIED TEXT = '××TOKSTR;
+         SIGNAL CONDITION(BADSTMT);
+         END;
+     END;
+   END SELECT;
+
+ SELECT_CLAUSE: PROC;
+ /**********************************************************************
+ * CALLED TO PROCESS A SELECT-CLAUSE.                                  *
+ **********************************************************************/
+   DCL I FIXED BIN(15,0);
+   DO I=1 REPEAT I+1;
+     IF TOKSTR='*'
+       THEN DO;
+         SELECT_ALL_FIELDS='1'B;
+         SCAN;
+         RETURN;
+         END;
+     IF I=1
+       THEN SELECT_DISTINCT=(TOKSTR='DISTINCT');
+     IF TOKSTR='ALL' × TOKSTR='DISTINCT'
+       THEN SCAN; /* GET NEXT TOKEN */
+       ELSE LEAVE;
+     END;
+   CALL SELECT_LIST(SELECT_LIST_PTR,CMDDATA,SCANPARM);
+   IF SELECT_LIST_PTR^=NULL
+     THEN CALL SELECT_SUMMARY_CHECK;
+   END SELECT_CLAUSE;
+
+ SELECT_SUMMARY_CHECK: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO CHECK A SELECT_LIST FOR SUMMARY STATISTIC PROCESSING.     *
+ *                                                                     *
+ **********************************************************************/
+   DCL (D,S) PTR;
+   DCL I FIXED BIN(15,0);
+
+   /* FIRST CHECK FOR BLANKET SUMMARY */
+   IF SUMMARY_KEYWORD(SELECT_LIST_PTR->FIELD_EXP_HDR->TOKSTR)
+     & SELECT_LIST_PTR->FIELD_EXP_HDR->TOKSTR^='COUNT'
+     THEN DO;
+       IF SELECT_LIST_PTR->FIELD_EXP_HDR->NEXT_TOKEN^=NULL
+         THEN DO;
+           MSGDATA='BLANKET SUMMARY REQUEST MUST STAND ALONE';
+           SIGNAL CONDITION(BADSTMT);
+           END;
+       SELECT_ALL_FIELDS,SELECT_SUMMARY='1'B;
+       SELECT_SUMMARY_TYPE=SELECT_LIST_PTR->FIELD_EXP_HDR->TOKSTR;
+       FREE SELECT_LIST_PTR->SELECT_LIST_ELEMENT;
+       SELECT_LIST_PTR=NULL;
+       RETURN;
+       END;
+
+   /* NOW CHECK FOR ANY SUMMARY STAT REFERENCES IN SELECT_LIST */
+   I=0;
+   DO S=SELECT_LIST_PTR REPEAT S->SELECT_NEXT_FIELD WHILE(S^=NULL);
+     DO D=S->FIELD_EXP_HDR REPEAT D->NEXT_TOKEN WHILE(D^=NULL)
+       UNTIL(D->NEXT_TOKEN=NULL);
+       END;
+     IF D^=NULL
+       THEN IF SUMMARY_KEYWORD(D->TOKSTR)
+         THEN DO;    /* IT IS A SUMMARY REFERENCE */
+           I=1;
+           S->SELECT_SUM,S->SELECT_EXP='1'B;
+           END;
+     END;
+   IF I=0
+     THEN RETURN; /* NO SUMMARY REFERENCES */
+   SELECT_SUMMARY='1'B;
+   END SELECT_SUMMARY_CHECK;
+
+ SELNEW: PROC RETURNS(PTR);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO ALLOCATE AND INITIALIZE A NEW SELECT_HTEXT CONTROL BLOCK. *
+ * IT WILL QUEUE THE NEW CONTROL BLOCK ON THE SUBQ_HDR QUEUE, AND      *
+ * WILL RETURN A POINTER TO IT.                                        *
+ *                                                                     *
+ **********************************************************************/
+   DCL (SAVPTR,RETPTR) PTR;
+   SAVPTR=SELPTR; /* SAVE CURRENT SELPTR IN CASE OF RECURSION */
+   ALLOCATE SELECT_HTEXT SET(SELPTR);
+   RETPTR=SELPTR;
+
+   /* NOW QUEUE NEW SELECT_HTEXT BLOCK ON SUBQUERY QUEUE */
+
+   SUBQ_NEXT=NULL;
+   SUBQ_PREV=SUBQ_LAST;
+   IF SUBQ_LAST=NULL
+     THEN SUBQ_FIRST=SELPTR;
+     ELSE SUBQ_LAST->SUBQ_NEXT=SELPTR;
+   SUBQ_LAST=SELPTR;
+
+   /* NOW INITIALIZE OTHER SELECT_HTEXT FIELDS */
+
+   SUBQ_NUM,SUBQ_CNT=SUBQ_CNT+1;
+   TOKHDR,CURTOK=NULL;
+   SCANIX=1;
+   STRING(SELECT_FLAGS)='0'B;
+   SELECT_LIST_PTR,FROM_LIST_PTR,WHERE_PTR,GROUP_BY_PTR,
+     ORDER_BY_PTR,TO_PTR,DROP_LIST_PTR,RENAME_LIST_PTR=NULL;
+   SELECT_SUMMARY_TYPE='';
+   SELPTR=SAVPTR;
+   RETURN(RETPTR);
+   END SELNEW;
+
+ SELSUB: PROC(PSCANIX,PCURTOK) RECURSIVE;
+ /**********************************************************************
+ * THIS SUBROUTINE IS CALLED WHENEVER A SELECT KEYWORD IS              *
+ * ENCOUNTERED ON THE COMMAND LINE.  IT WILL ESTABLISH A NEW           *
+ * SELECT_HTEXT BLOCK AND QUEUE ALL OF THE TOKENS FOR THE SUBQUERY     *
+ * FROM THIS BLOCK.  IT WILL THEN REPLACE THE SELECT TOKEN POINTED TO  *
+ * BY PCURTOK WITH A TOKEN STRUCTURE DESCRIBING AN OPERAND NAME OF THE *
+ * FORM SELECTDD, WHERE DD IS THE UNIQUE NUMBER ASSOCIATED WITH THE    *
+ * SUBQUERY.
+ **********************************************************************/
+   DCL PSCANIX FIXED BIN(15,0); /* PSCANIX CONTAINS THE SCANIX VALUE
+     AFTER THE SELECT KEYWORD WAS ENCOUNTERED. */
+   DCL PCURTOK PTR; /* POINTS TO THE TOKEN STRUCTURE FOR THE SELECT
+     KEYWORD. */
+   DCL (SCNT,PCNT) FIXED BIN(15,0);
+   DCL (SAVPTR,SAVTOK,NEWTOK) PTR;
+   SAVPTR=SELPTR; /* SAVE CURRENT SELPTR IN CASE OF RECURSION */
+   SELPTR=SELNEW; /* GO ALLOCATE AND INITIALIZE SELECT_HTEXT BLOCK */
+   SCANIX=PSCANIX;
+   SCNT=SUBQ_CNT;
+
+   /* NOW CONTINUE THE SCAN UNTIL THE CLOSING PAREN OR NO_MORE_TOKENS
+   IS ENCOUNTERED. */
+
+   PCNT=0;
+   DO UNTIL(TYPE=NO_MORE_TOKENS × PCNT<0);
+     SCAN; /* GET NEXT TOKEN */
+     IF CURTOK->TOKSTR='SELECT'
+       THEN CALL SELSUB(SCANIX,CURTOK); /* GO PROCESS SUBQUERY. */
+     IF CURTOK->TOKSTR=')' & CURTOK->TYPE^=QUOTED_STRING
+       THEN PCNT=PCNT-1;
+       ELSE IF CURTOK->TOKSTR='(' & CURTOK->TYPE^=QUOTED_STRING
+         THEN PCNT=PCNT+1;
+     END;
+
+   /* NOW REPLACE LAST ELEMENT WITH A NO_MORE_TOKENS TOKEN */
+
+   ALLOCATE TOKEN SET(NEWTOK); /* ALLOCATE NO_MORE_TOKENS TOKEN */
+   NEWTOK->ELIX=CURTOK->PRIOR_TOKEN->ELIX;
+   NEWTOK->TYPE=NO_MORE_TOKENS;
+   NEWTOK->TOKSTR='';
+   NEWTOK->NEXT_TOKEN=NULL;
+   IF TOKHDR=CURTOK
+     THEN DO;
+       NEWTOK->PRIOR_TOKEN=NEWTOK;
+       TOKHDR=NEWTOK;
+       END;
+     ELSE DO;
+       NEWTOK->PRIOR_TOKEN=CURTOK->PRIOR_TOKEN;
+       NEWTOK->PRIOR_TOKEN->NEXT_TOKEN=NEWTOK;
+       END;
+   SAVTOK=CURTOK;
+   CURTOK=NEWTOK;
+
+   /* NOW REQUEUE THAT LAST TOKEN ELEMENT TO CALLER'S SELECT_HTEXT */
+
+   PCURTOK->NEXT_TOKEN=SAVTOK;
+   SAVTOK->PRIOR_TOKEN=PCURTOK;
+   SAVTOK->NEXT_TOKEN=NULL;
+
+   /* NOW FIX UP TOKEN POINTED TO BY PCURTOK TO LOOK LIKE OPERAND
+   NAME OF THE FORM SELECTDD */
+
+   PUT STRING(PCURTOK->TOKSTR) EDIT('SELECT',SCNT)(A,P'9999');
+   PCURTOK->TYPE=OPERAND;
+   PSCANIX=SCANIX; /* UPDATE PSCANIX TO POINT BEYOND TEXT FOR THIS
+     SELECT */
+   SELPTR=SAVPTR; /* RESTORE ORIGINAL SELPTR IN CASE OF RECURSION */
+   END SELSUB;
+
+ SEQ_SPEC: PROC RETURNS(PTR);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PROCESS A SORT SEQUENCE SPECIFICATION (SEQ-SPEC) FOR      *
+ * EITHER AN ORDER-BY OR A GROUP-BY CLAUSE.                            *
+ *                                                                     *
+ **********************************************************************/
+   DCL (LAST,OBPTR) PTR;
+   LAST,OBPTR=NULL;
+   DO WHILE(CURTOK->TYPE^=NO_MORE_TOKENS);
+     IF TYPE^=OPERAND
+       THEN LEAVE; /* END OF ORDER-BY CLAUSE */
+     ALLOCATE ORDER_BY_SPEC;
+     ORDER_NAME=CURTOK;
+     ORDER_ASCENDING='1'B; /* DEFAULT TO ASCENDING */
+     SCAN;
+     IF CURTOK->TOKSTR='ASC' × CURTOK->TOKSTR='DESC'
+       THEN DO;
+         IF CURTOK->TOKSTR='DESC'
+           THEN ORDER_ASCENDING='0'B; /* INDICATE DESCENDING */
+         SCAN;
+         END;
+     CALL SINGLE_QUEUE(OBPTR,LAST,OSPPTR);
+     IF CURTOK->TOKSTR^=','
+       THEN LEAVE; /* END OF ORDER-BY CLAUSE */
+     SCAN; /* SKIP OVER DELIMITING COMMA */
+     END;
+   RETURN(OBPTR);
+   END SEQ_SPEC;
+
+ SUMMARY_KEYWORD: PROC(KEY) RETURNS(BIT(1));
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO DETERMINE IF A GIVEN TOKEN IS A SUMMARY STATISTIC         *
+ * FUNCTION REFERENCE.                                                 *
+ *                                                                     *
+ **********************************************************************/
+   DCL KEY CHAR(*) VAR;
+   SELECT(KEY);
+     WHEN('AVG','COUNT','MAX','MIN','STD','SUM') RETURN('1'B);
+     OTHERWISE RETURN('0'B);
+     END; /* SELECT */
+   END SUMMARY_KEYWORD;
+
+ TO_CLAUSE: PROC;
+ /**********************************************************************
+ * CALLED TO PROCESS A TO_CLAUSE.                                      *
+ **********************************************************************/
+   DCL LAST PTR;
+   IF TO_PTR^=NULL
+     THEN DO; /* IT IS DUPLICATE ORDER KEYWORD */
+       MSGDATA='ERROR - TO CLAUSE MAY ONLY APPEAR ONCE.';
+       SIGNAL CONDITION(BADSTMT);
+       END;
+   SCAN; /* GET FIRST TOKEN AFTER TO KEYWORD */
+   IF TYPE^=OPERAND & ^(TYPE=NUMERIC_CONSTANT & INDEX(TOKSTR,'.')=0)
+     THEN DO;
+       MSGDATA='INVALID TO CLAUSE';
+       SIGNAL CONDITION(BADSTMT);
+       END;
+   TO_PTR=CURTOK;
+   SCAN; /* GET TO END OF CLAUSE, HOPEFULLY. */
+   END TO_CLAUSE;
+
+ UPDATE_PARSE: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN THE CURRENT SUBCOMMAND IS UPDATE. IT WILL PLACE A DUMMY *
+ * SELECT_HTEXT CONTROL BLOCK ON THE SUBQ_HDR QUEUE, AND WILL PARSE    *
+ * THE UPDATE SUBCOMMAND.                                              *
+ *                                                                     *
+ **********************************************************************/
+   DCL LAST PTR;
+   SELPTR=SELNEW; /* GO ALLOC AND INIT NEW SELECT_HTEXT BLOCK */
+   SCANIX=MSCANIX;
+   DO UNTIL(TYPE=NO_MORE_TOKENS);
+     SCAN;
+     END;
+   SCANIX=0;
+   CURTOK=TOKHDR;
+   CALL UPDATE_PARSE_TO; /* GO PROCESS TO-SPEC */
+   DO WHILE(TYPE^=NO_MORE_TOKENS);
+     SELECT(TOKSTR);
+       WHEN('SET') CALL UPDATE_PARSE_SET;
+       WHEN('WHERE') CALL WHERE_CLAUSE;
+       OTHERWISE SIGNAL CONDITION(BADSTMT);
+       END; /* SELECT */
+     END;
+   IF TYPE^=NO_MORE_TOKENS
+     THEN SIGNAL CONDITION(BADSTMT);
+   END UPDATE_PARSE;
+
+ UPDATE_PARSE_SET: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN THE CURRENT SUBCOMMAND IS UPDATE TO PROCESS THE SET     *
+ * SPECIFICATIONS.                                                     *
+ *                                                                     *
+ **********************************************************************/
+
+   DCL LASTFLD PTR;
+   LASTFLD,SELECT_LIST_PTR=NULL;
+   SCAN; /* GET 1ST TOKEN AFTER SET KEYWORD */
+   DO WHILE(TYPE^=NO_MORE_TOKENS);
+     IF TYPE^=OPERAND
+       THEN LEAVE; /* END OF SET SPECIFICATION */
+     ALLOCATE SELECT_LIST_ELEMENT;
+     CALL SINGLE_QUEUE(SELECT_LIST_PTR,LASTFLD,SELFPTR);
+     SELECT_COUNT,SELECT_BUCKET1,SELECT_BUCKET2=0;
+     STRING(SELECT_ELEMENT_FLAGS)='0'B;
+     SELECT_EXP='1'B;
+     SELECT_NAME=TOKSTR;
+     SCAN;
+     IF TOKSTR^='='
+       THEN SIGNAL CONDITION(BADSTMT);
+     SCAN;
+     FIELD_EXP_HDR=POLISH(CURTOK,PRECEDENCE,MSGDATA,CURTOK);
+     IF FIELD_EXP_HDR=NULL
+       THEN SIGNAL CONDITION(BADSTMT);
+     IF TOKSTR^=',' × TYPE=NO_MORE_TOKENS
+       THEN LEAVE; /* END OF SET SPEC */
+     SCAN;
+     END;
+   END UPDATE_PARSE_SET;
+
+ UPDATE_PARSE_TO: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN THE CURRENT SUBCOMMAND IS UPDATE TO PROCESS THE TO/FROM *
+ * SPECIFICATION.                                                      *
+ *                                                                     *
+ **********************************************************************/
+   DCL PNAME CHAR(8);
+   /* FOR NOW, PROCESS ONLY A SINGLE NAME */
+   IF TYPE^=OPERAND
+     THEN SIGNAL CONDITION(BADSTMT);
+   IF TOKSTR='SET' × TOKSTR='WHERE'
+     THEN PNAME='';     /* USE CURRENT DATA SET */
+     ELSE DO;
+       PNAME=TOKSTR;
+       SCAN;
+       END;
+   ALLOCATE FROM_FIELD;
+   FROM_NEXT_FIELD=NULL;
+   FROM_LIST_PTR=FROFPTR;
+   FROM_NAME=PNAME;
+   SHORT_FROM_NAME='';
+   FROM_RHP=NULL;
+   STRING(FROM_FLAGS)='0'B;
+   FROM_RES2='';
+   FROM_RECPTR=NULL;
+   END UPDATE_PARSE_TO;
+
+ WHERE_CLAUSE: PROC;
+ /**********************************************************************
+ * CALLED TO PROCESS A WHERE CLAUSE.                                   *
+ **********************************************************************/
+   IF WHERE_PTR^=NULL
+     THEN DO; /* IT IS DUPLICATE WHERE KEYWORD */
+       MSGDATA='ERROR - WHERE CLAUSE MAY ONLY APPEAR ONCE.';
+       SIGNAL CONDITION(BADSTMT);
+       END;
+   SCAN; /* GET FIRST TOKEN AFTER WHERE KEYWORD */
+   CALL SEARCH_CONDITION; /* GO PARSE SEARCH_CONDITION */
+   WHERE_PTR=SRCH_PTR; /* SET WHERE_PTR */
+   SRCH_PTR=NULL;
+   END WHERE_CLAUSE;
+
+   END DENT49A;

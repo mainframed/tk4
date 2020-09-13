@@ -1,0 +1,2612 @@
+*          DATA SET ZMON       AT LEVEL 004 AS OF 02/01/79
+         LCLA  &BUFSIZE
+         LCLA  &MAXLPA
+         LCLA  &LOADLEN
+         LCLA  &SIOLEN
+         LCLA  &SVCCODE
+         LCLA  &PAGEDS
+         LCLC  &OS
+         LCLC  &DUMPER
+         LCLA  &RQELEN
+SUPERMON CSECT
+*
+&BUFSIZE SETA  2048           BLOCK SIZE OF MONITOR FILE
+&MAXLPA  SETA  96             NO. LPA MODULES PER DESCRIPTOR RECORD
+&LOADLEN SETA  12             LENGTH OF LINK,LOAD,ETC. RECORD
+&SIOLEN  SETA  4              LENGTH OF SIO RECORD
+&SVCCODE SETA  34
+&RQELEN  SETA  12             LENGTH OF RQE
+&PAGEDS  SETA  4              MAX NO. PAGE DATASETS
+&DUMPER  SETC  'EAB1MDMP'
+&OS      SETC  'VS1'
+         AIF   ('&OS' EQ 'MFT').RQELEN
+         AIF   ('&OS' NE 'MVT').RQELEN1
+&RQELEN  SETA  16
+         AGO   .RQELEN
+.RQELEN1 ANOP
+&RQELEN  SETA  20
+&PAGEDS  SETA  4
+.RQELEN  ANOP
+         AIF   ('&OS' EQ 'MFT' OR '&OS' EQ 'MVT').INTCODE
+&SVCCODE SETA  138
+.INTCODE ANOP
+SCVTMSSQ EQU   108
+SMON     TITLE 'SUPER MONITOR - MAIN CONTROL'
+*
+*   MONITOR SUPERVISION ROUTINE
+*
+         USING *,15
+         STM   14,12,12(13)
+         LR    2,15
+         LA    12,4094(0,2)
+         USING SUPERMON,2
+         USING SUPERMON+4094,12
+         USING CVT,4
+         DROP  15
+         LR    10,13
+         LA    13,SAVE
+         ST    10,4(0,13)
+         ST    13,8(0,10)
+*
+*   GET SUPERVISOR STATE,  PROTECT KEY ZERO
+*   INITIALISE THE MONITOR
+*
+         ST    1,SUPERMON
+         MODESET KEY=ZERO,MODE=SUP
+         LA    3,INIT
+         USING SAMPBUF,3
+         BAL   14,INIT
+         BAL   14,RESET       ZERO SAMPLING BUFFER
+         MVI   DECB,X'7F'
+*                                                                     *
+*       STAE CONTROL BLOCK SET UP HERE                                *
+*                                                                     *
+         STAE  ABEND,CT,,XCTL=NO,PURGE=HALT,ASYNCH=YES
+         LTR    15,15
+         BNZ   STAEFAIL
+*
+*   WAIT HERE TILL SAMPLING INTERVAL EXPIRES
+*
+STIMER   EQU   *
+         SSM   *+1            MAKE NON-INTERUPTABLE
+         STIMER WAIT,TUINTVL=CYCLE
+*
+*  SCAN THE SYSTEM
+*
+         BAL   14,SCAN
+         SSM   FF             ENABLE
+*
+*   SEE IF TIME FOR REPORT
+*
+         LH    6,SAMPLES
+         CH    6,SAMPSREP
+         BL    CHKWRITE       IF NOT TIME FOR REPORT
+         CLI   B1,2           BUFFER STILL BEING WRITTEN ?
+         BE    CHKWRITE
+         BAL   14,RPTITEMS
+         MVI   B1,1           INDICATE BUFFER READY
+*
+*   SEE IF A WRITE OPERATION HAS COMPLETED
+*
+CHKWRITE TM    DECB,X'40'     HAS A WRITE COMPLETED
+         BNO   CHKSTOP        BRANCH IF NO
+         CLI   DECB,X'7F'     GOOD I/O COMPLETION CODE
+         BNE   IOERR
+*
+*   FIND WHICH WRITE WAS IN PROGRESS
+*
+         CLI   B1,2
+         BE    B1DONE         SAMPLING BUFFER
+         CLI   B2,2
+         BE    B2DONE         LOAD BUFFER
+         CLI   B3,2
+         BE    B3DONE         SIO BUFFER
+         B     NXTWRITE       WRITE COMPLETION DONE BY TRAP ROUTINE
+*
+*   SAMPLING BUFFER HAS BEEN WRITTEN
+*
+B1DONE   MVI   B1,0
+         LH    6,RPTCOUNT     INCREMENT
+         LA    6,1(0,6)                REPORT
+         STH   6,RPTCOUNT                    COUNT
+         CVD   6,DWORD
+         OI    DWORD+7,X'0F'
+         UNPK  MSGRPT+7(3),DWORD+6(2)
+         CNOP  0,4
+         LA    15,0
+         BAL   10,WTOM        WTO 'REPORT XXX TAKEN'
+         CH    6,NREPORTS
+         BNL   EPILOGUE       EXIT IF REQUIRED NUMBER PRODUCED
+         BAL   14,RESET       RESET SAMPLING BUFFER
+         B     NXTWRITE
+*
+*   LOAD BUFFER HAS BEEN WRITTEN
+*
+B2DONE   MVI   B2,0
+         SSM   *+1            NON-INTERRUPTIBLE
+         MVI   LOADSWCH,0
+         L     11,ABOTLOAD
+         LH    10,LDSPTOTL    NO. ENTRIES IN LOAD SPILL AREA
+         LTR   10,10
+         BZ    NOSPILL1
+         CH    10,MAXLDSP
+         BNH   *+8
+         STH   10,MAXLDSP
+         L     9,SPILLTOP
+         SH    9,HLOADLEN     A(FIRST ENTRY IN LOAD SPILL)
+*   MOVE SPILL ENTRIES INTO LOAD BUFFER
+SPILMOV1 MVC   0(&LOADLEN,11),0(9)
+         SH    9,HLOADLEN
+         LA    11,&LOADLEN.(0,11)
+         BCT   10,SPILMOV1
+         MVC   LDSPLAST(4),SPILLTOP     RESET
+NOSPILL1 ST    11,LOADNEXT                   POINTERS
+         SSM   FF
+         B     NXTWRITE
+*
+*   SIOBUFFER HAS BEEN WRITTEN
+*
+B3DONE   MVI   B3,0
+         SSM   *+1
+         MVI   SIOSWCH,0
+         LH    8,SISPTOTL
+         L     6,ABOTMSIO
+         LTR   8,8
+         BZ    NOSPILL2
+         CH    8,MAXSISP
+         BNH   *+8
+         STH   8,MAXSISP
+         L     7,ASPILL
+*   MOVE SPILL ENTRIES INTO SIOBUF
+SPILMOV2 MVC   0(&SIOLEN,6),0(7)
+         LA    6,&SIOLEN.(0,6)
+         LA    7,&SIOLEN.(0,7)
+         BCT   8,SPILMOV2
+         MVC   SISPNEXT(4),ASPILL
+NOSPILL2 ST    6,SIONEXT
+         SSM   FF
+*
+*   SCHEDULE WRITING OF NEXT BUFFER
+*
+NXTWRITE CLC   B1(3),ZEROS    ANY BUFFER READY
+         BE    DODUMP         SEE IF DUMPER IS WAITING
+         TIME  DEC            FOR TIME STAMP OF BUFFER
+         LA    1,WRITE        LIST FORM WRITE
+         L     15,DCB+48      A(WRITE MODULE)
+         CLI   B2,1
+         BE    LOADWRIT
+         CLI   B3,1
+         BE    SIOWRITE
+         CLI   B1,1
+         BE    SAMPWRIT
+         B     DODUMP
+*
+*   WRITE OUT LOAD BUFFER
+*
+LOADWRIT L     6,ALOADBUF
+         MVI   B2,2
+         B     WRITEREC
+*
+*   WRITE OUT SIO BUFFER
+*
+SIOWRITE L     6,ASIOBUF
+         MVI   B3,2
+         B     WRITEREC
+*
+*   WRITE OUT SAMPLING BUFFER
+*
+SAMPWRIT LR    6,3
+         MVI   B1,2
+*
+*   INITIATE THE WRITE OPERATION
+*
+WRITEREC ST    0,4(0,6)       TIME STAMP
+         ST    6,12(0,1)      AREA ADDRESS
+         LH    7,BLOCKNO
+         LA    7,1(0,7)
+         STH   7,BLOCKNO
+         STH   7,0(0,6)       BLOCK NUMBER
+         BALR  14,15
+         B     CHKSTOP
+*
+*   SEE IF DUMPER IS READY
+*
+DODUMP   TM    CLOSEFLG,1     IS DUMPER RUNNING
+         BNO   CHKSTOP
+         AIF   ('&OS' EQ 'MFT' OR '&OS' EQ 'MVT').LAB1
+         CLOSE (DCB,REREAD),TYPE=T
+         AGO   .LAB2
+.LAB1    ANOP
+         STM   2,4,SAVE+12    SAVE SENSITIVE REGISTERS
+         LA    2,DCB
+         L     3,DCB+68       GET AN IOB     PTS TO PREFIX
+         IC    8,12(0,3)      COMPLETION CODE
+         LA    9,4(0,3)       A(ECB)
+         ST    9,12(0,3)            AND STORE IN IOBECBPT
+         STC   8,12(0,3)
+         OI    0(3),X'40'     WRITE OP IN PROCESS
+         SR    7,7
+         IC    7,DCB+67       WRITE CCW OFFSET
+         LA    8,0(7,3)       A(WRITE CCW)
+         SH    8,H8           A(PREVIOUS CCW)
+         ST    8,DWORD        SAVE CCW ADDRESSS
+         NI    4(8),X'7F'     TURN OFF DATA CHAIN BIT
+         L     15,DCB+76      A(WRITE EOB MODULE)   IGG019CD
+         BALR  14,15
+         LM    2,4,SAVE+12    RESTORE REGISTERS
+         WAIT  1,ECB=(9)
+         L     8,DWORD
+         OI    4(8),X'80'     RESTORE DATA CHAIN BIT IN CCW
+.LAB2    ANOP
+         L     1,DUMPECB
+         POST  (1)
+         AIF   ('&OS' NE 'MFT' AND '&OS' NE 'MVT').LAB3
+         TM    0(9),X'7F'
+         BNO   IOERR
+         POINT DCB,F256       NEXT WRITE TO START OF FILE
+.LAB3    ANOP
+         NI    CLOSEFLG,X'FE'
+*
+*   SEE IF OPERATOR HAS STOPPED US
+*
+CHKSTOP  L     6,ACSCB
+         AIF   ('&OS' EQ 'MFT' OR '&OS' EQ 'MVT').LAB4
+         B     STIMER *************************************************
+.LAB4    ANOP
+         TM    48(6),X'40'    TEST STOP/MODIFY ECB
+         BNO   STIMER         GO BACK TO SLEEP
+         CLC   B1(3),ZEROS    CHECK FOR OUTSTANDING I/O
+         BNE   CHKWRITE
+         B     EPILOGUE       TERMINATE MONITOR
+*
+*   END OF MONITORING.   RESTORE SYSTEM & EXIT
+*
+EPILOGUE EQU   *
+         L     6,AFINCH
+         L     7,ATRPCODE
+         CLC   0(14,6),SAVEFNCH  SET REFERENCE BIT
+         CLC   0(14,7),SAVEIOS   SET REFERENCE BIT
+         SSM   *+1
+*
+         CLI   NOLOAD,C'1'
+         BE    *+16
+         MVC   0(14,6),SAVEFNCH
+         MVC   96(8,0),SVCPSW
+         CLI   NOSIO,C'1'
+         BE    *+10
+         MVC   0(14,7),SAVEIOS
+*
+         SSM   FF             ENABLE
+*
+*   WRITE LAST LOAD BUFFER
+*
+FINLOAD  CLI   LASTIO,0
+         BNE   CLOSE          NO FURTHER WRITES PERMITTED
+         CLI   NOLOAD,C'1'
+         BE    FINSIO
+         L     7,LOADNEXT
+         MVI   0(7),0         ZERO ENTRY TO SIGNIFY
+         MVC   1(&LOADLEN-1,7),0(7)           END-OF-DATA
+         L     6,ALOADBUF
+         BAL   10,LASTWRIT
+*
+*   WRITE LAST SIO BUFFER
+*
+FINSIO   CLI   NOSIO,C'1'
+         BE    FINSAMP
+         L     7,SIONEXT
+         MVC   0(&SIOLEN,7),ZEROS  INDICATE LAST ENTRY
+         L     6,ASIOBUF
+         BAL   10,LASTWRIT
+*
+*   WRITE FINAL REPORT
+*
+FINSAMP  LH    6,RPTCOUNT
+         CH    6,NREPORTS
+         BNL   CLOSE
+         BAL   14,RPTITEMS
+         LR    6,3
+         BAL   10,LASTWRIT
+         B     CLOSE
+*
+LASTWRIT TIME  DEC
+         ST    0,4(0,6)       TIMESTAMP
+         LH    7,BLOCKNO
+         LA    7,1(0,7)
+         STH   7,BLOCKNO
+         STH   7,0(0,6)       BLOCK NUMBER
+         WRITE DECB,SF,,(6),MF=E
+         CHECK DECB
+         BR    10
+*
+*   CLOSE FILE
+*
+CLOSE    SR    0,0
+         CLI   NOSIO,C'1'
+         BE    *+8
+         AH    0,BUFSIZE
+        CLI   NOLOAD,C'1'
+         BE    *+8
+         AH    0,BUFSIZE
+         LTR   0,0
+         BZ    CLSE
+         FREEMAIN R,LV=(0),A=ASIOBUF
+CLSE     CLOSE DCB
+*
+*   FINAL MESSAGES TO OPERATOR
+*
+         LA    15,1
+         BAL   10,WTOM        WTO 'MONITOR ENDED'
+         LH    6,LOADLOST
+         CVD   6,DWORD
+         OI    DWORD+7,X'0F'
+         UNPK  MSGLOST+11(5),DWORD+5(3)
+         LH    6,SIOLOST
+         CVD   6,DWORD
+         OI    DWORD+7,X'0F'
+         UNPK  MSGLOST+23(5),DWORD+5(3)
+         LH    6,MAXLDSP
+         CVD   6,DWORD
+         OI    DWORD+7,X'0F'
+         UNPK  MSGLOST+43(3),DWORD+6(2)
+         LH    6,MAXSISP
+         CVD   6,DWORD
+         OI    DWORD+7,X'0F'
+         UNPK  MSGLOST+53(3),DWORD+6(2)
+         LA    15,2
+         BAL   10,WTOM        WTO 'LOST LOADS ETC'
+         AIF   ('&OS' NE 'MFT' AND '&OS' NE 'MVT').LAB5
+         L     6,AOURTCB
+         XC    160(4,6),160(4) ZERO TCBNSTAE
+.LAB5    ANOP
+*
+*   RETURN TO PROBLEM STATE AND PROTECT KEY
+*
+         MODESET KEY=NZERO,MODE=PROB
+*
+*   EXIT
+*
+         ABEND 99,DUMP
+         L     13,4(0,13)
+         LM    14,12,12(13)
+         SR    15,15
+         BR    14
+         TITLE 'SUPER MONITOR - I/O ERROR ON MONITOR FILE'
+*
+*   I/O ERROR WHILE WRITING TO MONITOR FILE
+*
+SYNAD    MVC   MSGIOERR+4,CSYNAD
+IOERR    LA    15,3
+         BAL   10,WTOM        WTO 'I/O ERROR OR SYNAD'
+         MVI   LASTIO,1
+         B     EPILOGUE
+         TITLE 'SUPER MONITOR - STAE EXIT ROUTINE'
+*
+*   STAE EXIT ROUTINE
+*
+ABEND    BALR  10,0
+         USING *,10
+         CLI   88(1),0
+         BNE   PPSTATE
+         L     2,88(0,1)
+         L     2,12(0,2)
+         AIF   ('&OS' NE 'VS2').NOCDE
+         L     2,16(0,2)      A(EP) FROM CDE
+.NOCDE   ANOP
+         B     *+8
+PPSTATE  EQU   *
+         L     2,96(0,1)      EP OF P/P FROM STAE WORK AREA
+         LA    12,4094(0,2)
+         UNPK  MSGABND(4),5(2,1)
+         OI    MSGABND+3,X'F0'
+         TR    MSGABND+1(3),HEXTAB
+         MVI   MSGABND,C' '
+         L     6,AFINCH
+         L     7,ATRPCODE
+         CLC   0(14,6),SAVEFNCH  SET REFERENCE BIT
+         CLC   0(14,7),SAVEIOS   SET REFERENCE BIT
+         SSM   *+1
+         CLI   NOLOAD,C'1'
+         BE    *+16
+         MVC   0(14,6),SAVEFNCH
+         MVC   101(3,0),SVCPSW+5
+         CLI   NOSIO,C'1'
+         BE    *+10
+         MVC   0(14,7),SAVEIOS
+         SSM   FF
+*
+         ST    14,SAVE
+         LA    15,4
+         BAL   10,WTOM        WTO 'XXXX ABEND'
+         L     14,SAVE
+*
+         SR    15,15
+         BR    14
+         DROP  10
+         TITLE 'SUPER MONITOR - CALCULATE REPORT CONSTANT ITEMS'
+*
+*   S/R TO CALCULATE REPORT CONSTANT ITEMS
+*
+RPTITEMS EQU   *
+         AIF   ('&OS' EQ 'MVT' OR '&OS' EQ 'VS2').LAB6
+         LH    7,NOPARTNS
+         SR    8,8
+         SR    9,9
+         LA    15,PARTCLAS
+PTNLOOP  L     6,ABBX(8)      A(BBX)
+         LTR   6,6
+         BZ    NEXTPTN
+         L     11,8(0,6)      HIGH PARTITION ADDRESS
+         LTR   11,11
+         BNZ   PTNCALC
+         MVC   0(4,15),BLANKS
+         STH   11,PARTSIZE(9)
+         B     NEXTPTN
+PTNCALC  EQU   *
+         S     11,4(0,6)         - LOW ADDRESS  =  SIZE IN BYTES
+         LA    11,1023(0,11)  ROUNDED UP
+         SRL   11,10                    SIZE IN K
+         STH   11,PARTSIZE(9) PARTITION SIZE IN K
+         L     6,ATCB(8)
+         L     6,124(0,6)     A(PIB)
+         MVC   0(2,15),38(6)           CLASSES
+         OI    0(15),X'40'             CHANGE ZERO
+         OI    1(15),X'40'                     TO BLANKS IF NO CLASSES
+*        TR    0(2,15),PTNCODES        CAN NOT SEE THE POINT OF THIS
+NEXTPTN  LA    8,4(0,8)
+         LA    9,PARTB-PARTA(0,9)
+         LA    15,PARTB-PARTA(0,15)
+         BCT   7,PTNLOOP
+.LAB6    ANOP
+*   CALCULATE  RQE DISTURBANCE
+         L     6,CVTIOQET     A(RQE TABLE)
+         LR    7,6
+*
+         LH    8,RQETOTAL
+RQEUPSET CLC   8(4,7),ZEROS   LOOK FOR ZERO PRTY & DEB FIELD IN RQE
+         BE    RQEFRIPL
+         LA    7,&RQELEN.(0,7)
+         BCT   8,RQEUPSET
+*
+RQEFRIPL SR    7,6
+         SR    6,6
+         D     6,FRQELEN
+         STH   7,RQEUSED
+         BR    14             RETURN TO CALLER
+         TITLE 'SUPER MONITOR - RESET SAMPLING BUFFER'
+*
+*   S/R TO RESET SAMPLING BUFFER AFTER REPORT RECORD WRITTEN
+*
+RESET    SR    6,6
+         LA    7,SPILL
+         LA    8,SVCS
+         SR    7,8
+         SRL   7,2            NO OF WORDS TO BE ZEROED
+*
+ZEROBUF  ST    6,0(0,8)       ZERO
+         LA    8,4(0,8)           EACH
+         BCT   7,ZEROBUF              FULLWORD
+*
+         BR    14
+         TITLE 'SUPER MONITOR - SCAN'
+*
+*   S/R TO SCAN ALL REQUIRED AREAS OF O/S
+*
+SCAN     ST    14,SCANRET
+         LH    6,SAMPLES      INCREMENT NO. SAMPLES
+         LA    6,1(0,6)            TAKEN FOR
+         STH   6,SAMPLES                THIS REPORT
+*
+*   CPU ACTIVITY MEASUREMENT
+*
+         MVI   STATUS1,X'80'  CPU & CHANNEL STATUS - ASSUME CPU WAIT
+         L     5,AOURTCB      A(TCB) FOR THIS MONITOR
+         SR    8,8
+         L     6,116(0,5)     A(NEXT LOWER TCB)
+         AIF   ('&OS' NE 'VS2').LAB7
+         B     NEXTTCB+4
+.LAB7    ANOP
+TCBFLGS  CLI   33(6),0        TEST FOR NON-DISPATCHABILITY
+         AIF   ('&OS' NE 'VS2').LAB8
+         BNE   NEXTTCB
+         CLI   32(6),0
+.LAB8    ANOP
+         BE    CPUDISP
+NEXTTCB  L     6,116(0,6)     A(NEXT LOWER TCB)
+         LTR   6,6
+         BZ    TCBSDONE
+         B     TCBFLGS
+CPUDISP  L     7,0(0,6)       A(RB) FOR DISPATCHABLE TASK
+         CLI   28(7),0        WAIT COUNT
+         BNH   READY
+         CLC   0(8,7),DUMPER  SEE IF SPECIAL DUMPER
+         BNE   NEXTTCB
+         L     11,12(0,7)     EP ADDR OF PROG
+         ST    11,DUMPECB
+         CLI   0(11),X'80'
+         BNE   NEXTTCB
+         OI    CLOSEFLG,1     FLAG TO SAY CLOSE AND OPEN FILE
+         B     NEXTTCB
+READY    LA    8,1(0,8)       INCREMENT DISPATCHABLE TASK COUNT
+         AIF   ('&OS' EQ 'MVT' OR '&OS' EQ 'VS2').LAB9
+         SR    14,14
+         SR    15,15
+         LH    9,NOPARTNS
+         L     11,24(0,6)
+         LA    11,0(0,11)
+BBXCOMP  C     11,ABBX(15)    FIND PARTITION FOR THIS TCB
+         BE    PARTREDY
+         LA    15,4(0,15)
+         LA    14,PARTB-PARTA(0,14)
+         BCT   9,BBXCOMP
+         B     NOTPART
+PARTREDY LH    9,PARTDISP(14) INCREMENT
+         LA    9,1(0,9)              PARTITION
+         STH   9,PARTDISP(14)               DISPATCHABLE COUNT
+.LAB9    ANOP
+NOTPART  EQU   *
+         NI    STATUS1,X'7F'  TURN OFF CPU WAIT
+         B     NEXTTCB
+TCBSDONE CH    8,MAXTASKS
+         BNH   *+8
+         STH   8,MAXTASKS
+         AH    8,TASKS
+         STH   8,TASKS
+         SR    8,8
+         IC    8,25           TIMER OLD PSW   KEY,AMWP
+         LA    11,3
+         NR    8,11           WP
+         TM    25,X'F0'       TEST KEY
+         BNZ   *+8
+         LA    8,4(0,8)       PK 0
+         SLL   8,1
+         LH    14,CPUSTATE(8)
+         LA    14,1(0,14)
+         STH   14,CPUSTATE(8)
+         TITLE 'SUPER MONITOR - SCAN SELECTOR CHANNELS'
+*
+*   MEASURE SELECTOR CHANNEL ACTIVITY
+*
+         LA    6,256          X'100'  FIRST SELECTOR CHANNEL
+         LH    9,NOCHANLS
+         SR    5,5
+*   LOOP FOR EACH CHANNEL
+CHTEST   TCH   0(6)
+         BC    8,CHDONE
+         BC    6,CHBUSY
+         BC    1,CHNOTOP
+*   CHANNEL BUSY
+CHBUSY   LH    8,CHANBUSY(5)
+         LA    8,1(0,8)
+         STH   8,CHANBUSY(5)
+         TM    STATUS1,X'80'
+         BZ    CHBUSFLG
+         LH    8,CHANBUSW(5)
+         LA    8,1(0,8)
+         STH   8,CHANBUSW(5)
+         B     CHBUSFLG
+*   CHANNEL NOT OPERATIONAL
+CHNOTOP  LH    8,CHANNOP(5)
+         LA    8,1(0,8)
+         STH   8,CHANNOP(5)
+         B     CHDONE
+*
+CHBUSFLG LR    8,6            EG.X'100' FIRST TIME
+         SRL   8,8               X'001'
+         STH   8,CH1+2
+         LA    7,64              X'40'  B'01000000'
+CH1      SRL   7,0                      B'00100000'
+         STC   7,CH2+1
+CH2      OI    STATUS1,0      SET CHANNEL BUSY BIT
+*
+CHDONE   LA    6,256(0,6)     NEXT CHANNEL
+         LA    5,CHANB-CHANA(0,5) NEXT SET OF COUNTERS
+         BCT   9,CHTEST
+         TITLE 'SUPER MONITOR - SCAN SCHEDULER QCBS'
+*
+*   SCAN SCHEDULER QCB'S
+*
+         AIF   ('&OS' EQ 'MVT' OR '&OS' EQ 'VS2').QCBMVT
+         L     9,CVTBTERM     A(ABTERM)
+         L     9,12(0,9)      A(QCBHEAD)
+         AGO   .QCBINIT
+.QCBMVT  ANOP
+         L     9,CVTABEND     A(SECONDARY CVT)
+         L     9,20(0,9)      SCVTQCB0 = A(QCBHEAD)
+.QCBINIT ANOP
+         L     9,0(0,9)       A(FIRST MAJOR QCB)
+         LTR   9,9
+         BZ    QCBDONE
+         B     QCBMIN
+*
+*
+         USING QCBMAJOR,9
+QCBNEWMJ L     9,QMAJNEXT     A(NEXT MAJOR QCB)
+         LTR   9,9
+         BZ    QCBDONE
+*
+*
+QCBMIN   L     8,QMAJMIN      A(MINOR QCB)
+         CLC   QMAJNAME,SYSIEFSD  CONSIDER ONLY SYSIEFSD
+         BNE   QCBNEWMJ
+         USING QCBMINOR,8
+         B     QCBDOMIN
+*
+*
+QCBNEWMN L     8,QMINNEXT
+         LTR   8,8
+         BZ    QCBNEWMJ       NO MORE MINORS   TRY NEXT MAJOR
+*
+*
+QCBDOMIN CLI   QMINPKF,X'FF'  IGNORE IF NOT
+         BNE   QCBNEWMN                     SYSTEMWIDE
+         SR    6,6
+         CLI   QMINNAML,X'02' LENGTH OF MINOR QUEUE NAME
+         BNE   QCBNEWMN       IGNORE IF NOT LENGTH 2
+         CLI   QMINNAME,C'Q'         OR IF NOT Q SOMETHING
+         BNE   QCBNEWMN
+         TM    QMINNAME+1,X'F0'      OR IF NOT Q NUMBER
+         BNO   QCBNEWMN
+         IC    7,QMINNAME+1
+         SLL   7,28           GET THE 'N' IN QN
+         SRL   7,28
+         CH    7,H9
+         BH    QCBNEWMN       IGNORE
+         LTR   7,7                   IF NOT
+         BNP   QCBNEWMN                     Q1-Q9
+*
+*
+         L     6,QMINQEL      A(FIRST+ QEL ON QUEUE)
+         SR    10,10          ZERO QEL COUNT
+         LR    5,6            A(QEL) FOR TASK WHICH HAS RESOURCE
+*
+QCBNEWQL EQU   *
+         USING QCBQEL,5
+         L     5,QELNEXT      A(NEXT QEL)
+         LA    5,0(0,5)
+         LTR   5,5
+         BZ    QCBCOUNT       RECORD COUNT IF NO MORE ON QUEUE
+         TM    QELCODE,X'80'  EXCLUSIVE ?
+         BZ    QCBEXCL        UP COUNT IF YES
+         LTR   10,10          ANY TASKS ALREADY WAITING ?
+         BNZ   QCBEXCL        UP COUNT IF YES
+         TM    QELCODE-QCBQEL(6),X'80' FIRST QEL SHARED ?
+         BO    QCBNEWQL       IF YES AND NO TASK WAITING THEN IGNORE
+*
+QCBEXCL  LA    10,2(0,10)     INCREMENT COUNT OF WAITING TASKS
+         B     QCBNEWQL
+*
+*
+QCBCOUNT CH    10,H6          ONLY COUNTS
+         BNH   *+8                        1,2 AND 3+
+         LA    10,6                                  RECORDED
+         LTR   10,10
+         BNP   QCBNEWMN       IGNORE IF NO TASKS WAITING
+*
+*
+         MH    7,H6
+         AR    10,7
+         SH    10,H8
+         LH    7,Q1(10)       INCREMENT
+         LA    7,1(0,7)                 COUNT
+         STH   7,Q1(10)                       IN SAMPLING RECORD
+         B     QCBNEWMN
+*
+QCBDONE  EQU   *
+.QCBSKIP ANOP
+         DROP  5,8,9
+         AIF   ('&OS' EQ 'MVT' OR '&OS' EQ 'VS2').LAB10
+         TITLE 'SUPER MONITOR - SCAN PARTITION STATES'
+*
+*   RECORD PARTITION STATES
+*
+         LH    14,NOPARTNS
+         SR    6,6
+         SR    7,7
+*   LOOP FOR EACH PARTITION
+PART     L     8,ABBX(7)
+         LTR   8,8
+         BZ    PARTNEXT
+         L     10,8(0,8)      PARTITION INACTIVE ? I.E.HIGH ADDR = 0
+         LTR   10,10
+         BZ    PARTNEXT
+*   SUM FREE AREAS
+         SR    10,10
+         AIF   ('&OS' EQ 'MFT' OR '&OS' EQ 'MVT').PART01
+         L     11,0(0,8)      A(PFQE)
+PARTFQES A     10,8(0,11)     ADD FREE AREA SIZE
+         L     11,0(0,11)     PTR TO NEXT PFQE
+         LTR   11,11
+         BP    PARTFQES
+         AGO   .PART02
+.PART01  ANOP
+         L     11,0(0,8)      A(FQE)
+PARTFQES A     10,4(0,11)     ADD FREE AREA SIZE
+         L     11,0(0,11)     PTR TO NEXT FQE
+         LTR   11,11
+         BNP   PARTDONE       AVOID 0C5'S
+         C     11,CVTMZ00          THROUGH
+         BL    PARTFQES                 OVERWRITTEN FQES
+.PART02  ANOP
+*
+PARTDONE L     11,4(0,8)      LOW ADDRESS
+         L     8,8(0,8)       HIGH ADDRESS
+         SR    8,11
+         SR    8,10           LEAVES USED AREA
+         C     8,PARTUSED(6)
+         BNH   *+8
+         ST    8,PARTUSED(6)
+         L     8,ATCB(7)
+         L     8,124(0,8)     PIB
+         TM    12(8),1        IS PROB PROG RUNNING
+         BZ    PARTNEXT       BRANCH IF NO
+         LH    8,PARTPROB(6)
+         LA    8,1(0,8)
+         STH   8,PARTPROB(6)
+*
+PARTNEXT LA    7,4(0,7)
+         LA    6,PARTB-PARTA(0,6)
+         BCT   14,PART
+.LAB10   ANOP
+         TITLE 'SUPER MONITOR - SCAN SQA'
+*
+*   MEASURE USE OF SQA
+*
+         AIF   ('&OS' EQ 'VS2').LAB11
+         L     10,CVTMSER
+         L     10,100(0,10)
+         AGO   .LAB12
+.LAB11   ANOP
+         L     10,CVTABEND       A(SCVT)
+         L     10,SCVTMSSQ(0,10) A(GOVRFLB)
+         L     10,4(0,10)        A(DQE)
+         L     10,0(0,10)        A(FQE)
+.LAB12   ANOP
+         L     6,SQASIZE
+*
+SQASUM   LTR   10,10
+         BNP   SQADONE
+         AIF   ('&OS' NE 'MFT' AND '&OS' NE 'MVT').LAB13
+         C     10,CVTMZ00     CHECK AGAINST
+         BNL   SQADONE             HIGHEST M/C ADDR
+.LAB13   ANOP
+         L     8,4(0,10)      SIZE OF FREE AREA
+         SR    6,8
+         L     10,0(0,10)     NEXT FQE
+         B     SQASUM
+*
+SQADONE  C     6,SQAUSED
+         BNH   *+8
+         ST    6,SQAUSED
+         AIF   ('&OS' EQ 'VS2').LAB14
+         TITLE 'SUPER MONITOR - SCAN SYSTEM DATASET ACTIVITY'
+*
+*   MEASURE SYSTEM DATASET ACTIVITY
+*
+         SR    15,15
+         LA    14,3
+         AH    14,NOPAGEDS
+         SR    5,5
+*   LOOP FOR EACH SYSTEM DATASET
+DSCHECK  L     6,DSUCBS(15)
+         LTR   6,6            IGNORE
+         BZ    DSQNXT               IF UCB=0
+         LH    7,20(0,6)      A(RQE FOR LAST ACTIVITY ON THIS DEVICE)
+         BAL   8,DSTEST       SEE IF REQUIRED DATASET
+         LTR   11,11
+         BZ    DSQCHECK
+*   CHECK DEVICE STATUS
+DSACT    TM    6(6),X'80'
+         BNO   DSQCHECK
+         LH    7,DSBUSY(5)    DATASET BUSY
+         LA    7,1(0,7)
+         STH   7,DSBUSY(5)
+         TM    STATUS1,X'80'  CPU WAIT ?
+         BZ    DSQCHECK
+         LH    7,DSBUSYW(5)   BUSY & CPU WAIT
+         LA    7,1(0,7)
+         STH   7,DSBUSYW(5)
+         TM    6(6),X'04'     DATA TRANSFER ?
+         BO    DSQCHECK
+         TM    6(6),X'02'     SEEKING ?
+         BNO   DSQCHECK
+         LH    7,DSSEEK(5)    SEEKING
+         LA    7,1(0,7)
+         STH   7,DSSEEK(5)
+         TM    STATUS1,X'80'
+         BZ    DSQCHECK
+         LH    7,DSSEEKW(5)   SEEK & CPU WAIT
+         LA    7,1(0,7)
+         STH   7,DSSEEKW(5)
+*
+DSQCHECK SR    7,7
+         IC    7,10(0,6)      CHANNEL TABLE INDEX FROM UCB
+         SR    6,6
+         SLL   7,3
+         L     8,CVTILCH      A(LOGICAL CHANNEL WORD TABLE)
+         AR    7,8
+         LTR   7,7
+         BNH   DSQDONE
+         C     7,CVTMZ00
+         BH    DSQDONE
+*   COUNT NO. RQES FOR THIS DATASET
+DSQLOOP  LH    7,0(0,7)       A(FIRST/NEXT RQE ON LOGICAL CHAN QUEUE)
+         LTR   7,7
+         BM    DSQDONE
+         C     7,CVTMZ00
+         BH    DSQDONE
+         BAL   8,DSTEST       REQUIRED DATASET ?
+         LTR   11,11
+         BZ    DSQLOOP
+         LA    6,1(0,6)       INCR NO. RQES FOR THIS DATASET
+         B     DSQLOOP
+*
+DSQDONE  CH    6,H5
+         BL    *+8
+         LA    6,4            COUNT 4+ TOGETHER
+         AR    6,6
+         LA    9,DSRQE(5)
+         LH    7,0(6,9)       REQUEST QUEUE SIZE COUNT
+         LA    7,1(0,7)
+         STH   7,0(6,9)
+DSQNXT   LA    5,DSB-DSA(0,5)
+         LA    15,4(0,15)
+         BCT   14,DSCHECK
+         B     DA
+         TITLE 'SUPER MONITOR - SCAN   S/R TO TEST IF RQE REQUIRED'
+*
+*   S/R TO DETERMINE WHETHER RQE IS FOR REQUIRED DATASET
+*
+*   R7 = A(RQE) FOR LAST ACTIVITY ON DEVICE
+*   R8 = RETURN ADDRESS
+*   R15  INDICATES WHICH SYSTEM DATASET 0=SVC,4=LINK,8=JOBQ,12+=PAGE
+*   R11  SET TO  0  NOT REQUIRED DATASET
+*                1  REQUIRED DATASET
+*
+DSTEST   L     9,8(0,7)       A(DEB)    R7 -> RQE
+         L     9,24(0,9)      A(DCB)
+         LA    9,0(0,9)       A(DCB)
+         SR    11,11          ZERO FOUND INDICATOR
+         CH    15,H4
+         BL    DSVCLIB
+         BE    DSLINKLB
+         CH    15,H12
+         BNL   DSPAGE
+         B     DSJOBQ
+*
+DSVCLIB  L     10,CVTSVDCB    A(SVCLIB DCB)
+DSCOMP   CR    9,10           DCB VIA RQE : DCB OF REQUIRED DATASET
+DSBNE    BCR   7,8            RETURN IF NOT EQUAL
+         LA    11,1(0,11)     SET FOUND INDICATOR
+         BR    8
+DSLINKLB L     10,CVTLINK     A(LINKLIB DCB)
+         B     DSCOMP
+DSJOBQ   L     10,CVTJOB      A(SYSJOBQE DCB, FIRST SCHEDLR CONTRL BLK)
+         B     DSCOMP
+DSPAGE   TM    16(7),X'10'    IS PAGE SUPERVISOR REQUESTOR ?
+         B     DSBNE
+.LAB14   ANOP
+         TITLE 'SUPER MONITOR - SCAN DIRECT ACCESS DEVICES'
+*
+*   MEASURE ACTIVITY ON EACH DIRECT ACCESS DEVICE
+*
+DA       SR    5,5
+         SR    8,8
+*   LOOP FOR EACH DEVICE
+DADEVICE L     6,DAUCBS(8)
+         LTR   6,6
+         BZ    RQESTATE
+         TM    3(6),X'80'     DEVICE ONLINE ?
+         BO    DAREADY
+         LH    14,DAOFFLNE(5)
+         LA    14,1(0,14)
+         STH   14,DAOFFLNE(5)
+         B     DANEXT
+DAREADY  TM    6(6),X'40'     DEVICE NOT READY ?
+         BNO   DABIZY
+         LH    14,DANOTRDY(5) NOT READY
+         LA    14,1(0,14)
+         STH   14,DANOTRDY(5)
+         B     DACUBIZY
+*
+DABIZY   SR    14,14
+         IC    14,56(0,6)     NO. USERS
+         CH    14,DAUSERS(5)
+         BNH   *+8
+         STH   14,DAUSERS(5)
+         TM    6(6),X'80'     DEVICE BUSY ?
+         BNO   DACUBIZY
+         TM    6(6),X'02'     S/A SEEK EXECUTING ?
+         BNO   DAINCBUS
+         TM    6(6),X'04'     DATA TRANSFER ?
+         BO    DAINCBUS
+         LH    14,DASEEK(5)   DEVICE IS SEEKING
+         LA    14,1(0,14)
+         STH   14,DASEEK(5)
+         B     DACUBIZY
+DAINCBUS LH    14,DABUSY(5)   DEVICE IS IN DATA TRANSFER
+         LA    14,1(0,14)
+         STH   14,DABUSY(5)
+*
+DACUBIZY TM    6(6),X'08'
+*   CODING HERE FOR CONTROL UNIT BUSY IF REQUIRED
+         TM    6(6),X'80'     DEVICE BUSY ?
+         BNO   DARQE
+         TM    STATUS1,X'80'  CPU WAIT ?
+         BZ    DARQE
+         LH    14,DABUSYW(5)  DEVICE BUSY + CPU WAIT
+         LA    14,1(0,14)
+         STH   14,DABUSYW(5)
+         TM    6(6),X'02'     SEEK OR DATA TRANSFER ?
+         BNO   DARQE
+         TM    6(6),X'04'     DATA TRANSFER ?
+         BO    DARQE
+         LH    14,DASEEKW(5)  SEEK + CPU WAIT
+         LA    14,1(0,14)
+         STH   14,DASEEKW(5)
+DARQE    SR    14,14
+         IC    14,10(0,6)     INDEX TO LOGICAL CHANNEL TABLE
+         SLL   14,3
+         L     15,CVTILCH     A(LOGICAL CHANNEL WORD TABLE)
+         AR    14,15               + INDEX
+         SR    15,15
+DARQESUM LH    14,0(0,14)     A(RQE) FOR REQST ON THIS LOGICAL CHAN
+         LTR   14,14
+         BM    DARQEINC
+         LH    9,2(0,14)      A(UCB) ADDRESSED BY RQE
+         CR    9,6            REQUEST FOR THIS DEVICE ?
+         BNE   DARQESUM
+         LA    15,1(0,15)     INCREMENT QUEUE COUNT
+         B     DARQESUM
+DARQEINC CH    15,H5
+         BL    *+8
+         LA    15,4
+         SLL   15,1
+         LA    7,DARQES(5)
+         LH    14,0(15,7)
+         LA    14,1(0,14)
+         STH   14,0(15,7)
+DANEXT   LA    8,4(0,8)
+         LA    5,DAB-DAA(0,5)
+         B     DADEVICE
+         TITLE 'SUPER MONITOR - SCAN OVERALL RQE STATE'
+*
+*   CALCULATE OVERALL RQE STATE
+*
+RQESTATE L     14,CVTIXAVL    A(FREELIST PTR)
+         SR    15,15
+*
+RQECHAIN LH    14,0(0,14)
+         LTR   14,14
+         BM    RQESFREE
+         LA    15,1(0,15)
+         B     RQECHAIN
+*
+RQESFREE CH    15,RQETOTAL
+         BNH   RQEINC
+         LA    15,4           FAIL CONDITION
+         B     SCANFAIL
+RQEINC   LH    14,RQETOTAL
+         SR    14,15          ACTIVE RQES
+         SLL   14,1           HALF WORD COUNTS
+         LH    15,RQECOUNT(14)
+         LA    15,1(0,15)
+         STH   15,RQECOUNT(14)
+         TITLE 'SUPER MONITOR - SCAN CHANNELS'
+*
+*   GENERAL STATUS OF CHANNELS
+*
+         TM    STATUS1,X'80'
+         BO    STATUSA
+         LH    8,CPUBUSY      CPU BUSY
+         LA    8,1(0,8)
+         STH   8,CPUBUSY
+*
+STATUSA  TM    STATUS1,X'40'
+         BZ    STATUSB
+         LH    8,MPXBUSY      MULTIPLEXOR BUSY
+         LA    8,1(0,8)
+         STH   8,MPXBUSY
+         TM    STATUS1,X'80'
+         BZ    STATUSC
+         LH    8,MPXBUSYW     MULTIPLEXOR BUSY + CPU WAIT
+         LA    8,1(0,8)
+         STH   8,MPXBUSYW
+         B     STATUSC
+*
+STATUSB  LH    8,MPXNOTBS     MULTIPLEXOR NOT BUSY
+         LA    8,1(0,8)
+         STH   8,MPXNOTBS
+*
+STATUSC  TM    STATUS1,X'80'
+         BZ    STATUSE
+         TM    STATUS1,X'7F'
+         BZ    STATUSD
+         LH    8,ANYCHANW     ANY CHAN BUSY + CPU WAIT
+         LA    8,1(0,8)
+         STH   8,ANYCHANW
+*
+STATUSD  TM    STATUS1,X'3F'
+         BZ    STATUSE
+         LH    8,ANYSELW      ANY SELECTOR BUSY + CPU WAIT
+         LA    8,1(0,8)
+         STH   8,ANYSELW
+STATUSE  TM    STATUS1,X'7F'
+         BZ    STATUSF
+         LH    8,ANYCHAN      ANY CHAN BUSY
+         LA    8,1(0,8)
+         STH   8,ANYCHAN
+*
+STATUSF  TM    STATUS1,X'3F'
+         BZ    SCANDONE
+         LH    8,ANYSEL       ANY SELECTOR CHANNEL BUSY
+         LA    8,1(0,8)
+         STH   8,ANYSEL
+*
+*   RETURN FROM SCAN
+SCANDONE SR    15,15
+SCANFAIL EQU   *
+         L     14,SCANRET
+         BR    14
+         TITLE 'SUPER MONITOR - INITIALISE THE MONITOR'
+*
+*   ROUTINE TO INITIALISE THE MONITOR BY CALCULATING AS MANY
+*        RUN-CONSTANT VALUES AS POSSIBLE
+*        A DESCRIPTOR RECORD DESCRIBING THE CONFIGURATION IS
+*        WRITTEN TO THE MONITOR FILE
+*        WHEN FINISHED WITH THIS ROUTINE IS OVERLAYED WITH THE
+*        SAMPLING BUFFER
+*        THE DESCRIPTOR RECORD OVERLAYS EARLY PART OF ROUTINE
+*
+         USING DESCRPTR,3
+         CNOP  0,4
+INIT     ST    14,SCANRET
+         L     4,16           A(CVT)
+         L     6,CVTTCBP      A(TCB WORDS)
+         L     6,4(0,6)       A(TCB)
+         AIF   ('&OS' EQ 'VS2').LAB15
+         MVI   28(6),0        ZERO PROTECT KEY
+*        MVC   SCB+12(4),0(6)       PUT A(PRB) IN SCB
+.LAB15   ANOP
+         ST    6,AOURTCB
+         AIF   ('&OS' EQ 'VS2').LAB16
+         L     7,40(0,6)      A(JOBLIB DCB)
+         LTR   7,7                     IS THERE A JOBLIB
+         BZ    NOJOBLIB                NO - DONT FREE IT
+*        CLOSE (M)
+         LR    1,7
+         LA    0,56
+*        FREEMAIN R,LV=(0),A=(1)       FREE JOBLIB DCB
+         SR    7,7
+         ST    7,40(0,6)      ZERO TCBJLB
+.LAB16   ANOP
+NOJOBLIB L     6,124(0,6)              A(PIB)
+         L     6,20(0,6)      A(CSCB)
+         ST    6,ACSCB
+         L     8,SUPERMON
+         L     6,0(0,8)       PARM PTR
+         LH    5,0(0,6)       LENGTH OF PARM
+         LTR   5,5
+         BZ    WTORPARM
+         LA    6,2(0,6)       A(FIRST PARM CHARACTER)
+         LA    8,PARMS
+         BAL   11,SORTPARM
+         B     WTORPARM
+         TITLE 'SUPER MONITOR - INIT   EXTRACT PARM INFORMATION'
+*
+*   ROUTINE TO INTERPRET PARM INFORMATION
+*
+*         R5 = NO. CHARS IN PARM
+*         R6 = START OF PARM
+*         R8 = PTR TO FIRST OF CONTIGUOUS WORDS TO RECEIVE PARAMS
+*         R11  RETURN ADDR
+*
+SORTPARM EQU   *
+         LA    10,107         ','
+*
+NEXTPARM SR    7,7
+NEXTCHAR EQU   *
+         SR    15,15
+         IC    15,0(7,6)      LOOK AT EACH CHAR
+         SR    15,10
+         BZ    COMMA          BRANCH IF COMMA
+         LA    7,1(0,7)       TO CHECK NEXT CHAR
+         BCT   5,NEXTCHAR
+*                             FALL THROUGH IF NO COMMA
+COMMA    LTR   7,7
+         BZ    MISCOMMA       B IF COMMA FOUND STRAIGHT AWAY
+         LA    9,4            4
+         SR    9,7              - NO.CHARS IN FIELD
+AJSTPARM STC   9,MVC+3        OFFSET OF FIELD IN TARGET
+         BM    XSPARM
+         BCTR  7,0
+         STC   7,MVC+1        LENGTH FOR MOVE
+MVC      MVC   0(0,8),0(6)    MOVE
+         AR    6,7            INCR.
+         LA    6,1(0,6)           PTR TO
+MISCOMMA LA    6,1(0,6)                 NEXT FIELD
+         LTR   5,5            RETURN
+         BCR   8,11                 IF ALL PARMS DONE
+         LA    8,4(0,8)
+         BCTR  5,0            REDUCE BECAUSE COMMA HAS BEEN SKIPPED
+         B     NEXTPARM
+XSPARM   SR    6,9            PSUEDO START OF FIELD  <= 4 CHAR
+         SR    9,9            START OF TARGET
+         LA    7,4            NO. CHARS
+         B     AJSTPARM
+         TITLE 'SUPER MONITOR - INIT   ASK FOR PARMS'
+*
+*   ASK OPERATOR TO CHANGE PARM IF REQUIRED
+*
+WTORPARM MVC   REPLY(16),BLANKS
+         MVI   WRKCYCLE,C'0'
+         MVC   WRKCYCLE+1(11),WRKCYCLE
+         SR    7,7
+         ST    7,WRKFUNC
+         ST    7,REPECB
+         WTOR  'SUPER MONITOR - ENTER ''U'' OR PARMS',                 *
+               REPLY,16,REPECB
+         WAIT  ECB=REPECB
+         OC    REPLY(16),BLANKS
+NOTQ     CLI   REPLY,C'U'
+         BE    MERGPARM
+         SR    5,5
+         LA    6,REPLY
+REPLOOP  CLI   0(6),C' '
+         BE    ENDREP
+         LA    5,1(0,5)
+         LA    6,1(0,6)
+         B     REPLOOP
+ENDREP   SR    6,5
+         LA    8,WRKCYCLE
+         BAL   11,SORTPARM
+         B     MERGPARM
+         TITLE 'SUPER MONITOR - INIT   MERGE ALL PARM INFO'
+*
+*   MERGE PARMS FROM EXEC AND WTOR
+*
+MERGPARM CLC   WRKCYCLE,C0000
+         BNE   INTVL
+PARMCYC  MVC   WRKCYCLE,PARMCYCL
+*
+INTVL    CLC   WRKINTVL,C0000
+         BNE   RPRT
+PARMINT  MVC   WRKINTVL,PARMINTV
+*
+RPRT     CLC   WRKRPRTS,C0000
+         BNE   FUNCS
+PARMRPT  MVC   WRKRPRTS,PARMRPTS
+*
+FUNCS    MVC   FUNCIONS(4),C0000
+         L     7,WRKFUNC
+         LTR   7,7
+         BZ    PARMFUN
+         LA    6,WRKFUNC
+         B     FUNCMOVE
+PARMFUN  L     7,PARMFUNC
+         LTR   7,7
+         BZ    PARMCHK
+         LA    6,PARMFUNC
+FUNCMOVE SR    8,8
+         LA    7,3
+FUNLOOP1 IC    8,0(7,6)
+         LTR   8,8
+         BZ    FUN1
+         BCT   7,FUNLOOP1
+FUN1     AR    6,7
+         LA    9,2
+         SR    9,7
+         STC   9,FUNMVC+1
+FUNMVC   MVC   FUNCIONS(0),1(6)
+         TITLE 'SUPER MONITOR - INIT   CONVERT PARM INFORMATION'
+*
+*   VALIDATE, CONVERT  AND SAVE  PARMS
+*
+PARMCHK  LA    6,WRKCYCLE
+         LA    7,12
+PARMCHK1 CLI   0(6),X'F0'     CHECK
+         BL    WTORPARM            FOR
+         CLI   0(6),X'F9'             ONLY
+         BH    WTORPARM                   0-9
+         LA    6,1(0,6)                      IN
+         BCT   7,PARMCHK1                      PARMS
+         PACK  DWORD(8),WRKCYCLE(4)
+         CVB   7,DWORD
+         LA    8,1(0,7)       GUESS SCAN TAKES EXTRA 1/100 TH
+         ST    8,SVCSAVE
+         SR    6,6
+         M     6,FTENMILL
+         SR    6,6
+         D     6,F26042
+         ST    7,CYCLE
+         PACK  DWORD(8),WRKINTVL(4)
+         CVB   7,DWORD
+         MH    7,H6000        REPORT INTERVAL IN .01 SECS
+         SR    6,6
+         D     6,SVCSAVE
+         STH   7,SAMPSREP     NO. SAMPLES PER REPORT  (APPROX)
+         PACK  DWORD(8),WRKRPRTS(4)
+         CVB   6,DWORD
+         STH   6,NREPORTS
+*
+GOODPARM MVC   MSGPARM+1(3),WRKRPRTS+1
+         MVC   MSGPARM+6(3),WRKINTVL+1
+         MVC   MSGPARM+29(3),WRKCYCLE+1
+         CLI   NOLOAD,C'1'
+         BE    *+10
+         MVC   MSGPARM+40(5),CLOADS
+         CLI   NOSIO,C'1'
+         BE    *+10
+         MVC   MSGPARM+47(5),CSIOS
+         LA    15,5
+         BAL   10,WTOM        WTO 'CYCLE TIME ETC'
+         TIME  DEC
+         ST    1,DATE         DATE OF MONITOR RUN
+         MVC   SPCYCLE(12),WRKCYCLE
+         MVC   SPFUNC(4),FUNCIONS
+         MVI   INIT+2,0
+         MVI   INIT+3,1
+         TITLE 'SUPER MONITOR - INIT   GETMAIN FOR BUFFERS'
+*
+*   GETMAIN FOR BUFFERS
+*
+         SR    0,0
+         CLI   NOSIO,C'1'
+         BE    *+8
+         AH    0,BUFSIZE
+         CLI   NOLOAD,C'1'
+         BE    *+8
+         AH    0,BUFSIZE
+         LTR   0,0
+         BZ    GOTMAIN
+         GETMAIN EC,LV=(0),A=ASIOBUF
+         LTR   15,15
+         BNZ   NOSPACE
+         MVC   ALOADBUF,ASIOBUF
+         CLI   NOSIO,C'1'
+         BE    GOTMAIN
+         CLI   NOLOAD,C'1'
+         BE    GOTMAIN
+         L     0,ASIOBUF
+         AH    0,BUFSIZE
+         ST    0,ALOADBUF
+         B     GOTMAIN
+*
+NOSPACE  LA    15,6
+         BAL   10,WTOM        WTO 'NO BUFFER SPACE'
+         MVI   NOLOAD,C'1'
+         MVI   NOSIO,C'1'
+*
+GOTMAIN  EQU   *
+         TITLE 'SUPER MONITOR - INITIALISE BUFFER AND SPILL POINTERS'
+*
+*   INITIALISE BUFFER & SPILL POINTERS
+*
+         CLI   NOLOAD,C'1'
+         BE    PTRSIO
+         L     6,ALOADBUF
+         MVI   2(6),0
+         MVI   3(6),2
+         LA    7,8(0,6)
+         ST    7,ABOTLOAD
+         ST    7,LOADNEXT
+         AH    6,BUFSIZE
+         LA    7,&LOADLEN
+         SR    6,7
+         ST    6,ATOPLOAD     A(TOP ENTRY IN LOADBUF)
+PTRSIO   CLI   NOSIO,C'1'
+         BE    PTRSDONE
+         L     6,ASIOBUF
+         MVI   2(6),0
+         MVI   3(6),3
+         LA    7,8(0,6)
+         ST    7,ABOTMSIO     A(FIRST ENTRY IN SIOBUF)
+         ST    7,SIONEXT
+         AH    6,BUFSIZE
+         LA    7,&SIOLEN
+         SR    6,7
+         ST    6,ATOPSIO      A(TOP ENTRY IN SIOBUF)
+PTRSDONE EQU   *
+         L     6,BLANKS
+         LA    8,CPUMODEL
+         LA    7,DESCTOP
+         LA    9,BLNKDESC-4
+         CR    9,7
+         BH    *+6
+         LR    7,9
+         SR    7,8
+         SRL   7,2
+BLNKDESC ST    6,0(0,8)
+         LA    8,4(0,8)
+         BCT   7,BLNKDESC
+         TITLE 'SUPER MONITOR - INIT DEVICE DETAILS'
+*
+*   CALCULATE TOTAL RQE IN SYSTEM
+*
+         L     6,CVTIOQET     A(REQUEST ELEMENT TABLE)
+         LR    7,6
+         A     7,FRQELEN      A(SECOND ENTRY)
+*
+RQECNT   CLC   0(2,7),H1
+         BE    RQEND
+         A     7,FRQELEN
+         B     RQECNT
+*
+RQEND    SR    7,6
+         SR    6,6
+         D     6,FRQELEN      NO. ENTRIES IN TABLE
+         STH   7,RQETOTAL
+         STH   7,TOTALRQE
+*
+*
+*   INITIALISE UNIT ADDRESSES
+*
+         L     6,CVTILK1      ADDR CHAN & CU SECTION OF UCB L/U TABLE
+         LA    7,256          X'100' = FIRST SELECTOR CHANNEL
+         LA    8,6(0,6)       PTR TO ENTRY FOR CHAN 6
+*
+CHLOOP   CLI   0(8),0
+         BNE   COUNTED
+         BCT   8,CHLOOP
+COUNTED  SR    8,6
+         STH   8,NOCHANLS
+         STH   8,SELECTRS
+         AIF   ('&OS' EQ 'VS2').LAB19
+*
+*   INITIALISE NUCLEUS,SQA DETAILS
+*
+         L     6,CVTMSER      CVTMSER
+         L     7,104(0,6)     LOW BOUNDARY
+         ST    7,NUCSIZE
+         L     8,108(0,6)     HIGH BOUNDARY
+         SR    8,7
+         ST    8,SQASIZE
+         ST    8,SIZESQA
+.LAB19   ANOP
+*
+*   DIRECT ACCESS DEVICE ADDRESSES
+*
+         SR    8,8
+         SR    11,11
+         LA    10,ADADEVCE
+         L     9,CVTILK2      ADDR UCB ADDRESS LIST BIT OF UCB L/U TAB
+*
+*   START OF UCB LOOP
+*
+NEXTUCB  LH    6,0(0,9)       A(UCB)
+         LTR   6,6
+         BZ    NEXTDA
+         BM    UCBDONE
+         CLI   18(6),X'20'    UCBTYPE  BYTE 3
+         BNE   NEXTDA
+         TM    3(6),X'80'     IGNORE IF DEVICE OFFLINE
+         BZ    NEXTDA
+         LA    5,DAUCBS
+         LH    7,DACOUNT
+         LTR   7,7
+         BZ    SAVEUCB
+*
+TESTSAME C     6,0(0,5)       SCAN LIST
+         BE    NEXTDA                OF UNIQUE
+         LA    5,4(0,5)                     UCB ADDRS
+         BCT   7,TESTSAME                           FOUND SO FAR
+*
+SAVEUCB  ST    6,DAUCBS(11)   SAVE A(UCB)
+         MVC   1(3,10),13(6)  UNIT ADDR
+         MVI   0(10),X'40'
+         SR    7,7
+         IC    7,19(0,6)      UNIT TYPE
+         STC   7,DATYPE(8)
+         LH    7,DACOUNT
+         LA    7,1(0,7)
+         STH   7,DACOUNT
+         CLI   DACOUNT+1,40   ONLY 40 D/A DEVICES ALLOWED
+         BE    UCBDONE
+         LA    8,1(0,8)
+         LA    11,4(0,11)
+         LA    10,4(0,10)
+NEXTDA   LA    9,2(0,9)       NEXT UCB ENTRY
+         B     NEXTUCB
+*
+*   END OF UCB LOOP
+*
+UCBDONE  SR    7,7
+         STH   7,PAGESETS
+         STH   7,NOPAGEDS
+         L     5,CVTSVDCB     A(SVCLIB DCB)
+         L     5,44(0,5)               DEB
+         L     5,32(0,5)               UCB
+         ST    5,DSUCBS
+         MVC   ASVCLIB+1(3),13(5)
+         MVI   ASVCLIB,X'40'
+         L     5,CVTLINK      A(LINKLIB DCB)
+         L     5,44(0,5)                DEB
+         L     5,32(0,5)                UCB
+         ST    5,DSUCBS+4
+         MVC   ALINKLIB+1(3),13(5)
+         MVI   ALINKLIB,X'40'
+         L     5,CVTJOB       A(SYSJOBQE DCB)
+         LH    5,190(0,5)              UCB
+         ST    5,DSUCBS+8
+         MVC   ASYSJOBQ+1(3),13(5)
+         MVI   ASYSJOBQ,X'40'
+         AIF   ('&OS' EQ 'MFT' OR '&OS' EQ 'MVT').NONPAGE
+         LA    9,APAGEDS
+         LA    8,PGUCBS
+         AIF   ('&OS' NE 'VS1').PAGEDCB
+         L     6,CVTPGSIA     A(PAGE SVR INFORMATION AREA)
+         L     6,8(0,6)       A(PAGE DEVICE DESCRIPTOR TABLE)
+         L     6,8(0,6)       A(DEB)
+         AGO   .PAGEDEB
+.PAGEDCB ANOP
+         L     6,CVTPAGE1     A(DCB) FOR PRIMARY PAGE DATASET
+         L     6,44(0,6)      A(DEB FOR ALL PAGE DATASETS
+.PAGEDEB ANOP
+         IC    7,16(0,6)      NO. PAGE DATASETS
+         STH   7,PAGESETS
+         CH    7,H4
+         BNH   *+8
+         LA    7,4            MAXIMUM OF 4
+         STH   7,NOPAGEDS
+         LA    10,32(0,6)     A(FIRST EXTENT ENTRY)
+UCBPAGE  L     11,0(0,10)
+         ST    11,0(0,8)      A(UCB)
+         MVC   1(3,9),13(11)  UNIT NAME
+         LA    10,16(0,10)    NEXT EXTENT
+         LA    9,4(0,9)       NEXT DEVICE NAME SLOT
+         LA    8,4(0,8)       NEXT UCB ADDRESS SLOT
+         BCT   7,UCBPAGE      EACH PAGE DATASET
+.NONPAGE ANOP
+         TITLE 'SUPER MONITOR - INITIALISE STORAGE MAP'
+         AIF   ('&OS' EQ 'MVT' OR '&OS' EQ 'VS2').STORSZ
+*
+*   INITIALISE NO. PARTITIONS AND ALL BOUNDARY BOX ADDRESSES
+*
+         SR    11,11
+         L     9,AOURTCB      A(CURRENT TCB)
+         B     GETBBX
+*
+NXTTCB   L     9,116(0,9)
+         LTR   9,9
+         BZ    PTNSDONE
+         C     9,44(9)                 IS THIS A JOB-STEP TCB ?
+         BNE   NXTTCB                  IGNORE IF NOT
+GETBBX   L     5,24(0,9)      A(BBX)
+         ST    5,ABBX(11)
+         ST    9,ATCB(11)
+         LA    11,4(0,11)
+         B     NXTTCB
+PTNSDONE SRL   11,2           NO. OF PTNS
+         STH   11,NOPARTNS
+         SR    6,6
+         ST    6,TYPEDESC
+         TITLE 'SUPER MONITOR - INIT BLDL,CORE SIZE,MODEL,RQE TOTAL'
+*
+*   CALCULATE BLDL SIZE
+*
+BLDL     SR    9,9
+         L     6,CVTPRLTV
+         SH    6,H4           A(SVCLIB BLDL PTR)
+         LR    7,6
+         SH    7,H4           A(LINKLIB BLDL PTR)
+         BAL   14,BLDLCALC
+         LR    6,7
+         BAL   14,BLDLCALC
+         ST    9,BLDLSIZE
+         B     STORAGE
+*
+*
+BLDLCALC L     6,0(0,6)
+         LTR   6,6
+         BCR   8,14
+         LH    8,0(0,6)       NO. ENTRIES
+         MH    8,2(0,6)       * LENGTH OF EACH ENTRY
+         LA    8,4(0,8)
+         AR    9,8
+         BR    14
+.STORSZ  ANOP
+*
+*
+*   CALCULATE STORAGE SIZE
+*
+STORAGE  EQU   *
+         AIF   ('&OS' EQ 'VS2').LAB21
+         SR    7,7
+         ST    7,BLDLSIZE     ZERO BLDL
+.LAB21   ANOP
+         LA    7,1
+         A     7,CVTMZ00      HIGHEST STORAGE ADDRESS + 1
+         SRL   7,10              / 1024
+         STH   7,VIRTSIZE     STORAGE SIZE IN K
+         AIF   ('&OS' EQ 'MFT' OR  '&OS' EQ 'MVT').REALCOR
+         LA    7,1
+         A     7,CVTEORM      HIGHEST REAL ADDRESS + 1
+         SRL   7,10              / 1024
+.REALCOR ANOP
+         STH   7,REALSIZE     REAL STORAGE SIZE IN K
+         AIF   ('&OS' NE 'VS2').LAB23
+         MVC   NUCSIZE(4),CVTNUCB    NUCLEUS SIZE
+         AIF   ('&OS' EQ 'VS2').STORVS2
+         L     6,CVTMSER
+         L     8,108(0,6)
+         S     8,104(0,6)
+         AGO   .SQASZ
+.STORVS2 ANOP
+         L     9,CVTABEND
+         L     9,108(0,9)     A(GOVRFLB)
+         L     7,8(0,9)       A(DPQE-8)
+         L     7,8(0,7)       A(PQE FOR V=R)
+         MVC   AVEQR(4),24(7) A(START OF V=R)
+         MVC   VEQRSIZE(4),12(9)   SIZE OF USEABLE V=R
+         MVC   VEQVSIZE(4),16(9)                   V=V
+         L     7,0(0,9)       A(SQA)
+         L     8,CVTMZ00
+         SR    8,7
+         LA    8,1(0,8)
+.SQASZ   ANOP
+         ST    8,SQASIZE
+         ST    8,SIZESQA
+.LAB23   ANOP
+*
+*   PICK UP SYSTEM RELEASE NUMBER
+*
+         LR    6,4
+         SH    6,H4
+         MVC   SYSRELNO(4),0(6) WORD PREFIXING CVT
+*
+*   PICK UP OPERATING SYSTEM TYPE
+*
+         IC    6,CVTDCB       MFT=X'20'  MVTMP=X'14'  MVT=X'10'
+         STC   6,DATE         VS1=X'22'               VS2=X'12'
+*
+*   PICK UP MODEL NUMBER
+*
+         LR    6,4
+         SH    6,H6
+         LH    6,0(0,6)
+         STH   6,DWORD
+         UNPK  DWORD(8),DWORD(3)
+         MVC   CPUMODEL(4),DWORD+3
+*
+*   OPEN MONITOR DATA SET
+*
+         OPEN  (DCB,(OUTPUT))
+         TM    DCB+48,X'10'
+         BNO   OPENFAIL
+         TITLE 'SUPER MONITOR - INITIALISE CONTENTS DETAILS'
+         AIF   ('&OS' EQ 'VS2').LPAVS2
+*
+*   INITIALISE RSVC,RAM DETAILS
+*
+         LA    8,LPAMODUL
+         LA    9,12
+         MH    9,MAXLPA
+         AR    8,9
+         ST    8,ALIMLPA
+         L     9,CVT0FN00     A(EP FINCH)
+         SH    9,H4096
+IGGORES1 N     9,FFFFFC
+IGGORES  CLC   8(8,9),IGG019
+         BE    FOUNDIGG
+         LA    9,4(0,9)
+         C     9,CVTMZ00
+         BL    IGGORES
+         B     NOIGG019
+FOUNDIGG L     6,0(0,9)
+         ST    6,ARSVC
+         L     7,4(0,9)
+         ST    7,ARAM
+         SR    10,10
+         ST    10,RSVCSIZE
+         SR    9,9
+         ST    10,RAMSIZE
+         LR    5,6
+         LA    8,LPAMODUL
+         BAL   6,LPASUM
+         ST    10,RSVCSIZE
+         SR    10,10
+         L     5,ARAM
+         BAL   6,LPASUM
+         ST    10,RAMSIZE
+         ST    9,LPANO
+         B     DESCOUT
+         TITLE 'SUPER MONITOR - INIT   PROCESS LPA'
+*
+*   S/R TO MOVE MODULE NAMES & SIZES AND TO COUNT BOTH
+*
+*   R5  START OF LOAD LIST CHAIN TO BE EXAMINED
+*   R6  RETURN ADDR
+*   R8  AREA INTO WHICH NAMES AND LENGTHS TO BE MOVED
+*   R9  COUNT OF MODULES
+*   R10 TOTAL LENGTH
+SAVEREG6 DS    F
+LPASUM   LTR   5,5
+         BCR   8,6            RETURN IF ZERO PTR AT LIST END
+         CLC   8(5,5),IGC00
+         BNE   LPACHECK
+         MVC   DWORD(4),12(5) E.G. C'001I'
+         OI    DWORD+3,X'F0'       C'0019'
+         PACK  DWORD(8),DWORD(4)   X'019C'
+         CVB   15,DWORD            F'19'
+         LR    1,15
+         SRL   1,5            RSVCS WORD NO. CONTAINING BIT
+         SLL   1,5
+         SR    15,1           BIT NO. WITHIN WORD
+         STC   15,LPASRL+3
+         LA    15,256
+         SLL   15,23          HIGH ORDER BIT SET
+LPASRL   SRL   15,0
+         SRL   1,3            OFFSET OF RSVCS WORD CONTAINING BIT
+         O     15,RSVCS(1)    SET ON RESIDENT TYPE 3/4 SVC BIT
+         ST    15,RSVCS(1)
+LPACHECK C     8,ALIMLPA
+         BL    LPAMOVE
+         ST    9,LPANO
+         ST    6,SAVEREG6
+         LR    6,3
+         BAL   10,LASTWRIT
+         L     6,SAVEREG6
+         LA    8,LPAMODUL
+         SR    9,9
+LPAMOVE  MVC   0(8,8),8(5)
+         LA    9,1(0,9)
+         AIF   ('&OS' NE 'MFT').LPNOTMF
+         LH    15,16(0,5)     NO. CONTIGUOUS DOUBLE WORDS
+         LA    15,1(0,15)        + DOUBLE WORD
+         AGO   .LPALEN
+.LPNOTMF AIF   ('&OS' NE 'VS1').LPNOVS1
+         SR    15,15
+         IC    15,17(0,5)     LENGTH RB+CDB IN DOUBLE WORDS
+         LA    15,1(0,15)       + DWORD FOR PREFIX
+         SR    1,1
+         IC    1,16(0,5)      OFFSET OF CDB
+         LA    14,8(1,5)      A(CDB)
+         LH    14,6(0,14)     LENGTH OF NOTELIST + MODULE IN WORDS
+         AR    15,14          TOTAL DOUBLE WORDS
+         AGO   .LPALEN
+.LPNOVS1 ANOP
+         AGO   .LPALEN
+.LPALEN  ANOP
+         SLL   15,3           LENGTH IN BYTES
+         ST    15,8(0,8)
+         AR    10,15          TOT LENGTH SO FAR
+         L     5,0(0,5)       NEXT ON LOAD LIST
+         LA    8,12(0,8)
+         B     LPASUM
+         AGO   .DESC
+.LPAVS2  ANOP
+         MVC   LPANO(4),ZEROS
+         MVC   TYPEDESC(4),ZEROS
+         LA    8,LPAMODUL
+         LA    9,LPAQ-11      DO NOT OVERLAY LPAQ, ETC.
+         SSM   *+1            DISABLE TO AVOID BROKEN CDE CHAIN
+LPAQ     L     6,CVTQLPAQ     A(FIRST CDE)
+         B     LPAQNXT        DUMMY CDE PTS TO CDE
+LPAQTEST TM    0(6),X'80'     IGNORE IF NOT FLPA/MLPA
+         BZ    LPAQNXT
+         TM    0(6),X'04'     IGNORE IF A MINOR CDE
+         BO    LPAQNXT
+         CLC   17(3,6),AVEQR+1 COMPARE EP WITH V=R AREA
+LPAQBC   BC    2,LPAQNXT      BRANCH IF HIGH (^  FLPA) THEN LOW(^MLPA)
+         BAL   10,CONTENTS
+LPAQNXT  L     6,0(0,6)       NEXT CDE
+         LA    6,0(0,6)       REMOVE HIGH BYTE
+         LTR   6,6
+         BNZ   LPAQTEST
+         LA    6,ZEROS-8      ZERO WORD AT END OF LIST
+         BAL   10,CONTENTS
+         TM    LPAQBC+1,X'20' MLPA ALREADY DONE ?
+         BNO   LPAFMDUN       BRANCH IF YES
+         LA    6,64           CONVERT BC TO BRANCH IF LOW
+         STC   6,LPAQBC+1
+         B     LPAQ           DO MLPA
+LPAFMDUN LA    7,128          SET INDICATOR
+         STC   7,LPAQBC+1               FOR FLPA/MLPA DONE
+LPADIR   L     6,CVTLPDIA     DO LPA DIRECTORY
+         LA    6,0(0,6)
+LPACONT  BAL   10,CONTENTS
+         LA    6,32(0,6)      NEXT LPDE
+         CLI   8(6),X'FF'     LAST NAME IS FF'S
+         BNE   LPACONT
+         LA    6,ZEROS-8
+         BAL   10,CONTENTS    ZERO WORD AT END OF LIST
+         B     DESCDONE
+*
+*   S/R TO RECORD MODULES IN FLPA,MLPA,LPA
+*
+CONTENTS MVC   0(8,8),8(6)    MOVE MODULE NAME TO RECORD
+         MVC   8(4,8),ZEROS   SET LENGTH TO ZEROS
+         LA    8,12(0,8)      NEXT SLOT IN RECORD
+         CR    8,9
+         BCR   13,10          STILL ROOM
+         SSM   FF             ENABLE TO WRITE RECORD
+         LA    8,LPAMODUL     RECORD FULL
+         LH    15,BLOCKNO
+         LA    15,1(0,15)
+         STH   15,BLOCKNO
+         STH   15,TYPEDESC
+         WRITE DECB1,SF,DCB,(3),'S'
+         CHECK DECB1
+         TM    LPAQBC+1,X'80' HAVE FLPA/MLPA BEEN FINISHED
+         BCR   1,10           RETURN IF YES
+         MVC   0(4,8),ZEROS   END OF FLPA/MLPA LIST
+         LA    8,12(0,8)
+         TM    LPAQBC+1,X'40' SEE IF FLPA COMPLETED
+         BO    LPAFMDUN       BRANCH IF YES
+         MVC   0(4,8),ZEROS   END OF BOTH FLPA AND MLPA LIST
+         LA    8,12(0,8)
+         B     LPAFMDUN
+*
+DESCDONE LA    9,LPAMODUL
+         CR    8,9
+         BE    SETTRAPS
+.DESC    ANOP
+         TITLE 'SUPER MONITOR - INIT   WRITE DESCRIPTOR RECORD'
+*
+*   WRITE OUT DESCRIPTOR RECORD
+*
+DESCOUT  LR    6,3
+         BAL   10,LASTWRIT
+         MVI   DECB,X'7F'
+         LA    6,1
+         STH   6,TYPEDESC+2
+         TITLE 'SUPER MONITOR - INIT   SET SVC AND FINCH TRAPS'
+SETTRAPS EQU   *
+*
+*   SET  SVC  AND  FINCH  TRAPS
+*
+         LA    11,4
+         L     10,100         A(SVC FLIH)
+SFLIHCHK CLI   0(10),X'90'
+         BE    SVFLIHOK
+         LA    10,2(0,10)
+         BCT   11,SFLIHCHK
+         B     SFLIHBAD
+SVFLIHOK LH    11,2(0,10)     SVC FLIH SAVE AREA
+         STH   11,SVCTRAP+2   FOR SVCTRAP
+         STH   11,SVCNORM+2             INITIAL SAVE AREA
+         STH   11,SVCLOAD+2
+         MVC   SVCPSW(8),96   SAVE SVC NEWPSW
+         AIF   ('&OS' EQ 'VS2').SVCHPSW
+         CLI   NOLOAD,C'1'
+         BE    DOFINCH
+         L     7,CVTBOSV      A(PROGRAM FETCH)
+         SH    7,H22
+         CLC   0(12,7),CHKFINCH        NON-PCI FETCH
+         BE    DOFINCH
+         SH    7,H4                    TRY PCI FETCH
+         CLC   0(12,7),CHKFINCH        PCI FETCH
+         BE    DOFINCH
+         MVI   NOLOAD,C'1'
+         LA    15,7
+         BAL   10,WTOM        WTO 'NO LOADS'
+         B     LDTRPDUN
+DOFINCH  ST    7,AFINCH
+         MVC   SAVEFNCH(14),0(7)
+         SSM   *+1
+.SVCHPSW ANOP
+         CLI   NOLOAD,C'1'
+         AIF   ('&OS' EQ 'VS2').LAB27
+         BE    *+16
+         AGO   .LAB271
+.LAB27   ANOP
+         BE    LDTRPDUN
+         SSM   *+1
+         AIF   ('&OS' EQ 'VS2').SVCONLY
+.LAB271  ANOP
+         MVC   0(12,7),FNCHCODE NEW FINCH CODE
+.SVCONLY ANOP
+         MVC   101(3,0),ASVCTRAP+1
+         SSM   FF
+LDTRPDUN EQU   *
+         TITLE 'SUPER MONITOR - INIT   SET IOIS TRAP'
+*
+*   SET SIO TRAP
+*
+         CLI   NOSIO,C'1'
+         BE    NOSIOTRP
+         LA    6,100
+* LOOK FOR CODE NEAR LABEL XCP162 IN IOS - CODE FOR RPS DEVICES
+SEARCHIO CLC   0(6,6),OIMVCTM          FIST SIX BYTES OF IOS INSTNS
+         BNE   NEXT
+         CLC   28(4,6),OIMVCTM+8       CHECK A FURTHER INSTRUCTION
+         BNE NEXT
+         BE    TRAPCODE
+NEXT     LA    6,2(0,6)
+         C     6,ARAM
+         BH    SIOFAIL
+         B     SEARCHIO
+SIOFAIL  LA    15,8
+         BAL   10,WTOM        WTO 'NO SIOS'
+         MVI   NOSIO,C'1'
+         B     NOSIOTRP
+TRAPCODE MVC   SAVEIOS(16),0(6)
+         MVC   ZAPCODE(16),0(6)         STORE TO BE RE-EXECUTED
+         ST    6,ATRPCODE     FOR SYSTEM RESTORE
+         LR    7,6            SAVE TRAPCODE MODULE ADDRESS
+         N     7,F3
+         SSM   *+1
+         LTR   7,7
+         BZ    WORDALGN
+         MVC   0(2,6),X0700   USE NOPR TO ALIGN REST OF CODE INC ADDR
+         LA    6,2(0,6)
+WORDALGN MVC   0(12,6),IOSCODE
+         SSM   FF
+NOSIOTRP EQU   *
+         AIF   ('&OS' NE 'VS2').LAB28
+         TITLE 'SUPER MONITOR - CLIMB UP TCB CHAIN'
+*
+*   CLIMB UP TCB CHAIN
+*
+TCBTCB   EQU   116
+TCBLMP   EQU   34
+TCBBACK  EQU   220
+         SSM   *+1
+         L     5,AOURTCB
+         MVC   TCBLMP(2,5),FF
+         L     6,TCBBACK(0,5) A(HIGHER TCB)
+         MVC   TCBTCB(4,6),TCBTCB(5) CHAIN FROM HIGHER TO LOWER TCB
+         L     7,TCBTCB(5)    A(LOWER TCB)
+         LTR   7,7
+         BZ    *+8            BRANCH IF NO LOWER TCB
+         ST    6,TCBBACK(0,7) STORE A(HIGHER TCB) IN TCBBACK OF LOWER
+         L     6,CVTHEAD      TOP TCB  (PAGE SUPERVISOR)
+         L     7,TCBTCB(0,6)  NEXT TO TOP TCB
+         ST    5,TCBTCB(0,6)  PUT OUR TCB ADDR IN TOP TCBTCB
+         ST    7,TCBTCB(0,5)  CHAIN LOWER TCB VIA OUR TCBTCB
+         ST    6,TCBBACK(0,5) CHAIN US BACK TO HIGHEST TCB
+         ST    5,TCBBACK(0,7) CHAIN 2ND HIGHEST TCB BACK TO US
+         SSM   FF
+CLIMBED  EQU   *
+.LAB28   ANOP
+         TITLE 'SUPER MONITOR - INIT   MAKE NON-CANCELLABLE AND RETURN'
+         AIF   ('&OS' EQ 'VS2').LAB29
+         L     6,ACSCB
+         LA    5,27(0,6)      A(CIBCTR)
+         SR    7,7
+         IC    7,0(0,5)
+         LA    7,1(0,7)
+         SSM   *+1
+         NI    7(6),X'FD'     MAKE NON-CANCELLABLE
+         STC   7,0(0,5)       CIBCTR AT LEAST ONE
+         SSM   FF
+.LAB29   ANOP
+         AIF   ('&OS' NE 'VS2').LAB30
+         STAE  ABEND
+         AGO   .LAB31
+.LAB30   ANOP
+         L     6,AOURTCB
+*        MVC   160(4,6),ASCB       PUT SCB IN TCB
+.LAB31   ANOP
+         L     14,SCANRET     RETURN TO MAINSTREAM OF MONITOR
+         BR    14
+         TITLE 'SUPER MONITOR - INIT   DATA AREA'
+FNCHCODE DS    0F
+         L     15,12(0,15)
+         BR    15
+         DC    A(FINCHTRP)
+IOSCODE  DC    X'05A0'
+         DC    X'58A0A006'
+         DC    X'07FA'
+         DC    A(IOSTRAP)
+OPENFAIL LA    15,9
+         BAL   10,WTOM        WTO 'OPEN FAIL'
+         B     KILL
+NOIGG019 LA    15,10
+         BAL   10,WTOM        WTO 'NO IGG019'
+         B     KILL
+SFLIHBAD LA    15,11
+         BAL   10,WTOM        WTO 'SVC FLIH FAIL'
+KILL     SVC   240
+         L     13,4(0,13)
+         LM    14,12,12(13)
+         LA    15,8           RETURN CODE
+         BR    14             TERMINATE JOB
+*
+*   DATA AREA FOR USE BY INIT AND FOR LATER OVERLAYING BY SCANBUF
+*
+FTENMILL DC    F'10000000'
+F26042   DC    F'26042'
+H6000    DC    H'6000'
+         DS    0F
+H4096    DC    H'4096'
+IGG019   DC    C'IGG019'
+         AIF   ('&OS' EQ 'MFT' OR '&OS' EQ 'MVT').X0000
+         DC    C'IF'
+         AGO   .IGGSET
+.X0000   ANOP
+         DC    X'0000'
+.IGGSET  ANOP
+IGC00    DC    C'IGC00'
+         AIF   ('&OS' EQ 'VS2').LAB32
+ASCB     DC    A(SCB)         TCBNSTAE
+.LAB32   ANOP
+ARSVC    DS    F
+ARAM     DC    F'100000'
+ALIMLPA  DS    F
+MAXLPA   DC    H'&MAXLPA'
+DACOUNT  DC    H'0'
+OIMVCTM  DC    X'910870014710551241A7003140A08A5A'
+X0700    DC    X'0700'
+F3       DC    F'3'
+H1       DC    H'1'
+H30      DC    H'30'
+H22      DC    H'22'
+CHKFINCH DC    X'18519879500041D0000194FD201F'
+MSGPARM  DC    C' XXX  XXX-MIN REPORTS. CYCLE=XXX HTHS               '
+MSGNOBUF DC    C'NO BUFFER SPACE'
+MSGNOLD  DC    C'NOLOAD'
+MSGNOSIO DC    C'NOSIO'
+MSGOPEN  DC    C'OPEN FAIL'
+MSGIGG19 DC    C'IGG019 FAIL'
+MSGSVCFL DC    C'SVCFLIH FAIL'
+SPARE    DS    400C
+TOPSPILL EQU   *
+         TITLE 'WRITE MESSAGES TO CONSOLE'
+*
+*   SUBROUTINE TO WTO SUPERMONITOR MESSAGES
+*
+*   R10 = RETURN ADDRESS      R15 = MESSAGE NUMBER
+*
+WTOM     SR    14,14
+         IC    14,MSGLEN(15)
+         STC   14,MSGMVC+1
+         LA    14,21(0,14)
+         STH   14,MSG+4
+         SLL   15,2
+         L     15,MSGADDR(15)
+MSGMVC   MVC   MSG+24(1),0(15)
+MSG      WTO   'SUPER MONITOR -                                        *
+                                '
+         BR    10
+         TITLE 'SUPER MONITOR - SVC TRAP'
+**********
+*    IN THIS PREFIX TO SVC FLIH THE OCCOURANCE OF EACH SVC IS COUNTED.
+*
+*    A RECORD IS GENERATED FOR EACH LINK,XCTL,LOAD,ATTACH
+*         RECORD TYPE    L   LINK
+*                        X   XCTL
+*                        D   LOAD
+*                        A   ATTACH
+*         MODULE NAME
+*         LIBRARY        S   SVCLIB
+*                        L   LINKLIB
+*                        P   PRIVATE LIBRARY
+*                        O   LINKLIB OR JOBLIB
+*         DE TYPE        B   BLDL ENTRY PROVIDED
+**********
+         TITLE 'SUPER MONITOR - SVC TRAP'
+*
+*   PREFIX TO SVC FLIH     HENCE NON-INTERRUPTABLE HERE
+*
+SVCTRAP  ST    1,0            SVCSAV ADDR FILLED IN BY INIT
+         BALR  1,0
+         USING *,1
+         DROP  2,12
+         STM   2,0,SVCSAVE
+         L     12,AINIT
+         USING SAMPBUF,12
+         L     4,16
+         L     7,0(0,4)
+         L     7,4(0,7)       TCB OF TASK ISSUING SVC
+         AIF   ('&OS' EQ 'VS2').PKINTCB
+         IC    5,112(0,7)     TCBID
+         AGO   .SVCNO
+.PKINTCB ANOP
+         IC    5,28(0,7)      PROTECT KEY
+.SVCNO   ANOP
+         LH    2,&SVCCODE     SVC NO.
+         CH    2,H127
+         BNH   *+8
+         LA    2,127          LUMP 127+ TOGETHER
+         SLL   2,2
+         LA    3,1
+         AL    3,SVCS(2)
+         ST    3,SVCS(2)
+         AIF   ('&OS' EQ 'VS2').ALLRES
+         SRL   2,2
+         CH    2,H127
+         BNL   SVC67842
+         LR    6,2
+         LR    3,2
+         SRL   2,3
+         LA    10,RSVCS(2)
+         SLL   2,3
+         SR    3,2
+         STC   3,SVCSRL+3
+         LA    3,128
+SVCSRL   SRL   3,0
+         STC   3,SVCTM+1
+SVCTM    TM    0(10),0        SEE IF RESIDENT TYPE 3 OR 4
+         BNO   SVC67842
+         CVD   6,DWORD
+         OI    DWORD+7,X'0F'
+         UNPK  SVCNAME+3(5),DWORD+6(2)
+         NI    SVCNAME+7,X'CF'
+         LA    2,SVCNAME
+         LA    3,217          'R' RESIDENT TYPE 3 OR 4
+         LA    10,64
+         LR    7,10
+         B     SVCREC
+.ALLRES  ANOP
+SVC67842 EQU   *
+         CLI   &SVCCODE+1,6
+         BL    EXIT           SVC < 6
+         LA    10,64          BLANK ASSUME NOT DE TYPE
+         BNE   *+12
+         LA    3,211          LINK = 'L'
+         B     SVC6AND7
+         CLI   &SVCCODE+1,8
+         BH    SVCGT8         SVC > 8
+         BNE   SVC7
+         LA    3,196          LOAD='D'
+         LTR   0,0
+         BP    *+8
+         LA    10,194         'B' BLDL ENTRY SUPPLIED
+         LPR   2,0
+SVCLOAD  L     7,0            ADDR FILLED IN BY INIT
+         L     7,0(0,7)       A(DCB) FOR LOAD
+         B     SVC8
+SVC7     LA    3,231          XCTL='X'
+         B     SVC6AND7
+SVCGT8   CLI   &SVCCODE+1,42
+         BNE   EXIT
+ATTACH   LA    3,193          ATTACH='A'
+SVC6AND7 L     2,SVCSAVE+52   R15 AT ENTRY TO SVCFLIH
+         N     2,FFFFFC
+         CL    2,CVTMZ00
+         BNL   EXIT
+         TM    0(2),X'80'     TEST FOR -VE I.E. DE TYPE MACRO
+         BNO   *+8
+         LA    10,194         'B' BLDL ENTRY SUPPLIED
+         L     7,4(0,2)       A(DCB) FOR LINK,XCTL,ATTACH
+         L     2,0(0,2)
+SVC8     LA    2,0(0,2)
+         CL    2,CVTMZ00
+         BNL   EXIT
+         LA    7,0(0,7)       REMOVE HIGH BYTE
+         LTR   7,7
+         BNZ   SVCLINK
+         LA    7,214          'O' LINKLIB OR JOBLIB
+         B     SVCREC
+SVCLINK  C     7,CVTLINK
+         BNE   SVCSVC
+         LA    7,211          'L' LINKLIB
+         B     SVCREC
+SVCSVC   C     7,CVTSVDCB
+         BNE   SVCP
+         LA    7,226          'S' SVCLIB
+         B     SVCREC
+SVCP     LA    7,215          'P' PRIVATE LIBRARY OR JOBLIB
+*
+SVCREC   BAL   6,LOADREC      MAKE AN ENTRY IN LOADBUF
+*
+EXIT     MVC   48(8),SVCPSW   MOVE PSW TO PROGRAM OLD PSW
+         LM    2,0,SVCSAVE
+SVCNORM  L     1,0
+         LPSW  48
+         DROP  1
+         AIF   ('&OS' EQ 'VS2').FINCHX
+         TITLE 'SUPER MONITOR - FINCH TRAP'
+**********
+*    CONTROL PASSES TO THIS ROUTINE AT ENTRY TO IEWMSEPT WHICH IS THE
+*    FINCH ENTRY POINT FOR THE SUPERVISOR.
+*    ENTRIES TO FINCH BY THE OVERLAY SUPERVISOR VIA IEWFBOSV ARE NOT
+*    MONITORED.
+*    REGISTER 1 POINTS TO FETCH PARAMETER LIST
+*                  + 0   A(DCB)
+*                  + 4   A(NOTE LIST)
+*                  + 8   A(BLDL ENTRY)
+*                  + C   NO. RELOCATION FACTORS
+*                  +10   A(PROBLEM PROG CORE)
+*                  +14   RELOCATED ENTRY POINT
+*
+**********
+         TITLE 'SUPER MONITOR - FINCH TRAP'
+*   TRAP ALL FINCH REQUESTS
+FINCHTRP SSM   1(15)          MAKE NON-INTERRUPTABLE
+         USING FINCHTRP,15
+         STM   0,14,SVCSAVE
+         LR    12,15
+         USING FINCHTRP,12
+         DROP  15
+         L     4,16
+         L     7,0(0,4)
+         L     7,4(0,7)       TCB OF TASK ISSUING FINCH
+         C     7,AOURTCB
+         BE    GOTOFNCH
+         IC    5,112(0,7)     TCBID
+         LR    2,10
+         LA    3,198          'F' FOR FETCH TYPE RECORD
+         L     6,8(0,1)       A(MODULE NAME) FROM PARAMETER LIST
+         CLC   CVTSVDCB+1(3),1(1) SVCDCB : DCB IN PARAMETER LIST
+         BNE   NOTSVC
+         LA    7,226          'S' FOR SVCLIB
+         MVC   WRK(1),10(10)  XRBSTAB BYTE 1
+         NI    WRK,X'F0'
+         CLI   WRK,X'C0'
+         BE    FILLNAME       SVRB FOR TYPE2 OR NOT LOADED TYPE 3,4 SVC
+         CLI   0(6),C'I'
+         BNE   FILLNAME
+         LR    2,6
+         B     GENREC
+*
+FILLNAME MVC   SVCNAME+3(5),3(10)
+         OI    SVCNAME+3,X'F0'
+         LA    2,SVCNAME
+         B     GENREC
+*
+NOTSVC   SR    7,7
+         IC    7,12(0,6)
+         IC    7,LIBIND(7)
+*
+GENREC   LA    10,64
+         BAL   6,LOADREC
+*
+GOTOFNCH L     15,AFINCH
+         LM    0,14,SVCSAVE
+*        NEXT FOUR INSTRUCTIONS WERE REMOVED FROM FINCH
+         LR    5,1                     **********
+         LM    7,9,0(5)                **********
+         LA    13,1                    **********
+         NI    31(2),X'FD'             **********
+         SSM   5(15)          RESTORE SYSTEM MASK
+         B     14(15)
+         DROP  12
+.FINCHX  ANOP
+         TITLE 'SUPER MONITOR - GENERATE RECORD IN LOAD BUFFER'
+**********
+*
+*   S/R TO PLACE ENTRIES IN LOADBUF
+*
+*   ON ENTRY  R2    A(MODULE NAME)
+*             R3    X,L,D,A FOR XCTL,LINK,LOAD,ATTACH
+*                   F       FOR FETCH RECORD
+*                   R       FOR RESIDENT TYPE 3 OR 4 SVC
+*             R5    TCBID
+*             R6    RETURN ADDRESS
+*             R7    P,L,J,S,O   LIBRARY = PRIVATE, LINKLIB, JOBLIB,
+*                                         SVCLIB, LINKLIB OR JOBLIB
+*             R10   B IF BLDL PROVIDED FOR DE TYPE MACRO
+*
+**********
+LOADREC  BALR  8,0
+         USING *,8
+         TM    LOADSWCH,X'01'
+         BO    LSPILLED
+LOADOK   L     9,LOADNEXT
+         STC   3,0(0,9)       RECORD TYPE
+         MVC   1(8,9),0(2)    MODULE NAME
+         STC   7,9(0,9)       LIBRARY INDICATOR
+         STC   5,10(0,9)      TCBID
+         STC   10,11(0,9)
+         LA    9,&LOADLEN.(0,9)
+         C     9,ATOPLOAD
+         BH    LOADFULL
+         ST    9,LOADNEXT
+         BR    6              RETURN
+*
+*
+LOADFULL MVI   LOADSWCH,1
+         MVI   B2,1           INDICATE BUFFER READY FOR OUTPUT
+         SR    9,9
+         STH   9,LDSPTOTL     ZERO COUNT OF SPILL ENTRIES
+         MVC   LDSPLAST(4),SPILLTOP
+         BR    6
+*
+*
+*   ENTRY WILL HAVE TO BE MADE IN SPILL AREA
+LSPILLED L     9,LDSPLAST     PTR TO LAST USED LOAD SPILL ENTRY
+         SH    9,HLOADLEN     PTR TO NEXT LOAD SPILL ENTRY
+         C     9,SISPNEXT     ROOM LEFT IN SPILL ?
+         BL    LOSTLOAD       BRANCH IF NO
+         STC   3,0(0,9)       BUILD
+         MVC   1(8,9),0(2)         RECORD
+         STC   7,9(0,9)                 IN
+         STC   5,10(0,9)                  SPILL
+         STC   10,11(0,9)                      AREA
+         ST    9,LDSPLAST     PTR TO LAST USED ENTRY
+         LH    9,LDSPTOTL     INCREMENT
+         LA    9,1(0,9)            TOTAL OF
+         STH   9,LDSPTOTL               LOAD SPILL ENTRIES USED
+         BR    6
+*
+LOSTLOAD LH    9,LOADLOST     LOAD RECORD
+         LA    9,1(0,9)            IS DEFINITELY
+         STH   9,LOADLOST               LOST
+         BR    6
+         TITLE 'SUPER MONITOR - IOIS TRAP'
+**********
+*
+*   PREFIXES IOS DISK START I/O MODULE TO RECORD SEEK ADDRS
+*
+**********
+         USING *,10
+IOSTRAP  STM   8,9,SVCSAVE
+         TM    SIOSWCH,1
+         BO    SSPILLED
+*
+SIOOK    L     9,SIONEXT
+         MVC   0(2,9),4(7)    DEVICE ADDRESS
+         CLI   19(7),X'05'    DATA CELL ?
+         BE    *+14
+         MVC   2(2,9),35(2)   CC
+         B     *+10
+         MVC   2(2,9),37(2)   CC = HH FOR DATA CELL
+         LA    9,&SIOLEN.(0,9)
+         C     9,ATOPSIO
+         BH    SIOFULL
+         ST    9,SIONEXT
+         B     GOTOIOS
+*
+SIOFULL  MVI   SIOSWCH,1      INDICATE BUFFER READY FOR OUTPUT
+         MVI   B3,1
+         SR    9,9
+         STH   9,SISPTOTL
+         MVC   SISPNEXT(4),ASPILL
+         B     GOTOIOS
+*
+SSPILLED L     9,SISPNEXT
+         LA    8,&SIOLEN.(0,9)
+         C     8,LDSPLAST
+         BH    LOSTSIO        RECORD IS LOST
+         MVC   0(2,9),4(7)
+         CLI   19(7),X'05'    DATA CELL ?
+         BE    *+14
+         MVC   2(2,9),35(2)   CC
+         B     *+10
+         MVC   2(2,9),37(2)   CC = HH FOR DATA CELL
+         LA    9,&SIOLEN.(0,9)
+         ST    9,SISPNEXT
+         LH    9,SISPTOTL
+         LA    9,1(0,9)
+         STH   9,SISPTOTL
+         B     GOTOIOS
+*   ENTRY IS LOST
+LOSTSIO  LH    9,SIOLOST
+         LA    9,1(0,9)
+         STH   9,SIOLOST
+*
+*   RETURN TO IOS
+*
+GOTOIOS  LM    8,9,SVCSAVE
+         L     10,ATRPCODE
+         LA    10,16(10)
+ZAPCODE  EQU   *                                              D
+         DC    XL16'0'
+*        TM    UCBFL5(UCBREG),UCBEXTSN     *   OLD IOS INSTN   *
+*        BC    1,XCPRPS                    *   OLD IOS INSTN   *
+*        LA    WKREG1,UCBSKA+1(UCBREG)     *   OLD IOS INSTN   *
+*        STH   WKREG1,SEEK1+2              *   OLD IOS INSTN   *
+         BR    10
+STAEFAIL ABEND 100,DUMP
+         TITLE 'SUPER MONITOR - DATA AREA'
+DATA     DS    0D
+SAVE     DS    18F
+SVCSAVE  DS    15F
+         ORG   SVCSAVE        SVCSAVE NOT USED TILL END OF INIT
+PARMS    EQU   *
+PARMCYCL DC    CL4'0000'
+PARMINTV DC    CL4'0000'
+PARMRPTS DC    CL4'0000'
+PARMFUNC DC    F'0'
+REPLY    DS    4F
+WRKCYCLE DS    F
+WRKINTVL DS    F
+WRKRPRTS DS    F
+WRKFUNC  DS    F
+         ORG
+RSVCS    DC    4F'0'          BITS INDICATING RESIDENT TYPE 3,4 SVCS
+CYCLE    DS    F              SAMPLING CYCLE IN TIMER UNITS
+FUNCIONS DS    F              NOSIO,NOLOAD,NOSCAN
+NOSIO    EQU   FUNCIONS
+NOLOAD   EQU   FUNCIONS+1
+NOSCAN   EQU   FUNCIONS+2
+SAMPSREP DS    H              NO. SAMPLES PER REPORT  (APPROX)
+NREPORTS DS    H              NO. REPORTS TO BE PRODUCED
+RPTCOUNT DC    H'0'           CURRENT COUNT OF REPORTS
+AFINCH   DC    A(INIT)        A(IEWMSEPT)
+ATRPCODE DC    A(INIT)        A(DISK START I/O MODULE OF IOS)
+SAVEFNCH DS    14C            REPLACED FINCH CODE
+SAVEIOS  DS    16C                     REPLACE IOS CODE
+*   PSW TO RETURN AT END OF TRAP TO SVC FLIH
+SVCPSW   DS    2F             SAVE SVC NEW PSW
+         ORG   SAVEFNCH       AVAILABLE TILL LATER IN INIT
+REPECB   DC    F'0'
+C0000    DC    CL4'0000'
+         ORG
+AOURTCB  DS    F              A(TCB OF THIS MONITOR)
+AINIT    DC    A(INIT)        A(SAMPBUF FOR SVCTRAP)
+ALOADBUF DS    F              A(LOAD BUFFER) SUPPLIED BY GETMAIN
+ABOTLOAD DS    F              A(FIRST USEABLE ENTRY IN LOADBUFFER)
+LOADNEXT DS    F              A(NEXT AVAILABLE ENTRY IN LOADBUFFER)
+ATOPLOAD DS    F              A(TOP ENTRY IN LOADBUF)
+ASPILL   DC    A(SPILL)       A(SPILL AREA)
+LDSPLAST DC    A(TOPSPILL)    A(LAST USED ENTRY IN LOADSPILL)
+SPILLTOP DC    A(TOPSPILL)    A(BYTE AFTER TOP OF SPILL)
+ASIOBUF  DS    F              A(SIO BUFFER) SUPPLIED BY GETMAIN
+ABOTMSIO DS    F              A(FIRST USEABLE ENTRY IN SIOBUFFER)
+SIONEXT  DS    F              A(NEXT AVAILABLE ENTRY IN SIOBUFFER)
+ATOPSIO  DS    F              A(TOP ENTRY IN SIOBUF)
+SISPNEXT DC    A(SPILL)       A(NEXT AVAILABLE ENTRY IN SIOSPILL)
+LDSPTOTL DC    H'0'           TOT NO. ENTRIES IN LOAD SPILL
+SISPTOTL DC    H'0'                              SIO SPILL
+MAXLDSP  DC    H'0'           MAX ENTRIES IN LOAD SPILL
+MAXSISP  DC    H'0'           MAX ENTRIES IN SIO SPILL
+LOADSWCH DC    X'00'          INDICATES MAIN BUF OR SPILL FOR LOADS
+SIOSWCH  DC    X'00'                                      FOR SIOS
+ABBX     DS    16F            A(BBX) FOR P0 -P15
+         ORG   ABBX
+CLOADS   DC    C'LOADS'
+CSIOS    DC    C'SIO''S'
+         ORG
+ATCB     DS    16F            A(TCB) FOR P0 - P15
+DAUCBS   DC    40F'0'         A(UCB) FOR EACH OF 40 D/A DEVICES
+DSUCBS   DC    3F'0'          A(UCB) FOR SVCLIB,LINKLIB,SYSJOBQ
+PGUCBS   DC    &PAGEDS.F'0'   A(UCB) FOR EACH PAGE DATASET
+NOCHANLS DS    H              NO. SELECTOR CHANNELS
+RQETOTAL DS    H              NO. RQES SYSGENED
+NOPARTNS DS    H              NO. PARTITIONS SYSGENED
+NOPAGEDS DS    H              NO. PAGE DATASETS
+SQASIZE  DS    F              SIZE OF SQA
+AVEQR    DS    F              A(NONPAGEABLE DYNAMIC AREA)
+ACSCB    DS    F              A(CSCB) FOR THIS MONITOR
+SCANRET  DS    F              RETURN ADDRESS FROM SCAN
+STATUS1  DS    C
+B1       DC    X'00'          SAMPLING  1 - BUFFER TO BE WRITTEN
+B2       DC    X'00'          LOAD      2 - BUFFER BEING WRITTEN
+B3       DC    X'00'          SIO
+MPXBUSY  DC    H'0'           MAY INCLUDE
+MPXBUSYW DC    H'0'                IN SAMPBUF
+MPXNOTBS DC    H'0'                     LATER ON
+SVCNAME  DC    CL8'IGC'       USED IN FINCHTRAP TO CONSTRUCT SVCNAME
+DUMPER   DC    C'&DUMPER'
+DUMPECB  DS    F
+ZEROS    DC    F'0'           NEEDED FOR VARIOUS LENGTH COMPARES
+BLOCKNO  DC    H'0'           NO. OF RECORD WRITTEN TO FILE
+F8640000 DC    F'8640000'     NO. OF .01 SECS IN 24 HRS
+F256     DC    F'256'
+FFFFFC   DC    X'00FFFFFC'
+FF       EQU   FFFFFC+1
+MSGADDR  DC    A(MSGRPT)
+         DC    A(MSGEND)
+         DC    A(MSGLOST)
+         DC    A(MSGIOERR)
+         DC    A(MSGABND)
+         DC    A(MSGPARM)
+         DC    A(MSGNOBUF)
+         DC    A(MSGNOLD)
+         DC    A(MSGNOSIO)
+         DC    A(MSGOPEN)
+         DC    A(MSGIGG19)
+         DC    A(MSGSVCFL)
+MSGLEN   DC    X'0F'     0    MSGRPT              LENGTH-1
+         DC    X'04'     1    MSGEND
+         DC    X'37'     2    MSGLOST
+         DC    X'08'     3    MSGIOERR
+         DC    X'09'     4    MSGABND
+         DC    X'33'     5    MSGPARM
+         DC    X'0E'     6    MSGNOBUF
+         DC    X'05'     7    MSGNOLD
+         DC    X'04'     8    MSGNOSIO
+         DC    X'08'     9    MSGOPEN
+         DC    X'0A'    10    MSGIGG19
+         DC    X'0B'    11    MSGSVCFL
+CSYNAD   DC    C'SYNAD'
+LIBIND   DC    C'PLJ '        LIBRARY INDICATOR USED FOR FINCHTRAP
+MSGRPT   DC    C'REPORT XXX TAKEN'
+MSGEND   DC    C'ENDED'
+MSGLOST  DC    C'LOST LOADS XXXXX SEEKS XXXXX SPILLED LOADS XXX SEEKS X*
+               XX'
+MSGIOERR DC    C'I/O ERROR'
+MSGABND  DC    C'XXXX ABEND'
+         DS    0F
+PTNCODES EQU   *-24
+BLANKS   DC    C'                ABCDEFGHIJKLMNO'
+SYSIEFSD DC    C'SYSIEFSD'
+CLOSEFLG DC    X'00'
+H24      DC    H'24'
+H12      DC    H'12'
+H3       DC    H'3'
+H4       DC    H'4'
+H5       DC    H'5'
+H6       DC    H'6'
+H8       DC    H'8'
+H9       DC    H'9'
+LASTIO   DC    X'00'          0=I/O OK  1=PERFORM NO FURTHER I/O
+WRK      DS    C
+FRQELEN  DC    F'&RQELEN'
+H127     DC    H'127'
+HEXTAB   EQU   *-240
+F0THRUF  DC    C'0123456789ABCDEF'
+BUFSIZE  DC    H'&BUFSIZE'
+DWORD    DS    D              FOR DECIMAL CONVERSIONS
+HLOADLEN DC    H'&LOADLEN'
+HSIOLEN  DC    H'&SIOLEN'
+LOADLOST DC    H'0'
+SIOLOST  DC    H'0'
+ASVCTRAP DC    A(SVCTRAP)
+SCB      DC    F'0'           STAE CONTROL BLOCK
+         DC    A(ABEND)
+         DC    F'0'
+         DC    A(0)           RB ADDRESS
+WRITE    WRITE DECB,SF,DCB,MF=L
+DCB      DCB   DDNAME=MONITOR,MACRF=WP,DSORG=PS,RECFM=F,SYNAD=SYNAD,   *
+               BLKSIZE=&BUFSIZE
+         TITLE 'SUPER MONITOR - SAMPLING BUFFER'
+SAMPBUF  DSECT
+TYPESAMP DS    F              RECORD TYPE & NUMBER
+TIMESAMP DS    F              TIME RECORD WRITTEN
+SVCS     DS    128F           COUNTS OF SVCS 0-127
+SAMPLES  DS    H              NO. OF SAMPLES TAKEN FOR THIS REPORT
+CPUBUSY  DS    H              CPU UTILIZATION
+TASKS    DS    H              TOTAL NO. DISPATCHABLE TASKS
+MAXTASKS DS    H              MAX DISPATCHABLE TASKS
+CPUSTATE DS    H               CS    PK^=0   CPU ACTIVE   SVR STATE
+         DS    H               CP
+         DS    H               WS
+         DS    H               WP
+         DS    H              0CS
+         DS    H              0CP
+         DS    H              0WS
+         DS    H              0WP
+RQECOUNT DS    31H            NO. TIMES 0-30 RQES USED
+RQEUSED  DS    H              MAX RQES USED SINCE LAST IPL
+CHANA    EQU   *
+CHANBUSY DS    H              SELECTOR CHANNEL ONE BUSY
+CHANBUSW DS    H                                   BUSY & CPU WAITING
+CHANNOP  DS    H                                   NOT OPERATIONAL
+CHANB    EQU   *
+         DS    15H                     CHANNELS TWO THROUGH SIX
+SQAUSED  DS    F              MAX SQA USED
+PARTA    EQU   *
+PARTUSED DS    F              PARTITION 0 BYTES USED
+PARTDISP DS    H                          DISPATCHABLE
+PARTCLAS DS    2C                         JOB CLASSES
+PARTSIZE DS    H                          SIZE IN K BYTES
+PARTPROB DS    H                          PROBLEM PROGRAM RUNNING
+PARTB    EQU   *
+         DS    45F                      1 TO 15
+ANYCHAN  DS    H              ANY CHANNEL BUSY
+ANYSEL   DS    H              ANY SELECTOR CHANNEL BUSY
+ANYCHANW DS    H              ANY CHANNEL BUSY + CPU WAIT
+ANYSELW  DS    H              ANY SELECTOR CHANNEL BUSY + CPU WAIT
+DSA      EQU   *
+DSBUSY   DS    H              SVCLIB BUSY (DATA TRANSFER)
+DSSEEK   DS    H                     SEEKING
+DSBUSYW  DS    H                     BUSY + CPU WAITING
+DSSEEKW  DS    H                     SEEKING + CPU WAITING
+DSRQE    DS    5H                    0,1,2,3,4+ RQES ON QUEUE
+DSB      EQU   *
+         DS    9H             LINKLIB
+         DS    9H             SYSJOBQ
+         DS    &PAGEDS.CL18   PAGE DATASETS
+DAA      EQU   *
+DABUSY   DS    H              DIRECT ACCESS DEVICE BUSY
+DASEEK   DS    H                                   SEEKING
+DABUSYW  DS    H                                   BUSY + CPU WAIT
+DASEEKW  DS    H                                   SEEKING + CPU WAIT
+DANOTRDY DS    H                                   NOT READY
+DAOFFLNE DS    H                                   OFFLINE
+DAUSERS  DS    H                                   NO. USERS
+DARQES   DS    5H                                  0,1,2,3,4+ RQES
+DAB      EQU   *
+         DS    468H                  39 OTHER D.A. DEVICES
+         DS    30H
+Q1       DS    3H             1,2,3+ TASKS WAITING ON SYSIEFSD Q1
+Q29      DS    24H                                             Q2 TO 9
+         CNOP  0,4
+SAMPTOP  EQU   *
+SPILL    EQU   INIT+SAMPTOP-SAMPBUF
+         TITLE 'SUPER MONITOR - DESCRIPTOR RECORD'
+DESCRPTR DSECT
+TYPEDESC DS    F              RECORD TYPE
+TIMEDESC DS    F              TIME RECORD WRITTEN
+DATE     DS    F              DATE AT RUN START
+SPCYCLE  DS    F              SPECIFIED SAMPLING CYCLE TIME
+SPINTVL  DS    F                        REPORT INTERVAL
+SPREPRTS DS    F                        NO. OF REPORTS
+SPFUNC   DS    F                        FUNCTIONS (NOSIO,NOLOAD,NOSCAN)
+CPUMODEL DS    F              CPU MODEL NUMBER
+SYSRELNO DS    F              SYSTEM RELEASE NUMBER
+NUCSIZE  DS    F              SIZE IN BYTES OF NUCLEUS
+SIZESQA  DS    F                               SQA
+BLDLSIZE DS    F                               BLDL
+RAMSIZE  DS    F                               RAM
+RSVCSIZE DS    F                               RSVC
+VEQRSIZE EQU   RAMSIZE                         NONPAGEABLE DYNAMIC AREA
+VEQVSIZE EQU   RSVCSIZE                        PAGEABLE DYNAMIC AREA
+REALSIZE DS    H              STORAGE SIZE IN K BYTES  -  REAL
+VIRTSIZE DS    H                                          VIRTUAL
+TOTALRQE DS    H              TOTAL RQE IN SYSTEM
+SELECTRS DS    H              NO. SELECTOR CHANNELS
+PAGESETS DS    H              NO. PAGE DATASETS
+         DS    H
+ASVCLIB  DS    F              UNIT ADDRESS - SVCLIB
+ALINKLIB DS    F                             LINKLIB
+ASYSJOBQ DS    F                             SYSJOBQ
+APAGEDS  DS    &PAGEDS.F                     PAGE DATASETS
+ADADEVCE DS    F                             DIRECT ACCESS DEVICE
+         DS    47F                          47 OTHER D.A. DEVICES
+DATYPE   DS    48C            D.A. DEVICE TYPE FROM UCBTYP BYTE 3
+LPANO    DS    F              NO. MODULES IN LPA
+LPAMODUL DS    2F             LPA MODULE NAME
+LPAMDLEN DS    F                         LENGTH
+MODULE   EQU   LPAMODUL       FLPA/MLPA/LPA MODULE NAME
+DESCTOP  EQU   DESCRPTR+&BUFSIZE
+         TITLE 'SUPER MONITOR - QCB DSECTS'
+QCBMAJOR DSECT                     MAJOR QCB
+QMAJNEXT DS    A                   NEXT MAJOR QCB (OR ZERO)
+QMAJPREV DS    A                   PREVIOUS MAJOR QCB (OR QCBHEAD)
+QMAJMIN  DS    A                   START OF MINOR QCB Q
+QMAJNAME DS    CL8                 MAJOR Q-NAME
+QMAJLEN  EQU   *-QCBMAJOR
+         SPACE 3
+QCBMINOR DSECT                     MINOR QCB
+QMINQEL  DS    A                   START OF QEL QUE
+QMINPREV DS    A                   PREVIOUS MINOR (OR MAJOR IF FIRST)
+QMINNEXT DS    A                   NEXT MINOR QCB (OR ZERO)
+QMINNAML DS    X                   LENGTH OF MINOR Q-NAME
+QMINPKF  DS    X                   PKF FOR STEP IF STEPWIDE REQUEST
+*                                  OR X'FF' IF SYSTEMWIDE REQUEST
+QMINNAME DS    CL8                 MINOR Q-NAME
+QMINLEN  EQU   *-QCBMINOR
+         SPACE 3
+QCBQEL   DSECT                     QEL (QUE ELEMENT)
+QELSMC   DS    0X                  SMC (SYSTEM MUST COMPLETE) BYTE
+*                                  X'00' NO MC WAS REQUESTED
+*                                  X'10' STEP MC REQUEST
+*                                  X'20' SYSTEM MC REQUEST
+QELNEXT  DS    A                   NEXT QEL (OR ZERO)
+QELCODE  DS    0X                  CODE BYTE
+*                                  1... .... SHARED REQUEST
+*                                  0... .... EXCLUSIVE REQUEST
+*                                  .1.. .... THIS IS A RESERVE MACRO
+*                                            ISSUED IN SHARED DASD.
+*                                            QELSVRB IS UCBADDRESS
+QELPREV  DS    A                   PREVIOUS QEL (OR MINOR IF FIRST)
+QELTCB   DS    A                   TCB ASSOCIATED WITH THIS ENQ
+QELSVRB  DS    A                   ADDRESS OF SVRB (OR UCB IF SHR DASD)
+QELLEN   EQU   *-QCBQEL
+         TITLE 'SUPER MONITOR - CVT'
+CVT      DSECT
+CVTTCBP  DS    F
+         DS    F
+CVTLINK  DS    F
+CVTJOB   DS    F
+         DS    4F
+CVTPRLTV DS    F
+CVTILK1  DS    F
+CVTILK2  DS    F
+         DS    2F
+CVTBTERM DS    F
+         DS    5F
+CVT0FN00 DS    F
+         DS    F
+CVTSVDCB DS    F
+         DS    7F
+CVTDCB   DS    F
+CVTIOQET DS    F
+CVTIXAVL DS    F
+CVTNUCB  DS    F
+CVTBOSV  DS    F
+         DS    F
+CVTILCH  DS    F
+         DS    F
+CVTMSER  DS    F
+         DS    2F
+CVTHEAD  DS    F
+CVTMZ00  DS    F
+         DS    4F
+CVTQCDSR DS    F
+CVTQLPAQ DS    F
+         DS    2F
+CVTABEND DS    F
+         ORG   CVT+312
+CVTEORM  DS    F
+         ORG   CVT+348
+CVTPGSIA DS    F
+         ORG   CVT+360
+CVTLPDIA DS    F
+CVTPAGE1 DS    F
+         END

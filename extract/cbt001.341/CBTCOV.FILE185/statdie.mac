@@ -1,0 +1,1100 @@
+* MODULE:                                                           YCC
+*        STATDIE                                                    YCC
+* FUNCTION:                                                         YCC
+*        A SOFTWARE MONITOR TO MEASURE CPU USE, RUNNING AS A        YCC
+*        SELF SUSTAINING DISABLED EXIT OF THE TIMER SECOND          YCC
+*        LEVEL INTERRUPT HANDLER. ONLY STANDARD SYSTEM              YCC
+*        INTERFACES ARE USED AND NO SYSTEM MODIFICATION IS          YCC
+*        REQUIRED. PERIODICALLY THE EXIT RECEIVES CONTROL           YCC
+*        AND SAMPLES THE STATE OF THE SYSTEM AT THE TIMER           YCC
+*        INTERRUPT. INFORMATION IS INITIALLY STORED IN A            YCC
+*        FIXED TRACE BUFFER. WHEN THAT FILLS UP, AN SRB             YCC
+*        IS SCHEDULED IN THE MASTER SCHEDULER ADDRESS               YCC
+*        SPAC TO COPY THE DATA TO ONE OF A RING OF                  YCC
+*        COMMON AREA PAGABLE BUFFERS.                               YCC
+*                                                                   YCC
+*        CURRENTLY THE SAMPLED INFORMATION INCLUDES THE             YCC
+*        PSW AT THE TIME OF INTERRUPT, ACTIVE PERFORMANCE           YCC
+*        GROUP, COUNT OF READY TCBS ON THE DISPATCHER               YCC
+*        QUEUE, SVC NUMBER IF AN SVC IS IN CONTROL, AND             YCC
+*        MODULE NAME FROM THE CDE OFF THE TOP PRB IN                YCC
+*        THE RB QUEUE. WHEN THE SRB IS SCHEDULED IT                 YCC
+*        ALSO TRACES THE CURRENT SRM RCT VALUES, THE                YCC
+*        RUA AND CMPLT IN THE DOMAIN TABLES, AND                    YCC
+*        THE FRAME STATUS COUNTS IN THE PVT.                        YCC
+*                                                                   YCC
+* SYSTEM LEVEL:                                                     YCC
+*        MVS R3.7 + SU7                                             YCC
+*                                                                   YCC
+*        VERSION OF 5/5/77                                          YCC
+* AUTHOR:                                                           YCC
+*        HOWARD GILBERT                                             YCC
+*        YALE COMPUTER CENTER                                       YCC
+*        175 WHITNEY AVE                                            YCC
+*        NEW HAVEN, CONN 06520                                      YCC
+*        203 432-4080                                               YCC
+*                                                                   YCC
+* COMPONENTS:                                                       YCC
+*        STATDIE - INITIALIZATION ENTRY POINT                       YCC
+*        DIEPURG - TERMINATION ENTRY POINT                          YCC
+*        STATSTDE- FIXED DATA TABLE                                 YCC
+*        DIEEXIT - STATDIE TIMER DISABLED EXIT                      YCC
+*        STATFRR - RECOVERY ROUTINE FOR DIEEXIT                     YCC
+*        STATSRB - STATDIE 30 SECOND SRB                            YCC
+*                                                                   YCC
+* EXTERNAL REFERENCES: NONE                                         YCC
+*                                                                   YCC
+* MACROS:      ASSORTED MACROS FROM MACLIB, AMODGEN, AND PVTMACS    YCC
+         EJECT                                                      YCC
+*                   INSTALLATION                                    YCC
+* TARGET LIBRARY: LPALIB                                            YCC
+*                                                                   YCC
+* LINKEDIT PARMS: RENT,REUS,AC=1                                    YCC
+*                                                                   YCC
+* LINKEDIT CONTROL CARDS:                                           YCC
+*            ALIAS DIEPURG                                          YCC
+*            ALIAS STATSTDE                                         YCC
+*            ALIAS STATWAMT                                         YCC
+*            NAME STATDIE(R)                                        YCC
+*                                                                   YCC
+* PREREQUISITES:  MVS 37 AND SUPERVISOR 2 SU (UZ80700)              YCC
+*                                                                   YCC
+* SYSTEM MODIFICATIONS: NONE                                        YCC
+*                                                                   YCC
+* STORAGE REQUIREMENTS:                                             YCC
+*            4K FIXED COMMON                                        YCC
+*           80K PAGABLE COMMON (ONE PAGE FAULTED IN EVERY 30 SECONDS,
+*                               THEN ALLOWED TO PAGE BACK OUT AGAIN)YCC
+         SPACE 5                                                    YCC
+* DISTRIBUTION:                                                     YCC
+*        THIS MATERIAL IS NOT RESTRICTED IN ANY MANNER AND MAY      YCC
+*        BE FREELY REPRODUCED AND DISTRIBUTED FOR ANY PURPOSE.      YCC
+*        THERE ARE TWO LITTLE RULES:                                YCC
+*          1) DO NOT COUNTERFIT THE 'YCC' IN COLS 69-71 OF          YCC
+*             THE STANDARD DISTRIBUTED VERSION IF YOU MAKE          YCC
+*             CHANGES OR ADDITIONS.                                 YCC
+*          2) SEND THE AUTHOR A NOTE IF YOU HAVE INSTALLED          YCC
+*             AND USED THE PROGRAM SO HE CAN KEEP TABS ON           YCC
+*             ITS POPULARITY AND CAN WARN ABOUT ANY LATE            YCC
+*             CORRECTIONS.                                          YCC
+         EJECT                                                      YCC
+*                     PROGRAMMING NOTES                             YCC
+*                                                                   YCC
+*     'DIE' STANDS FOR DISABLED INTERRUPT EXIT. IN MVS THERE ARE TWOYCC
+* KINDS OF DIE'S, ONE FOR IO AND ONE FOR TIMER INTERRUPTS. THE DIE  YCC
+* IS A USER ROUTINE IN FIXED STORAGE POINTED TO BY A USER SUPPLIED  YCC
+* CONTROL BLOCK AND RELATED TO AN OUTSTANDING SERVICE REQUEST WHICH YCC
+* WILL EVENTUALLY GENERATE AN INTERRUPT. THE DIE IS AN AUTHORIZED   YCC
+* SYSTEM INTERFACE. THE FOLLOWING DISCUSSION RELATES ONLY TO TIMER  YCC
+* DIE'S.                                                            YCC
+*     THE USER SUPPLIED CONTROL BLOCK FOR TIMER SERVICES IS THE     YCC
+* TIMER QUEUE ELEMENT (TQE). 'USER' HERE MUST BE UNDERSTOOD TO      YCC
+* BE A BROAD TERM, BECAUSE FOR MOST USERS THE TQE IS CONSTRUCTED    YCC
+* AND QUEUED BY THE STIMER SVC AND NOT BY THE APPLICATION PROGRAM.  YCC
+* WITH SUPERVISOR 2 (SU 7), A NEW SYSTEM SERVICE ROUTINE WAS        YCC
+* INTRODUCED TO ALLOW KEY 0 USERS TO MORE EASILY BUILD THEIR OWN    YCC
+* TQE'S. THIS SERVICE IS CALLED 'SETDIE' AND IS DOCUMENTED IN       YCC
+* SPL:SUPERVISOR. THERE IS NO ASSOCATED MACRO.                      YCC
+*      EACH TQE CONTAINS AN INTERRUPT TIME AND A POINTER TO THE     YCC
+* DIE ROUTINE. ALL TIMER MANAGEMENT IN A MULTIPROCESSOR SYSTEM      YCC
+* IS CONDUCTED BY CPU 0 IF IT HAS AN OPERABLE CLOCK.                YCC
+* IF THIS TQE REPRESENTS THE EARLIEST INTERRUPT IN THE QUEUE, THE   YCC
+* CLOCK COMPARATOR IS CHANGED. EITHER CPU CAN ACCESS THE TQE        YCC
+* CHAIN WHILE HOLDING THE DISPATCHER LOCK. IF THE CLOCK             YCC
+* COMPARATOR MUST BE CHANGED, HOWEVER, CPU 1 MUST SIGP CPU 0        YCC
+* TO DO THE PROCESSING.                                             YCC
+*      WHEN A TIMER INTERRUPT IS HONORED ON CPU 0, THE TIMER        YCC
+* SECOND LEVEL INTERRUPT HANDLER DEQUES THE TQE AND EXITS TO        YCC
+* THE DIE INDICATED IN IT. CONTROL IS RECEIVED IN THE ADDRESS       YCC
+* SPACE DISPATCHED WHEN THE INTERRUPT WAS RECOGNIZED, PHYSICALLY    YCC
+* DISABLED, WITH THE TIME OF INTERRUPT AND REGISTERS STORED IN      YCC
+* THE LCCA. THE DIE EXIT CAN ONLY REFERENCE STORAGE LOCATIONS       YCC
+* IN SQA, FIXED CSA, THE NUCLEUS, OR IN THE LSQA OF THE INTERRUPTED YCC
+* ADDRESS SPACE. IT RETURNS CONTROL TO THE TIMER SLIH WHICH NORMALLYYCC
+* EXITS TO THE DISPATCHER.                                          YCC
+*     PRIOR TO RETURNING, THE DIE CAN REINITIALIZE THE TQE AND      YCC
+* REQUE IT FOR THE NEXT INTERRUPT. THE TIMER DIE IS THUS A SELF     YCC
+* SUSTAINING PROCESS, TIMER DRIVEN, BUT LOGICALLY UNRELATED TO      YCC
+* ANY TASK OR ADDRESS SPACE OR JOB. ONCE INITIALIZED IT CONTINUES   YCC
+* TO FUNCTION UNTIL PURGED BY SOME OTHER AUTHORIZED USER OR BY      YCC
+* ITS OWN INTERNAL ERROR. FURTHERMORE, IT IS A USER EXIT AND DOES   YCC
+* NOT REPLACE OR EFFECT ANY STANDARD SYSTEM ROUTINES. THIS TECHNIQUEYCC
+* IS IDENTICAL TO THAT USED BY MF1 AND RMF FOR THEIR DEVICE AND     YCC
+* CHANNEL SAMPLING EXITS, AND BY THE SRM FOR ITS ONCE-A-SECOND      YCC
+* SYSTEM STATUS EVALUATION AND PAGE STEALING EXIT, BUT IT IS        YCC
+* A LOGICALLY SEPARATE FUNCTION.                                    YCC
+         EJECT                                                      YCC
+*      STATDIE HAS GONE THROUGH SEVERAL DEVELOPMENTAL PHASES. THIS  YCC
+* VERSION IS A MAJOR MODIFICATION TO PREVIOUS RELEASES. THE PRIMARY YCC
+* EMPHASIS OF THIS RELEASE HAS BEEN:                                YCC
+*                                                                   YCC
+* 1) THIS VERSION PROVIDES NECESSARY SUPPORT FOR OUR-MF. PREVIOUS   YCC
+*    VERSIONS CONCENTRATED ONLY ON THE PSW SAMPLING FUNCTION OF     YCC
+*    STATDIE, BUT OTHER SYSTEM VALUES MUST BE SAMPLED PERIODICALLY  YCC
+*    IF A FULL SYSTEM MEASUREMENT FACILITY IS TO BE SUPPORTED.      YCC
+*    THIS MEANS A NON-HOMOGENEOUS OUTPUT DATASET AND REQUIRES       YCC
+*    MODIFICATION TO POST-PROCESSING REPORT GENERATORS.             YCC
+*                                                                   YCC
+* 2) THIS VERSION INSTALLS DIRECTLY ON THE RECEIVING SYSTEM WITHOUT YCC
+*    ANY LOCAL MODIFICATIONS. THE PREVIOUS VERSIONS DEPENDED ON A   YCC
+*    GLOBAL POINTER CHAINED OFF THE CVTUSER FIELD TO LOCATE THE     YCC
+*    FIXED DATA AREA (THE STDE) WHICH WAS GETMAINED OUT OF SQA.     YCC
+*    THIS IS THE ORTHODOX WAY TO RUN THIS KIND OF SYSTEM FUNCTION.  YCC
+*    THIS VERSION ELIMIATES THE NEED FOR THAT POINTER BY ASSEMBLING YCC
+*    THE STDE INTO THIS MODULE AND LONG-TERM FIXING THE PAGE        YCC
+*    CONTAINING THIS MODULE IN CORE. THE STDE CAN THEN BE LOCATED   YCC
+*    BY OTHER PROGRAMS WITH A SIMPLE 'LOAD' MACRO. THIS IS NOT AN   YCC
+*    ORTHODOX WAY OF DOING BUSINESS, BUT IT WORKS WELL AND SEEMS TO YCC
+*    BE THE BETTER CHOICE.                                          YCC
+*                                                                   YCC
+* 3) THE FEW 'GENERATION PARAMETERS' WHICH ARE THE NUMERICAL VALUES YCC
+*    MOST LIKELY TO BE CHANGED BY LOCAL CONVENTION HAVE BEEN        YCC
+*    SIMPLIFIED AND REORGANIZED.                                    YCC
+*                                                                   YCC
+* 4) LOCAL EXPERIMENTATION IS BOTH ENCOURAGED AND DISCOURAGED BY    YCC
+*    THE VARIOUS CHANGES MADE IN THIS RELEASE. ON THE MINUS SIDE,   YCC
+*    THE REQUIREMENT THAT THIS MODULE BE IN LPALIB MEANS THAT ITS   YCC
+*    REPLACEMENT BY ORTHODOX METHODS WOULD REQUIRE A CLPA. ON THE   YCC
+*    PLUS SIDE:                                                     YCC
+*      THE DIEPURG ENTRY POINT WILL NOW PURGE AN ACTIVE STATDIE     YCC
+*      OPERATION AND FREE THE GETMAINED STORAGE.                    YCC
+*      THE MODULE REMAINS FIXED IN CORE, AND THE CODE IS RELOCATABLE,
+*      SO IT IS POSSIBLE TO USE A SMALL UTILITY PROGRAM TO LOAD THE YCC
+*      STATDIE MODULE FROM A STEPLIB, MODESET TO KEY ZERO, AND      YCC
+*      OVERWRITE THE PURGED LPA RESIDENT VERSION.                   YCC
+*      AN FRR ROUTINE HAS BEEN ADDED SO THAT ERRORS GENERATED BY    YCC
+*      REFERENCING UNFIXED OR ILLEGAL STORAGE LOCATIONS DURING      YCC
+*      THE DATA GATHERING PHASE OF STATDIE REMAIN LOCALLIZED        YCC
+*      WITHIN STATDIE.                                              YCC
+*      BY ASSIGING STATDIE A LOCATION IN LPALIB, IT IS NOW POSSIBLE YCC
+*      TO USE DSS TO DEBUG STATDIE MODIFICATIONS. DSS BREAKPOINTS   YCC
+*      CAN NOW BE ESTABLISHED PRIOR TO STATDIE ACTIVATION.          YCC
+*                                                                   YCC
+         EJECT                                                      YCC
+         MACRO                                                      YCC
+&LAB     BNV   &REG,&GOTO                                           YCC
+.*  HYPOTHETICAL BRANCH ON NOT VALID INSTRUCTION                    YCC
+.*  TESTS THE ADDRESS IN THE REGISTER FOR A NON ZERO                YCC
+.*  VALID VIRTUAL ADDRESS, AND BRANCHS TO THE SECOND ARGUMENT       YCC
+.*  IF THE ADDRESS FAILS THE TEST. THIS DESTROYS REGISTER 0.        YCC
+.*  USES PRIVILGED LRA INSTRUCTION, SO REQUIRES SUPERVISOR STATE    YCC
+&LAB     LA    &REG,0(&REG)                                       × YCC
+         LTR   &REG,&REG                                          × YCC
+         BZ    &GOTO                                              × YCC
+         LRA   R0,0(&REG)                                         × YCC
+         BC    7,&GOTO                                            × YCC
+         MEND                                                       YCC
+         SPACE 5                                                    YCC
+         GBLA  &MILLISC                                             YCC
+         EJECT                                                      YCC
+STATDIE  CSECT                                                      YCC
+         STATGLBL
+         EJECT                                                      YCC
+**                                                                  YCC
+* DSECTS                                                            YCC
+**                                                                  YCC
+         SPACE 1                                                    YCC
+         STATPSW
+         EJECT
+         STDE
+         EJECT
+         PGBUF
+         SPACE 5
+R0       EQU   0                                                    YCC
+R1       EQU   1                                                    YCC
+R2       EQU   2                                                    YCC
+R3       EQU   3                                                    YCC
+R4       EQU   4                                                    YCC
+R5       EQU   5                                                    YCC
+R6       EQU   6                                                    YCC
+R7       EQU   7                                                    YCC
+R8       EQU   8                                                    YCC
+R9       EQU   9                                                    YCC
+R10      EQU   10                                                   YCC
+R11      EQU   11                                                   YCC
+R12      EQU   12                                                   YCC
+R13      EQU   13                                                   YCC
+R14      EQU   14                                                   YCC
+R15      EQU   15                                                   YCC
+         EJECT                                                      YCC
+*****************************************************************   YCC
+* PROCEDURE:                                                    *   YCC
+*        STATDIE                                                *   YCC
+* FUNCTION:                                                     *   YCC
+*        INITIALIZATION OF DIE PROCESSING                       *   YCC
+* ATTRIBUTES:                                                   *   YCC
+*        AUTHORIZED, REUSABLE                                   *   YCC
+* ENTRY CONDITIONS:                                             *   YCC
+*        NORMAL OS LINKAGE FOR ENTRY AND EXIT.                  *   YCC
+* RETURN CODES:                                                 *   YCC
+*        0  DIE ESTABLISHED NORMALLY                            *   YCC
+*        4  DIE WAS ALREADY ACTIVE OR NO CLOCK AVAILABLE        *   YCC
+*       12  THIS MODULE IS NOT IN THE LPA                       *   YCC
+*        100-112  100 MORE THAN THE RETURN CODE FROM PAGEFIX    *   YCC
+*****************************************************************   YCC
+* INTERNAL PROGRAMMING CONVENTIONS:                             *   YCC
+*                                                               *   YCC
+* ACTIVE EXIT LABELS:                                           *   YCC
+*        RESET - BRANCHED TO FROM KEY ZERO CODE. MODESETS       *   YCC
+*             BACK TO PROBLEM STATE. R15 CONTAINS RETURN        *   YCC
+*             CODE.                                             *   YCC
+*        RET - BRANCHED TO FROM PROBLEM KEY CODE. R15           *   YCC
+*             CONTAINS RETURN CODE.                             *   YCC
+* REGISTER USAGE:                                               *   YCC
+*        R2-R5  WORK REGISTERS                                  *   YCC
+*        R6     STDE AREA POINTER                               *   YCC
+*        R7     SAVEAREA ADDRESS (R13 SAVED)                    *   YCC
+*        R10    BASE REGISTER                                   *   YCC
+*****************************************************************   YCC
+         EJECT                                                      YCC
+**                                                                  YCC
+* NORMAL OS ENTRY                                                   YCC
+**                                                                  YCC
+STATDIE  CSECT                                                      YCC
+         SAVE  (14,12),,*                                           YCC
+         BALR  R10,0                                                YCC
+         USING *,R10                                                YCC
+         USING PSA,R0                                               YCC
+         SPACE 5                                                    YCC
+**                                                                  YCC
+* IT IS ESSENTIAL THAT THIS PROGRAM RUN IN FIXED OR PAGABLE LPA     YCC
+* THE TQE WILL GO ON THE TIMER QUEUE, AND A LOT OF CODE WILL BE     YCC
+* EFFECTED IF THE TQE ADDRESS IS NOT IN COMMON STORAGE.             YCC
+* SO WE CHECK ITS ADDRESS TO INSURE IT IS NOT IN THE PRIVATE AREA   YCC
+**                                                                  YCC
+         LA    R5,4               PROVISIONALLY INDICATE FIXED LPA  YCC
+         LA    R10,0(R10)                                           YCC
+         LR    R7,R13                                               YCC
+         LA    R15,12             PROVISIONAL RETURN CODE           YCC
+         L     R2,CVTPTR                                            YCC
+         L     R2,CVTPVTP-CVT(R2)                                   YCC
+         USING PVT,R2                                               YCC
+         LH    R0,PVTLPRIV        RBN OF LOWEST PRIVATE ADDR        YCC
+         SLL   R0,8               CONVERT TO ADDRESS                YCC
+         CR    R0,R10             COMPARE TO PROGRAM BASE           YCC
+         BH    INLPA              TEST FOR FIXED LPA                YCC
+         SR    R5,R5              CLEAR FIXED LPA INDICATION        YCC
+         SR    R0,R0                                                YCC
+         ICM   R0,3,PVTLCSA       PICK UP RBN OF CSA                YCC
+         SLL   R0,8               CONVERT TO ADDRESS                YCC
+         CR    R0,R10             TEST FOR CSA                      YCC
+         BH    RET                NOGOOD IF PRIVATE                 YCC
+INLPA    EQU   *                  COME HERE IF OK                   YCC
+         DROP  R2                                                   YCC
+         SPACE 5                                                    YCC
+         LA    R6,STATSTDE                                          YCC
+         USING STDE,R6                                              YCC
+         LA    R15,4                                                YCC
+         TM    STDELAST,STDEATIV+STDEPURG                           YCC
+         BNZ   RET                                                  YCC
+         SPACE 5                                                    YCC
+**                                                                  YCC
+* THIS BEGINS A MODESET BLOCK. CODE IN THIS BLOCK EXECUTES IN KEY 0 YCC
+* AND SUPERVISOR STATE. EXIT MAY NOT BE MADE FROM THIS BLOCK EXCEPT YCC
+* BY A BRANCH TO 'RESET' WHICH IS THE MODESET BACK TO PROBLEM STATE YCC
+* AT THE END OF THE BLOCK                                           YCC
+**                                                                  YCC
+         MODESET KEY=ZERO,MODE=SUP ------------------------------>× YCC
+         SPACE 5                                                  × YCC
+**                                                                × YCC
+* TEST FIXED LPA INDICATION IN R5 AND BYPASS FOLLOWING CODE IF    × YCC
+* THIS MODULE IS ALREADY FIXED                                    × YCC
+***                                                               × YCC
+         LTR   R5,R5                                              × YCC
+         BNZ   FIXED                                              × YCC
+         SPACE 5                                                  × YCC
+**                                                                × YCC
+* THE STDE MUST NOW BE LONG TERM FIXED                            × YCC
+* THE RSM WILL INSURE THAT THE STDE IS MOVED TO A REAL STORAGE    × YCC
+* LOCATION WHICH DOES NOT INTERFERE WITH THE THE V=R REGIONS      × YCC
+* OR RECONFIGURABLE STORAGE LOCATIONS.                            × YCC
+**                                                                × YCC
+         LA    R2,DIEEND-STATSTDE(R6)                             × YCC
+         XC    0(4,R7),0(R7)  USE SAVE AREA FOR ECB               × YCC
+         PGFIX R,A=(6),EA=(2),ECB=(7),LONG=Y                      × YCC
+         LA    R15,100(R15)                                       × YCC
+         CH    R15,=H'100'                                        × YCC
+         BNE   RESET                                              × YCC
+         SPACE 5                                                  × YCC
+**                                                                × YCC
+* AN ORTHODOX FIX DOES NOT HOLD ONCE THE TASK GOES AWAY           × YCC
+* THE PREVIOUS CALL TO RSM WAS REQUIRED TO GET A 'GOOD' STORAGE   × YCC
+* ADDRESS FOR THE STDE. NOW THAT IT IS POSITIONED, WE 'NAIL' THE  × YCC
+* DAMN PAGE IN CORE BY MANUALLY INCREMENTING THE  FIX COUNT IN    × YCC
+* THE PFTE TO 100. WHILE THIS IS NOT AN ORTHODOX OPERATION, IT    × YCC
+* IS PERFECTLY WELL DEFINED IN TERMS OF THE CURRENT RSM.          × YCC
+**                                                                × YCC
+         LRA   R1,0(R6)           WHERE IS IT FIXED?              × YCC
+         SRL   R1,12              RELATIVE PAGE                   × YCC
+         SLL   R1,4               CONVERT TO RBN                  × YCC
+         L     R2,CVTPTR                                          × YCC
+         L     R2,CVTPVTP-CVT(R2)                                 × YCC
+         USING PVT,R2                                             × YCC
+         L     R2,PVTPFTP                                         × YCC
+         DROP  R2                                                 × YCC
+         LA    R1,0(R1,R2)                                        × YCC
+         L     R0,PFTFXCT-PFTE(R1) GET FIX COUNT                  × YCC
+FIXCS    LR    R2,R0                                              × YCC
+         ICM   R2,12,=H'100'                                      × YCC
+         CS    R0,R2,PFTFXCT-PFTE(R1)                             × YCC
+         BNE   FIXCS                                              × YCC
+         SPACE 3                                                  × YCC
+FIXED    EQU   *                                                  × YCC
+         SPACE 5                                                  × YCC
+**                                                                × YCC
+* NOW ZERO THE TQE AND STDE                                       × YCC
+**                                                                × YCC
+         LA    R2,STDE                                            × YCC
+         L     R3,=A(STDELEN)                                     × YCC
+         SR    R4,R4                                              × YCC
+         SR    R5,R5                                              × YCC
+         MVCL  R2,R4                                              × YCC
+         SPACE 2                                                  × YCC
+**                                                                × YCC
+* OBTAIN PAGABLE BUFFERS AND SAVE THEIR ADDRESS                   × YCC
+**                                                                × YCC
+         LA    R2,STDEBUFP                                        × YCC
+         XC    STDEWORK(10),STDEWORK                              × YCC
+         GETMAIN EU,LV=PGBFCT*PGBLEN,SP=241,A=(2),BNDRY=PAGE,     × YCC*
+               MF=(E,STDEWORK)                                    × YCC
+         LA    R2,STDEWAMT                                        × YCC
+         XC    STDEWORK(10),STDEWORK                              × YCC
+         GETMAIN EU,LV=4096,SP=241,A=(2),BNDRY=PAGE,              × YCC*
+               MF=(E,STDEWORK)                                    × YCC
+         OI    STDELAST,STDEATIV                                  × YCC
+         L     R1,STDEWAMT                                        × YCC
+         XC    4(4,R1),4(R1)      ZERO WAMT LEN FIELD             × YCC
+         MVC   STDEGET,GETINFO                                    × YCC
+         MVC   STDELSTO,=AL2(STDEFILL-STDEENTY)
+         MVC   STDEPLEN(8),=AL2(PGBLEN,PGBFCT,SRBINTVL,MAXDMN)    × YCC
+         L     R2,STDEBUFP                                        × YCC
+         L     R3,GETINFO                                         × YCC
+         LA    R3,0(R3)                                           × YCC
+         SR    R4,R4                                              × YCC
+         SR    R5,R5                                              × YCC
+         MVCL  R2,R4              ZERO BUFFER                     × YCC
+         SPACE 5                                                  × YCC
+**                                                                × YCC
+* NOW FINISH OFF TQE INITIALIZATION AND BRANCH TO SETDIE          × YCC
+**                                                                × YCC
+         LR    R1,R6              COPY TQE ADDRESS                × YCC
+         USING TQE,R1                                             × YCC
+         MVC   TQEVAL(8),INCREMT-STATSTDE(R6)                     × YCC
+         LA    R15,STDEEXIT                                       × YCC
+         ST    R15,TQEEXIT                                        × YCC
+         SPACE 2                                                  × YCC
+         L     R15,CVTPTR                                         × YCC
+         USING CVT,R15                                            × YCC
+         L     R2,CVTPVTP
+         USING PVT,R2                                             × YCC
+         MVC   STDELADR+1(2),PVTLPRIV                             × YCC
+         MVC   STDEHADR+1(2),PVTLCSA                              × YCC
+         DROP  R2                                                 × YCC
+         L     R15,CVTTPC                                         × YCC
+         USING TPC,R15                                            × YCC
+         L     R15,TPCSDIE                                        × YCC
+         DROP  R15                                                × YCC
+**                                                                × YCC
+* 1) R1 CONTAINS ADDRESS OF 128 BYTE FIXED TQE, ZERO EXCEPT FOR   × YCC
+*    A) TQEAID - STILL ZERO SINCE NO PERMINENT ASID IS ASSOCIATED × YCC
+*          WITH THIS TQE.                                         × YCC
+*    B) TQEVAL - CONTAINS TIME INTERVAL TO FIRST INTERRUPT.       × YCC
+*    C) TQEEXIT - CONTAINS ADDRESS OF STDEEXIT, THE SQA RESIDENT  × YCC
+*          COPY OF THE DIEEXIT CODE.                              × YCC
+* 2) R2-R12 ARE UNIMPORTANT                                       × YCC
+* 3) WE ARE TCB, KEY ZERO, ENABLED SUPERVISOR STATE.              × YCC
+**                                                                × YCC
+         BALR  R14,R15                                            × YCC
+**                                                                × YCC
+* LOSS OF R13-R3 HAS OCCURRED                                     × YCC
+**                                                                × YCC
+         DROP  R1                                                 × YCC
+         DROP  R6                                                 × YCC
+         SPACE 5                                                  × YCC
+**                                                                × YCC
+* CLEANUP AND RETURN                                              × YCC
+**                                                                × YCC
+RESET    MODESET KEY=NZERO,MODE=PROB <----------------------------× YCC
+         SR    R15,R15            SET RETURN CODE                   YCC
+         SPACE 2                                                    YCC
+RET      LR    R13,R7                                               YCC
+         RETURN (14,12),RC=(15)                                     YCC
+         SPACE 5                                                    YCC
+**                                                                  YCC
+* STATDIE CONSTANTS                                                 YCC
+**                                                                  YCC
+         DS    0F                                                   YCC
+GETINFO  DC    AL1(241),AL3(PGBFCT*PGBLEN)                          YCC
+         EJECT                                                      YCC
+*****************************************************************   YCC
+* PROCEDURE:                                                    *   YCC
+*        DIEPURG                                                *   YCC
+* FUNCTION:                                                     *   YCC
+*        PURGES ACTIVE STATDIE FUNCTION                         *   YCC
+* PROGRAMMING NOTE:                                             *   YCC
+*        THIS SOULD BE AN ALTERNATE ENTRY POINT OF STADIE       *   YCC
+*        IT CAN BE INVOKED BY PGM=DIEPURG                       *   YCC
+*        OR CAN BE LINKED TO BY ANY AUTHORIZED PROGRAM          *   YCC
+* ATTRIBUTES:                                                   *   YCC
+*        AUTHORIZED, NOT REENTRANT                              *   YCC
+* ENTRY CONDITIONS:                                             *   YCC
+*        NORMAL OS LINKAGE                                      *   YCC
+* RETURN CODES                                                  *   YCC
+*        0  DIE HAS BEEN PURGED                                 *   YCC
+*        4  DIE WAS NOT ACTIVE                                  *   YCC
+*        8  ERROR PURGING DIE                                   *   YCC
+*****************************************************************   YCC
+* PROGRAMMING NOTES:                                            *   YCC
+* THERE IS NO SYNCHRONOUS WAY TO PURGE STATDIE WITHOUT          *   YCC
+* A LOT OF UNNECESSARY LOCKING. IN A MP ENVIRONMENT,            *   YCC
+* EITHER THE DIE OR THE SRB CAN BE ON THE OTHER CPU WHEN        *   YCC
+* DIEPURG IS INVOKED. HOWEVER, EVERYTHING IS TIMER DRIVEN       *   YCC
+* SO THIS ENTRY POINT SIMPLY SETS THE                           *   YCC
+* STDEPURG BIT AND THEN SUSPENDS EXECUTION WITH A STIMER FOR    *   YCC
+* LONG ENOUGH TO INSURE THAT THE DIE HAS TERMINATED             *   YCC
+* ITSELF.                                                       *   YCC
+*                                                               *   YCC
+* REGISTER USAGE:                                               *   YCC
+*        R5 HOLDS RETURN CODE FOR OS RETURN                     *   YCC
+*        R6 POINTS TO STDE                                      *   YCC
+*        R7 HOLDS R13 FROM OS ENTRY TILL THE RETURN             *   YCC
+*        R10 BASE REGISTER                                      *   YCC
+*****************************************************************   YCC
+         EJECT                                                      YCC
+         ENTRY DIEPURG                                              YCC
+DIEPURG  SAVE  (14,12),,*                                           YCC
+         BALR  R10,0                                                YCC
+         USING *,R10                                                YCC
+         LR    R7,R13                                               YCC
+         LA    R6,STATSTDE                                          YCC
+         USING STDE,R6                                              YCC
+         LA    R5,4                                                 YCC
+         TM    STDELAST,STDEATIV                                    YCC
+         BZ    RETPRG                                               YCC
+         SPACE 2                                                    YCC
+**                                                                  YCC
+* THIS BEGINS A MODESET BLOCK. CODE IN THIS BLOCK EXECUTES IN KEY 0 YCC
+* AND SUPERVISOR STATE. EXIT MAY NOT BE MADE FROM THIS BLOCK        YCC
+* EXCEPT BY A BRANCH TO 'RUNNING' WHICH IS THE MODESET BACK TO      YCC
+* PROBLEM STATE AT THE END OF THE BLOCK                             YCC
+**                                                                  YCC
+         MODESET KEY=ZERO,MODE=SUP ------------------------------>× YCC
+         SPACE 2                                                  × YCC
+         OI    STDELAST,STDEPURG  SCHEDULE THE DIE TO PURGE SELF  × YCC
+         SPACE 2                                                  × YCC
+         STIMER WAIT,BINTVL=SECS WAIT A FEW SECONDS               × YCC
+         SPACE 2                                                  × YCC
+         LA    R5,8               PROVISIONAL RETURN CODE         × YCC
+         TM    TQEFLGS-TQE(R6),TQEOFF IS TQE OFF TIMER QUEUE?     × YCC
+         BZ    RUNNING            THIS IS AN ERROR, DIE STILL GOIN× YCC
+         SPACE 2                                                  × YCC
+         L     R1,STDEBUFP                                        × YCC
+         L     R0,STDEGET                                         × YCC
+         FREEMAIN R,LV=(0),A=(1) FREE PAGABLE BUFFERS             × YCC
+         L     R1,STDEWAMT
+         XC    STDEWAMT,STDEWAMT
+         L     R0,WAMTINFO
+         FREEMAIN R,LV=(0),A=(1) FREE WAMT   BUFFER               × YCC
+         SPACE 2                                                  × YCC
+         NI    STDELAST,X'FF'-STDEATIV-STDEPURG                   × YCC
+         SR    R5,R5                                              × YCC
+         DROP  R6                                                 × YCC
+         SPACE 2                                                  × YCC
+RUNNING  MODESET KEY=NZERO,MODE=PROB <----------------------------× YCC
+         SPACE 2                                                    YCC
+RETPRG   LR    R15,R5                                               YCC
+         LR    R13,R7                                               YCC
+         RETURN (14,12),RC=(15)                                     YCC
+SECS     DC    FS4E-1'&MILLISC'   4 TIMES STATDIE INTERVAL          YCC
+WAMTINFO DC    AL1(241),AL3(4096)
+         LTORG                                                      YCC
+         EJECT                                                      YCC
+         ENTRY STATSTDE,STATWAMT                                    YCC
+STATSTDE DS    0D                                                   YCC
+**                                                                  YCC
+* THIS IS THE STDE ONCE IT IS FIXED IN CORE                         YCC
+*                                                                   YCC
+* SEE THE STDE DSECT FOR A DESCRIPTION OF THE CONTENTS OF THIS      YCC
+* CONTROL BLOCK                                                     YCC
+**                                                                  YCC
+         DC    (STDELEN)X'00'                                       YCC
+         SPACE 5                                                    YCC
+         ORG   STATSTDE+STDEWAMT-STDE                               YCC
+STATWAMT DC    A(0)                                                 YCC
+         ORG
+         EJECT                                                      YCC
+*****************************************************************   YCC
+* PROCEDURE :                                                   *   YCC
+*        DIEEXIT                                                *   YCC
+*        THE SYSTEM STATISTICS TIME DISABLED EXIT               *   YCC
+* ATTRIBUTES:                                                   *   YCC
+*        KEY ZERO, SUPERVISOR STATE, PHYSICALLY DISABLED        *   YCC
+*        RUNS IN AN ARBITRARY ADDRESS SPACE UNDER THE TIMER SLIH*   YCC
+* ENTRY CONDITIONS:                                             *   YCC
+*        R1  POINTS TO TQE                                      *   YCC
+*        R14 CONTAINS RETURN ADDRESS                            *   YCC
+*        R15 CONTAINS ENTRY POINT ADDRESS                       *   YCC
+* EXIT CONDITONS:                                               *   YCC
+*        NORMAL - RETURN WITH TQE REQUED FOR NEXT INTERRUPT.    *   YCC
+*        PAUSED - RETURN WITH TQE REQUED BUT STDE UNCHANGED.    *   YCC
+*        PURGED - RETURN WITHOUT REQUING TQE.                   *   YCC
+* RECOVERY  ENVIRONMENT:                                        *   YCC
+*        THE DATA GATHERING PHASE IS COVERED BY A FRR           *   YCC
+*        ROUTINE WHICH PROTECTS THE INTERRUPTED TASK            *   YCC
+*        FROM THE NORMAL RECOVERY OF TIMER SLIH WHEN A          *   YCC
+*        TRANSLATION EXCEPTION IS RECOGNIZED IN A DIE.          *   YCC
+* LOCKING CONVENTIONS:                                          *   YCC
+*        THE DISP LOCK IS OBTAINED PRIOR TO CALLING THE TQE ENQUE   YCC
+*        ROUTINE, AND IT IS RELEASED AFTER IT RETURNS TO US.    *   YCC
+*****************************************************************   YCC
+* INTERNAL PROGRAMMING CONVENTIONS:                             *   YCC
+*                                                               *   YCC
+* REGISTER USAGE:                                               *   YCC
+*        R0-R1 WORK REGISTERS                                   *   YCC
+*        R2: ADDRESS OF PSW                                     *   YCC
+*        R3: ADDRESS OF ASCB OR XTLST                           *   YCC
+*        R4: ADDRESS OF TCB , RB, OR CDE                        *   YCC
+*        R5: WORK REGISTER                                      *   YCC
+*        R6: ADDRESS OF TQE IN STDE                             *   YCC
+*        R7-R8 WORK REGISTERS                                   *   YCC
+*        R9 : HOLDS THE RETURN ADDRESS                          *   YCC
+*        R10: BASE REGISTER                                     *   YCC
+*        NO REGISTERS ARE SAVED OR RESTORED BY THIS EXIT        *   YCC
+*        SETLOCK DESTROYS R11-14                                *   YCC
+*                                                               *   YCC
+* ACTIVE EXIT LABELS:                                           *   YCC
+*        REQUE - BRANCH TO FROM WITHIN SETFRR BLOCK             *   YCC
+*        REQUE2- BRANCH TO FROM OUTSIDE SETFRR BLOCK            *   YCC
+*****************************************************************   YCC
+         EJECT                                                      YCC
+DIEEXIT  DS    0H                                                   YCC
+         LR    R10,R15            R10 IS THE BASE                   YCC
+         USING DIEEXIT,R10                                          YCC
+         LR    R6,R1                                                YCC
+         USING STDE,R6                                              YCC
+         STCK  STDEITOD
+         LR    R9,R14                                               YCC
+         TM    STDELAST,STDEPURG                                    YCC
+         BZ    CONT                                                 YCC
+         NI    STDELAST,X'FF'-STDEPURG                              YCC
+         BR    R14                                                  YCC
+CONT     EQU   *                                                    YCC
+         TM    STDELAST,STDEPAUS                                    YCC
+         BO    REQUE2             WAIT TILL NEXT INTERVAL           YCC
+         SPACE 5                                                    YCC
+         LA    R2,STATFRR                                           YCC
+         ST    R2,STDEWORK                                          YCC
+**                                                                  YCC
+* THIS BEGINS A FRR BLOCK. EXIT CANNOT BE MADE FROM THIS BLOCK      YCC
+* EXCEPT FOR A BRANCH TO 'REQUE' WHICH IS THE LABEL OF THE          YCC
+* SETFRR MACRO INSTRUCTION WHICH DELETES THE TOP FRR FROM THE       YCC
+* STACK. THE FRR ITSELF IS DOCUMENTED BELOW.                        YCC
+**                                                                  YCC
+         SETFRR A,FRRAD=STDEWORK,WRKREGS=(7,8) ------------------>× YCC
+         SPACE 5                                                  × YCC
+**                                                                × YCC
+* FIND THE NEXT ENTRY IN THE STDE AND STORE IT IN R2              × YCC
+**                                                                × YCC
+         SR    R2,R2                                                YCC
+         ICM   R2,7,STDELAST+1    GET LAST USED ENTRY OFFSET      × YCC
+         LA    R2,PSWLEN(R2)           BUMP BY PSW LENGTH         × YCC
+         CH    R2,=AL2(STDELNTY-STDEENTY)                         × YCC
+         BL    NOTFULL                                            × YCC
+         TM    STDELAST,STDESRBA
+         BNZ   REQUE
+         MVC   STDEENTY(5*PSWLEN),STDESPIL
+         LA    R2,5*PSWLEN
+NOTFULL  EQU   *                                                  × YCC
+         STCM  R2,7,STDELAST+1    SAVE FOR NEXT ENTRY             × YCC
+         LA    R2,STDEENTY(R2)    GET ADDRESS OF ENTRY            × YCC
+         SPACE 5                                                  × YCC
+**                                                                × YCC
+* PUT PSW INTO THE TRACE ENTRY AND CLEAR SPECIAL BITS             × YCC
+**                                                                × YCC
+         USING PSW,R2                                             × YCC
+         MVC   PSW(8),FLCEOPSW                                    × YCC
+         NI    PSWMASK,PSWKEY+PSWWAIT+PSWPROB CLEAR SPECIAL BITS  × YCC
+         MVI   PSWSVC,0                                           × YCC
+         MVC   PSWNAME,=CL8' '                                    × YCC
+         SPACE 5                                                  × YCC
+**                                                                × YCC
+* PUT THE PG # INTO THE PSW, SAVE ASCB ADDR IN R3                 × YCC
+**                                                                × YCC
+         L     R3,PSAAOLD                                         × YCC
+         USING ASCB,R3                                            × YCC
+         MVI   PSWPG,0                                            × YCC
+         LTR   R3,R3                                              × YCC
+         BZ    REQUE                                              × YCC
+         L     R5,ASCBOUCB                                        × YCC
+         MVC   PSWPG,OUCBNPG-OUCB(R5)                             × YCC
+         SPACE 5                                                  × YCC
+*****                                                             × YCC
+* NOW, A LOT OF INTERRUPTS OCCUR IN THE THREE ENABLING            × YCC
+* INSTRUCTIONS ASSOCIATED WITH THE RELEASE OF A GLOBAL SPIN       × YCC
+* LOCK. IT IS NOT INFORMATIVE TO LEAVE THE PSW POINTING           × YCC
+* TO IEAVELK. THE REAL USER HAS LEFT HIS ADDRESS IN R14           × YCC
+* WHICH THE EXTERNAL FLIH STORED IN THE LCCA. WE MOVE THAT        × YCC
+* ADDRESS TO THE INSTRUCTION PART OF THE PSEUDO-PSW. WE           × YCC
+* DONT HAVE DIRECT INFORMATION ON THE LOCATION OF IEAVELK,        × YCC
+* BUT WE CAN FAKE IT WITH POINTERS IN THE LIT (LOCK INTERFACE     × YCC
+* TABLE). I WANT TO KNOW WHEN THIS ADJUSTMENT HAS BEEN            × YCC
+* MADE, SO I MAKE THE PSW ADDRESS ODD.                            × YCC
+*****                                                             × YCC
+         L     R5,PSALITA                                         × YCC
+         L     R5,X'44'(R5)       ->GSLUMOBT AT IEAVELK+X'16'     × YCC
+         C     R5,PSWINST                                         × YCC
+         BH    NOTELK                                             × YCC
+         LA    R5,X'DEA'(R5)      ->END OF IEAVELK, APPROXIMATELY × YCC
+         C     R5,PSWINST                                         × YCC
+         BL    NOTELK                                             × YCC
+         L     R5,PSALCCAV                                        × YCC
+         L     R5,LCCAXGR1-LCCA+14*4(R5) FIND R4                  × YCC
+         LA    R5,0(R5)           CLEAR HIGH BYTE                 × YCC
+         ST    R5,PSWINST                                         × YCC
+NOTELK   EQU   *                                                  × YCC
+         SPACE 5
+**
+* PUT CPU ID IN LOW ORDER BIT OF INSTRUCTION
+* 0=CPU0, 1=CPU1
+**
+         OC    PSWINST+3(1),PSACPUPA+1
+         EJECT                                                    × YCC
+**                                                                × YCC
+* SPECIAL PROGRAMMING NOTE FOR THIS SECTION                       × YCC
+*                                                                 × YCC
+* THE TCB AND RB CHAIN SEEMS TO BE MAINTAINED UNDER               × YCC
+* THE LOCAL LOCK. WE CANNOT OBTAIN THAT LOCK, AND SO CANNOT       × YCC
+* GUARANTEE THE INTEGRITY OF THE CHAIN. THE FOLLOWING CODE        × YCC
+* ATTEMPTS TO VALIDATE THE ADDRESSES IT USES PRIOR TO             × YCC
+* REFERENCING  STORAGE LOCATIONS. OCCASIONAL SPURIOUS             × YCC
+* RESULTS COULD OCCUR IF WE HAVE INTERRUPTED LINK, XCTL,          × YCC
+* ATTACH OR SVC 3. WITHOUR THIS CHECK, STATDIE WOULD              × YCC
+* GO DOWN ABOUT ONCE EVERY TWO HOURS.                             × YCC
+**                                                                × YCC
+         SPACE 2                                                  × YCC
+**                                                                × YCC
+* SET THE PSWSVC CODE AS FOLLOWS:                                 × YCC
+*   =0 IF NOT IN TCB MODE CURRENTLY                               × YCC
+*   OR SET TO INTERRUPT CODE AT OFFSET (-1) IN RB PREFIX          × YCC
+*        IF TYPE 1 SVC                                            × YCC
+*   OR SET TO INTERRUPT CODE AT OFFSET (-1) OF RB PREFIX OF       × YCC
+*        PREVIOUS RB IF CURRENT RB IS AN SVRB                     × YCC
+*   OR =0  FOR NON-SVC TCBMODE                                    × YCC
+**                                                                × YCC
+         L     R4,PSATOLD         GET TCB PTR                     × YCC
+         BNV   R4,NONAME          QUIT IF INVALID                 × YCC
+         USING TCB,R4                                             × YCC
+         L     R4,TCBRBP          GET CURRENT RB ADDR             × YCC
+         BNV   R4,NONAME          QUIT IF INVALID                 × YCC
+         USING RBBASIC,R4                                         × YCC
+         TM    ASCBFLG1,ASCBTYP1  IF TYPE 1 SVC IN CONTROL        × YCC
+         DROP  R3                                                 × YCC
+         BZ    ISITSVRB                                           × YCC
+         OI    PSWMASK,PSWSVCMD   IN SVC MODE                     × YCC
+         LA    R5,0(R4)           THEN GET SVC NUMBER FROM        × YCC
+         BCTR  R5,0                  OFFSET -1 IN CURRENT RB      × YCC
+         MVC   PSWSVC(1),0(R5)          PREFIX.                   × YCC
+         B     SVCSET                                             × YCC
+ISITSVRB TM    RBSTAB1,RBFTSVRB     ELSE IF THIS IS AN SVRB       × YCC
+         BNO   NOTSVC             THEN                            × YCC
+         OI    PSWMASK,PSWSVCMD   IN SVC MODE                     × YCC
+         L     R4,RBLINK          GET SVC NUMBER FROM             × YCC
+         LA    R5,0(R4)              OFFSET -1 IN THE PREVIOUS    × YCC
+         BCTR  R5,0                      RB PREFIX                × YCC
+         MVC   PSWSVC(1),0(R5)                *                   × YCC
+SVCSET   EQU   *                                                  × YCC
+NOTSVC   EQU   *                                                  × YCC
+         SPACE 1                                                  × YCC
+**                                                                × YCC
+* NOW TO LOCATE THE HIGHEST PRB IN THE RB CHAIN                   × YCC
+* AND FIND THE NAME OF THE PROGRAM RUNNING IN THE ADDRESS SPACE   × YCC
+**                                                                × YCC
+         LA    R5,10              PREVENT LOOP                    × YCC
+ISITPRB  TM    RBSTAB1,RBFTP                                      × YCC
+         BZ    GOTPRB                                             × YCC
+         L     R4,RBLINK                                          × YCC
+         BNV   R4,NONAME          QUIT IF INVALID                 × YCC
+         BCT   R5,ISITPRB                                         × YCC
+GOTPRB   L     R4,RBCDE                                           × YCC
+         USING CDENTRY,R4                                         × YCC
+         BNV   R4,NONAME          QUIT IF INVALID                 × YCC
+         MVC   PSWNAME,CDNAME                                     × YCC
+         L     R1,PSWINST                                         × YCC
+         C     R1,STDELADR                                        × YCC
+         BL    NONAME                                             × YCC
+         C     R1,STDEHADR                                        × YCC
+         BH    NONAME                                             × YCC
+         SPACE 2                                                  × YCC
+**                                                                × YCC
+* FIRST LEVEL PSW INSTRUCTION ADDRESS ADJUSTMENT                  × YCC
+* IF THE INSTRUCTION IS IN THE EXTENT OF THE MODULE REPRESENTED   × YCC
+* BY THE TOP PRB, THEN SUBTRACT THE ORIGIN OF THE MODULE          × YCC
+* FROM THE PSW ADDRESS AND SET THE HIGH ORDER BIT OF THE          × YCC
+* PSW SECOND WORD ON TO INDICATE RELATIVE ADDRESSING              × YCC
+**                                                                × YCC
+         TM    CDATTR2,CDXLE      IS THERE AN XLST                × YCC
+         BZ    JOBPAK             NO, QUIT                        × YCC
+         L     R3,CDXLMJP         GET ITS ADDRESS                 × YCC
+         BNV   R3,NONAME                                          × YCC
+         USING XTLST,R3                                           × YCC
+         LM    R7,R8,XTLMSBLA     PICK UP LEN AND ADDR            × YCC
+         CR    R8,R1                                              × YCC
+         BH    JOBPAK             YES, QUIT                       × YCC
+         LA    R7,0(R7,R8)        GET END OF MODULE               × YCC
+         CR    R7,R1                                              × YCC
+         BL    JOBPAK             YES, QUIT                       × YCC
+         SR    R1,R8              BY SUBTRACTING ORIGIN           × YCC
+         O     R1,HIGHBIT         AND FLAG BIT 0                  × YCC
+         ST    R1,PSWINST         SAVE BACK                       × YCC
+         B     KNOWNAME                                           × YCC
+         SPACE 5                                                  × YCC
+**                                                                × YCC
+* THE FOLLOWING CODE IS NORMALLY BYPASSED                         × YCC
+* TO AVOID NUNECESSARY PROCESSING. IT WILL SEARCH                 × YCC
+* THE JOBPACK FOR A CDE ASSOCIATED WITH A MODULE WHICH INCLUDES   × YCC
+* THE INSTRUCTION ADDRESS. IF ONE IS FOUND, THE INSTRUCTION       × YCC
+* IS RELATIVIZED AND THE CDENAME IS REPLACED. THIS CODE           × YCC
+* CAN BE TURNED ON IF YOU WANT TO TRACK CPU ACTIVITY IN           × YCC
+* MULTIMODULE PROGRAMS, BUT IS NOT THE KIND OF THING YOU          × YCC
+* DO ALL THE TIME.                                                × YCC
+**                                                                × YCC
+JOBPAK   B     KNOWNAME           ** ZAP TO NOP FOR ACTIVATION ** × YCC
+         LA    R5,20              LIMIT SEARCH                    × YCC
+         L     R4,PSATOLD                                         × YCC
+         L     R4,TCBJPQ-TCB(R4)                                  × YCC
+NXTCDE   BNV   R4,NONAME                                          × YCC
+         TM    CDATTR2,CDXLE      IS THERE AN XLST                × YCC
+         BZ    CHAINCDE             NO, NEXT                      × YCC
+         L     R3,CDXLMJP         GET ITS ADDRESS                 × YCC
+         BNV   R3,NONAME                                          × YCC
+         LM    R7,R8,XTLMSBLA     PICK UP LEN AND ADDR            × YCC
+         CR    R8,R1                                              × YCC
+         BH    CHAINCDE             YES, NEXT                     × YCC
+         LA    R7,0(R7,R8)        GET END OF MODULE               × YCC
+         CR    R7,R1                                              × YCC
+         BL    CHAINCDE             YES, NEXT                     × YCC
+         SR    R1,R8              BY SUBTRACTING ORIGIN           × YCC
+         O     R1,HIGHBIT         AND FLAG BIT 0                  × YCC
+         ST    R1,PSWINST         SAVE BACK                       × YCC
+         MVC   PSWNAME,CDNAME                                     × YCC
+         B     KNOWNAME                                           × YCC
+CHAINCDE L     R4,CDCHAIN                                         × YCC
+         BCT   R5,NXTCDE                                          × YCC
+KNOWNAME EQU   *                                                  × YCC
+NONAME   EQU   *                                                  × YCC
+         DROP  R3                                                 × YCC
+         DROP  R4                                                 × YCC
+         EJECT                                                    × YCC
+**                                                                × YCC
+* NOW SET THE SPECIAL STATUS BIT FOR SRB MODE                     × YCC
+**                                                                × YCC
+         L     R4,PSALCCAV                                        × YCC
+         USING LCCA,R4                                            × YCC
+         TM    LCCADSF2,LCCASRBM                                  × YCC
+         BZ    NOTSRB                                             × YCC
+         OI    PSWMASK,PSWSRB                                     × YCC
+NOTSRB   EQU   *                                                  × YCC
+         DROP  R4                                                 × YCC
+         SPACE 5                                                  × YCC
+*****                                                             × YCC
+* NOW IF THE BUFFER WAS JUST FILLED, WE SCHEDULE AN SRB IN        × YCC
+* THE MASTER SCHEDULER ADDRESS SPACE TO PAGEFAULT IN THE          × YCC
+* NEXT PAGABLE BUFFER AND COPY THE FIXED BUFFER INTO IT.          × YCC
+* UNTIL IT COMPLETES, THE STDESRBA FLAG IS SET                    × YCC
+*****                                                             × YCC
+         SR    R0,R0                                                YCC
+         ICM   R0,7,STDELAST+1                                    × YCC
+         CH    R0,=AL2(STDEFILL-STDEENTY)
+         BNE   REQUE
+         SPACE 1                                                  × YCC
+SCHED    DS    0H                                                 × YCC
+* ZERO THE SRB BECAUSE IT IS NOT CLEAR IF IT CAN BE REUSED        × YCC
+* UNLESS FIRST CLEARED. GETTING THE SRB ROUNTINE ENTRY POINT      × YCC
+* ADDRESS REQUIRES A LITTLE WORK, BECAUSE WE NEED THE ADDRESS     × YCC
+* OF THE COPY OF STATSRB WHICH WAS COPIED TO THE END OF THE       × YCC
+* STDE, AND BECAUSE THAT LOCATION CAN BE >4096 FROM THE AVAILABLE × YCC
+* BASE REGISTER. SET THE STDESRBA BIT SO WE DO NOT ADD ANOTHER    × YCC
+* PSW TO THE FIXED BUFFER UNTIL IT HAS BEEN COPIED BY THE SRB.    × YCC
+         XC    STDESRB,STDESRB                                    × YCC
+         LA    R7,STDESRB                                         × YCC
+         USING SRB,R7                                             × YCC
+         MVC   SRBID,=CL4'SRB'                                    × YCC
+         LA    R1,(STATSRB-DIEEXIT)+STDEEXIT-1024                 × YCC
+         LA    R1,1024(R1)                                        × YCC
+         ST    R1,SRBEP                                           × YCC
+         L     R1,CVTPTR                                          × YCC
+         L     R1,CVTASVT-CVT(R1)                                 × YCC
+         L     R1,ASVTENTY-ASVT(R1)                               × YCC
+         ST    R1,SRBASCB                                         × YCC
+         OI    STDELAST,STDESRBA                                  × YCC
+         SCHEDULE SRB=STDESRB,SCOPE=LOCAL                         × YCC
+         DROP  R7                                                 × YCC
+         SPACE 5                                                  × YCC
+REQUE    SETFRR D,WRKREGS=(7,8) <---------------------------------× YCC
+         SPACE 5                                                    YCC
+**                                                                  YCC
+* REQUE THE TQE BY BRANCHING TO THE DISPATCHER                      YCC
+**                                                                  YCC
+REQUE2   DS    0H                                                   YCC
+         USING TQE,R6             SAME VALUE , DIFFERENT DSECT      YCC
+         LM    R0,R1,TQEVAL                                         YCC
+         AL    R1,INCREMT+4                                         YCC
+         BC    12,*+8                                               YCC
+         AL    R0,=F'1'                                             YCC
+         AL    R0,INCREMT                                           YCC
+         STM   R0,R1,TQEVAL                                         YCC
+* NOW ESTABLISH 'CPU AFFINITY' TO THE OTHER CPU, BY FILLING LOW BYTE
+* WITH X'FE' FOR CPU 0, X'FF' FOR CPU1
+         LH    R1,=H'-1'          PRIME WITH X'FF'
+         SH    R1,PSACPUPA        SUB CPU NUMBER
+         STC   R1,TQEVAL+7
+         USING STDE,R6
+         SPACE 5
+LOCK     SETLOCK OBTAIN,TYPE=DISP,MODE=UNCOND,DISABLED,  -------->× YCC*
+               RELATED=UNLOCK                                     × YCC
+         SPACE 5                                                  × YCC
+*****                                                             × YCC
+* COUNT READY TCBS                                                × YCC
+*****                                                             × YCC
+         TM    STDELAST,STDEPAUS                                  × YCC
+         BO    NOCOUNT                                            × YCC
+         SR    R1,R1                                              × YCC
+         L     R3,CVTPTR                                          × YCC
+         L     R3,CVTASCBH-CVT(R3)                                × YCC
+         USING ASCB,R3                                            × YCC
+ASLP     LTR   R3,R3                                              × YCC
+         BZ    LASTASCB                                           × YCC
+         A     R1,ASCBTCBS                                        × YCC
+         S     R1,ASCBCPUS                                        × YCC
+         L     R3,ASCBFWDP                                        × YCC
+         B     ASLP                                               × YCC
+         DROP  R3                                                 × YCC
+LASTASCB STC   R1,PSWRDY                                          × YCC
+         DROP R2                                                  × YCC
+NOCOUNT  EQU   *                                                  × YCC
+         SPACE 5                                                    YCC
+         L     R15,CVTPTR                                         × YCC
+         USING CVT,R15                                            × YCC
+         L     R15,CVTQTE00                                       × YCC
+         DROP  R15                                                × YCC
+         LR    R1,R6                                              × YCC
+**                                                                × YCC
+* NOW TO CALL THE TQE ENQUE ROUTINE                               × YCC
+* 1) IN SUPERVISOR STATE, KEY 0, UNDER DISP LOCK                  × YCC
+* 2) TQEVAL CONTAINS THE TOD FOR THE NEXT INTERRUPT               × YCC
+* 3) THE REST OF THE TQE IS UNCHANGED FROM ENTRY TO DIE.          × YCC
+* 4) R1 CONTAINS THE ADDRESS OF THE TQE                           × YCC
+* 5) R2 CONTAINS THE RETURN ADDRESS                               × YCC
+**                                                                × YCC
+         BALR  R2,R15                                             × YCC
+UNLOCK   SETLOCK RELEASE,TYPE=DISP,DISABLED,RELATED=LOCK   <------× YCC
+         SPACE 5                                                    YCC
+**                                                                  YCC
+* RETURN                                                            YCC
+**                                                                  YCC
+         STCK  STDEWORK
+         LM    R0,R1,STDEWORK
+         SL    R1,STDEITOD+4
+         BC    3,*+6
+         BCTR  R0,0
+         SL    R0,STDEITOD
+         AL    R1,STDECPUT+4
+         BC    12,*+8
+         AL    R0,=F'1'
+         AL    R0,STDECPUT
+         STM   R0,R1,STDECPUT
+         LR    R14,R9                                               YCC
+         BR    R14                                                  YCC
+         DROP  R6                                                   YCC
+         DROP  R10                                                  YCC
+         SPACE 5                                                    YCC
+**                                                                  YCC
+* CONSTANTS                                                         YCC
+**                                                                  YCC
+         DS    0F                                                   YCC
+INCREMT  DC    FL8S32E-3'&MILLISC'                                  YCC
+HIGHBIT  DC    XL4'80000000'                                        YCC
+         LTORG                                                      YCC
+         EJECT                                                      YCC
+*****************************************************************   YCC
+* PROCEDURE                                                     *   YCC
+*        STATFRR                                                *   YCC
+* FUNCTION:                                                     *   YCC
+*        FUNCTIONAL RECOVERY ROUTINE FOR DIEEXIT                *   YCC
+* PROGRAMMING NOTE:                                             *   YCC
+*        DIEEXIT DOES NOT OBTAIN ANY IMPORTANT RESOURCES WHILE  *   YCC
+*        THIS ROUTINE IS ON THE FRR STACK, AND THIS             *   YCC
+*        ROUTINE DOES NOT ATTEMPT ANY SIGNIFICANT RECOVERY.     *   YCC
+*        INSTEAD, IT RETURNS TO THE TIMER SLIH WITHOUT          *   YCC
+*        REQUEING THE TQE, THUS PURGING STATDIE PROCESSING.     *   YCC
+*        THE REAL REASON FOR THIS CODE IS THAT IF THE           *   YCC
+*        FRR ROUTINE OF THE TIMER SLIH GETS CONTROL FOR         *   YCC
+*        ANY ERROR, IT WILL MEMTERM THE INTERRUPTED ADDRESS     *   YCC
+*        SPACE. AS DISTRIBUTED, STATDIE HAS RUN AT YALE         *   YCC
+*        FOR MANY DAYS WITHOUT ERROR, BUT YOU ARE               *   YCC
+*        ENCOURAGED TO MAKE YOUR OWN MODS AND EXPERIMENT        *   YCC
+*        WITH NEW IDEAS. IF A STATDIE SEGMENT EXCEPTION         *   YCC
+*        WERE ALLOWED TO BLOW UP A RANDOM ADDRESS SPACE,        *   YCC
+*        IT WOULD MAKE THIS CODE VERY UNPOPULAR IN              *   YCC
+*        SYSTEMS WITH BIG IMS TP APPLICATIONS. SO WE            *   YCC
+*        CATCH THE ERROR OURSELVES AND GO AWAY QUIETLY.         *   YCC
+*****************************************************************   YCC
+         SPACE 5                                                    YCC
+STATFRR  DS    0H                                                   YCC
+         USING *,R15                                                YCC
+         USING SDWA,R1                                              YCC
+         L     R9,SDWAGR09                                          YCC
+         SETRP RC=4,RETADDR=(9),RECORD=YES,RECPARM=FRRID            YCC
+         BR    R14                                                  YCC
+FRRID    DC    C'STATDIE DIEEXIT STATFRR '                          YCC
+         DROP  R15                                                  YCC
+         DROP  R1                                                   YCC
+         EJECT                                                      YCC
+*****************************************************************   YCC
+* PROCEDURE                                                     *   YCC
+*        STATSRB                                                *   YCC
+*        THE SYSTEM STATISTICS SRB ROUTINE                      *   YCC
+*        COPIES PSW'S TO PAGABLE CSA                            *   YCC
+* ATTRIBUTES                                                    *   YCC
+*        KEY ZERO, SUPERVISOR, ENABLED, MASTER ADDRESS SPACE    *   YCC
+*        SRB MODE                                               *   YCC
+* LOCKING CONVENTIONS:                                          *   YCC
+*        THE LOCAL AND CMS LOCKS ARE OBTAINED AND RELEASED.     *   YCC
+*****************************************************************   YCC
+* REGISTER USAGE                                                *   YCC
+*        R0-R6 WORK REGISTERS AND MVCL                          *   YCC
+*        R7 POINTS TO PAGABLE BUFFER                            *   YCC
+*        R8 POINTS TO STDE                                      *   YCC
+*        R9 HOLDS RETURN ADDRESS                                *   YCC
+*        R10 BASE REGISTER                                      *   YCC
+*        R11-R14 USED BY SETLOCK                                *   YCC
+*        NO REGISERS ARE SAVED OR RESTORED                      *   YCC
+*****************************************************************   YCC
+         EJECT                                                      YCC
+STATSRB  DS    0H                                                   YCC
+         LR    R8,R0                                                YCC
+         USING STDESRB,R8                                           YCC
+         BALR  R10,0                                                YCC
+         USING *,R10                                                YCC
+         LR    R9,R14                                               YCC
+         SPACE 1                                                    YCC
+**                                                                  YCC
+* ADDRESS THE SPECIFIC PAGABLE BUFFER FROM THE PGB POOL             YCC
+**                                                                  YCC
+         SR    R2,R2                                                YCC
+         L     R1,STDEBUFP        GET FIRST PAGABLE BUFFER          YCC
+         IC    R2,STDENXBF        AND NEXT BUFFER OFFSET            YCC
+         MH    R2,=AL2(PGBLEN)                                      YCC
+         LA    R7,0(R1,R2)        ADDRESS TARGET BUFFER             YCC
+         USING PGBUF,R7                                             YCC
+         SPACE 1                                                    YCC
+         STCK  PGBTOD                                               YCC
+         SPACE 1                                                    YCC
+**                                                                  YCC
+* MOVE THE PSWS FROM THE FIXED BUFFER TO THE PAGABLE BUFFER.        YCC
+**                                                                  YCC
+         MVC   PGBPSWD,PSWDSCR                                      YCC
+         LA    R0,PGBPSWS                                           YCC
+         LH    R1,=AL2(FXBUFL)    BYTE LENGTH OF BUFFER             YCC
+         LR    R3,R1              IN SOURCE AND TARGET              YCC
+         LA    R2,STDEENTY        SOURCE IS FIXED BUFFER            YCC
+         MVCL  R0,R2              MOVE IT OR LOSE IT                YCC
+         SPACE 1                                                    YCC
+**                                                                  YCC
+* LOCATE THE RCT AND MOVE THE 5 SRM VALUES TO THE PAGABLE BUFFER    YCC
+**                                                                  YCC
+         L     R1,CVTPTR                                            YCC
+         L     R1,CVTOPCTP-CVT(R1)                                  YCC
+         USING IRARMCNS,R1                                          YCC
+         MVC   PGBRCTD,RCTDSCR                                      YCC
+         MVC   PGBRCT(10),RCVUICA                                   YCC
+         SPACE 1                                                    YCC
+**                                                                  YCC
+*  MOVE THE MPLT AND RUA FROM UP TO 'MAXDMN' DOMAINS TO THE         YCC
+* PAGABLE BUFFER                                                    YCC
+**                                                                  YCC
+         LA    R2,DMDTEND-DMDT    LENGTH OF DMDT ENTRY              YCC
+         L     R3,RMCTDMDE        LAST DMDT ENTRY                   YCC
+         L     R1,RMCTDMDT        FIRST DMDT ENTRY                  YCC
+         USING DMDT,R1                                              YCC
+         MVC   PGBDMND,DMNDSCR    BUILD RECORD DESCRIPTOR           YCC
+         LA    R4,4               INCREMENT                         YCC
+         LA    R5,PGBDMN+MAXDMN*4                                   YCC
+         LA    R6,PGBDMN          ADDRESS TARGET                    YCC
+DMNLOOP  MVC   0(4,R6),DMDTMPLT   MOVE MPLT AND RUA                 YCC
+         BXH   R1,R2,ENDDMN       CHECK FOR LAST DOMAIN             YCC
+         BXLE  R6,R4,DMNLOOP      CHECK FOR MAXDMN                  YCC
+ENDDMN   EQU   *                                                    YCC
+         SPACE 2                                                    YCC
+         L     R1,CVTPTR                                            YCC
+         L     R1,CVTPVTP-CVT(R1)                                   YCC
+         USING PVT,R1                                               YCC
+         MVC   PGBPVTD,PVTDSCR                                      YCC
+         MVC   PGBAFC,PVTAFC                                        YCC
+         MVC   PGBPOOL,PVTPOOL                                      YCC
+         MVC   PGBCFMCT,PVTCFMCT                                    YCC
+         MVC   PGBCNTFX,PVTCNTFX                                    YCC
+         MVC   PGBSQAFX,PVTSQAFX                                    YCC
+         MVC   PGBCOMFX,PVTCOMFX                                    YCC
+         SPACE 2                                                    YCC
+         SR    R1,R1              NOW INCREMENT OFFSET              YCC
+         IC    R1,STDENXBF                                          YCC
+         LA    R1,1(R1)           BY ONE                            YCC
+         CH    R1,=AL2(PGBFCT)    BUT IF IT IS BIGGER THAN          YCC
+         BL    *+6                PAGABLE BUFFER COUNT              YCC
+         SR    R1,R1              GO TO ZERO OFFSET                 YCC
+         STC   R1,STDENXBF                                          YCC
+         NI    STDELAST,X'FF'-STDESRBA  DIE WILL START UP AGAIN     YCC
+         BR    R9                                                   YCC
+         SPACE 2                                                    YCC
+* PROTOTYPE RDW'S FOR PAGABLE BUFFER                                YCC
+PSWDSCR  DC    AL1(PGRPSWS,PSWLEN)                                  YCC
+         DC    AL2(FXBUFL)                                          YCC
+RCTDSCR  DC    AL1(PGRRCT,10)                                       YCC
+         DC    AL2(12)                                              YCC
+DMNDSCR  DC    AL1(PGRDMN,4)                                        YCC
+         DC    AL2(MAXDMN*4)                                        YCC
+PVTDSCR  DC    AL1(PGRPVT,12)                                       YCC
+         DC    AL2(12)                                              YCC
+         LTORG                                                      YCC
+         SPACE 2                                                    YCC
+STATPCH  DC    (4096-*+STATDIE)X'00'                                YCC
+DIEEND   EQU   *                                                    YCC
+DIELEN   EQU   *-DIEEXIT                                            YCC
+         EJECT                                                      YCC
+         PRINT NOGEN                                                YCC
+**                                                                  YCC
+* WE WOULD LIKE TO HAVE A USABLE SET OF MAPPING MACROS FOR THE      YCC
+* SRM CONTROL BLOCKS IN IRARMCNS, BUT NONE OF THE DISTRIBUTED       YCC
+* MACROS REALLY WORK AS ASSEMBLER DSECTS. SO IT IS NECESSARY        YCC
+* TO ROLL OUR OWN UNTIL IBM GETS ON THE STICK                       YCC
+***                                                                 YCC
+IRARMCNS DSECT                                                      YCC
+         ORG   IRARMCNS+180                                         YCC
+RMCTDMDT DS    A                                                    YCC
+RMCTDMDE DS    A                                                    YCC
+         ORG   IRARMCNS+X'1F8'                                      YCC
+         IRARCT DSECT=NO                                            YCC
+**                                                                  YCC
+* MAPPING MACROS                                                    YCC
+**                                                                  YCC
+         IHAPVT                                                     YCC
+         IHAPFTE                                                    YCC
+         SPACE 3                                                    YCC
+         IHAPSA                                                     YCC
+         IHAASVT                                                    YCC
+         IHASRB                                                     YCC
+         IHAASCB                                                    YCC
+         IHATQE                                                     YCC
+         IHALCCA                                                    YCC
+         IRAOUCB                                                    YCC
+         IRADMDT                                                    YCC
+         IEAVVTPC                                                   YCC
+         IHARB                                                      YCC
+         IHACDE                                                     YCC
+         IHAXTLST                                                   YCC
+         IHAFRRS                                                    YCC
+         IHASDWA                                                    YCC
+         IKJTCB                                                     YCC
+         CVT   DSECT=YES                                            YCC
+         END   ,                                                    YCC

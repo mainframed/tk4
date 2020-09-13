@@ -1,0 +1,1339 @@
+         PRINT     GEN
+**********************************************************************
+*                                                                    *
+*          W A T E R L O O   C O P Y   C A T A L O G U E             *
+*                                                                    *
+*        AUTHORS: GUNDARS ZVAIGZNE,  BRUCE LENNOX                    *
+*                                                                    *
+*                                                                    *
+*        TO PERFORM A HIGH SPEED COPY OF A CATALOG FROM ONE          *
+*        DAD  VOLUME TO ANOTHER. THIS PROGRAM WAS WRITTEN MAINLY     *
+*        TO MAKE SYSTEM BACKUP A MORE REASONABLE PROCESS.            *
+*                                                                    *
+*        THE PRESENT DEVICES SUPPORTED ARE THE 2301,2303,2311,2314,  *
+*                                              2305-I,2305-II,3330.  *
+*                                                                    *
+**********************************************************************
+*                                                                    *
+*        THE FOLLOWING JCL WILL EXECUTE THE PROGRAM:                 *
+*                                                                    *
+*        //WATACTLG JOB 'ACCT NO.'                                   *
+*        //JOBLIB  DD DSN=SYS3.SYSTEMS.LOADLIB,DISP=SHR              *
+*        //   EXEC PGM=WATACTLG,PARM='PURGE'                         *
+*        //SYSPRINT DD SYSOUT=A                                      *
+*        //SYSUT1   DD UNIT=2301,VOL=SER=002301,DISP=SHR             *
+*        //SYSUT2   DD UNIT=2314,VOL=SER=BACK01,DISP=SHR             *
+*        /*                                                          *
+*                                                                    *
+*        OR, IF THE SYSUT2 SYSCTLG IS NOT YET ALLOCATED,             *
+*                                                                    *
+*        //SYSUT2   DD DSN=SYSCTLG,UNIT=2314,VOL=SER=BACK01,         *
+*        //            DISP=(NEW,KEEP),SPACE=(CYL,(5),,CONTIG)       *
+*                                                                    *
+*        //SYSIN IS NOT NECCESSARY SINCE ALL OTHER INFORMATION       *
+*        WILL BE DETERMINED BY THE PROGRAM.                          *
+*                                                                    *
+**********************************************************************
+*                                                                    *
+*        PARM FIELD : FOR FUTURE USE                                 *
+*        THE PARM FIELD DETERMINES WHETHER OR NOT THE SYSUT2 VOLUME  *
+*        IS PROTECTED IF IT ALREADY CONTAINS A SYSCTLG DATA SET.     *
+*        IF IT DOES THEN THE PARM FIELD MUST CONTAIN THE KEYWORD     *
+*        OPERAND 'PURGE' IN ORDER THAT A NEW SYSCTLG WILL BE CREATED *
+*        OVER THE PREVIOUS ONE.                                      *
+*                                                                    *
+**********************************************************************
+         EJECT
+**********************************************************************
+*                                                                    *
+*        THIS PROGRAM CONTAINS FIVE PHASES WRITTEN AND TESTED        *
+*        SEPERATELY. TO GAIN FURTHER REAL TIME EXECUTION SPEED,      *
+*        PHASE 2 SETS UP CHAINED CHANNEL COMMANDS TO BE USED         *
+*        WITH EXCP.                                                  *
+*                                                                    *
+*        (1) INITIALIZE:                                             *
+*            CHECK FOR PRESENCE OF SYSPRINT, SYSUT1, SYSUT2.         *
+*            CHECK FOR PARM FIELD PRESENCE AND VALIDITY.             *
+*            PRINT THE COPY INFORMATION: FROM, TO, PURGE.            *
+*            READ THE FIRST CATALOG BLOCK AND ESTIMATE THE SIZE.     *
+*            CHECK IF SYSUT2 HAS A CATALOG ALREADY.                  *
+*            IF IT DOES, CHECK FOR PURGE VALIDITY.                   *
+*            IF PURGE OK, THEN CHECK IF SIZE IS LARGE ENOUGH.        *
+*            IF IT IS TOO SMALL SCRATCH IT.                          *
+*            IF IT THEN DOESN'T EXIST CREATE A NEW ONE.              *
+*                                                                    *
+*         (2)DO A GETMAIN TO OBTAIN SUFFICIENT CORE FOR THREE        *
+*            TRACKS OF THE LARGER CAPACITY VOLUME CATALOGUE.         *
+*            DO A GETMAIN FOR THE CCW'S AND THEN SET THEM UP         *
+*            WITH COMMAND CHAINING.                                  *
+*                                                                    *
+*        (3)READ IN THE SYSUT1 AND SYSUT2 JFCB FOR MODIFICATION      *
+*           AND OPEN BOTH SYSCTLGS.  BEGIN READING AND INITIALIZE    *
+*           THE SYNCHRONIZATION SCHEME.                              *
+*                                                                    *
+*        (4)MOVE THE CATALOGUE :                                     *
+*           PHASE FOUR CONSISTS OF ALL THE I/O ROUTINES,  THE TTR    *
+*           CONVERSION ROUTINE,  AND THE ROUTINES FOR FINALIZING     *
+*           THE COPY STEP.                                           *
+*                                                                    *
+*        (5)THE FORMAT 1 DSCB OF THE SYSCTLG IS ZAPPED TO INDICATE   *
+*           TO THE SYSTEM THAT THE CATALOGUE HAS BEEN FORMATTED      *
+*           AND IS NOW USEABLE.                                      *
+*                                                                    *
+*       *CONTROL*                                                    *
+*           CONTROL SYNCHRONIZES ALL INPUT, OUTPUT, AND CONVERSION   *
+*           ROUTINES.                                                *
+*                                                                    *
+*       *BUFFER SCHEME*                                              *
+*           THE BUFFER REGION ALLOCATED BY THE VARIABLE GETMAIN IS   *
+*           LARGE ENOUGH TO HANDLE THREE TRACKS OF THE LARGER        *
+*           CAPACITY DEVICE (I.E.  MAX. NO. OF BLKS/TRK).            *
+*                                                                    *
+**********************************************************************
+         EJECT
+**********************************************************************
+**********************************************************************
+**                                                                  **
+**             P H A S E  O N E     -INITIALIZE                     **
+**                                  -CHECK DD FOR SYSPRINT ,SYSUT1-2**
+**                                  -CHECK FOR PARM AND VALIDATE    **
+**                                                                  **
+**********************************************************************
+**********************************************************************
+R0         EQU        0                                              *
+R1         EQU        1                                              *
+R2         EQU        2                                              *
+R3         EQU        3                                              *
+R4         EQU        4                                              *
+R5         EQU        5                                              *
+R6         EQU        6                                              *
+R7         EQU        7                                              *
+R8         EQU        8                                              *
+R9         EQU        9                                              *
+R10        EQU       10                                              *
+R11        EQU       11                                              *
+R12        EQU       12                                              *
+R13        EQU       13                                              *
+R14        EQU       14                                              *
+R15        EQU       15                                              *
+SEARCH     EQU        8                                              *
+DISP       EQU        9                                              *
+WATACTLG CSECT                                                       *
+         SAVE      (14,12)             *REGULAR OS LINKAGE           *
+         LR        2,15                * LOAD BASE REG               *
+         USING     WATACTLG,2          * EASIER TO READ DUMP WITH B=0*
+         L         R11,PRNTBLK         * GET BASE ADDRESS FOR CNSTS  *
+         USING     DDTABLE,R11         * FOR CONSTANTS BEYOND 4K     *
+         LA        3,SAVEAREA          * SAVE REGISTERS FOR OS       *
+         ST        3,8(13)             *                             *
+         ST        13,4(3)             *                             *
+         LR        13,3                *                             *
+         L         1,0(1)              *                             *
+         ST        1,FWORK             * SAVE PARM FIELD ADDRESS     *
+         EXTRACT   TIOTADDR,FIELDS=TIOT  GET MY TIOT ADDR            *
+         L         3,TIOTADDR          * GET ADDRESS OF DD ENTRIES   *
+         LA        3,24(3)             *                             *
+OLOOP    LA        4,DDTABLE           * TABLE CONTAINS DDNAMES      *
+         LA        5,3                 * AND AFTERWARDS-ADDROF ENTRY *
+ILOOP    CLC       4(8,3),0(4)         * COMPARE DDNAME              *
+         BNE       *+8                                               *
+         ST        3,8(4)              * SAVE ADDR OF ENTRY IF FOUND *
+         LA        4,12(4)             * INCREMENT WITHIN DDTABLE    *
+         BCT       5,ILOOP             * INNER LOOP IS DDTABLE SEARCH*
+         IC        5,0(3)              * SHOULD BE LENGTH OF ENTRY   *
+         LTR       5,5                 * END OF TIOT                 *
+         BC        8,CHECKDD           * YES CHECK ALL DD PRESENT    *
+         AR        3,5                 * GET TO NEXT ENTRY           *
+         B         OLOOP               * OUTER LOOP IS TIOT SEARCH   *
+CHECKDD  C         5,DDPRINT           * IS SYSPRINT DD PRESENT      *
+         BNE       CHKUT1              * YES CONTINUE                *
+         MVI       PRINTSW,X'F0'       * ELSE DONT PRINT ANYTHING    *
+         MVI       SNAPSW,X'F0'        * DON'T SNAP EITHER           *
+WTO      WTO       'JCL ERROR!  //SYSPRINT  CARD IS MISSING.'        *
+CHKUT1   BAL       12,PRINT            * PRINT THE HEAD FIRST        *
+         C         5,DDUT1             * CHECK FOR SYSUT1            *
+         BNE       CHKUT2              *                             *
+         BAL       12,ERROR            * NO ERROR CODE 1             *
+         DC        H'1'                *                             *
+CHKUT2   C         5,DDUT2             * SYSUT2 PRESENT              *
+         BNE       CHKPARM             *                             *
+         BAL       12,ERROR            * NO ERROR CODE 2             *
+         DC        H'2'                *                             *
+CHKPARM  L         1,FWORK             * GET PARM ADDRESS            *
+         CLI       1(1),X'00'          * IS THERE ANY PARM           *
+         BE        PHASE1A             * NO. BYPASS VALIDITY CHECK   *
+         CLC       2(5,1),=C'PURGE'    * IS PURGE SPECIFIED          *
+         BNE       PHASE1B             * INVALID PARM                *
+         MVI       PURGSW,X'FF'        * YES TURN ON SWITCH          *
+         MVC       PURGMSG+7(3),=C'WAS'  INDICATE WHICH IN PRINT MSG *
+         B         PHASE1A             * GO AROUND ERROR SET         *
+PHASE1B  BAL       12,ERROR            * AN INVALID PARM IS BEST     *
+         DC        H'3'                * TREATED AS ABSENT           *
+         EJECT                                                       *
+**********************************************************************
+**********************************************************************
+**                                                                  **
+**       P H A S E  O N E     -PRINT THE COPY PARAMETERS            **
+**                                                                  **
+**                                                                  **
+**********************************************************************
+**********************************************************************
+PHASE1A  L         3,DDUT1             * GET TIOT ENTRY ADDRESS      *
+         L         3,16(3)             * DISPLACE TO UCB ADDR.       *
+         LA        3,0(3)              * CLEAR HIGH ORDER BITS       *
+         MVC       INFO+25(6),28(3)    * GET VOL-SER NUMBER          *
+         SR        4,4                 *                             *
+         IC        4,19(3)             * GET DEVTYPE CODE            *
+         MH        4,=H'6'             * INDEX TO PROPER ENTRY IN TAB*
+         LA        5,DEVTABLE-6        *                             *
+         AR        5,4                 *                             *
+         MVC       INFO+20(4),0(5)     * PUT UNIT NAME IN LINE       *
+         MVC       INBLK(2),4(5)       * SAVE BLOCKS/TRK INPUT FILE  *
+         ST        R5,INDISP           *REQUIRE THIS ADDRESS LATER   *
+         L         3,DDUT2             * GET TIOT ENTRY ADDRESS  UT2 *
+         L         3,16(3)             * DISPLACE TO UCB ADDR.       *
+         LA        3,0(3)              * CLEAR HIGH ORDER            *
+         MVC       INFO+41(6),28(3)    * GET VOL-SER NUMBER          *
+         MVC       CVOL(6),28(3)       * PUT IN CVOL FOR CAMLST      *
+         SR        4,4                 *                             *
+         IC        4,19(3)             * GET DEVTYPE CODE            *
+         MH        4,=H'6'             * INDEX TO UNIT NAME IN TABLE *
+         LA        5,DEVTABLE-6        *                             *
+         AR        5,4                 *                             *
+         MVC       INFO+36(4),0(5)     * PUT UNIT NAME IN LINE       *
+         MVC       OUTBLK(2),4(5)      * SAVE BLKS/TTR FOR OUTPUT    *
+         ST        R5,OUTDISP          *REQUIRE THIS ADDRESS LATER   *
+         MVC       LINE(50),INFO       *                             *
+         BAL       12,PRINT            * NOW PRINT THE INFORMATION   *
+         MVC       LINE(21),PURGMSG    * PRINT IF PURGE SPECIFIED    *
+         BAL       12,PRINT            *                             *
+         LA        R3,DEVTABLE         *GET ADDRESS OF DEVICE TABLE  *
+         L         R5,INDISP           *REQUIRE THIS ADDRESS         *
+         SR        R5,R3               *GET DISPLACEMENT             *
+         SR        R4,R4               *                             *
+         D         R4,=F'3'            *TO GET ANOTHER DISPLACEMENT  *
+         LA        R4,CYLTRK           *GET THE ADDRESS OF THIS TABLE*
+         AR        R4,R5               *GET REQ'D VALUE              *
+         MVC       INTRK(2),0(R4)      *GET INPUT TRK/CYL            *
+         L         R5,OUTDISP          *REQUIRE THIS ADDRESS IN DEVTA*
+         SR        R5,R3               *CALCULATE DISPLACEMENT       *
+         SR        R4,R4               *                             *
+         D         R4,=F'3'            *CALCULATE THIS DISPLACEMENT  *
+         LA        R4,CYLTRK           *GET ADDRESS OF THIS TABLE    *
+         AR        R4,R5               *GET TO DESIRED VALUE         *
+         MVC       OUTTRK(2),0(R4)     *GET OUTPUT TRK/CYL           *
+         B         PHASE2              *READ IN THE FIRST TRACK      *
+*                                      *                             *
+CATINFO  MVC       TTR,=X'000001'      * INITIAL TTR                 *
+         L         R8,BLKADDR          *GET ADDRESS OF THE 1ST BLOCK *
+         ST        R8,MBLKADDR         * ADDRESS USED BY CONVERT RTN *
+         SR        R4,R4               * CLEAR THIS REGISTER         *
+         A         R8,=F'16'           * GO TO COUNT ADDRESS         *
+         MVC       TTR(3),256(R8)      * SAVE THE TTR OF NEXT BLOCK  *
+         LH        10,14(R8)           * GET THE CATALOGUE UPPER LIM *
+         MH        10,INBLK            * CONTAINS TT*BLKS/TRK        *
+         IC        R4,16(R8)           * GET THE R                   *
+         AR        10,R4               * ADD THE R TO TT*OUTBLK      *
+         ST        10,NBLOCKS          * SAVE THE VALUE              *
+         CVD       10,DWORK            * CONVERT TO DECIMAL AND PRINT*
+         UNPK      BLKLINE+24(4),DWORK+5(3)                          *
+         OI        BLKLINE+27,X'F0'    * ENSURE F-ZONE               *
+         MVC       LINE(36),BLKLINE    * PUT INFORMATION ON SYSPRINT *
+         BAL       12,PRINT            *                             *
+         BR        R9                  *CONTINUE I/O OPERATIONS      *
+         EJECT
+**********************************************************************
+**********************************************************************
+**                                                                  **
+**              P H A S E  T W O  -  SET UP POINTERS FOR ROUTINES   **
+**                                   GETMAINS FOR CTLG & CHANNEL PGM**
+**********************************************************************
+**********************************************************************
+*                                                                    *
+* GETMAIN FOR I/O CATALOG BLOCKS & CONTROL BRANCH SET UP FOR I/O     *
+PHASE2   LA        R6,OUTPUT           *OUTPUT RQUIRES LESS I/O CALLS*
+         LA        R7,WRSWITCH         *GET ADDRESS FOR SWITCHING RTN*
+         STM       R6,R7,LESSIO        *                             *
+         LA        R6,INPUT            *INPUT HAS MORE I/O CALLS     *
+         LA        R7,RDSWITCH         *GET ADDRESS FOR SWITCHING RTN*
+         STM       R6,R7,MOREIO        *                             *
+         LA        R7,CROSSWCH         *GET THE ADDRESS OF THIS SWICH*
+         LA        R6,PROCSWCH         *AND THIS SWITCH              *
+         STM       R6,R7,SWFORRD       *STORE IN THE APPROPRIATE ORDER
+         MVI       FIRSTSW,X'F0'       * GO TO THE RIGHT INIT ROUTINE*
+* THE ABOVE OPERATIONS WILL BE ANNULLED AT OUTMIN                    *
+*                         IF THE OPPOSITE IS TRUE                    *
+         LA        R5,816              *NO OF BYTES/BLK * 3          *
+         LA        R4,0                *FOR MULTIPLICATION           *
+         LA        R10,LENGTH          *LENGTH REGION FOR GETMAIN    *
+         LH        R7,INBLK            *GET NO OF INPUT BLK/TRK      *
+         LH        R3,OUTBLK           *GET NO OF OUTPUT BLK/TRK     *
+         CR        R3,R7               *FIND OUT WHICH IS LARGEST    *
+         BNH       OUTMIN              *OUTPUT BLK IS MINIMUM        *
+INMIN    STH       R3,MAXBLK           *MAX NO OF BLKS/TRK=>NO OF CCW*
+         STH       R7,MINBLK           *MIN NO OF BLKS/TRK=NO PROCESD*
+         MR        R4,R3               *CALC SMALLEST ALLOCATION     *
+         ST        R5,0(R10)           *STORE AT FIRST WD AT LENGTH  *
+         LA        R5,272(R5)          *TRY FOR LARGER AREA          *
+         ST        R5,4(R10)           *STORE AT SECOND WD AT LENGTH *
+         B         COREAREA            *NOW DO GETMAIN               *
+OUTMIN   LA        R6,INPUT            *INPUT REQUIRES LESS I/O CALLS*
+         LA        R7,RDSWITCH         *GET ADDRESS FOR SWITCHING RTN*
+         STM       R6,R7,LESSIO        *                             *
+         LA        R6,OUTPUT           *OUTPUT HAS MORE I/O CALLS    *
+         LA        R7,WRSWITCH         *GET ADDRESS FOR SWITCHING RTN*
+         STM       R6,R7,MOREIO        *                             *
+         LA        R7,PROCSWCH         *GET THE ADDRESS OF THIS SWICH*
+         LA        R6,CROSSWCH         *AND THIS ADDRESS             *
+         STM       R6,R7,SWFORRD       *STORE IN THE APPROPRIATE ORDER
+         MVI       FIRSTSW,X'00'       * GO TO THE RIGHT INIT ROUTINE*
+         LH        R7,OUTBLK           *GET MAX NO OF BLKS/TRK       *
+         LH        R3,INBLK            *GET MIN NO OF BLKS/TRK       *
+         B         INMIN               *SET UP FOR GETMAIN           *
+*VARIABLE GETMAIN TO ALLOW FLEXIBILITY OF PROGRAM                    *
+COREAREA GETMAIN   VC,LA=LENGTH,A=BLKADDR                            *
+         ST        R15,REG15                                         *
+         LTR       R15,R15             * ZERO RETURN CODE - SUCCESS  *
+         BC        7,NOCORE            * ERROR                       *
+         L         R4,BLKADDR          * GET ADDRESS OF CORE AREA    *
+         A         R4,RCKD             * ADD ON COMMAND CODE         *
+         ST        R4,RCKD             * STORE IN ADDR FEILD OF CCW  *
+         B         BOUND               *                             *
+NOCORE   BAL       12,ERROR            *                             *
+         DC        H'6'                *                             *
+BOUND    L         R3,BLKADDR          * GET ADDRESS OF BLK AREA     *
+         LH        R5,MAXBLK           * GET MAX BLKS/TRK            *
+         SR        R4,R4               * FOR MULTIPLICATION          *
+         M         R4,=F'272'          * CALCULATE NO OF BYTES       *
+         AR        R3,R5               * GET ADDRESS OF 1ST BOUNDARY *
+         ST        R3,BOUND1           *                             *
+         AR        R3,R5               * GET ADDRESS OF 2ND BOUNDARY *
+         ST        R3,BOUND2           *                             *
+         AR        R3,R5               * GET 3RD BOUNDARY ADDRESS    *
+         ST        R3,BOUND3           *                             *
+* GETMAIN FOR CHAINED CHANNEL PROGRAM  *                             *
+GETCHAN  LH        R5,MAXBLK           * GET MAX BLKS/TRK            *
+         SLA       R5,3                * MULTIPLY BY EIGHT           *
+         LA        R5,8(R5)            * ANOTHER CCW FOR TIC         *
+         M         R4,=F'3'            * 3 TIMES = NO OF CCW'S       *
+         ST        R5,LGTHCHAN         * MINIMUM CORE REQ'T          *
+         LA        R5,24(R5)           * TRY FOR LARGER AREA         *
+         ST        R5,LGTHCHAN+4       * MAX CORE REQ'D              *
+COREPGM  GETMAIN   VC,LA=LGTHCHAN,A=CHPG                             *
+         ST        R15,REG15           * TO ALLOW CHECK              *
+         LTR       R15,R15             * ZERO RETURN CODE - SUCCESS  *
+         BC        7,NOCORE            * GETMAIN FAILED - ERROR      *
+*                                      *                             *
+* SET UP INITIAL READ CHANNEL PROGRAM  *                             *
+CHAN     L         R3,CHPG             * ADDRESS OF CHAN PGM AREA    *
+         ST        R3,CALCADDR         * REQUIRED FOR CONVERSION RTN *
+         SR        R4,R4               * FOR MULTIPLICATION          *
+         LH        R5,MAXBLK           * MAX NO OF BLKS/TRK          *
+         M         R4,=F'3'            * NO OF CCW'S FOR BCT         *
+         LM        R6,R7,RCKD          * LOAD READ CKD COMMAND       *
+RDRTN    STM       R6,R7,0(R3)         * STORE READ COMMAND          *
+         LA        R3,8(R3)            * INCREMENT FOR NEXT READ     *
+         A         R6,=F'272'          * INCREMENT ADDRESS FLD BY 272*
+         BCT       R5,RDRTN            * SET UP ALL READ COMMANDS    *
+         LM        R6,R7,TIC           * GET TIC COMMAND             *
+         A         R6,CHPG             * POINT TO BEGINNING AGAIN    *
+         STM       R6,R7,0(R3)         * PUT TIC COMND AT END OF CCWS*
+         STM       R6,R7,RDTIC2        * SET UP 2ND READ TIC         *
+         STM       R6,R7,WRTIC2        * SET UP 2ND WRITE TIC        *
+         LM        R4,R7,SEARCHID      * GET SEARCH & TIC CCW'S      *
+         A         R6,=A(RDSEARCH)     * NEED THIS POINTER           *
+         STM       R4,R7,RDSEARCH      * READ CHANNEL PROGRAM        *
+         A         R4,=F'8'            * GO TO WRITESEARCH           *
+         A         R6,=F'24'           * GO TO WRSEARCH CCW          *
+         STM       R4,R7,WRSEARCH      * WRITE CHANNEL PROGRAM       *
+* THE FOLLOWING SETS UP THE ADDRESSES TO TURN OFF AND ON             *
+* THE COMMAND CHAIN BIT FOR THE LARGER CAPACITY TRACK                *
+MAXCCBIT L         R4,CHPG             * GET ADDRESS OF THE CHAN PGM *
+         LH        R5,MAXBLK           * GET MAX BLKS/TRK            *
+         SLA       R5,3                * MULTIPLY BY 8               *
+         AR        R4,R5               * GO TO END OF FIRST TRACK    *
+         S         R4,=F'4'            * GO BACK FOUR BYTES          *
+         ST        R4,BNDCHPG1         * CONTAINS ADDRESS OF CC BIT  *
+         AR        R4,R5               *                             *
+         ST        R4,BNDCHPG2         * 2ND ADDRESS OF CC BIT       *
+         AR        R4,R5               *                             *
+         ST        R4,BNDCHPG3         * 3RD ADDRESS OF CC BIT       *
+         MVI       WRITEECB,X'7F'      * FOR WRITEECB                *
+*                                      *                             *
+*                                      *                             *
+**********************************************************************
+**********************************************************************
+**                                                                  **
+**              P H A S E  T H R E E - OPEN SYSUT1 & SYSUT2 SYSCTLG **
+**                                     INITIALIZE READ AND WRITE    **
+**********************************************************************
+**********************************************************************
+*                                      *                             *
+         LA        R6,JFCBAREA         * GET THE JFCB ADDRESS        *
+ENQ      ENQ      (QNAME,RNAME,E,7),RET=HAVE ENQ ON SYSCTLG          *
+         LTR       R15,R15             * ENQ'D????                   *
+         BZ        RSYSCTLG            *                             *
+         BAL       R12,ERROR           * ERROR IF WE CANNOT ENQ      *
+         DC        H'13'               * THIRTEENTH ERROR MESSAGE    *
+RSYSCTLG MVI       DEQ,X'00'           * MUST DEQ LATER              *
+         RDJFCB    READDCB             * READ THE JFCB               *
+         MVC       0(44,R6),DSNAME1    * MOVE IN THE SYSCTLG DSNAME  *
+         XI        76(R6),X'80'        * TURN ON THE HIGH ORDER BIT  *
+OPREAD   OPEN      READDCB,TYPE=J      * OPEN THE SYSCTLG DATA SET   *
+         TM        READDCB+48,X'10'    * WAS THE OPEN SUCCESSFUL?    *
+         BC        8,RDUNOPEN          * NO - TERMINATE JOB          *
+         MVI       INPUTSW,X'00'       * ALLOW A CLOSE FOR READDCB   *
+         B         OCONT               * CONTINUE                    *
+RDUNOPEN BAL       12,ERROR            * WRITE OUT ERROR MESSAGE     *
+         DC        H'7'                * 7TH ERROR MESSAGE IN LIST   *
+OCONT    LA        R5,READDCB          * GET DCB ADDRESS             *
+         L         R5,44(R5)           * GET DEB ADDRESS             *
+         MVC       INSTART(4),38(R5)   * START ADDRESS OF INPUT SYSCTLG
+         MVC       READIOB+35(4),38(R5)  PUT IN THE TRACK ADDRESS    *
+         MVC       RDSRADDR(4),38(R5)  * AND HERE                    *
+         LA        R3,READIOB          *                             *
+         ST        R5,28(R3)           * STORE THE DEB ADDR IN THE IOB
+SETINSWH LH        R3,INBLK            * GET NO OF INPUT BLK/TRK     *
+         L         R5,CHPG             * GET CHANNEL PGM ADDRESS     *
+         SLA       R3,3                * INCREMENT TO END OF TRACK   *
+         AR        R5,R3               *                             *
+         S         R5,=F'4'            *                             *
+         MVI       0(R5),X'00'         * TURN OFF CC BIT             *
+         EXCP      READIOB             * START READ OF INPUT CATALOG *
+         BAL       R4,WAITFORD         * WAIT FOR COMPLETION OF READ *
+WRITINFO BAL       R9,CATINFO          * WRITE OUT CATALOG PARAMETERS*
+         L         R8,RNBLOCKS         * GET INITIAL NO OF BLKS      *
+         AH        R8,INBLK            * ADD ONE TRACK               *
+         ST        R8,RNBLOCKS         * PUT IT BACK                 *
+OFFINSWH MVI       0(R5),X'40'         * TURN ON CC BIT              *
+         LR        R7,R5               * NEED IT HERE TOO            *
+         AR        R5,R3               * GO TO END OF NEXT TRACK     *
+         MVI       0(R5),X'00'         * TURN OFF CC BIT             *
+         A         R7,=F'4'            * GO TO NEXT CCW              *
+         ST        R7,CHGRDCC          * FOR COMPARISON IN CONVERT   *
+         LR        R9,R7               * REQUIRE IT HERE TOO         *
+         ST        R7,NEXTTIC          * NOW PUT IT BACK FOR LATER   *
+         STH       R7,RDTIC2+2         * CHANGE THE TIC POINTER      *
+         SRL       R7,16               *                             *
+         STC       R7,RDTIC2+1         *                             *
+         MVC       RDSRADDR(4),READIOB+35    GET THE TRK ADDRESS     *
+         BAL       R4,NEXTRKRD         * CHANGE THE TRACK ADDRESS    *
+         MVC       READIOB+35(4),RDSRADDR  PUT IT IN THE IOB         *
+         EXCP      READIOB             *                             *
+         BAL       R4,WAITFORD         *                             *
+WHERETO  L         R8,RNBLOCKS         * GET THE NO OF BLKS READ IN  *
+         AH        R8,INBLK            * ADD A TRACK                 *
+         ST        R8,RNBLOCKS         * AND PUT IT BACK             *
+FIRSTSW  EQU       *+1                 * FOR PROPER INIT ROUTINE     *
+         BC        0,IDONT             *                             *
+         MVI       0(R5),X'40'         * TURN OFF THE SWITCH         *
+         ST        R5,LASTRDSW         * LAST RD SWITCH ON           *
+         L         R9,BNDCHPG3         * GET LAST CCW CC ADDRESS     *
+         ST        R9,LASTWRSW         * TO INITIALIZE WRITE         *
+         B         OPWRITE             * NO? - CONTINUE              *
+IDONT    C         R9,BNDCHPG1         * IS THE FIRST BLOCK READ IN? *
+         BL        OFFINSWH            * NO - READ ANOTHER TRACK     *
+         MVI       0(R5),X'40'         * TURN OFF THE SWITCH         *
+         ST        R5,LASTRDSW         * TO INITIALIZE THE WRITE     *
+         L         R9,BNDCHPG3         * TO INITIALIZE THE WRITE     *
+         ST        R9,LASTWRSW         *                             *
+* OPEN SYSUT2 SYSCTLG DATA SET         *                             *
+OPWRITE  LA        R6,JFCBAREA         * GET THE ADDRESS OF JFCBAREA *
+         RDJFCB    WRITEDCB            * READ THE JFCB               *
+         MVC       0(44,R6),DSNAME2    * MOVE IN THE SYSCTLG DSNAME  *
+         XI        76(R6),X'80'        * TURN ON THE HIGH ORDER BIT  *
+         OPEN      (WRITEDCB,(OUTPUT)),TYPE=J                        *
+         TM        WRITEDCB+48,X'10'   * WAS THE OPEN SUCCESSFUL?    *
+         BC        8,WRUNOPEN          * NO - TERMINATE JOB          *
+         MVI       OUTPUTSW,X'00'      * ALLOW A CLOSE FOR WRITEDCB  *
+         B         PCONT               * CONTINUE                    *
+WRUNOPEN BAL       R12,ERROR           * WRITE OUT ERROR MESSAGE     *
+         DC        H'9'                * 9TH ERROR MESSAGE           *
+PCONT    LA        R5,WRITEDCB         * GET THE DCB ADDRESS         *
+         L         R5,44(R5)           * GET THE DEB ADDRESS         *
+         MVC       WRITEIOB+35(4),38(R5)  GET THE INITIAL TRK ADDR   *
+         MVC       WRSRADDR(4),38(R5)  *  WANT IT HERE TOO           *
+         ST        R5,WRITEIOB+28      * PUT THE DEB ADDRESS IN IOB  *
+         L         R7,WRSRADDR         * GET THE FIRST WRITE ADDRESS *
+         ST        R7,OTRKADDR         * FOR THE CONVERSION ROUTINE  *
+         LH        R6,42(R5)           * GET THE LAST CYLINDER ADDR  *
+         SH        R6,WRSRADDR         * CALC NO OF CYL              *
+         MH        R6,OUTTRK           * CALC NO OF TRACKS           *
+         LH        R5,44(R5)           * GET LAST OF TRK ADDRESS     *
+         LA        R5,1(R5)            * PLUS TRACK ZERO             *
+         SH        R5,WRSRADDR+2       * CALC NO OF TRACKS           *
+         AR        R6,R5               * CALC TOTAL NO OF TRACKS     *
+         MH        R6,OUTBLK           * CALC TOTAL NO OF BLKS       *
+         ST        R6,OBLOCKS          * NO OF OUTPUT BLOCKS AVAILBLE*
+         EJECT
+**********************************************************************
+**********************************************************************
+**                                                                  **
+**                   C O N T R O L   - SYNCHRONIZES ALL OPERATIONS  **
+**                                                                  **
+**********************************************************************
+**********************************************************************
+CONTROL  L         R11,PRNTBLK         * LOAD THE BASE REGISTER      *
+         CLC       WNBLOCKS(4),OBLOCKS * ARE ALL THE OUTPUT BLKS WRIT*
+         BE        ALLWRIT             * IF YES CHECK INPUT SYSCTLG  *
+         CLC       RNBLOCKS(4),NBLOCKS * ARE ALL THE BLOCKS READ IN? *
+         BE        ALLREAD             * YES? - DENOUEMENT           *
+         CLI       CROSSWCH,X'10'      * IS THE SWITCH ON?           *
+         BE        DOMAXIO             * DO I/O ON 1/3 BLOCK         *
+         CLI       PROCSWCH,X'10'      * HAS A BLK JUST BEEN PROCESSD*
+         BE        DOMINIO             * YES? DO I/O ON SMALLER OP   *
+         LA        R12,CONTROL         * WANT TO RETURN HERE NEXT    *
+         B         CONVERT             * PROCESS A BLOCK             *
+DOMAXIO  LM        R4,R5,LESSIO        * GET ADDRESS OF I/O ROUTINE  *
+         BALR      R12,R5              * CALCULATE & SET SWITCH      *
+         LA        R12,CONTROL         * GET THE ADDRESS OF CONTROL  *
+         BR        R4                  * DO I/O ON 1/3 BLOCK         *
+DOMINIO  LM        R4,R5,MOREIO        * GET ADDRESS OF I/O ROUTINE  *
+         BALR      R12,R5              * CALCULATE & SET SWITCH      *
+         LA        R12,CONTROL         * GET THE ADDRESS OF CONTROL  *
+         BR        R4                  * DO SMALLER I/O ROUTINE      *
+ENDOFILE MVC       LINE(39),THISMANY   * MOVE IN MESSAGE             *
+         L         R3,UBLOCKS          * GET NO OF USED BLOCKS       *
+         CVD       R3,DWORK            * CONVERT TO DECIMAL          *
+         UNPK      LINE+1(4),DWORK+5(3)  MOVE IT IN LINE             *
+         OI        LINE+4,X'F0'        *                             *
+         BAL       R12,PRINT           * PRINT NO OF BLOCKS USED     *
+         BAL       R12,FORMAT          * ZAP FORMAT BYTE IN DSCB     *
+         MVC       LINE(128),FINALPRT  * SET UP COMPLETION MESSAGE   *
+         BAL       R12,PRINT           * PRINT FINAL MESSAGE         *
+         B         ENDJOB              * FINISHED !                  *
+         EJECT
+**********************************************************************
+**********************************************************************
+**                                                                  **
+**               P H A S E   F O U R  -  MOVE THE CATALOGUE         **
+**                                                                  **
+**********************************************************************
+**********************************************************************
+**********************************************************************
+*                                                                    *
+*                  D E N O U E M E N T                               *
+*                                                                    *
+**********************************************************************
+ALLREAD  SR        R5,R5               * FOR ZEROING BLOCKS          *
+         SR        R6,R6               *       SAME                  *
+         L         R3,LASTRDSW         * WHERE TO START ZEROING      *
+         S         R3,=F'4'            * GO BACK 4 BYTES             *
+         L         R3,0(R3)            * GET 1ST HALF OF CCW         *
+         LA        R3,272(R3)          * START ZEROING HERE          *
+         L         R4,LASTWRSW         * WHERE TO STOP ZEROING?      *
+         S         R4,=F'4'            * GO BACK 4 BYTES             *
+         L         R4,0(R4)            * GET FIRST HALF OF CCW       *
+         LA        R4,272(R4)          * STOP ZEROING HERE           *
+         C         R4,BOUND3           * IS IT OUT OF RANGE          *
+         BE        REDEFIN4            * REDEFINE R4                 *
+ZEROBCT  LA        R7,34               * NO OF DOUBLE WORDS/BLK      *
+         LA        R12,ZEROBLK         * RETURN ADDRESS              *
+         C         R3,BOUND3           * IS IT OUT OF RANGE?         *
+         BE        REDEFINE            * YES - GO TO BEGINNING       *
+ZEROBLK  STM       R5,R6,0(R3)         * ZERO TWO WORDS AT A TIME    *
+         LA        R3,8(R3)            * GO TO NEXT DOUBLE WORD      *
+         BCT       R7,ZEROBLK          * DO ENTIRE BLOCK             *
+         LA        R12,ANBCT           * RETURN ADDRESS              *
+         C         R3,BOUND3           * IS IT OUT OF RANGE          *
+         BE        REDEFINE            * GO TO BEGINNING             *
+ANBCT    CR        R3,R4               * ENOUGH DONE?                *
+         BE        CONTWR              * FINISHED THIS PART          *
+         B         ZEROBCT             * NO - GO BACK                *
+REDEFINE L         R3,BLKADDR          * REDEFINE ADDRESS            *
+         BR        R12                 * GO BACK                     *
+REDEFIN4 L         R4,BLKADDR          * REDEFINE REG 4              *
+         B         ZEROBCT             * GO BACK                     *
+CONTWR   MVI       COUNT+1,X'00'       * TURN OF BRANCH SWITCH       *
+FINISHWR L         R3,SWFORWR          * GET PROPER SWITCH ADDRESS   *
+         CLI       0(R3),X'10'         * HAS A BLK BEEN PROCESSED?   *
+         BE        WRITEAGN            * WRITE ANOTHER TRACK         *
+         BAL       R12,CONVERT         * PROCESS A BLOCK             *
+         L         R11,PRNTBLK         * RESTORE THE BASE REGISTER   *
+WRITEAGN BAL       R12,WRSWITCH        * SET UP CCW'S                *
+         BAL       R12,OUTPUT          * WRITE A TRACK               *
+         LA        R12,FINISHWR        * GET THE RETURN ADDRESS      *
+         L         R3,WNBLOCKS         * GET NO OF BLOCKS WRITTEN OUT*
+         C         R3,OBLOCKS          * ARE THEY ALL WRITTEN OUT    *
+         BL        ZEROAGN             * NO - CONTINUE WRITE         *
+         B         ENDOFILE            * END JOB                     *
+ZEROAGN  L         R3,CHGWRCC          * GET START OF LAST WRITE     *
+         L         R3,0(R3)             * GET HALF OF CCW          *
+         LA        R3,0(R3)            * REQUIRE ADDRESS ONLY        *
+         SR        R5,R5               * FOR ZEROING                 *
+         SR        R6,R6               * FOR ZEROING                 *
+         LH        R4,OUTBLK           * GET OUTPUT BLKS/TRK         *
+         ST        R12,REG15           * SAVE FOR RETURN             *
+         LA        R12,THISBCT         * REQUIRE THIS RETURN ADDRESS *
+NOTHING  LA        R7,34               * NO OF DOUBLE WORDS/BLOCK    *
+ALLZERO  STM       R5,R6,0(R3)         * ZERO A DOUBLE WORD AT A TIME*
+         LA        R3,8(R3)            * GO TO NEXT DOUBLE WORD      *
+         BCT       R7,ALLZERO          * DO A BLOCK                  *
+         C         R3,BOUND3           * IS IT OUT OF RANGE?         *
+         BE        REDEFINE            * REDEFINE REGISTER 3         *
+THISBCT  BCT       R4,NOTHING          * DO A TRACK                  *
+         L         R12,REG15           * GO BACK FOR CONVERSION RTN  *
+         BR        R12                 * GO BACK                     *
+* FINISH READING IN THE REST OF THE CATALOG & CHECK FOR ANY USED BLOCKS
+ALLWRIT  MVC       WMINSIZE(4),WNBLOCKS  MOVE NO OF BLOCKS WRITTEN   *
+WALLWRIT L         R4,CHGRDCC          * GET ADDR OF LAST READ CHAIN *
+         L         R4,0(R4)            * GET 1ST HALF OF THIS CCW    *
+         LA        R4,8(R4)            * GO TO KEY ADDRESS           *
+ALLRIGHT L         R3,LASTWRSW         * PNTR TO LAST WRITE CCW      *
+         S         R3,=F'4'            * GO TO FIRST HALF            *
+         L         R3,0(R3)            * GET FIRST HALF OF CCW       *
+         LA        R3,8(R3)            * GO TO KEY ADDRESS           *
+T        LA        R3,272(R3)          * GO TO NEXT BLK              *
+         C         R3,BOUND3           * IS IT OUT OF RANGE?         *
+         BH        REDEFAD             * YES - REDEFINE ADDRESS      *
+U        CR        R3,R4               * FINISHED THIS REGION?       *
+         BE        MORERD              * YES - READ IN SOME MORE     *
+         L         R5,WMINSIZE         * GET NO OF BLKS WRITTEN      *
+         AH        R5,ONE              * ADD A BLOCK                 *
+         ST        R5,WMINSIZE         * UPDATED VALUE               *
+         CLC       0(4,R3),=X'FFFFFFFF'  IS THE BLOCK USED?          *
+         BNE       T                   * NO - CONTINUE SEARCH        *
+         LA        R12,T               * GET RETURN ADDRESS          *
+         B         HOWSMALL            * CALCULATE MINIMUM SIZE      *
+REDEFAD  L         R3,BLKADDR          * REDEFINE THE ADDRESS        *
+         LA        R3,8(R3)            * GO TO KEY ADDRESS           *
+         B         U                   * CONTINUE                    *
+MORERD   L         R3,CHGRDCC          * GET ADDRESS OF LAST READ CCW*
+         LA        R12,SMALLCON        * REQUIRE RETURN ADDRESS      *
+         LH        R4,INBLK            * GET INPUT BLKS PER TRK      *
+         L         R3,0(R3)            * GET FIRST HALF OF CCW       *
+         LA        R3,8(R3)            * REQUIRE ADDRESS OF KEY      *
+         C         R3,BOUND3           *                             *
+         BL        KEYSRCH             *                             *
+         L         R3,BLKADDR          *                             *
+         LA        R3,8(R3)            *                             *
+KEYSRCH  L         R6,WMINSIZE         * GET MIN SIZE OF CATLG       *
+         AH        R6,ONE              *                             *
+         ST        R6,WMINSIZE         * UPDATED VALUE               *
+         CLC       0(4,R3),=X'FFFFFFFF'  IS THE BLOCK USED?          *
+         BE        HOWSMALL            * YES - CALC MIN SIZE REQ'D   *
+SMALLCON LA        R3,272(R3)          * GO TO NEXT BLOCK            *
+         C         R3,BOUND3           * IS IT OUT OF RANGE?         *
+         BH        GOON                *                             *
+KEYBCT   BCT       R4,KEYSRCH          * CHECK A TRACK               *
+         CLC       RNBLOCKS(4),NBLOCKS * ARE THEY ALL READ IN?       *
+         BE        TOOSMALL            *                             *
+         BAL       R12,RDSWITCH        * SET UP READ                 *
+         BAL       R12,INPUT           * READ A TRACK                *
+         B         MORERD              * DO THE NEXT READ            *
+HOWSMALL L         R6,WMINSIZE         * GET THIS VALUE              *
+         AH        R6,ONE              *                             *
+         SRDA      R6,32               * FOR DIVISION                *
+         LH        R8,OUTBLK           * GET OUTPUT BLKS/TRK         *
+         DR        R6,R8               * CALC NO OF OUTPUT TRKS REQ'D*
+         LTR       R6,R6               * IS THERE A REMAINDER?       *
+         BZ        NOREM               *                             *
+         AH        R7,ONE              * ADD ANOTHER TRACK           *
+NOREM    ST        R7,MINSIZE          8 STORE THIS VALUE HERE       *
+         BR        R12                 * GO BACK                     *
+GOON     L         R3,BLKADDR          * REDEFINE THE ADDRESS        *
+         LA        R3,8(R3)            * GO TO KEY ADDRESS           *
+         B         KEYBCT              * CONTINUE                    *
+TOOSMALL L         R3,MINSIZE          * TO CALCULATE REQ6D SIZE     *
+         LTR       R3,R3               * IS THE CTLG TOO SMALL?      *
+         BZ        ENDOFILE            * NO - CONTINUE               *
+*CONVERT VALUE TO DECIMAL AND PRINT REQ'D SYSCTLG SIZE               *
+         CVD       R3,DWORK            * CONVERT TO DECIMAL          *
+         UNPK      SIZMSG+39(4),DWORK+5(3)  UNPACK IT                *
+         OI        SIZMSG+42,X'F0'     *                             *
+         MVC       LINE(50),SIZMSG     * MOVE IN THE MESSAGE         *
+         BAL       R12,PRINT           * PRINT IT                    *
+         BAL       R12,ERROR           * ERROR MESSAGE               *
+         DC        H'10'               * TENTH ERROR MESSAGE         *
+         EJECT
+**********************************************************************
+*                                                                    *
+*                     I N P U T                                      *
+*                                                                    *
+**********************************************************************
+INPUT    L         R3,CHGRDCC          * GET THE STRT OF NXT INPUT CCW
+         LH        R4,INBLK            * GET INPUT BLK/TRK           *
+         LA        R7,RADJ             *                             *
+CHGRCODE MVI       0(R3),X'1E'         * CHANGE THE CODE             *
+         LA        R3,8(R3)            * GO TO NEXT CCW              *
+         C         R3,BNDCHPG3         *                             *
+         BH        ADJCOADR            *                             *
+RADJ     BCT       R4,CHGRCODE         * DO AS MANY AS NECESSARY     *
+READATRK BAL       R4,NEXTRKRD         * CALCULATE THE NEXT TRK ADDR *
+         MVC       READIOB+35(4),RDSRADDR  IOB REQUIRES ADDRESS      *
+         EXCP      READIOB             * READ A TRACK                *
+         BAL       R4,WAITFORD         * WAIT FOR READ               *
+UCONT    L         R3,RNBLOCKS         * GET NO OF BLKS READ IN      *
+         AH        R3,INBLK            * ADD ANOTHER TRACK           *
+         ST        R3,RNBLOCKS         * UPDATED VALUE               *
+         L         R3,SWFORRD          * GET THE RIGHT SWITCH ADDR   *
+         MVI       0(R3),X'40'         * TURN THE SWITCH OFF         *
+         L         R3,LASTRDSW         * GET THE CMMD CHAIN SW ADDR  *
+         MVI       0(R3),X'40'         * TURN THIS SWITCH OFF        *
+         BR        R12                 * GO BACK TO CONTROL          *
+**********************************************************************
+*                                                                    *
+*                   O U T P U T                                      *
+*                                                                    *
+**********************************************************************
+OUTPUT   L         R3,CHGWRCC          * GET START OF NXT CCW PTR    *
+         LH        R4,OUTBLK           * GET NO OF OUTPUT BLK/TRK    *
+         LA        R7,WADJ             *                             *
+CHGWCODE MVI       0(R3),X'1D'         * CHANGE THE CODE             *
+         LA        R3,8(R3)            * GO TO NEXT CCW              *
+         C         R3,BNDCHPG3         *                             *
+         BH        ADJCOADR            *                             *
+WADJ     BCT       R4,CHGWCODE         * DO AS MANY AS NECESSARY     *
+WRITATRK BAL       R4,NEXTRKWR         * CALCULATE WRITE TRK ADDRESS *
+         MVC       WRITEIOB+35(4),WRSRADDR  IOB REQUIRES ADDRESS     *
+         EXCP      WRITEIOB            * WRITE A TRACK               *
+         BAL       R4,WAITFOWR         * WAIT FOR WRITE              *
+VCONT    L         R3,WNBLOCKS         * NO OF BLKS WRITTEN          *
+         AH        R3,OUTBLK           * ADD ANOTHER TRACK           *
+         ST        R3,WNBLOCKS         * UPDATED VALUE               *
+         L         R3,SWFORWR          * GET THE WRITE SWITCH ADDR   *
+         MVI       0(R3),X'40'         * TURN OFF THE SWITCH         *
+         L         R3,LASTWRSW         * GET CMMD CHAIN SW ADDR      *
+         MVI       0(R3),X'40'         * TURN THIS SWITCH OFF        *
+         BR        R12                 * GO BACK TO CONTROL          *
+         EJECT
+**********************************************************************
+*                                                                    *
+*        T H E  A L L  I M P O R T A N T  C O N V E R S I O N        *
+*                                                                    *
+**********************************************************************
+CONVERT  ST        R12,REG12           * SAVE THIS REGISTER FOR LATER*
+         L         R3,MBLKADDR         * INITIAL ADDRESS OF BLOCK    *
+         LH        R7,MINBLK           *  MIN BLKS PER TRACK         *
+NEXTSTEP SR        R5,R5               *                             *
+         IC        R5,SAVEREC          * GET THE NEXT RECORD NUMBER  *
+         SH        R5,ONE              * SUBTRACT ONE                *
+         LTR       R5,R5               * IS IT ZERO /                *
+         BNZ       NEWBLK              * IF NOT DON'T UPDATE ADDRESS *
+         LH        R6,OTRKADDR+2       *   PICK UP THE (HH)          *
+FIRST    B         ONCE                * BRANCH FIRST TIME THRU ONLY *
+         AH        R6,ONE              *  ADD 1                      *
+         CH        R6,OUTTRK           * IS IT AT MAXIMUM            *
+         BL        TRKOK               * NO - ITS STILL OK           *
+         MVC       OTRKADDR+2(2),=X'0000' SAVE NEW (HH)              *
+         LH        R6,OTRKADDR         * PICK UP (CC)                *
+         AH        R6,ONE              * INCREMENT BY 1              *
+         STH       R6,OTRKADDR         * SAVE THIS TOO               *
+         B         NEWBLK              *                             *
+ONCE     MVI       FIRST+1,X'00'       *   SET BRANCH TO NOP         *
+TRKOK    STH       R6,OTRKADDR+2       *  SAVE NEW (HH)              *
+NEWBLK   L         R11,CBLOCKS         * GET NO OF BLOCKS PROCESSED  *
+         AH        R11,ONE             * ADD A BLOCK                  8
+         ST        R11,CBLOCKS         * UPDATED VALUE               *
+         MVC       4(1,R3),SAVEREC     * INSERT RECORD               *
+         MVC       0(4,R3),OTRKADDR    * INSERT CURRENT TRK ADDRESS  *
+COUNT    B         ABRANCH             * BRANCH UNTIL ALL INPUT OUT  *
+         MVC       5(3,R3),COUNTINF    * MOVE IN 3 BYTES OF COUNT    *
+ABRANCH  CLC       8(2,R3),=X'0000'    * CHECK FOR KEY ZERO          *
+         BE        CONEND              * IF SO - DON'T TOUCH IT      *
+         L         R8,UBLOCKS          * GET NO OF USED BLOCKS       *
+         AH        R8,ONE              * ADD ANOTHER BLOCK           *
+         ST        R8,UBLOCKS          * UPDATED VALUE               *
+         LA        SEARCH,18(R3)       * SEARCH POINTS TO FIRST ENTRY*
+*  THIS IS DONE ONLY ONCE - ON FIRST BLOCK OF CATALGUE               *
+NOP      NOP        INITIAL            *                             *
+         MVI        NOP+1,X'F0'        * SWITCH  TO EXECUTE ONLY ONCE*
+         LA        DISP,8              * POINT TO FIRST TTR OF V.I.C.E
+         BAL       12,CVTREPL          * CONVERT AND REPLACE         *
+         LA        DISP,12             * PICK OUT NEXT TTR           *
+         L         R10,OBLOCKS         * GET NO OF OUTBLKS           *
+         BAL       12,LASTBLK          *    CONVERT                  *
+         LA        DISP,16             * PICK OUT LAST TTR OF V.I.C.E*
+         BAL       12,CVTREPL          *    AND CONVERT ALSO         *
+         LA        SEARCH,22(SEARCH)   * INCREMENT TO NEXT ENTRY     *
+         MVC       DATACNT(2),16(R3)   *  SAVE DATA COUNT FOR BLOCK  *
+         B         LOOP                * BRANCH AND DETERMINE ENTRY  *
+INITIAL  MVC       DATACNT(2),16(R3)   * PICK UP DATA COUNT OF BLOCK *
+CHECKVCB LA        R5,8(R3)            *  TEST - IF NOT A V.C.B      *
+         AH        R5,DATACNT          *   OTHER BLKS WILL HAVE      *
+         CLC       0(4,5),=X'FFFFFFFF' *            OF BLOCK         *
+         BE        KEEPON              *    LOOKS NORMAL             *
+         CLC       239(10,SEARCH),=X'00000000000000000000' MAYBE'V.C.B.
+         BE        VOLCTBLK            * QUESS SO                    *
+         B         BADBLOCK            * SETEUP ERROR MESSAGE        *
+*   CHECK FOR INDEX CONTROL ENTRY      *                             *
+KEEPON   CLI       7(SEARCH),X'01'     *                             *
+         BE        INDEXCNT            *                             *
+*   CHECK FOR INDEX LINK ENTRY         *                             *
+LOOP     LA        R5,16(R3)           * R5 POINTING AT DATA IN BLOCK*
+         AH        R5,DATACNT          * POINTING AT END OF DATAIN BLK
+         CR        SEARCH,R5           * CHECK FOR OVERFLOW ERROR    *
+         BNH       OK                  *                             *
+         B         BADBLOCK            * SET UP  ERROR MESSAGE       *
+OK       CLI       7(SEARCH),X'FF'     *                             *
+         BE        INDEXLNK            *                             *
+*   CHECK FOR DUMMY FIELD OF ZEROS     *                             *
+         CLC       8(3,SEARCH),=X'000000'                            *
+         BNE       TTRRTN              * CONVERT TTR'S OF THIS ENTRY *
+         SR        5,5                 * MAKE SURE NOTHING IN REG    *
+         IC        5,11(SEARCH)        * OTHERWISE PICK UP HALFWORDS *
+         SLL       5,1                 * LEFT--MULTIPY BY 2          *
+         LA        SEARCH,12(5,SEARCH) * AND INCREMENT SEARCH TO NEXT*
+         B         LOOP                * ENTRY - BRANCH TO LOOP      *
+*   ALL OTHER ENTRYS FOLLOW SAME TTR PATTERN - FIND AND CONVERT      *
+TTRRTN   LA        DISP,8              * DISTANCE INTO ENTRY-TTR     *
+         BAL       12,CVTREPL          * CONVERT AND REPLACE         *
+         SR        5,5                 * ZERO OUT REG 5              *
+         IC        5,11(SEARCH)        * PICK UP COUNT FIELD         *
+         SLL       5,1                 * MULTIPY BY 2                *
+         LA        SEARCH,12(5,SEARCH) * INCREMENT SEARCH TO NEXT ENTY
+         B         LOOP                * GO LOOK FOR ANOTHER ENTRY   *
+**********************************************************************
+*                                                                    *
+*        T  T  R  C O N V E R S I O N   R O U T I N E                *
+*                                                                    *
+**********************************************************************
+*  ROUTINE TO CONVERT AND REPLACE A GIVEN TTR                        *
+CVTREPL  SR        10,10               * ZERO OUT REGS               *
+         IC        10,1(DISP,SEARCH)   * LOAD T                      *
+         SLL       10,8                * MAKE ROOM FOR THE R         *
+         IC        10,2(DISP,SEARCH)   * LOAD THE R                  *
+TTRVERT  SRDL      10,8                * PUT THE R IN REG 11         *
+         MH        10,INBLK            * MULTIPLY BY BLK/TRK         *
+         SRL       11,24               * PUT R IN LOW ORDER POSITION *
+         AR        10,11               * ADD THE R                   *
+         C         R10,NBLOCKS         * IS THE TTR OUT OF RANGE?    *
+         BNH       LASTBLK             * IF NOT - CONTINUE           *
+         B         BADBLOCK            * SET UP ERROR MESSAGE        *
+LASTBLK  LR        5,10                * PUT ABSOLUTE VALUE IN R5    *
+         SR        4,4                 * ZERO OUT REG 4              *
+         LH        6,OUTBLK            *                             *
+         DR        4,6                 *                             *
+         LR        11,5                * PUT T BACK IN REG 11        *
+         SLL       11,8                * SHIFT OVER _ ROOM FOR R     *
+         AR        11,4                * ADD IN THE R                *
+REPLACE  STC       11,2(DISP,SEARCH)   * STORE THE R                 *
+         STC       11,TEST             * CHECK FOR RECORD OF ZERO    *
+         CLI       TEST,X'00'          *                             *
+         BNE       CARRYON             * GOOD --  FORGET IT          *
+         SR        5,5                 * OOPS THAT CAN'T BE BETTER   *
+         IC        5,OUTBLK+1          * MAKE IT THINK IT'S LAST REC *
+         STC       5,2(DISP,SEARCH)    *     AND STORE IT            *
+         SRL       11,8                *   NOW WE HAVE TO FIX THE TT *
+         S         11,=F'1'            *  SHIFT OUT THE R AND        *
+         STC       11,1(DISP,SEARCH)   *   SUBTRACT 1 AND STORE IT   *
+         BR        12                  *                             *
+CARRYON  SRL       11,8                * SHIFT OUT THE R             *
+         STC       11,1(DISP,SEARCH)   * REPLACE TT WITH NEW TT      *
+         BR        12                  * RETURN                      *
+*   CONTROL BLOCK ROUTINE              *                             *
+VOLCTBLK CLC       8(3,SEARCH),=X'000000' IF TTR IS ZERO DON'T TOUCH *
+         BE        CONEND              * JUST PRINT OUT BLOCK        *
+         LA        DISP,249            * POINT OUT BEGINNING OF TTR  *
+         BAL       12,CVTREPL          * REPLACE WITH NEW TTR        *
+         B         CONEND              * PRINT OUT CONVERTED BLOCK   *
+*   INDEX CONTROL ENTRY ROUTINE        *                             *
+INDEXCNT LA        DISP,8              *  PICK UP BOTH               *
+         BAL       12,CVTREPL          *    TTR'S IN THIS TYPE       *
+         LA        DISP,12             *         OF ENTRY AND        *
+         BAL       12,CVTREPL          *               CONVERT       *
+         LA        SEARCH,18(SEARCH)   *  INCREMENT TO NEXT ENTRY    *
+         B         LOOP                *  DETERMINE NEXT ENTRY TYPE  *
+*    INDEX LINK ENTRY ROUTINE          *                             *
+INDEXLNK CLC       8(3,SEARCH),=X'000000' IF TTR ZERO -'DON'T        *
+         BE        CONEND              *  CONVERT - JUST PRINT       *
+         LA        DISP,8              *  PICK UP TTR                *
+         BAL       12,CVTREPL          *      CONVERT AND REPLACE    *
+*    END OF BLOCK ROUTINES             *                             *
+CONEND   SR        R5,R5               *                             *
+         IC        R5,SAVEREC          * PICK UP OLD RECORD NO       *
+         A         R5,=F'1'            * INCREMENT BY 1              *
+         CH        R5,OUTBLK           * IS THE RECORD NUMBER ILLEGAL*
+         BH        REDEFREC            * IF YES - REDEFINE IT        *
+RECREDEF STC       R5,SAVEREC          * SAVE IT AGAIN               *
+         B         FIRSTIME            * SKIP THE FOLLOWING          *
+REDEFREC IC        R5,=X'01'           * REDIFINE THE RECORD NUMBER  *
+         B         RECREDEF            * CONTINUE                    *
+FIRSTIME B         ANCONT              *                             *
+         CL        R3,BOUND1           * GO TO NEXT BLOCK            *
+         BE        SETCROS             * HAS THE 1ST BNDRY BEEN CROSD*
+         CL        R3,BOUND2           * YES TURN ON SWITCH          *
+         BE        SETCROS             * HAS IT HIT 2ND BOUNDARY     *
+         CL        R3,BLKADDR          * TURN ON THIS SWITCH         *
+         BE        SETCROS             * HAS THE THIRD BNDRY BEEN CRS*
+         B         CONCONT             * NO - SKIP THE FOLLOWING     *
+ANCONT   MVI       FIRSTIME+1,X'00'    * GO BACK TO FIRST OF BLOCK   *
+         B         CONCONT             * SAVE INITIAL BLK ADDR AGAIN *
+SETCROS  MVI       CROSSWCH,X'10'      * TURN ON THE SWITCH          *
+CONCONT  LA        R3,272(R3)          * GO TO NEXT BLOCK            *
+         CL        R3,BOUND3           *  SET SWITCH ON              *
+         BNE       CHECKBCT            * SKIP THE NEXT LINE          *
+         L         R3,BLKADDR          * GO TO NEXT BLOCK            *
+         ST        R3,MBLKADDR         * PROCESS ANOTHER BLOCK       *
+CHECKBCT BCT       R7,NEXTSTEP         * WE ARE FINISHED             *
+         MVI       PROCSWCH,X'10'      *                             *
+         ST        R3,MBLKADDR         *                             *
+         L         R12,REG12           * REQUIRE RETURN ADDRESS      *
+         BR        R12                 *                             *
+BADBLOCK L         R11,PRNTBLK         * LOAD BASE REGISTER          *
+         LR        R6,R3               * GET CURRENT ADDRESS OF BLOCK*
+SNAPSW   EQU       *+1                 * COULD BE NO SYSPRINT DD CARD*
+         BC        0,NOSNAP            * SKIP NEXT PART              *
+DUMP     ST        R6,LIST             * START THE DUMP HERE         *
+         LA        R6,280(R6)          * GO IN 8 BYTES OF NEXT BLK   *
+         ST        R6,LIST+4           * END THE DUMP HERE           *
+         XI        LIST+4,X'80'        * TURN ON THE HIGH ORDER BIT  *
+         SNAP      DCB=PRINTER2,PDATA=REGS,LIST=LIST                  *
+NOSNAP   MVC       LINE(50),ILLEGENT   * MOVE IN THE ERROR MESSAGE   *
+         MVC       LINE+27(6),INFO+25  * PUT IN THE FROM VOLUME LABEL*
+         L         R8,CBLOCKS          * GET NO OF BLOCKS PROCESSED  *
+         MVC       BADTRKAD(4),INSTART * INITIALIZE THIS VALUE       *
+         LH        R5,INBLK            * GET INPUT BLOCKS PER TRACK  *
+         SRDA      R8,32               * FOR DIVISION                *
+         DR        R8,R5               * GET RELATIVE TRK ADDRESS    *
+         LH        R6,BADTRKAD+2       * GET TRK VALUE               *
+FINDTRK  AH        R6,ONE              * ADD A TRACK                 *
+         CH        R6,INTRK            * IS THE TRK ADDR ILLEGAL?    *
+         BL        CTRK                * NO - CONTINUE               *
+         LH        R6,BADTRKAD         * GET CYLINDER ADDRESS        *
+         AH        R6,ONE              * INCREMENT CYLINDER VALUE    *
+         STH       R6,BADTRKAD         *  PUT IT BACK                *
+         SR        R6,R6               * ZERO THIS REGISTER          *
+CTRK     STH       R6,BADTRKAD+2       *  STORE TRACK VALUE          *
+         BCT       R9,FINDTRK          * CALCULATE TRK ADDRESS       *
+         STC       R8,BADTRKAD+4       * STORE RECORD NUMBER         *
+         UNPK      LINE+51(11),BADTRKAD(6)                           *
+         NC        LINE+51(10),ANDIT   * CLEAR THE HIGH ORDER BIT    *
+         LA        R10,TRANSTBL        * GET ADDRESS OF CHAR TABLE   *
+         LA        R5,LINE+51          * GET ADDRESS OF LINE AREA    *
+         TR        0(10,R5),0(R10)     * TRANSLATE THE TRK ADDR      *
+         BAL       R12,PRINT           * PRINT THE MESSAGE           *
+         B         CONEND              * GO TO NEXT BLK              *
+         EJECT
+**********************************************************************
+*                                                                    *
+*   S E T  C O M M A N D  C H A I N  A N D  U P D A T E  T I C 2     *
+*                                                                    *
+**********************************************************************
+RDSWITCH L         R3,BNDCHPG3         * FOR COMPARISON PURPOSES     *
+         L         R6,LASTRDSW         * GET ADDRESS OF LAST RD CCW+4*
+         LR        R7,R6               *                             *
+         CR        R7,R3               * IS IT OUT OF RANGE?         *
+         BNL       WRAPRD1             * YES - CORRECTION REQUIRED   *
+         LA        R7,4(R7)            * DISPLACEMENT CORRECTION     *
+RDSW1    ST        R7,CHGRDCC          * BEGINNING OF CHAIN          *
+         STH       R7,RDTIC2+2         * PUT ADDRESS AT TIC COMMAND  *
+         SRL       R7,16               *                             *
+         STC       R7,RDTIC2+1         *                             *
+         LH        R10,INBLK           * GET INPUT BLKS/TRK          *
+         SLA       R10,3               * MULTIPLY BY 8               *
+         AR        R6,R10              * END OF COMMAND CHAIN?       *
+         CR        R6,R3               * IS IT REALLY?               *
+         BH        WRAPRD2             * NO.                         *
+RDSW2    MVI       0(R6),X'00'         * TURN OFF COMMAND CHAIN      *
+         ST        R6,LASTRDSW         * LAST END OF COMMAND CHAIN   *
+         BR        R12                 * GO BACK - FINISHED HERE     *
+WRAPRD1  L         R5,CHPG             * GET START OF CHANNEL PGM    *
+         SR        R7,R3               * GET NEW DISPLACEMENT        *
+         AR        R7,R5               * FROM BEGINNING              *
+         B         RDSW1               * RETURN                      *
+WRAPRD2  L         R5,CHPG             * GET ADDRESS OF CHANNEL PGM  *
+         SR        R6,R3               * GET DISPLACEMENT            *
+         AR        R6,R5               * FROM BEGINNING              *
+         S         R6,=F'4'            * DISPLACEMENT CORRECTION     *
+         B         RDSW2               * CONTINUE                    *
+WRSWITCH L         R3,BNDCHPG3         * FOR COMPARISON              *
+         L         R6,LASTWRSW         * GET LAST CCW ADDRESS+4      *
+         LR        R7,R6               *                             *
+         CR        R7,R3               * IS IT OUT OF RANGE?         *
+         BNL       WRAPWR1             * YES - CORRECTION REQUIRED   *
+         LA        R7,4(R7)            * DISPLACEMENT CORRECTION     *
+WRSW1    ST        R7,CHGWRCC          * BEGINNING OF CHAIN          *
+         STH       R7,WRTIC2+2         * PUT ADDR AT TIC COMMAND     *
+         SRL       R7,16               *                             *
+         STC       R7,WRTIC2+1         *                             *
+         LH        R10,OUTBLK          * GET OUTBLKS/TRK             *
+         SLA       R10,3               * MULTIPLY BY 8               *
+         AR        R6,R10              * END OF COMMAND CHAIN?       *
+         CR        R6,R3               * IS IT REALLY?               *
+         BH        WRAPWR2             * NO.                         *
+WRSW2    MVI       0(R6),X'00'         * TURN OFF COMMAND CHAIN      *
+         ST        R6,LASTWRSW         * LAST END OF CMMD CHAIN      *
+         BR        R12                 * FINISHED HERE - GO BACK     *
+WRAPWR1  L         R5,CHPG             * GET ADDR OF CHANNEL PGM     *
+         SR        R7,R3               * GET DISPLACEMENT            *
+         AR        R7,R5               * FROM BEGINNING              *
+         B         WRSW1               * CONTINUE                    *
+WRAPWR2  L         R5,CHPG             * GET CHANNEL PGM ADDRESS     *
+         SR        R6,R3               * GET DISPLACEMENT            *
+         AR        R6,R5               * FROM BEGINNING              *
+         S         R6,=F'4'            * DISPACEMENT CORRECTION      *
+         B         WRSW2               * CONTINUE                    *
+ADJCOADR L         R3,CHPG
+         BR        R7
+         EJECT
+**********************************************************************
+*                                                                    *
+*      T R A C K   A D D R E S S   U P D A T I N G   R O U T I N E S *
+*                                                                    *
+**********************************************************************
+NEXTRKRD LH        R6,RDSRADDR+2       * PICK UP LAST TRK READ       *
+         AH        R6,ONE              * ADD ONE TRACK               *
+         CH        R6,INTRK            * IS IT MAX TRK/CYL?          *
+         BL        RTRKOK              * NO? - OK                    *
+ADJCYL   MVC       RDSRADDR+2(2),=X'0000' YES -ZERO OUT THE TRK      *
+CYLADJ   LH        R6,RDSRADDR         * GET CYLINDER NUMBER         *
+         AH        R6,ONE              * GO TO NEXT CYLINDER         *
+         STH       R6,RDSRADDR         * UPDATED ADDRESS             *
+         B         TCONT               * CONTINUE                    *
+RTRKOK   STH       R6,RDSRADDR+2       * UPDATED ADDRESS             *
+TCONT    BR        R4                  * GO BACK                     *
+NEXTRKWR L         R6,CHGWRCC          * GET START OF PROGRAM CHAIN  *
+         L         R6,0(R6)            * GET 1ST HALF OF WRITE INSTR *
+         LA        R6,0(R6)            * REQUIRE LOWER ADDRESS ONLY  *
+         L         R6,0(R6)            * GET WRITE ADDRESS FROM CATLG*
+         ST        R6,WRSRADDR         * PUT IT HERE FOR NOW         *
+         BR        R4                  * NOW GO BACK                 *
+**********************************************************************
+*                                                                    *
+*                  I / O   W A I T    R O U T I N E S                *
+*                                                                    *
+**********************************************************************
+WAITFORD WAIT      1,ECB=READECB       * WAIT FOR LAST READ          *
+         TM        READECB,X'20'       * SUCCESSFUL COMPLETION?      *
+         BC        1,CONTACTR          * YES - CONTINUE              *
+         MVI       ENDJOB+1,X'00'      * TURN OFF THIS BRANCH SWITCH *
+READERR  BAL       R12,ERROR           * GO TO ERROR ROUTINE         *
+         DC        H'5'                * FIFTH ERROR MESSAGE         *
+CONTACTR BR        R4                  * GO BACK NOW                 *
+WAITFOWR WAIT      1,ECB=WRITEECB      * WAIT FOR LAST WRITE         *
+         TM        WRITEECB,X'20'      * SUCCESSFUL COMPLETION?      *
+         BC        1,CONTACTW          * YES - CONTINUE              *
+         MVI       ENDJOB+1,X'00'      * TURN OFF THIS BRANCH SWITCH *
+WRITEERR BAL       R12,ERROR           * GO TO ERROR ROUTINE         *
+         DC        H'8'                * EIGHTH ERROR MESSAGE        *
+CONTACTW BR        R4                  * GO BACK NOW                 *
+                   EJECT
+**********************************************************************
+**********************************************************************
+**                                                                  **
+**           P H A S E   F I V E  -  SPECIFY A FORMATTED CATALOG    **
+**                                   IN THE FORMAT 1 SYSCTLG DSCB.  **
+**********************************************************************
+**********************************************************************
+FORMAT   XI        WRITEDCB+48,X'80'   * TURN OFF THE HIGH ORDER BIT *
+         LA        R3,DSCBAREA         * GET THE ADDR FOR THE FORMAT1*
+         CLOSE     WRITEDCB            * CLOSE THE OUTPUT SYSCTLG DCB*
+         MVI       OUTPUTSW,X'F0'      * WRITEDCB IS ALREADY CLOSED  *
+* MODIFY THE CCW'S TO WRITE THE FORMAT 1 DSCB                        *
+         ST        R3,WRTIC2           * PUT IN ADDRESS OF DATA AREA *
+         MVI       WRTIC2,X'05'        * WRITE DATA COMMAND CODE     *
+         MVI       WRTIC2+7,X'60'      * 96 BYTES TO WRITE           *
+* READ IN THE SYSUT2 JFCB & MODIFY IT                                *
+         LA        R6,JFCBAREA         *                             *
+         RDJFCB    WRITEDCB            * READ THE JOB FILE CONTROL BLK
+         L         R4,=X'04040404'     * FORMAT 4 DSNAME             *
+         LA        R5,11               * 44 BYTES OF F4              *
+         MVC       DSNAME2(44),0(R6)   * MOVE IN THE FORMER DSNAME   *
+CHGDSNAM ST        R4,0(R6)            * CHANGE THE DSNAME           *
+         LA        R6,4(R6)            * BUMP IT 4 BYTES             *
+         BCT       R5,CHGDSNAM         * DO IT 44 TIMES              *
+         XI        32(R6),X'80'        * TURN ON THE HIGH ORDER BIT  *
+         OPEN      (WRITEDCB,OUTPUT),TYPE=J      OPEN DCB            *
+         TM        WRITEDCB+48,X'10'   * DID IT OPEN?                *
+         BC        8,VTOCCLSD          * NO - WRITE OUT MESSAGE      *
+         MVI       OUTPUTSW,X'00'      * ALLOW FOR A WRITEDCB CLOSE  *
+         B         VTOCOPEN            * YES - CONTINUE              *
+VTOCCLSD ST        R12,REG12           * SAVE THIS REGISTER          *
+         BAL       R12,ERROR           * WRITE OUT ERROR MESSAGE     *
+         DC        H'12'               * TWELTH ERROR MESSAGE        *
+         L         R12,REG12           * RECOVER THIS REGISTER       *
+         B         NOZAP               * WRITE OUT THIS MESSG        *
+* READ IN THE FORMAT 1 DSCB USING CAMLST & MODIFY IT                 *
+VTOCOPEN OBTAIN    CTLGDSCB            * READ IN THE DATA PORTION    *
+         MVI       56(R3),X'FF'        * SPECIFY FORMATTED SYSCTLG   *
+         MVC       WRSRADDR(5),96(R3)  * MOVE THE TRACK ADDRESS      *
+         MVC       WRITEIOB+35(5),96(R3)    IN THE IOB TOO           *
+         EXCP       WRITEIOB           * WRITE THE BLOCK BACK        *
+         WAIT       ECB=WRITEECB       * WAIT FOR WRITE              *
+         TM         WRITEECB,X'20'     * SUCCESS?                    *
+         BC         1,FFORMAT          * IF OK WE'RE FINISHED        *
+         BAL        R12,ERROR          * IF NOT WRITE OUT ERROR MSG  *
+         DC         H'11'              * ELEVENTH ERROR MESSAGE      *
+NOZAP    MVC        LINE(96),ZAPFAIL   * SET UP THE PRINT LINE       *
+         ST        R12,REG12           * STORE THIS REGISTER         *
+         BAL        R12,PRINT          * PRINT THIS LINE             *
+         L         R12,REG12           * RECOVER                     *
+FFORMAT  BR         R12                * END THE JOB                 *
+**********************************************************************
+*                                                                    *
+*        E N D   O F   J O B           -CLOSE AND EXIT               *
+*                                                                    *
+**********************************************************************
+ENDJOB   EQU       *                   *                             *
+DEQ      EQU       *+1                 *                             *
+         B         CLRDCB              *                             *
+         DEQ      (QNAME,RNAME,7,STEP),RET=HAVE    DEQ ON SYSCTLG    *
+INPUTSW  EQU       *+1                 *                             *
+CLRDCB   B         CLWDCB              *                             *
+         CLOSE     READDCB             *                             *
+OUTPUTSW EQU       *+1                 *                             *
+CLWDCB   B         CLOSEPRT            *                             *
+         XI        WRITEDCB+48,X'80'   *                             *
+         CLOSE     WRITEDCB            *                             *
+CLOSEPRT OC        NOCLOSE+1(1),PRINTSW  CLOSE SYSPRINT IF OPEN      *
+NOCLOSE  BC        0,EOJ  SHOULD BE BC 0,EOJ                         *
+         CLOSE     PRINTER             *                             *
+         CLOSE     PRINTER2            *                             *
+EOJ      L         13,SAVEAREA+4       *                             *
+         RETURN    (14,12)             *                             *
+**********************************************************************
+*                                                                    *
+*        E R R O R  R O U T I N E      -HANDLES ALL ERROR MESSAGES   *
+*                                                                    *
+**********************************************************************
+ERROR    LH        4,0(12)             * GET THE ERROR CODE          *
+         SLL       4,5                 * MULTIPLY BY 32 AND CALCULATE*
+         LA        3,ERRTAB-32         * GET ADDRESS OF ERROR TABLE  *
+         AR        3,4                 * THE DISPLACEMENT OF MESSAGE *
+         MVC       ERLINE+17(30),0(3)  * AND PUT IT IN PRINT LINE    *
+         MVC       ERACT(2),30(3)      * PUT ERROR LEVEL IN LINE     *
+         CLC       30(2,3),=C'08'      * CHECK SEVERITY LEVEL        *
+         BNH       ACCEPT              * LESS OR EQ 8 IS OK          *
+         MVC       ERACT+14(11),=C'TERMINATED.'                      *
+         MVI       QUITSW,X'F0'        * F0 MEANS FINISH             *
+         B         PRINTERR            *                             *
+ACCEPT   MVC       ERACT+14(11),=C'CONTINUING.'                      *
+PRINTERR LR        10,12               * SAVE BAL RETURN ADDRESS     *
+         MVC       LINE(108),ERLINE    * INDICATE WHAT TO PRINT      *
+         BAL       12,PRINT            * AND PRINT IT                *
+QUITSW   EQU       *+1                 * EOJ IF ERROR LEVEL >8       *
+         BC        0,ENDJOB            * ONLY BRANCH IF ERROR BAD    *
+         LA        12,2(10)            * PASS ERROR CODE AFTER BAL   *
+         BR        12                  * RETURN TO PROGRAM           *
+         EJECT
+**********************************************************************
+*                                                                    *
+*        P R I N T   R O U T I N E     -OPENS SYSPRINT, PRINTS ALL.  *
+*                                                                    *
+**********************************************************************
+PRINT    BC        0,ENDPRINT          * IF NO SYSPRINT BYPASS       *
+PRINTSW  EQU       *-3                 *                             *
+         BC        0,NOOPEN            * AROUND OPEN AFTER FIRST TIME*
+         OI        *-3,X'F0'           *                             *
+         OPEN      (PRINTER,(OUTPUT))  *                             *
+         OPEN      (PRINTER2,(OUTPUT)) * FOR SNAP DUMP               *
+NOOPEN   PUT       PRINTER,LINE        * LINE IS COMMON BUFFER       *
+         MVC       LINE(133),LINE-1    * CLEAR THE PRINT BUFFER      *
+ENDPRINT BR        12                  * RETURN TO CALLER            *
+         EJECT
+**********************************************************************
+*                                                                    *
+*        C O N S T A N T S  AND   T A B L E S                        *
+*                                                                    *
+**********************************************************************
+REG3     DC        F'10'               * REGISTER 3 CAUSE OF SHORTAGE*
+REG4     DC        F'10'               * REGISTER 4 FOR DENMNT BCT   *
+REG12    DC        F'0'                * SAVE REGISTER 12 HERE       *
+REG15    DC        F'0'                * SAVE REGISTER 15 HERE       *
+BOUND1   DS        F                   *FIRST 1/3 BOUNDARY OF CAT BLK*
+BOUND2   DS        F                   *SECOND BOUNDARY ADDRESS      *
+BOUND3   DS        F                   *THIRD BOUNDARY ADDRESS       *
+BLKADDR  DC        F'0'                *                             *
+         DC        F'0'                *                             *
+MBLKADDR DS         F                  * SAVE ADDR FOR CONVERT RTN   *
+CROSSWCH DC        X'40'               *ON IF 1/3 BOUNDARY IS CROSSED*
+PROCSWCH DC        X'40'               *ON WHEN ENOUGH BLKS ARE PROCS*
+INBLK    DC        H'0'                * INPUT NUMBER BLOCKS/TRACK   *
+OUTBLK   DC        H'0'                * SAME OUTPUT                 *
+OUTTRK   DC        H'0'                *NO OF TRK/CYL ON OUTPUT VOL  *
+INTRK    DC        H'0'                *NO OF TRK/CYL ON INPUT VOL   *
+NBLOCKS  DC        F'0'                *NO OF BLOCKS IN INPUT CTLG   *
+OBLOCKS  DC        F'0'                *NO OF BLOCKS IN OUTPUT CTLG  *
+RNBLOCKS DC        F'0'                *NO OF BLOCKS READ IN         *
+WNBLOCKS DC        F'0'                *NO OF BLOCKS WRITTEN OUT     *
+CBLOCKS  DC        F'0'                *                             *
+UBLOCKS  DC        F'0'                * NO OF USED BLOCKS           *
+MINSIZE  DC        F'0'                * FOR MINIMUM OUTPUT SIZE     *
+WMINSIZE DS        F                   * MIN SIZE OF OUTPUT SYSCTLG  *
+CHGRDCC  DS        F                   *ADDRESS OF NEXT CCW CHAIN    *
+CHGWRCC  DS        F                   *ADDRESS OF NEXT CCW CHAIN    *
+INSTART  DS        F                   * START ADDR OF INPUT SYSCTLG *
+BADTRKAD DC        2F'0'               *                             *
+OTRKADDR DS        F                   *                             *
+SAVEREC  DC        X'01'               *                             *
+LIST     DS        2F                  * FOR SNAP DUMP               *
+ONE      DC        H'1'                *FOR CALCULATING TRK ADDRESSES*
+DATACNT  DC        H'0'                *                             *
+TEST     DS        F                   *                             *
+COUNTINF DC        X'080100'           * COUNT                       *
+         LTORG                         *                             *
+PRNTBLK  DC        A(DDTABLE)          * ADDRESS OF CONSTANTS BEYOND *
+SAVEAREA DS        18F
+TIOTADDR DS        F
+ILLEGENT DC        C'-ERROR IN SYSCTLG ENTRY ON        AT '
+         DC        C'TRACK ADDRESS'
+         DROP      R2
+         DS        0F                  8 ASSURE FULL WORD BOUNDARY   *
+DDTABLE  EQU       *
+         DC        C'SYSPRINT'
+DDPRINT  DC        F'0'
+         DC        C'SYSUT1  '
+DDUT1    DC        F'0'
+         DC        C'SYSUT2  '
+DDUT2    DC        F'0'
+DEVTABLE DC        C'2311',H'8'        * THE FIRST ENTRY IS THE UNIT *
+         DC        C'2301',H'45'       * AND THE SECOND IS THE NO.   *
+         DC        C'2303',H'45'       * OF BLOCKS PER TRACK IT WILL *
+         DC        C'2321',H'20'       * HOLD.                       *
+         DC        C'    ',H'0'        *                             *
+         DC        C'2305',H'16'       *                             *
+         DC        C'2305',H'26'       *                             *
+         DC        C'2314',H'17'       *                             *
+         DC        C'3330',H'28'       *                             *
+BLANK    DC        C' '                * BLANK TO CLEAR PRINT LINE   *
+LINE     DC        CL33'1  '
+         DC        CL100'W A T E R L 0 0  C O P Y  C A T A L O G U E '
+ERLINE   DC        CL48'-ERROR DETECTED.'
+         DC        CL15'SEVERITY LEVEL'
+ERACT    DC        CL25'  . EXECUTION'
+         DC        CL20'                    '
+DSNAME1  DC        C'SYSCTLG                                     '
+DSNAME2  DC        C'SYSCTLG                                     '
+QNAME    DC        CL8'SYSCTLG'
+RNAME    DC        C'SYSCTLG'
+INFO     DC        CL50'-COPY CATALOG, FROM=    =      , TO=    ='
+BLKLINE  DC        CL36'0THE CATALOGUE CONTAINS      BLOCKS '
+PURGSW   DC        X'00'
+PURGMSG  DC        C'0PURGE NOT SPECIFIED.'
+SIZMSG   DC        C'-YOUR OUTPUT SYSCTLG REQUIRES AT LEAST      '   *
+         DC        C'TRACKS'                                         *
+THISMANY DC        C'-     BLOCKS OF THE CATALOGUE ARE USED.'        *
+TRANSTBL DC        C'0123456789ABCDEF' *                             *
+ANDIT    DC        X'0F0F0F0F0F0F0F0F0F0F'                           *
+MOREIO   DS        F                   *ADDRESS OF OUTPUT OR INPUT   *
+STRTNSW1 DS        F                   *ADDRESS OF SWITCH & TIC RTN  *
+LESSIO   DS        F                   *  ROUTINES * FOR CONTROL     *
+STRTNSW2 DS        F                   *ADDRESS OF SWCH & TIC SET RTN*
+SWFORRD  DS        F                   *ADDRESS OF SWITCH FOR RD RTN *
+SWFORWR  DS        F                   *ADDRESS OF SWITCH FOR WR RTN *
+WHICHREC DS        F                   *ADDR FOR RQ'D TTR REPL RTN   *
+FWORK    DS        F
+DWORK    DS        D
+LENGTH   DS        2F
+MAXBLK   DS        H
+MINBLK   DS        H
+INDISP   DS        F
+OUTDISP  DS        F
+CYLTRK   DC        H'10'
+U2301    DC        H'200'
+U2303    DC        H'10'
+U2321    DC        H'20'
+         DC        H'0'
+U2305I   DC        H'8'
+U2305II  DC        H'8'
+U2314    DC        H'20'
+U3330    DC        H'19'
+         DS        0D             *      ASSURE DWD BOUNDARY
+CVOL     DS        CL6                 * CVOL STORAGE                *
+         DS        0F
+JFCBPTR  DC        0F'0',X'87',AL3(JFCBAREA)
+TTR      DS        CL3                 * STORAGE FOR CURRENT TTR     *
+         DS        F
+BNDCHPG1 DS        F                   *ADDRESS OF 1ST CC BIT        *
+BNDCHPG2 DS        F                   *      SECOND                 *
+BNDCHPG3 DS        F                   *      THIRD                  *
+LASTRDSW DS        F                   *CC ADDRESS FOR LAST CCW SWCH *
+LASTWRSW DS        F                   *CC ADDRESS FOR LAST CCW SWCH *
+CALCADDR DS        F                   *ADDRESS FOR CONVERSION RTN   *
+* CHANNEL PROGRAM COMMANDS
+         DS        0D
+SEARCHID CCW       49,RDSRADDR,X'40',5
+TIC      CCW       8,0,0,0
+RCKD     CCW       30,0,X'60',272
+RDSRADDR DS        F
+RDSRLREC DC        F'0'                 *SEARCH FOR LAST RECORD      *
+WRSRADDR DS        F
+WRSRLREC DC        F'0'                 *SEARCH FOR LAST RECORD      *
+NEXTTIC  DS        F                    *ADDRESS FOR NEXT TIC        *
+         DS        0D
+RDSEARCH DS        2F
+RDTIC1   DS        2F
+RDTIC2   DS        2F
+WRSEARCH DS        2F
+WRTIC1   DS        2F
+WRTIC2   DS        2F
+CHPG     DS        2F                  *ADDRESS OF GETMAIN CHANNEL PGM
+LGTHCHAN DS        2F                  *GETMAIN LENGTHS              *
+ERRTAB   DC        C'THE SYSUT1 DD CARD IS MISSING.16'               *
+TWO      DC        C'THE SYSUT2 DD CARD IS MISSING.16'
+THREE    DC        C'THE PARM VALUE IS DEAD WRONG. 08'
+FOUR     DC        C'SYSUT1 CATALOG NOT READABLE.  16'
+FIVE     DC        C'I/O ERROR IN SYSUT1 CATALOG.  16'
+SIX      DC        C'INSUFFICIENT CORE AVAILABLE.  16'
+SEVEN    DC        C'UNABLE TO OPEN SYSUT1 DATASET.16'
+EIGHT    DC        C'I/O ERROR IN SYSUT2 CATALOG.  16'
+NINE     DC        C'UNABLE TO OPEN SYSUT2 DATASET.16'
+TEN      DC        C'SYSUT2 CATALOG IS TOO SMALL.  16'
+ELEVEN   DC        C'FORMAT BYTE ZAP FAILED.       08'
+TWELVE   DC        C'UNABLE TO OPEN SYSUT2 VTOC.   08'               *
+THIRTEEN DC        C'UNABLE TO ENQ ON SYSCTLG.     08'               *
+ZAPFAIL  DC        C'-YOUR CATALOG WILL USEABLE IF YOU '             *
+         DC        C'ZAP BYTE 101 (HEX ADDRESS 64), IN '             *
+         DC        C'THE FORMAT 1 DSCB TO HEX FF.'                   *
+FINALPRT DC        C'-$$$$$$$$$$ SYSCTLG HAS BEEN SUC'               *
+         DC        C'CESSFULLY COPIED $$$$$$$$$$     '               *
+         DC        C'                                '               *
+         DC        C'                                '               *
+**********************************************************************
+*                                                                    *
+*                      D C B   C O N S T A N T S                     *
+*                                                                    *
+**********************************************************************
+PRINTER  DCB       DSORG=PS,MACRF=PM,LRECL=133,BLKSIZE=133,            X
+               RECFM=FA,DDNAME=SYSPRINT                              *
+PRINTER2 DCB       DSORG=PS,RECFM=VBA,MACRF=(W),BLKSIZE=882,LRECL=125, X
+               DDNAME=SYSPRINT
+* SET UP DCB AND IOB - SYSTEM SETS UP REST                           *
+* INPUT DATA DATA CONTROL BLOCK                                      *
+READDCB  DCB       DDNAME=SYSUT1,DEVD=DA,MACRF=(E),EXLST=JFCBPTR     *
+*                                                                    *
+* OUTPUT DATA CONTROL BLOCK                                          *
+WRITEDCB DCB       DDNAME=SYSUT2,DEVD=DA,MACRF=(E),EXLST=JFCBPTR     *
+                   EJECT
+**********************************************************************
+*                                                                    *
+*            E C B  &  I O B   C O N S T A N T S                     *
+*                                                                    *
+**********************************************************************
+READECB  DC        F'0'                 *INPUT EVENT CONTROL BLOCK   *
+WRITEECB DC        F'0'                 *OUTPUT EVENT CONTROL BLOCK  *
+* INPUT-OUTPUT BLOCK FOR INPUT SYSCTLG                               *
+         DS        0F                   *ASSURE FULL WORD BOUNDARY   *
+READIOB  DC        X'42'                *COMMAND CHAINING & UNRLTD BIT
+RIOBFLG2 DC        X'00'                *SYSTEM USE                  *
+SENAECB  DC        H'0'                 *UNIT CK & COMPLETION CODE   *
+RDECBADR DC        A(READECB)           *ECB ADDRESS                 *
+RIOBFLG3 DC        X'00'                                             *
+         DC        XL7'00'              *CSW                         *
+CHPGRADR DC        A(RDSEARCH)          *READ CHANNEL PGM ADDRESS    *
+RDDCBADR DC        A(READDCB)           *READ DCB ADDRESS            *
+         DC        2F'0'
+RDDEBEXT DC        X'00'                *EXTENT NO                   *
+SEEKRD   DC        XL6'00'              *SEEK ADDRESS                *
+         DC        X'01'                *RECORD 1                    *
+*                                                                    *
+* INPUT-OUTPUT BLOCK FOR OUTPUT SYSCTLG                              *
+         DS        0F                   *ASSURE FULL WORD BOUNDARY   *
+WRITEIOB DC        X'42'                *COMND CHAINING & COMPLTN CODE
+WIOBFLG2 DC        X'00'                *SYSTEM USE                  *
+WENWECB  DC        H'0'                 *UNIT CK & COMPLETION CODE   *
+WDEBADR  DC        A(WRITEECB)          *ECB ADDRESS                 *
+WIOBFLG3 DC        X'00'                *                            *
+         DC        XL7'00'              *CSW                         *
+CHPGWADR DC        A(WRSEARCH)          *WRITE CHANNEL PGM ADDRESS   *
+WRTDCBAD DC        A(WRITEDCB)          *WRITE DCB ADDRESS           *
+         DC        2F'0'                *ERROR COUNTS ETC            *
+WRDEBEXT DC        X'00'                *EXTENT NO                   *
+WRTSEEK  DC        XL6'00'              *SEEK ADDRESS                *
+         DC        X'01'                *RECORD NUMBER               *
+CTLGDSCB CAMLST    SEARCH,DSNAME2,CVOL,DSCBAREA                      *
+         DS        0D                  * ASSURE DOUBLE WORD BOUNDARY *
+DSCBAREA DS        88F                 * REGION FOR FORMAT 1 OF SYSCTLG
+JFCBAREA DS        44F                 * READ ALL JFCB'S INTO HERE   *
+         END

@@ -1,0 +1,984 @@
+   TITLE 'INITOBJ Ver 1.08 - Initialize Data Areas in Object Files'
+*
+*        Function
+*        --------
+*        INITOBJ reads an object file output from the assembler
+*        and creates additional TXT records to initialize all
+*        undefined areas of the Csects to the specified Fill
+*        Character.
+*
+*        Whilst uninitialized DS variables are a programming
+*        practice best not used unfortunately it is a fact of
+*        life for some old legacy programs. The result is that
+*        the unitialized DS ends up with random contents of the
+*        linkage editor buffers. Versions of the Linkage Editor,
+*        later than distributed in MVS 3.8, initialized the
+*        buffers to x'00' so the uninitialized variables would be
+*        set to x'00'. The Binder took this concept further and
+*        introduced the Fill character so that the buffers may be
+*        initialized to this character. By changing the Fill
+*        Character and rebinding the object then it is possible
+*        to test for any dependence on uninitialized variables.
+*        None of these options are available in the MVS 3.8
+*        environment so INITOBJ has been writen to provided the
+*        same Fill Character function as the Binder. No changes
+*        are made to the Linkage Editor as this program functions
+*        as a pre-processor to the Linkage Editor.
+*
+*        Operation
+*        ---------
+*        INITOBJ runs as batch program following an assembly and
+*        processes the object records produced by the Assembler.
+*        Additional TXT records are inserted to initialize any
+*        areas of the Csects left uninitialized. These areas are
+*        initialized to the default value of x'00' unless this
+*        value has been overridden by specifying an optional Parm
+*        of 'FILL=XX' where XX becomes the Fill Character
+*        replacing x'00'.
+*
+*        The generated TXT records are marked with the default
+*        or specified Fill Character in bytes 73-74.
+*
+*        A WTO is generated for each Csect that has had
+*        additional TXT records generated. The number of TXT
+*        records and the total number of bytes inserted are
+*        listed in the WTO.
+*
+*        In addition, if a Fill Character was provided, via a JCL
+*        Parm, then a Linkage Editor IDENTIFY record is inserted
+*        into the output dataset identifying each Csect that has
+*        been modified and the Fill Char used.
+*
+*        All Csects are rounded up to a double word boundary.
+*        The additional bytes are set to the default or specified
+*        Fill Character. This assists in identifying storage
+*        overlay problems as the majority of Csects do not end on
+*        a double word boundary and therefore have random data
+*        at the end of the Csect after Linkage Editor processing.
+*
+*        Note that only named Csects are processed. Private Code (PC)
+*        is not processed.
+*
+*        Invoking INITOBJ
+*        ----------------
+*        // EXEC PGM=INITOBJ,PARM='FILL=xx'   <--- Optional Parm
+*           where xx is the hex value to be used as the Fill
+*           Character
+*        //SYSUT1 DD DSN=input object dataset from Assembler
+*        //SYSUT2 DD DSN=output object dataset to Linkage Editor
+*        //REPORT DD SYSOUT=*  optional DD for detailed report on
+*                              un-initialized areas
+*
+*        For SYSUT2 any BLKSIZE, a multiple of 80 is acceptable,
+*        but be aware of the unmodified Linkage Editor
+*        restriction of 3200 bytes.
+*
+*        Updating the ASMFCL and ASMFCLG cataloged procedures by
+*        inserting the INITOBJ JCl as an additional step between
+*        the Assembly and the Linkage Editor step is generally
+*        the most convenient way of running INITOBJ to process
+*        the object output from the Assembly.
+*
+*        Assembler Environment
+*        ---------------------
+*        This module requires the HLASM or the Tachyon Legacy
+*        Assembler for successful assembly.
+*
+*        Installation
+*        ------------
+*        Assemble the module and link edit it into a load library.
+*
+*        Attributes
+*        ----------
+*        This module is reuseable and reenterant.
+*
+*        Change Log
+*        ----------
+*        02Jun2010 ESDID incorrectly incremented for ESD types
+*                  LD,ER and WX
+*        11Jun2010 ESDID not incremented for ESD types ER and WX
+*
+*        Maximum number of ESD Entries
+*        -----------------------------
+&MAXESD  SETC  '1024'                  Maximum number of ESD Entries
+*
+INITOBJ  CSECT
+*
+         USING *,R10
+*
+         SAVE  (14,12),,'INITOBJ Ver 1.08 &SYSDATE &SYSTIME'
+*
+         LR    R10,R15                 Establish Addressability
+         LR    R9,R1                   Use R9 to save the parm for
+*                                      later processing
+*
+*        GETMAIN and clear the SAVEAREA/WORKAREA
+*
+         GETMAIN R,LV=WORKAREAL        GETMAIN SAVEAREA/WORKAREA
+*
+         LR    R4,R1                   R4  -> GETMAINED AREA
+         LR    R5,R0                   R5  -  L'GETMAINED AREA
+         SR    R15,R15                 Zero Pad Byte and L'Source
+         MVCL  R4,R14                  Zero GETMAINED Area
+         ST    R1,8(,R13)              Chain SAVEAREAs
+         ST    R13,4(,R1)
+         LR    R13,R1
+*
+*        Initialize GETMAINed WORKAREA
+*
+         USING WORKAREA,R13            Establish addressability
+         USING ESDENT,R9               For processing ESD Entries
+         USING CSD,R8                  Control for each SD
+         USING IHADCB,SYSUT1           DCB
+         USING ESDREC,RECIN            Input ESD Record
+IN       USING TXTREC,RECIN            Input TXT Record
+OUT      USING TXTREC,GENREC           Output TXT Record
+*
+*        Scan the TIOT for optional REPORT DD statement
+*
+         L     R2,PSATOLD-PSA          Get Addr of TCB
+         L     R4,TCBTIO-TCB(,R2)      Get Addr of TIOT
+         USING TIOT1,R4
+         SR    R2,R2                   Zero TIOT Entry Length Reg
+SCANTIOT EQU   *
+         ICM   R2,B'0001',TIOELNGH     Load TIOT Entry Length
+         BZ    SCANTIOTX               End of TIOT found
+         CLC   REPORTDD,TIOEDDNM       TIOT Entry for REPORT ?
+         BE    SCANTIOTA               Yes
+         AR    R4,R2                   Point to next TIOT Entry
+         B     SCANTIOT
+*
+         DROP  R4
+*
+*        REPORT DD found in TIOT
+*
+SCANTIOTA EQU  *
+         MVI   REPREQ,C'1'             Turn on Report Requested Flag
+         ZAP   REPPN,=P'0'             Initialize Page Number
+SCANTIOTX EQU  *
+         MVC   SYSUT1(SYSUT1L),MODELUT1  Move SYSUT1 DCB to workarea
+         MVC   SYSUT2(SYSUT2L),MODELUT2  Move SYSUT2 DCB to workarea
+         MVC   REPORT(REPORTL),MODELREP  Move REPORT DCB to workarea
+         LA    R1,SYSUT1EOD
+         STCM  R1,B'0111',DCBEODA      Store addr of EOD Routine in DCB
+         MVI   FILLCHAR_X,X'00'        Init FILLCHAR with default 00
+         MVC   FILLCHAR_C,=C'00'
+         MVC   WTOMSGWA(WTOMSGWAL),MODELWTO
+         MVI   GENREC,C' '             Blank Generated .TXT Record
+         MVC   GENREC+1(L'GENREC-1),GENREC
+         MVC   GENREC(L'TXT),TXT       Move in .TXT header
+*
+*        Validate Parm
+*
+         L     R9,0(,R9)               Point to Parm
+         LA    R1,2(,R9)               -> parm data
+         LH    R2,0(,R9)               Get length of parm
+         LTR   R2,R2                   Was a parm provided ?
+         BNZ   PPROCA                  Yes, go process it
+*
+*        No Parm provided, issue WTO and run with default
+*
+         MVI   FILLDEFT,C'1'           Set no Fill Char Provided
+         LA    R1,MSG1                 -> Error Msg
+         BAL   R14,WTOMSGR             WTO routine
+         B     OPENDS
+*
+*        Process Parm
+*
+PPROCA   EQU   *
+         CH    R2,=AL2(L'FILL+2)       Parm correct length ?
+         BNE   PPROCB                  No, Error msg
+         CLC   FILL,0(R1)              'FILL='
+         BNE   PPROCB                  No, Error Msg
+*
+*        Convert EBCDIC to Hex to set Fill Char
+*
+         MVC   FILLCHAR_C,L'FILL(R1)   Save for use in later IDENTIFY
+         MVC   CHAR16(2),L'FIll(R1)    Move into a workarea
+         TR    CHAR16(2),TRTAB         Translate to hex nibbles
+         MVO   FILLCHAR_X,CHAR16(1)    Move hi-order 4 bits into Fill
+         MVN   FILLCHAR_X(1),CHAR16+1  Move low-order 4 bits into Fill
+         B     OPENDS
+*
+*        Invalid Parm
+*
+PPROCB   LA    R1,MSG2                 -> Error Msg
+         BAL   R14,WTOMSGR             WTO Routine
+*
+*        Open the datasets and print optional REPORT heading
+*
+OPENDS   EQU   *
+         CLI   REPREQ,C'1'             Report Requested ?
+         BNE   OPENDSA                 No, Branch
+*
+         OI    OCLIST+8,X'80'          Terminate O/C List
+*
+         OPEN  (SYSUT1,(INPUT),SYSUT2,(OUTPUT),REPORT,(OUTPUT)),       X
+               MF=(E,OCLIST)
+*
+         LTR   R15,R15                 OPEN successful ?
+         BNZ   OPENDSB
+         BAL   R14,REPHEAD             Report Heading routine
+         B     PROCESS
+*
+OPENDSA  EQU   *
+         OI    OCLIST+4,X'80'          Terminate O/C List
+*
+         OPEN  (SYSUT1,(INPUT),SYSUT2,(OUTPUT)),MF=(E,OCLIST)
+*
+OPENDSB  EQU   *
+         LTR   R15,R15                 OPEN successful ?
+         BZ    PROCESS
+         LA    R1,MSG3                 R1 -> Error Msg
+         BAL   R14,WTOMSGR             WTO Routine
+         LA    R9,16                   Set Return Code of 16
+         B     ENDPROC
+*
+*        Process the Object Dataset
+*
+PROCESS  EQU   *
+*
+         GET   SYSUT1,RECIN            Read Object record
+*
+         CLC   ESD,RECIN               ESD Record ?
+         BE    PROCESD                 Yes, process ESD
+         CLC   RLD,RECIN               RLD Record ?
+         BE    PROCRLD                 Yes, Process RLD
+         CLC   TXT,RECIN               TXT Record ?
+         BE    PROCTXT                 Yes, Process TXT
+         CLC   END,RECIN               END Record ?
+         BE    PROCEND                 Yes, Process END
+*
+*        Record type not recognized, write it to SYSUT2
+*
+PROCESSW EQU   *                       Return Point after Record
+*                                      Processing
+         PUT   SYSUT2,RECIN            Write Record to SYSUT2
+*
+         B     PROCESS                 Process next input record
+*
+*        Process ESD Records
+*
+PROCESD  EQU   *
+         SR    R2,R2
+         ICM   R2,B'0011',ESDVFC       Get Bytes used in ESD Record
+         SRL   R2,4                    Div by 16 to get no. of entries
+         LA    R9,ESDVDATA             -> First ESD Entry
+         CLC   ESDESDID,=C'  '         All Items are LD Entries ?
+         BE    PROCESSW                Yes, Nothing to process.
+         SR    R3,R3
+         ICM   R3,B'0011',ESDESDID     Get ESDID of first entry
+PROCESDA EQU   *                       Loop Through the entries
+         CLI   ESDTYPE,ESDTYPE_LD      Type LD Entry Point ?
+         BE    PROCESDL                Yes, No ESDID is generated
+         CLI   ESDTYPE,ESDTYPE_SD      Type SD ?
+         BE    PROCESDG                Yes, Process this Entry
+         CLI   ESDTYPE,ESDTYPE_PC      Type PC ?
+         BE    PROCESDG                Yes, Process this Entry
+         B     PROCESDB                Incr ESDID but no processing
+*                                      Yes, Process SD entry
+PROCESDG LA    R1,&MAXESD              Maximum number of ESD entries
+         CR    R3,R1                   Exceeded ?
+         BL    PROCESDC                No, continue processing
+*
+*        Maximum number of ESD Entries exceeded
+*
+         LA    R1,MSG6                 R1 -> Error Msg
+         BAL   R14,WTOMSGR             WTO Routine
+         LA    R9,16                   Set Return Code of 16
+         B     CLOSEDS                 Terminate Program
+*
+PROCESDC EQU   *
+         LR    R8,R3                   Get ESD ID
+         SLL   R8,5                    Multiply the ESD Id by 32 L'CSD
+         LA    R8,ESDTAB-CSDL(R8)      Allow for first entry is 1 not 0
+         STCM  R3,B'0011',CESDID       Store the ESD ID
+         MVC   CNAME,ESDXSYMN          Name of SD or Blank for PC
+         CLI   ESDTYPE,ESDTYPE_PC      ESDID Type PC ?
+         BNE   PROCESDN                No, Branch
+         MVC   CNAME,=CL8'ESDID PC'    Give PC a name of ESDID PC
+PROCESDN SR    R1,R1
+         ICM   R1,B'0111',ESDLEN       Get len of ESD
+         A     R1,=F'7'                Round up to double word to
+         N     R1,=X'00FFFFF8'         prevent trash at end of SD or PC
+         ST    R1,CLEN
+         STCM  R1,B'0111',ESDLEN       Update rounded len in ESD record
+         ICM   R1,B'0111',ESDADDR      Get Rel Starting Addr
+         ST    R1,CPTR                 Set Ptr to Relative Addr of SD
+         ST    R1,CSLOC                Save Starting Addr of SD or PC
+*                                      to use to calc filling out Csect
+PROCESDB EQU   *
+         LA    R3,1(,R3)               Increment ESD ID for possible
+*                                      next entry
+PROCESDL EQU   *
+         LA    R9,ESDENTL(,R9)         -> to possible next ESD Entry
+*                                      in ESD Table
+         BCT   R2,PROCESDA             Test and loop if needed for
+*                                      next entry
+         B     PROCESSW
+*
+*        Process RLD Records
+*
+PROCRLD  EQU   *
+*
+*        Generate any required TXT Records before the RLD records
+*
+         BAL   R14,CLEANUP             Invoke CLEANUP Routine
+
+         B     PROCESSW
+*
+*        Process TXT Records
+*
+PROCTXT  EQU   *
+         SR    R3,R3
+         ICM   R3,B'0011',IN.TXTESDID  Get the ESD ID for this Record
+         LR    R8,R3                   Get ESD ID
+         SLL   R8,5                    Multiply the ESD ID by 32
+         LA    R8,ESDTAB-CSDL(R8)      Allow for first entry is 1 not 0
+         CLC   CESDID,IN.TXTESDID      Does the ESD ID entry in
+*                                      the table match the TXT ESD ID ?
+         BNE   PROCESSW                No, No entry in the table so
+*                                      must not be TXT for SD or PC
+         CLC   IN.TXTRADDR,CPTR+1      Compare TXT Rel Addr with Ptr
+*
+         BE    PROCTXTE                This TXT flows on from previous
+         BL    PROCTXTL                An ORG backwards
+         BH    PROCTXTH                Need to generate additional TXT
+*
+*        TXT Rel Addr matches Ptr
+*        Update Ptr and continue processing
+*
+PROCTXTE EQU   *
+         L     R1,CPTR
+         AH    R1,IN.TXTLEN            Add Len of TXT to calc new Ptr
+         ST    R1,CPTR
+         B     PROCESSW
+*
+*        TXT Rel addr is less than Ptr, An ORG backwards. Test
+*        if TXTLEN advances Ptr, if it does then update otherwise
+*        continue processing
+*
+PROCTXTL EQU   *
+         SR    R1,R1
+         ICM   R1,B'0111',IN.TXTRADDR  Get Rel Addr of TXT
+         AH    R1,IN.TXTLEN            Add Len of TXT to calc new Ptr
+         C     R1,CPTR                 New Ptr higher than current ?
+         BNH   PROCESSW                No, return to continue process
+         ST    R1,CPTR                 Yes, advance Ptr
+         B     PROCESSW                Continue process
+*
+*        Txt Rel Addr greater than Ptr, Additional TXT record(s)
+*        must be generated to fill storage with Fillchar value
+*
+PROCTXTH EQU   *
+         SR    R2,R2
+         ICM   R2,B'0111',IN.TXTRADDR  Calc length of additional TXT
+         S     R2,CPTR                 by subtracting PTR from TXTRADDR
+         BAL   R14,GENTXTR             Call GENTXTR with length of TXT
+*                                      to gen in R2 and start addr in
+*                                      CPTR
+         SR    R2,R2
+         ICM   R2,B'0111',IN.TXTRADDR  Get Rel Addr of TXT
+         AH    R2,IN.TXTLEN            Add Len of TXT to calc new Ptr
+         ST    R2,CPTR                 Advance Ptr
+         B     PROCESSW                Continue process
+*
+*        Process END Records
+*
+PROCEND  EQU   *
+*
+*        Generate any required TXT Records before the END record
+*
+         BAL   R14,CLEANUP             Invoke CLEANUP Routine
+*                                      Processing
+*
+         PUT   SYSUT2,RECIN            Write END Record to SYSUT2
+*
+*        Loop through the ESDTAB and generate IDENTIFY records
+*        for any CSECT for which additional TXT records were
+*        generated. If FILLDEFT is set on then bypass generation
+*        of IEWL Identify Control statements.
+*
+         LA    R8,ESDTAB               -> Control Table for SD
+         L     R7,=AL4((&MAXESD*CSDL)-1) Calc end of ESDTAB for
+         AR    R7,R8                   BXLE loop comparand
+         LA    R6,CSDL                 Increment value for BXLE
+         MVI   IDENTREC,C' '           Blank out record
+         MVC   IDENTREC+1(L'IDENTREC-1),IDENTREC
+         MVC   IDENTID,=C'IDENTIFY'
+PROCENDA EQU   *
+         CLC   CESDID,=X'0000'         Any ESD ID present ?
+         BE    PROCENDD                No ESD ID, Branch to loop end
+         CLC   CTCNT,=X'0000'          Any additional TXT records ?
+         BE    PROCENDD                No, not for this Csect
+         CLI   FILLDEFT,C'1'           Bypass generation of Identify ?
+         BE    PROCENDF
+         CLC   CNAME,=CL8'ESDID PC'    ESDID Type PC ?
+         BE    PROCENDF                Yes, Do not generate IDENTIFY
+         MVC   IDENTSD,CNAME           Move SD Name into IDENTIFY rec
+         MVI   IDENTTXT,C' '           Blank out old text
+         MVC   IDENTTXT+1(L'IDENTTXT-1),IDENTTXT
+         LA    R1,IDENTTXT-1           -> last byte of name
+PROCENDB EQU   *
+         CLI   0(R1),C' '              Found a non blank ?
+         BNE   PROCENDC                Yes, branch
+         BCT   R1,PROCENDB             No, decrement and loop back
+PROCENDC EQU   *
+         MVC   1(L'IDRDATA,R1),IDRDATA Move IDRDATA to next avail Char
+         MVC   L'IDRDATA-3(L'FILLCHAR_C,R1),FILLCHAR_C Plugin FILLER_C
+*
+         PUT   SYSUT2,IDENTREC         Write the IDENTIFY Record
+*
+*        Generate WTO for Csect
+*
+PROCENDF EQU   *
+         CLI   REPREQ,C'1'             Is a detailed REPORT being
+*                                      Produced ?
+         BE    PROCENDD                Yes, do not issue WTO
+         CLI   MSG4WTO,X'01'           Has Msg 4 Been Issued ?
+         BE    PROCENDG                Yes, Branch
+         LA    R1,MSG4                 -> Msg 4 Heading WTO
+         BAL   R14,WTOMSGR             WTO Routine
+         MVI   MSG4WTO,X'01'
+PROCENDG EQU   *
+         IC    R1,MSG5                 Length of Msg5
+         EX    R1,MVCMSG5              Move Msg5 Len + Text into MSG5WA
+         MVC   MSG5TEXT+MSG5CS-MSG5T(L'MSG5CS),CNAME Move Csect Name
+         LH    R1,CTCNT                Get Inserted Text Record Count
+         CVD   R1,WORKD
+         ED    MSG5TEXT+MSG5IREC-MSG5T(L'MSG5IREC),WORKD+5  Format
+*                                      count of Inserted TXT Records
+         L     R1,CBYTEC               Get Inserted Byte Count
+         CVD   R1,WORKD
+         ED    MSG5TEXT+MSG5IBC-MSG5T(L'MSG5IBC),WORKD+4  Format
+*                                      count of Inserted Bytes
+         LA    R1,MSG5WAL              R1 -> Info Msg
+         BAL   R14,WTOMSGR             WTO Routine
+*
+PROCENDD EQU   *
+         BXLE  R8,R6,PROCENDA          -> Next Entry
+*
+         LA    R2,ESDTAB               Zero the ESD TABLE in case
+         L     R3,=AL4(&MAXESD*CSDL)   this is output from a batched
+         SLR   R5,R5                   assembly and more object
+         MVCL  R2,R4                   records follow this END record
+         B     PROCESS
+*
+MVCMSG5  MVC   MSG5WAL(0),MSG5         Move Msg5 Length and text
+*
+*
+*        End of Data on SYSUT1
+*
+SYSUT1EOD EQU  *
+*
+CLOSEDS  EQU   *
+*
+*        CLOSE datasets
+*
+         CLI   REPREQ,C'1'            Was REPORT Requested ?
+         BNE   CLOSEDSB               No, Branch
+         CP    REPPN,=P'1'            Were any REPORT records written ?
+         BNE   CLOSEDSA               Yes, Branch
+         CLC   REPLN,=H'3'
+         BNE   CLOSEDSA               Yes, Branch
+*
+         PUT   REPORT,HEAD3           Null Report
+*
+CLOSEDSA EQU   *
+*
+         CLOSE (SYSUT1,,SYSUT2,,REPORT),MF=(E,OCLIST)
+*
+         FREEPOOL REPORT
+*
+         B     CLOSEDSC
+*
+CLOSEDSB EQU   *
+*
+         CLOSE (SYSUT1,,SYSUT2),MF=(E,OCLIST)
+*
+CLOSEDSC EQU   *
+*
+         FREEPOOL SYSUT1               No need to leave the buffers
+*
+         FREEPOOL SYSUT2
+*
+         LA    R9,0                    Set Zero return code
+*
+ENDPROC  EQU   *
+*
+*        All processing complete
+*
+         LR    R1,R13                  R1 -> GETMAINed Area
+         L     R13,4(,R13)             Restore caller's save area addr
+*
+         FREEMAIN R,LV=WORKAREAL,A=(1)  Free SAVEAREA/WORKAREA
+*
+         LR    R15,R9                  Return Code into R15
+*
+         RETURN (14,12),RC=(15)        Return to caller
+*
+***********************************************************************
+*                                                                     *
+*        Generate Additional Text Records                             *
+*                                                                     *
+*        On entry start addr of TXT is in CPTR                        *
+*        R2 has length of TXT to generate                             *
+*                                                                     *
+*        Optionally, generate detailed report of uninitialized        *
+*        areas                                                        *
+*                                                                     *
+***********************************************************************
+*
+GENTXTR  EQU   *
+         ST    R14,GENTXTR_RETADDR
+         MVC   OUT.TXTDID,FILLCHAR_C   Move Fillchar into Deck ID Fld
+         MVC   OUT.TXTESDID,CESDID     ESD ID for TXT Record
+         L     R1,CBYTEC               Add Number of bytes being
+         AR    R1,R2                   generated to Byte Count
+         ST    R1,CBYTEC
+         L     R3,CPTR                 Start Addr
+         CLI   REPREQ,C'1'             Detailed Report requested ?
+         BNE   GENTXTA                 No, Bypass Report generation
+         LH    R1,REPLN
+         LA    R1,1(,R1)               Increment Line No.
+         STH   R1,REPLN
+         CH    R1,REPMAXLN             Run out of Lines ?
+         BL    GENTXTP                 No, Branch
+         BAL   R14,REPHEAD             Start New page
+GENTXTP  EQU   *
+         MVC   REPREC,REPDTL           Move Record to I/O area
+         MVC   REPREC+REPESDID-REPDTL(L'REPESDID),CNAME
+         STCM  R3,B'0111',WORKD        Store Rel Addr
+         UNPK  CHAR16(7),WORKD(4)      Setup for TR to Character
+         TR    CHAR16(6),HEXTR-C'0'    Translate to Character
+         MVC   REPREC+REPRADDR-REPDTL(L'REPRADDR),CHAR16 Move to I/O
+         CVD   R2,WORKD                Convert length to Dec
+         ED    REPREC+REPLEN-REPDTL(L'REPLEN),WORKD+4
+*
+         PUT   REPORT,REPREC           Write Report Line
+*
+GENTXTA  EQU   *
+         CH    R2,=AL2(L'TXTDATA)      More than 1 TXT Record req ?
+         BNH   GENTXTB                 No, Branch
+*
+*        Generate multiple TXT Records
+*
+         STCM  R3,B'0111',OUT.TXTRADDR Set rel addr
+         MVC   OUT.TXTLEN,=AL2(L'TXTDATA) Set Length of TXT
+         MVC   OUT.TXTDATA(1),FILLCHAR_X  Propagate FILLCHAR
+         MVC   OUT.TXTDATA+1(L'TXTDATA-1),OUT.TXTDATA
+*
+         PUT   SYSUT2,GENREC           Write Generated TXT Record
+*
+         LH    R1,CTCNT                Get count of generated TXT rec
+         LA    R1,1(,R1)               Increment count
+         STH   R1,CTCNT                Store count
+         AH    R3,=AL2(L'TXTDATA)      Advance Rel addr
+         SH    R2,=AL2(L'TXTDATA)      Decrement data len
+         B     GENTXTA                 Retest count
+*
+GENTXTB  EQU   *
+         STCM  R3,B'0111',OUT.TXTRADDR Set Rel Addr
+         STCM  R2,B'0011',OUT.TXTLEN   Set TXT Len
+         MVI   OUT.TXTDATA,C' '        Blank out data field
+         MVC   OUT.TXTDATA+1(L'TXTDATA-1),OUT.TXTDATA
+         MVC   OUT.TXTDATA(1),FILLCHAR_X
+         BCT   R2,GENTXTC              Decrement the Count
+*                                      Bypass Ex if only 1 byte in len
+         B     GENTXTD
+GENTXTC  EQU   *
+         BCTR  R2,0                    for Ex
+         EX    R2,GENMVC
+GENTXTD  EQU   *
+*
+         PUT   SYSUT2,GENREC
+*
+         LH    R1,CTCNT                Get count of generated TXT rec
+         LA    R1,1(,R1)               Increment count
+         STH   R1,CTCNT                Store count
+         L     R14,GENTXTR_RETADDR
+         BR    R14                     Return
+*
+GENMVC   MVC   OUT.TXTDATA+1(0),OUT.TXTDATA   *** EX Ins ***
+*
+*
+***********************************************************************
+*
+*        Cleanup processing
+*
+*        An RLD or END record has been detected.
+*
+*        Ensure that all CSECTs have been padded out to their
+*        set length. Note that this routine may be called a number
+*        of times, once for each RLD record and again for END.
+*        Fields are updated so that additional TXT records will not
+*        be generated a second time.
+*
+***********************************************************************
+*
+CLEANUP  EQU   *
+         ST    R14,CLEANUP_RETADDR
+         LA    R8,ESDTAB               -> Control Table for SD
+         L     R7,=AL4((&MAXESD*CSDL)-1) Calc end of ESDTAB for
+         AR    R7,R8                   BXLE loop comparand
+         LA    R6,CSDL                 Increment value for BXLE
+CLEANUPA EQU   *
+         CLC   CESDID,=X'0000'         Any ESD ID present ?
+         BE    CLEANUPB                No ESD ID value present, branch
+         L     R4,CPTR                 Calc number of bytes in TXT
+         S     R4,CSLOC                records that have been processed
+         L     R2,CLEN                 Get length of Csect
+         SR    R2,R4                   Calc number of bytes short
+         BNP   CLEANUPB                Zero or -VE Csect complete
+         LR    R4,R2                   Save for later update of CPTR
+         BAL   R14,GENTXTR             Generate additional TXT records
+         L     R2,CPTR                 Advance CPTR by adding length
+         AR    R2,R4                   of generated TXT record(s)
+         ST    R2,CPTR
+CLEANUPB EQU   *
+         BXLE  R8,R6,CLEANUPA          -> Next Entry
+         L     R14,CLEANUP_RETADDR
+         BR    R14                     Return
+*
+***********************************************************************
+*                                                                     *
+*        Issue WTO for error or information messages                  *
+*                                                                     *
+***********************************************************************
+*
+WTOMSGR  DS    0H
+*
+*        R01 -> Message Text length followed by text
+*
+         ST    R14,WTOMSGR_RETADDR     Save Return addr
+         MVI   WTOMSGWA+4,C' '         Blank out max len of 100 bytes
+         MVC   WTOMSGWA+5(99),WTOMSGWA+4
+         SR    R2,R2
+         IC    R2,0(,R1)               Get length of text
+         BCTR  R2,0                    Decrement for EX
+         EX    R2,MVCMSG
+*
+         WTO   MF=(E,WTOMSGWA)         WTO error message
+*
+         L     R14,WTOMSGR_RETADDR
+         BR    R14                     Return to caller
+*
+MVCMSG   MVC   WTOMSGWA+4(0),1(R1)     *** Ex *** Move text into WTO
+*
+***********************************************************************
+*                                                                     *
+*        REPORT Heading Routine                                       *
+*                                                                     *
+***********************************************************************
+*
+REPHEAD  DS    0H
+         ST    R14,REPHEAD_RETADDR
+         MVC   REPREC,HEAD1           Move Heading line to I/O Area
+         AP    REPPN,=P'1'            Increment Page Number
+         ED    REPREC+HEADPN-HEAD1(L'HEADPN),REPPN   Format Page No.
+*
+         PUT   REPORT,REPREC          Write Heading
+*
+         PUT   REPORT,HEAD2           Write Secondary Heading line
+*
+         MVC   REPLN,=H'3'            Reset Line Count
+         L     R14,REPHEAD_RETADDR
+         BR    R14                    Return
+*
+*
+*********************************************************************
+*
+*        STATIC DATA AREAS
+*
+*********************************************************************
+*
+*        Error Messages
+*
+*        Maximun Length 100 chars
+*
+MSG1     DC    AL1(L'MSG1T)            Length of Text
+MSG1T    DC    C'INITOBJ - No parm provided, Fill Char defaulted to 00'
+MSG2     DC    AL1(L'MSG2T)
+MSG2T    DC    C'INITOBJ - Invalid Parm, Fill Char set to 00'
+MSG3     DC    AL1(L'MSG3T)
+MSG3T    DC    C'INITOBJ - OPEN for Dataset(s) Failed'
+MSG4     DC    AL1(L'MSG4T)
+MSG4T    DC    C'INITOBJ - Csect    Inserted TXT Records  Inserted ByteX
+               s'
+MSG5     DC    AL1(MSG5E-MSG5T)
+MSG5T    DC    C'INITOBJ - '
+MSG5CS   DC    CL8' '                  Csect Name
+         DC    CL7' '
+MSG5IREC DC    XL6'402020202020'       Number of Inserted TXT Records
+         DC    CL12' '
+MSG5IBC  DC    XL8'4020202020202020'   Number of Inserted Bytes
+MSG5E    EQU   *
+MSG6     DC    AL1(L'MSG6T)
+MSG6T    DC    C'INITOBJ - More than &MAXESD ESD Entries found'
+*
+*        Headings
+*
+HEAD1    DC    CL80' '
+         ORG   HEAD1
+         DC    C'1'                    ASA skip to new page
+         DC    CL1' '
+         DC    C'INITOBJ - Uninitialized Areas'
+         DC    CL01' '
+         DC    C'Page No.'
+HEADPN   DC    X'40202020'
+         DC    CL1' '
+         ORG
+HEAD2    DC    CL80' '
+         ORG   HEAD2
+         DC    C' '                    ASA space one
+         DC    CL1' '
+         DC    C'Csect    Rel Addr(hex) Length(dec)'
+         DC    CL1' '
+         ORG
+HEAD3    DC    CL80' '
+         ORG   HEAD3
+         DC    C'0'                    ASA skip 2 lines
+         DC    C'  No uninitialized areas found'
+         DC    CL1' '
+         ORG
+*
+*        Report Detail Line
+*
+REPDTL   DC    CL80' '
+         ORG   REPDTL
+         DC    C' '                    ASA space one
+         DC    CL1' '
+REPESDID DC    CL8' '                  Name of Csect
+         DC    CL4' '
+REPRADDR DC    CL6' '                  Relative Address(hex)
+         DC    CL3' '
+REPLEN   DC    X'4020202020202020'     Length of area(dec)
+         DC    CL1' '
+         ORG
+REPMAXLN DC    H'58'                   Maximum lines per page
+*
+FILL     DC    C'FILL='
+REPORTDD DC    CL8'REPORT'             optional REPORT DD name
+*
+ESD      DC    0CL4                    ESD Record Identifier
+         DC    X'02'
+         DC    C'ESD'
+RLD      DC    0CL4                    RLD Record Identifier
+         DC    X'02'
+         DC    C'RLD'
+TXT      DC    0CL4                    TXT Record Identifier
+         DC    X'02'
+         DC    C'TXT'
+END      DC    0CL4                    END Record Identifier
+         DC    X'02'
+         DC    C'END'
+*
+         PUSH  PRINT
+         PRINT NOGEN
+*
+*        Model DCBs
+*
+MODELUT1 DCB   DSORG=PS,MACRF=GM,DDNAME=SYSUT1,LRECL=80,RECFM=FB
+*
+MODELUT2 DCB   DSORG=PS,MACRF=PM,DDNAME=SYSUT2,LRECL=80,RECFM=FB
+*
+MODELREP DCB   DSORG=PS,MACRF=PM,DDNAME=REPORT,LRECL=80,RECFM=FBA
+*
+         POP   PRINT
+*
+*        Model WTO
+*
+MODELWTO WTO   '                                                       X
+                                                            ', 100 ch  X
+               ROUTCDE=(11),DESC=(7),MF=L
+*
+*        Translate table for FILLCHAR
+*
+TRTAB    DC    256X'00'                Default value
+         ORG   TRTAB+C'a'              Support upper and lower case
+         DC    X'0A0B0C0D0E0F'
+         ORG   TRTAB+C'A'
+         DC    X'0A0B0C0D0E0F'
+         ORG   TRTAB+C'0'
+         DC    X'00010203040506070809'
+         ORG
+HEXTR    DC    CL16'0123456789ABCDEF'
+IDRDATA  DC    C'(''FILLCHAR 00'')'    text for IDENTIFY Record
+*
+*        LITERAL POOL
+*
+         LTORG
+*
+*********************************************************************
+*
+*        GETMAINED WORK AREA
+*
+*********************************************************************
+*
+*        This area is initialized to zeros after Getmain
+*
+WORKAREA DSECT
+SAVEAREA DS    18F
+*
+*        OPEN/CLOSE List
+*
+OCLIST   OPEN  (,,,,,),MF=L
+*
+*        Subroutine Return Addrs
+*
+WTOMSGR_RETADDR DS  F
+CLEANUP_RETADDR DS  F
+GENTXTR_RETADDR DS  F
+REPHEAD_RETADDR DS  F
+*
+*        Work Areas
+*
+WORKD    DS    D                       For CVD etc
+CHAR16   DS    CL16                    String Work area
+FILLCHAR_X DS    XL1                   Set by Parm or default of X'00'
+FILLCHAR_C DS    CL2                   Set by Parm or default of C'00'
+FILLDEFT   DS    CL1                   Set to C'1' if no FILLCHAR
+*                                      is provided.
+REPREQ   DS    CL1                     Set to C'1' if Report DD Name
+*                                      is present in TIOT
+REPPN    DS    PL2                     Report Page Number
+REPLN    DS    H                       Report Line Number
+MSG4WTO  DS    XL1                     Set to x'01' if heading MSG 4
+*                                      WTO has been issued
+MSG5WAL  DS    AL1                     Length of Text
+MSG5TEXT DS    CL100                   Text
+*
+*        WTO Area
+*
+WTOMSGWA WTO   '                                                       X
+                                                            ', 100 ch  X
+               ROUTCDE=(11),DESC=(7),MF=L
+WTOMSGWAL EQU  *-WTOMSGWA
+*
+*        DCB Areas
+*
+         PUSH  PRINT
+         PRINT NOGEN               No need to see what DCBs look like
+*
+SYSUT1   DCB   DSORG=PS,MACRF=GM,DDNAME=SYSUT1
+SYSUT1L  EQU   *-SYSUT1                Length of SYSUT1 DCB
+SYSUT2   DCB   DSORG=PS,MACRF=PM,DDNAME=SYSUT2
+SYSUT2L  EQU   *-SYSUT2                Length of SYSUT2 DCB
+REPORT   DCB   DSORG=PS,MACRF=PM,DDNAME=REPORT
+REPORTL  EQU   *-REPORT                Length of REPORT DCB
+*
+         POP   PRINT
+*
+*        Record I/O Area
+*
+         DS    0F
+RECIN    DS    CL80
+*
+*        Generated TXT Record I/O Area
+*
+         DS    0F
+GENREC   DS    CL80
+*
+*        Generated IDENTIFY Record
+*
+         DS    0F
+IDENTREC DS    CL80
+         ORG   IDENTREC
+         DS    CL8
+IDENTID  DS    C'IDENTIFY'
+         DS    C' '
+IDENTSD  DS    CL8
+IDENTTXT DS    CL55
+         ORG
+*
+*        Report I/O Area
+*
+         DS    0F
+REPREC   DS    CL80
+*
+*        Csect Control Area
+*
+*        This must be at the end of the GETMAINed WORKAREA to
+*        avoid any addressability problems
+*
+         DS    0F
+ESDTAB   DS    &MAXESD.XL32           Provide for &MAXESD number
+*
+*********************************************************************
+*
+*        END OF GETMAINed WORK AREA
+*
+*********************************************************************
+*
+WORKAREAL EQU *-WORKAREA               Length of area to Getmain
+*
+*********************************************************************
+*
+*        DSECTS
+*
+*********************************************************************
+*
+ESDREC   DSECT                         Define ESD Fields in ESD record
+ESDX02   DS    X'02'
+ESDESD   DS    C'ESD'
+         DS    CL6' '
+ESDVFC   DS    AL2                     Variable Field Count
+         DS    CL2' '
+ESDESDID DS    AL2                     ESDID of First SD, ER, etc
+ESDVDATA DS    3XL16                   Up to three ESD ID entries
+*
+ESDENT   DSECT                         Define ESD Entry in ESD Record
+ESDXSYMN DS    CL8                     External Symbol Name
+ESDTYPE  DS    XL1                     External Symbol Type Code
+ESDTYPE_SD EQU X'00'                   SD
+ESDTYPE_LD EQU X'01'                   LD
+ESDTYPE_ER EQU X'02'                   ER
+ESDTYPE_PC EQU X'04'                   PC
+ESDTYPE_CM EQU X'05'                   CM
+ESDTYPE_XD EQU X'06'                   XD
+ESDTYPE_WX EQU X'0A'                   WX
+ESDADDR  DS    AL3                     Addr
+ESDFLAG  DS    XL1                     Flags
+ESDLEN   DS    AL3                     Length of SD
+ESDENTL  EQU   *-ESDENT                Length of Entry
+*
+TXTREC   DSECT                         Define TXT Fields in TXT Record
+TXTX02   DS    X'02'
+TXTTXT   DS    C'TXT'
+         DS    C' '
+TXTRADDR DS    AL3                     Relative Addr of data in
+*                                      TXTDATA
+         DS    C'  '
+TXTLEN   DS    AL2                     Length of data in TXTDATA
+         DS    C'  '
+TXTESDID DS    AL2                     ESD ID of the data
+TXTDATA  DS    CL56                    Data Field
+TXTDID   DS    CL2                     Deck ID from Title Stmt
+         DS    CL6' '                  Optional Seq Number
+*
+*        Control Block with entry for each SD found on ESD
+*        Records
+*
+CSD      DSECT
+CESDID   DS    AL2                     ESD ID of Csect
+CNAME    DS    CL8                     Name of SD
+         DS    0F
+CLEN     DS    AL4                     Length of SD
+CPTR     DS    AL4                     Current Ptr for SD
+CSLOC    DS    AL4                     Starting Location
+CBYTEC   DS    AL4                     Count of Inserted Bytes
+CTCNT    DS    AL2                     Count of additional TXT Recs
+CPAD     DS    CL2                     Padding
+CSDL     EQU   *-CSD                   Length of Control Block
+*
+         IEZREGS
+*
+         PUSH  PRINT
+         PRINT NOGEN                   No need to print
+         IHAPSA
+         IKJTCB
+TIOT     DSECT
+         IEFTIOT1
+         DCBD  DSORG=PO,DEVD=(DA)
+         POP   PRINT
+         END

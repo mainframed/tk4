@@ -1,0 +1,1908 @@
+//ASM020   JOB (9999,999,9),
+//         CLASS=1,MSGCLASS=T
+//ICFCAT   EXEC ASMFCL,LEPRM=',AC=1'
+//ASM.SYSLIB DD DSN=XXXXXXX.CATOUT.ASM,DISP=SHR     <--- BASF MACROS
+//           DD DSN=SYS1.MACLIB,DISP=SHR
+//ASM.SYSIN DD *
+         TITLE 'CATALOG RECOVERY'
+OP020    CSECT *
+         SPACE
+**********************************************************************
+*                                                                    *
+*               CATALOG RECOVERY                                     *
+*                                                                    *
+**********************************************************************
+*                                                                    *
+*   PROGRAMMER:  M. GIMPEL / BASF AG                                 *
+*   DATE      :  APRIL 1984                                          *
+*                                                                    *
+**********************************************************************
+*                                                                    *
+*   THIS PROGRAM OPENS AN ICF CATALOG AS A VSAM CLUSTER AND          *
+*   DOES VSAM INSERT, PUT UPDATE AND DELETE OF RECORDS.              *
+*                                                                    *
+*   LKED PARAMETER: AC=1                                             *
+*                                                                    *
+*   YOU CAN SPECIFY ONE OF THE FOLLOWING PARAMETERS:                 *
+*       NO PARAMETER:  UPDATE CATALOG FROM SMF LOGRECORDS            *
+*       SYSIN:         LIST OR DELETE SPECIFIC RECORDS               *
+*       LOAD:          LOAD CATALOG FROM UNLOAD OR EXPORT DATASET    *
+*       UNLOAD:        UNLOAD CATALOG TO OUTLOG FILE                 *
+*                                                                    *
+*   THE CATALOG WILL BE RESERVED WITH                                *
+*       QNAME = SYSIGGV2  AND                                        *
+*       RNAME = CATALOG NAME (MAX. 20 BYTES)                         *
+*                                                                    *
+*   YOU MUST SPECIFY DISP=OLD ON CATALOG DD-STATEMENT, IF YOU        *
+*   WANT TO INSERT RECORDS (FUNCTIONS LOAD AND UPDATE PER SMF).      *
+*   IN ALL OTHER CASES DISP=SHR WILL BE OK.                          *
+*                                                                    *
+*   EXAMPLE:                                                         *
+*                                                                    *
+*  /*JOBPARM SYSAFF=XXXX                                             *
+*  //ICFCAT  EXEC PGM=OP020,PARM=XXXX                PARAMETER       *
+*  //STEPLIB  DD DSN=XXXXXX,DISP=SHR                                 *
+*  //REPORT   DD SYSOUT=*                            CONTROL LIST    *
+*  //ERROR    DD SYSOUT=*                            ERROR LIST      *
+*  //CATLG    DD DSN=TESTCAT,DISP=OLD                CATALOG         *
+*  //SMFLOG   DD DSN=XXXXXX,DISP=SHR    (NO PARAM)   SMFLOG          *
+*  //SYSIN    DD *                      (SYSIN)      SYSIN           *
+*  D   ABCV.GDG4                         SAMPLE                      *
+*  R005ABCV.TEST1                        SAMPLE                      *
+*  //LOADLOG  DD DSN=XXXX,DISP=SHR      (LOAD)       FROM UNLOAD     *
+*                                  OR AN EXPORTED COPY BY IDCAMS     *
+*  //OUTLOG   DD DSN=XXXX,                           OUTLOG          *
+*  //   DISP=(,CATLG),DCB=(RECFM=VB,..),..    (UNLOAD AND SYSIN)     *
+*  //SYSUDUMP DD SYSOUT=*                                            *
+*  //ASTPARM  DD DSN=XXXX,DISP=SHR ×       FOR BASF AST-PROGRAM      *
+*  //ASTBLATT DD SYSOUT=*          ×     (AUTOMATIC CHECK OF COUNTS) *
+*                                        CAN BE OMITTED              *
+*                                                                    *
+*                                                                    *
+*   RECOVERY FROM SMF LOGRECORDS                                     *
+*   ----------------------------                                     *
+*                                                                    *
+*   ICF USER CATALOG UPDATE FROM SMF LOGRECORDS TYPE 61, 65, 66      *
+*       61 (X'3D')   -  CATALOG                                      *
+*       65 (X'41')   -  UNCATALOG                                    *
+*       66 (X'42')   -  RECATALOG                                    *
+*                                                                    *
+*       ALL SMF RECORDS INCLUDE A COMPLETE CATALOG-RECORD AS A       *
+*       RESULT OF THE CATALOG ACTION.                                *
+*                                                                    *
+*   PREREQUISITES TO USE THIS FUNCTION:                              *
+*       THE CATALOG SHOULD BE EXPORTED REGULARILY, E.G. DAILY        *
+*           TO HAVE A VALID COPY                                     *
+*           THIS COPY MUST BE IMPORTED BEFORE THIS PROGRAM STARTS    *
+*       NO OTHER VSAM-DATASETS MAY RESIDE ON THE CATALOG VOLUME:     *
+*           ALTER REMOVE VOLUME IS POSSIBLE TO GET RID OFF THE       *
+*           DAMAGED CATALOG - DELETE FORCE WOULD DELETE ALL          *
+*           VSAM-CLUSTERS OF THIS CATALOG                            *
+*           ONLY CATALOG-RECORDS ARE SELECTED, NO VVDS-RECORDS.      *
+*           IF THE CATALOG IS TO BE DEFINED ON A NEW VOLUME          *
+*           BECAUSE OF HEAD-CRASH E.G., INCONSITENSIES COULD OCCUR   *
+*           BETWEEN CATALOG AND VVDS OF CATALOG-VOLUME.              *
+*       SMF-RECORDS MUST BE SORTED (DATE AND TIME)                   *
+*           ONLY THOSE RECORDS, WHICH ARE WRITTEN SINCE LAST         *
+*           EXPORT OF CATALOG SHOULD BE SELECTED.                    *
+*                                                                    *
+*       UPDATES OF MASTER-CATALOG                                    *
+*           THIS PROGRAM DOES NOT DO UPDATES TO MASTER CATALOG       *
+*           (ALIAS POINTER)                                          *
+*                                                                    *
+* ***** NOTE: THE LAST TWO POINTS ARE PERFORMED THROUGH              *
+*       ----- PROGRAM OP017, WHICH SHOULD RUN BEFORE THIS PROGRAM    *
+*             STARTS.                                                *
+*             OP017 SELECTS ALL NECESSARY SMF-RECORDS FOR THE        *
+*             CATALOG TO BE RECOVERED AND UPDATES MASTERCATALOG      *
+*             BY IDCAMS                                              *
+*                                                                    *
+*                                                                    *
+*   SYSIN - PROCESSING                                               *
+*   ------------------                                               *
+*                                                                    *
+*   UNDER DDNAME SYSIN YOU CAN SPECIFY KEYS (=DSN) OF RECORDS YOU    *
+*   WANT TO LIST OR DELETE.                                          *
+*   SELECTED RECORDS ARE WRITTEN TO OUTLOG.                          *
+*                                                                    *
+*   FORMAT OF SYSIN:                                                 *
+*   01 - 01   FUNCTION (R=READ, D=DELETE)                            *
+*   02 - 04   COUNT (FOR READ ONLY)                                  *
+*   05 - 48   DSN                                                    *
+*                                                                    *
+*                                                                    *
+*   UNLOAD - PROCESSING                                              *
+*   -------------------                                              *
+*                                                                    *
+*   ALL CATALOG RECORDS ARE READ AND WRITTEN TO OUTLOG               *
+*   (RECFM=VB OR VBS).                                               *
+*                                                                    *
+*                                                                    *
+*   LOAD - PROCESSING                                                *
+*   -----------------                                                *
+*                                                                    *
+*   ALL RECORDS FROM LOADLOG WILL BE INSERTED INTO THE CATALOG,      *
+*   EXECPT THE CATALOG SELFDESCRIBING ONES.                          *
+*   LOADLOG CAN BE THE OUTPUT OF UNLOAD-PROCESSING OR AN             *
+*   EXPORT-COPY OF CATALOG BY IDCAMS. EXPORT CONTROL RECORDS ARE     *
+*   SKIPPED.                                                         *
+*   YOU CAN RERUN THE PROGRAM WITH THE SAME INPUT LOADLOG,           *
+*   DUPLICATE RECORDS ARE REJECTED.                                  *
+*                                                                    *
+**********************************************************************
+         EJECT
+         REG
+         SPACE
+         XSAVE (R12,R11),SVA,OP020
+         SPACE 3
+         L     R1,0(R1)            GET ADDR OF PARM
+         ST    R1,PARMADDR         SAVE IT
+         SPACE
+         USING SMF61,R6
+         SPACE 3
+         OPEN  (REPDCB,(OUTPUT),ERRDCB,(OUTPUT))
+         SPACE 3
+         L     R1,PARMADDR
+         LH    R2,0(R1)            LGTH OF PARM
+         LTR   R2,R2
+         BZ    OPENLOG             NO PARM, NORMAL PROSESSING
+         SPACE
+         CLC   2(4,R1),=CL4'LOAD'
+         BE    PREPLD
+         CLC   2(6,R1),=CL6'UNLOAD'
+         BE    PREPUNL
+         CLC   2(5,R1),=CL5'SYSIN'
+         BE    PREPSY
+         B     PARMERR             INVALID PARAMETER
+         SPACE 3
+PREPLD   EQU   *
+         LA    R3,LOADDCB+40         DDNAME
+         TIOTSCAN (R3)
+         LTR   R15,R15
+         BZ    LOADERR          DD STMT FOR LOADLOG MISSING
+         SPACE
+         OPEN  (LOADDCB,(INPUT))
+         SPACE
+         OI    SW,SLOAD         MARK LOAD PROCESSING
+         B     OPENCAT
+         SPACE 3
+PREPUNL  EQU   *
+         OI    SW,SUNLOAD       MARK UNLOAD PROCESSING
+         B     TSTOUTL
+         SPACE 3
+PREPSY   EQU   *
+         LA    R3,INDCB+40         DDNAME
+         TIOTSCAN (R3)
+         LTR   R15,R15
+         BZ    SYSINERR         DD STMT FOR SYSIN MISSING
+         SPACE
+         OPEN  (INDCB,(INPUT))
+         SPACE
+         OI    SW,SSYSIN
+         SPACE 3
+TSTOUTL  EQU   *
+         LA    R3,OUTDCB+40        DDNAME
+         TIOTSCAN (R3)             TEST OUT DD STMT
+         LTR   R15,R15
+         BZ    INERR01       NO DD STMT FOR OUT, ERROR
+         SPACE
+         OPEN  (OUTDCB,(OUTPUT))
+         SPACE
+         OI    SW,SOUTLOG         MARK OUTLOG OPEN
+         SPACE
+         B     OPENCAT       DO NOT OPEN LOG
+         SPACE 3
+OPENLOG  EQU   *
+         LA    R3,LOGDCB+40        DDNAME
+         TIOTSCAN (R3)             TEST LOG DD STMT
+         LTR   R15,R15
+         BZ    LOGERR        NO DD STMT FOR LOG, ERROR
+         SPACE
+         OPEN  (LOGDCB,(INPUT))
+         SPACE
+         OI    SW2,S2SMFLOG        MARK SMFLOG OPEN
+         SPACE 3
+*
+* OPEN CATALOG AS VSAM-CLUSTER
+* ----------------------------
+*
+         SPACE
+OPENCAT  EQU   *
+         OI    CATACB+50,X'01'        ALLOW BYPASS SECURITY
+         OI    CATACB+51,X'10'        SET ACBCATX BIT
+         SPACE 2
+         LA    R3,CATACB+40           DDNAME
+         TIOTSCAN (R3)
+         LTR   R15,R15
+         BZ    CATDDE                 DD STATEMENT MISSING
+         XR    R3,R3
+         ICM   R3,7,17(R15)           GET UCB ADDR
+         LTR   R3,R3
+         BZ    CATDDE2                DUMMY OR SYSOUT DD-STMT
+         ST    R3,UCBADDR
+         SPACE
+         XR    R3,R3
+         ICM   R3,7,12(R15)           GET JFCB ADDR
+         MVC   H1CAT,16(R3)           GET DSN OF CATALOG (REPORT)
+         MVC   E1CAT,16(R3)           GET DSN OF CATALOG (ERROR LST)
+         MVC   RNAME,16(R3)           FOR RESERVE
+         SPACE 2
+*        SETAUTH ON
+         SPACE
+         L     R1,16         CVT
+         L     R1,0(R1)      TCBPTR
+         L     R1,4(R1)      OWN TCB
+         L     R2,180(R1)    JSCB
+         SPACE
+         MODESET KEY=ZERO,MODE=SUP
+         OI    243(R2),X'80'          BYPASS PASSWORD PROTECT
+         SPACE
+         MODESET KEY=NZERO,MODE=PROB
+         SPACE 2
+*        LA    R15,SVCNTS            MAKE NONSWABABLE
+*        SVC   250
+         SPACE 2
+         RESERVE (QNAME,RNAME,E,20,SYSTEMS),UCB=UCBADDR
+         LTR   R15,R15
+         BNZ   RESERR
+         SPACE 2
+         OPEN  (CATACB,(OUTPUT))
+         LR    R2,R15                  SAVE RETURN CODE
+*        SETAUTH OFF
+         SPACE
+         LTR   R2,R2                   OPEN OK?
+         BNZ   VOPENERR
+         SPACE 2
+         TM    SW,SSYSIN               INPUT PER SYSIN?
+         BO    SYSIN                   YES, DON'T GET LOG
+         SPACE 2
+         TM    SW,SLOAD                LOAD PROCESSING?
+         BO    LOAD                    YES, DON'T GET LOG
+         SPACE 2
+         TM    SW,SUNLOAD              UNLOAD PROCESSING?
+         BO    UNLOAD                  YES, DON'T GET LOG
+         SPACE 2
+         XR    R7,R7
+         EJECT
+*
+*   NORMAL PROCESSING  -  INPUT FROM SMFLOG
+*   ---------------------------------------
+*
+         SPACE
+GETLOG   EQU   *
+         SPACE
+         LA    R7,1(R7)        FOR TEST
+         SPACE
+         NI    SW,255-SDEL     SET OFF SWITCH
+         GET   LOGDCB
+         ST    R1,LOGADDR
+         SPACE
+         L     R3,AVSMFALL           COUNT ALL SMF-RECORDS
+         LA    R3,1(R3)
+         ST    R3,AVSMFALL
+         SPACE
+         LR    R6,R1
+         CLC   SMF61CNM,H1CAT        SMF REC FOR WANTED CAT?
+         BE    CATOK                 YES, DO IT
+         L     R3,ANOTCAT            NO, SKIP IT
+         LA    R3,1(R3)
+         ST    R3,ANOTCAT
+         B     GETLOG
+         SPACE
+CATOK    EQU   *
+         LA    R1,SMF61CRC-SMFRCD61(R1)   ADDR OF DATA
+         ST    R1,RECADDR
+         XR    R2,R2
+         ICM   R2,3,0(R1)            GET RECORD SIZE
+         STCM  R2,15,CATRPL+48       STORE RECSIZE IN RPL
+         LA    R1,9(R1)              ADDR OF ARGUMENT (DSN)
+         STCM  R1,15,CATRPL+36       STORE ADDR IN RPL
+         MVC   L1CATDSN,0(R1)        SAVE CATDSN IN LIST
+         SPACE
+         BAL   R14,CALLPK            DATE TO LIST
+         SPACE 2
+         L     R6,LOGADDR            ADDR OF SMFRECORD
+         MVC   L1SMFDSN,SMF61ENM     SMFDSN TO LIST
+         SPACE
+         CLI   SMF61RTY,X'3D'           CATLG?  (61)
+         BE    CATALOG
+         SPACE
+         CLI   SMF61RTY,X'41'           UNCATLG?  (65)
+         BE    UNCAT
+         SPACE
+         CLI   SMF61RTY,X'42'           RECATALOG? (65)
+         BE    ALTER
+         SPACE
+         L     R1,AVSMFBAD
+         LA    R1,1(R1)
+         ST    R1,AVSMFBAD
+         B     GETLOG                NEXT RECORD
+         SPACE 3
+*
+*  UPDATE OF CATALOG RECORDS
+*  -------------------------
+*
+         SPACE
+RECAT    EQU   *
+         MVI   L1ACAT,C'R'           REAL ACTION = RECAT (LIST)
+         L     R1,AREC
+         LA    R1,1(R1)
+         ST    R1,AREC                COUNT REC FOR RECATALOG
+         SPACE
+         LA    R1,CAREA
+         STCM  R1,15,CATRPL+32       ADDR OF AREA FOR OLD REC
+         OI    CATRPL+41,UPD         UPDATE
+         GET   RPL=CATRPL
+         LTR   R15,R15
+         BZ    TRYPUT
+         SPACE
+         CLI   CATRPL+15,X'10'       RECORD NOT FOUND
+         BE    GETERR
+         B     GETERRS               SERIOUS GET ERROR
+         SPACE
+TRYPUT   EQU   *
+         L     R1,RECADDR            ADDR OF DATA
+         STCM  R1,15,CATRPL+32       ADDR OF AREA
+         XR    R2,R2
+         ICM   R2,3,0(R1)            GET RECORD SIZE
+         STCM  R2,15,CATRPL+48       STORE RECSIZE IN RPL
+         PUT   RPL=CATRPL
+         LTR   R15,R15
+         BNZ   UPDERRS               SERIOUS ERROR
+         SPACE
+         L     R1,ARECOK
+         LA    R1,1(R1)
+         ST    R1,ARECOK
+         BAL   R14,REPORT
+         B     GETLOG                NEXT RECORD
+         SPACE 3
+*
+*  CATALOG
+*  -------
+*
+         SPACE
+CATALOG  EQU   *
+         MVI   L1ASMF,C'C'           MARK CATALOG IN SMF-REC
+         L     R1,AVSMF3D
+         LA    R1,1(R1)
+         ST    R1,AVSMF3D
+         SPACE
+CATALOG1 EQU   *
+         MVI   L1ACAT,C'C'           MARK REAL ACTION CATALOG
+         L     R1,ACAT
+         LA    R1,1(R1)
+         ST    R1,ACAT
+         SPACE
+         L     R1,RECADDR            ADDR OF DATA
+         STCM  R1,15,CATRPL+32       ADDR OF AREA
+         NI    CATRPL+41,255-UPD     NO UPDATE WITH PUT INS
+         PUT   RPL=CATRPL
+         LTR   R15,R15
+         BNZ   CATALOG2
+         SPACE
+         L     R1,ACATOK
+         LA    R1,1(R1)
+         ST    R1,ACATOK
+         BAL   R14,REPORT
+         B     GETLOG
+         SPACE
+CATALOG2 EQU   *
+         CLI   CATRPL+15,X'08'       DUPLICATE RECORD?
+         BNE   INSERRS               SERIOUS ERROR
+         SPACE
+         L     R1,ACATDUP
+         LA    R1,1(R1)
+         ST    R1,ACATDUP
+         B     RECAT                 TRY TO UPDATE RECORD
+         SPACE 3
+*
+*  UNCATALOG
+*  ---------
+*
+         SPACE
+UNCAT    EQU   *
+         MVI   L1ASMF,C'U'           UNCAT IN SMF
+         L     R1,AVSMF41
+         LA    R1,1(R1)
+         ST    R1,AVSMF41
+         SPACE
+         L     R1,RECADDR            GET CAT RECORD
+         CLI   4(R1),C'B'            GDG-BASE RECORD?
+         BE    CHKGDGD
+         CLI   4(R1),C'C'            CLUSTER OR PAGE?
+         BE    CHKCLD
+         CLI   4(R1),C'J'            GDG EXTENSION?
+         BE    CHKEXTG
+         CLI   4(R1),C'E'            VSAM EXTENSION?
+         BE    CHKEXTV
+         SPACE
+DEL1     EQU   *
+         MVI   L1ACAT,C'U'           UNCAT (REAL ACTION)
+         L     R1,ADEL
+         LA    R1,1(R1)
+         ST    R1,ADEL
+         LA    R1,CAREA
+         STCM  R1,15,CATRPL+32       ADDR OF AREA FOR OLD REC
+         OI    CATRPL+41,UPD         UPDATE
+         GET   RPL=CATRPL
+         LTR   R15,R15
+         BZ    ERASE
+         SPACE
+         CLI   CATRPL+15,X'10'       RECORD NOT FOUND?
+         BE    DEL2                  NO, SERIOUS ERROR
+         SPACE
+         CLI   CATRPL+15,X'04'   EODAD OR KEY HIGHER THAN LAST KEY?
+         BNE   GETERRS               NO, SERIOUS ERROR
+         SPACE
+DEL2     EQU   *
+         TM    SW,SDEL     SECOND DEL RECORD FOR A CLUSTER?
+         BNO   GETERR      NO, OTHER CASE, REC NOT FOUND
+         L     R1,ADELDUP  YES, COUNT DUPLICATE DEL REC
+         LA    R1,1(R1)    AND IGNORE ERROR
+         ST    R1,ADELDUP
+         B     GETLOG
+         SPACE
+ERASE    EQU   *
+         ERASE RPL=CATRPL
+         LTR   R15,R15
+         BNZ   DELERRS               SERIOUS ERROR
+         SPACE
+         L     R1,ADELOK
+         LA    R1,1(R1)
+         ST    R1,ADELOK
+         BAL   R14,REPORT
+         B     GETLOG
+         SPACE 3
+CHKGDGD  EQU   *
+         L     R6,LOGADDR            ADDR OF SMFRECORD
+         CLI   SMF61TYP,C'B'         DELETE OF GDG BASE?
+         BE    DEL1                  YES
+         B     RECAT                 NO, DEL ONLY ONE ENTRY
+         SPACE
+CHKCLD   EQU   *
+         L     R6,LOGADDR            ADDR OF SMFRECORD
+         CLI   SMF61TYP,C'C'         DELETE OF CLUSTER?
+         BE    CHKCLD1               YES, CHECK IF SECOND RECORD
+         CLI   SMF61TYP,C'P'         DELETE OF PAGEDATASET?
+         BNE   RECAT                 NO, UPDATE CATALOG RECORD,
+*              PROBABLY PATH OR ALTIND HAS BEEN DELETED
+*              AND SPHERE RECORD MUST NOT BE DELETED BUT UPDATED
+CHKCLD1  EQU   *
+         CLC   XDSN,SMF61ENM         SECOND RECORD FOR CLUSTER?
+         BNE   MVCDSN                NO
+         OI    SW,SDEL               YES, THIS WILL PROBABLY
+*                                CAUSE AN ERROR WITH GET
+         MVC   XDSN,BLANK            CLEAR DSN, BECAUSE NEXT DSN
+*                                MUST BE A NEW CASE
+         B     DEL1
+MVCDSN   EQU   *
+         MVC   XDSN,SMF61ENM         GET NEW DSN
+         B     DEL1
+         SPACE
+CHKEXTG  EQU   *
+         L     R6,LOGADDR
+         CLI   SMF61TYP,C'B'         DEL EXT WITH DEL BASE?
+         BNE   DEL1                  NO, FIRST REC FOR DEL EXT
+         OI    SW,SDEL               YES, THIS WILL PROBABLY
+*                                CAUSE AN ERROR WITH GET
+         B     DEL1
+         SPACE
+CHKEXTV  EQU   *
+         L     R6,LOGADDR
+         CLI   SMF61TYP,C'C'         DEL EXT WITH DEL CLUSTER?
+         BE    DEL1                  YES, DEL CLUSTER SPHERE
+         B     RECAT                 NO, TRY TO UPDATE SPHERE REC
+         SPACE 3
+*
+*  RECATALOG
+*  ---------
+*
+         SPACE
+ALTER    EQU   *
+         MVI   L1ASMF,C'R'           ALTER IN SMF
+         L     R1,AVSMF42
+         LA    R1,1(R1)
+         ST    R1,AVSMF42
+         SPACE
+         L     R6,LOGADDR           GET ADDR OF SMFREC
+         CLI   SMF61FNC,C'R'        RENAME?
+         BNE   RECAT                NO, NORMAL PUT UPD
+         SPACE 2
+*
+*        RENAME
+*        ------
+*
+*   AT LEAST TWO SMF-RECORDS ARE WRITTEN FOR EACH RENAME ACTION:
+*   ONE FOR THE NEW NAME (KEY IN CATREC = NEW DSN) AND
+*   ONE FOR THE OLD NAME (KEY IN CATREC = OLD DSN)
+*   ADDITIONAL RECORDS UPDATE RELATED ENTRIES, SUCH
+*   AS TRUENAME-RECORDS FOR AIX, PATH- OR CLUSTER-ENTRIES
+*
+         SPACE 2
+         L     R1,AREN
+         LA    R1,1(R1)
+         ST    R1,AREN
+         SPACE
+         CLC   RODSN,SMF61ENM       SAME OLD DSN?
+         BE    REN2                 YES, GO ON
+         SPACE
+         TM    SW,SENM+SNNM         LAST RENAME OK?
+         BO    REN1                 YES
+         BNZ   RENERR               NO, NOT COMPLETE
+*                                ISSUE WARN MSG
+REN1     EQU   *
+         NI    SW,255-SENM-SNNM     CLEAR SWITCH
+         MVC   RODSN,SMF61ENM       SAVE NEW OLD-DSN
+         SPACE
+REN2     EQU   *
+         L     R1,RECADDR           ADDR OF CAT REC
+         CLC   SMF61ENM,9(R1)       OLD DSN = DSN IN CATREC?
+*         (THIS IS THE OLD KEY, CATRECORD MUST BE DELETED)
+         BNE   REN3                 NO, GO ON
+         OI    SW,SENM              YES, DELETE OLD RECORD (OLD KEY)
+         B     DEL1
+         SPACE
+REN3     EQU   *
+         CLC   SMF61NNM,9(R1)       NEW DSN = DSN IN CATREC?
+*         (THIS IS THE NEW KEY, CATRECORD MUST BE INSERTED)
+         BNE   RECAT                NO, UPDATE RELATED RECORD
+         OI    SW,SNNM              YES, INSERT NEW KEY
+         B     CATALOG1
+         EJECT
+*
+*   INPUT FROM SYSIN INSTEAD OF SMFLOG
+*   ----------------------------------
+*
+         SPACE
+SYSIN    EQU   *
+         OI    CATRPL+40,SEQ
+         NI    CATRPL+40,255-DIR
+         OI    CATRPL+40,GEN        GENERIC KEY SEARCH
+         LA    R1,44                ONLY LGTH OF DSN -
+         STCM  R1,3,CATRPL+16       EXCLUDE COUNT BYTE
+         SPACE
+         LA    R1,CAREA
+         STCM  R1,15,CATRPL+32      SAVE ADDR OF AREA
+         LA    R1,SDSN              ADDR OF ARGUMENT
+         STCM  R1,15,CATRPL+36      SAVE IT IN RPL
+         SPACE 3
+GETSYSIN EQU   *
+         GET   INDCB,IN
+         MVI   L1ASMF,C'S'       SAVE WANTED FUNCTION
+         MVC   L1ASMF+1(1),SFCT       SAVE WANTED FUNCTION
+         MVC   L1ACAT+1(L'SCOUNT),SCOUNT
+         MVC   L1CATDSN,SDSN     SAVE DSN IN LIST
+         MVC   L1SMFDSN,SDSN     SAVE DSN IN LIST
+         SPACE
+         CLI   IN,C'R'
+         BE    SREAD
+         CLI   IN,C'D'
+         BE    SDELETE
+         SPACE
+         B     INERR02          INVALID FUNCTION CODE
+         SPACE 2
+SREAD    EQU   *
+         L     R1,ASREAD
+         LA    R1,1(R1)
+         ST    R1,ASREAD
+         SPACE
+         LA    R3,1
+         CLC   SCOUNT,BLANK
+         BE    SR0             READ AT LEAST ONE RECORD
+         SPACE
+         LA    R1,SCOUNT
+         LA    R2,L'SCOUNT
+CHKCNT   EQU   *
+         CLI   0(R1),X'F0'
+         BL    INERR03          COUNT NOT NUMERIC
+         CLI   0(R1),X'F9'
+         BH    INERR03          COUNT NOT NUMERIC
+         BCT   R2,CHKCNT
+         SPACE
+         XC    DW,DW
+         PACK  DW+6(2),SCOUNT
+         CVB   R3,DW            REMEMBER COUNT
+         LTR   R3,R3
+         BNZ   SR0
+         LA    R3,1             READ AT LEAST ONE RECORD
+         SPACE
+SR0      EQU   *
+         OI    CATRPL+40,KGE    KEY GREATER OR EQUAL
+         SPACE
+         POINT RPL=CATRPL
+         LTR   R15,R15
+         BNZ   PNTERR
+         SPACE
+SR1      EQU   *
+         GET   RPL=CATRPL
+         LTR   R15,R15
+         BNZ   GETERRS         SERIOUS GET ERROR
+         SPACE
+         L     R1,ASGETR
+         LA    R1,1(R1)
+         ST    R1,ASGETR
+         SPACE
+         LA    R1,CAREA
+         MVC   L1CATDSN,9(R1)    SAVE DSN IN LIST
+         SPACE
+         XR    R2,R2
+         ICM   R2,3,0(R1)        GET LGTH OF CAT RECORD
+         LA    R2,4(R2)          ADD 4 FOR RDW
+         STCM  R2,3,CLGTH        LGTH OF RECORD
+         LA    R1,COUT           GET ADDR OF RDW
+         PUT   OUTDCB,COUT       RECORD TO OUT-DS
+         L     R1,ASROUT
+         LA    R1,1(R1)
+         ST    R1,ASROUT
+         SPACE
+         BAL   R14,REPORT
+         SPACE
+         BCT   R3,SR1           GET ALL RECORDS WANTED
+         B     GETSYSIN
+         SPACE 3
+SDELETE  EQU   *
+         L     R1,ASDEL
+         LA    R1,1(R1)
+         ST    R1,ASDEL
+         SPACE
+         NI    CATRPL+40,255-KGE   KEY EQUAL
+         OI    CATRPL+41,UPD       UPDATE
+         SPACE
+         POINT RPL=CATRPL
+         LTR   R15,R15
+         BNZ   PNTERR
+         SPACE
+SDEL1    EQU   *
+         GET   RPL=CATRPL
+         LTR   R15,R15
+         BNZ   GETERRS         SERIOUS GET ERROR
+         SPACE
+         LA    R1,CAREA
+         CLC   SDSN,9(R1)      RECORD TO BE DELETED?
+         BNE   GETSYSIN        NO, DELETE FOR THIS DSN OK
+         SPACE
+         MVC   L1CATDSN,9(R1)    SAVE DSN IN LIST
+         L     R2,ASGETD
+         LA    R2,1(R2)
+         ST    R2,ASGETD
+         SPACE
+         ERASE RPL=CATRPL
+         LTR   R15,R15
+         BNZ   DELERRS         SERIOUS DELETE ERROR
+         SPACE
+         L     R1,ASDELD
+         LA    R1,1(R1)
+         ST    R1,ASDELD
+         SPACE
+         LA    R1,CAREA
+         SPACE
+         XR    R2,R2
+         ICM   R2,3,0(R1)        GET LGTH OF CAT RECORD
+         LA    R2,4(R2)          ADD 4 FOR RDW
+         STCM  R2,3,CLGTH        LGTH OF RECORD
+         PUT   OUTDCB,COUT       RECORD TO OUT-DS
+         L     R1,ASDOUT
+         LA    R1,1(R1)
+         ST    R1,ASDOUT
+         SPACE
+         MVC   L1ERROR(7),=CL7'DELETED'
+         BAL   R14,REPORT
+         SPACE
+         B     SDEL1            LOOK FOR NEXT RECORD
+         EJECT
+*
+*   LOAD - PROCESSING
+*   -----------------
+*
+         SPACE
+LOAD     EQU   *
+         OI    CATRPL+40,DIR         PREPARE PUT INSERT
+         OI    CATRPL+40,SEQ
+         NI    CATRPL+41,255-UPD     NO UPDATE
+         SPACE
+LOADG    EQU   *
+         GET   LOADDCB
+         ST    R1,RECADDR
+* ************************  CHECK, IF LOADLOG = IDCAMS EXPORT DATASET
+BEXP     B     EXPORT       ---->  NOP AFTER EXPORT CONTROL RECORDS
+* ************************  ARE READ OR IF NO EXPORT DATASET
+         SPACE
+LOADG1   EQU   *
+         LA    R1,4(R1)               SKIP RDW
+         STCM  R1,15,CATRPL+32        ADDR OF AREA
+         XR    R2,R2
+         ICM   R2,3,0(R1)             GET LGTH OF CAT RECORD
+         STCM  R2,15,CATRPL+48         SAVE IT IN RPL
+         LA    R2,9(R1)               ADDR OF ARGUMENT
+         STCM  R2,15,CATRPL+36        SAVE IT IN RPL
+         SPACE
+         MVC   L1SMFDSN,9(R1)         MOVE DSN TO LIST
+         MVC   L1ACAT(2),=CL2'LD'
+         SPACE
+         L     R2,ALDINP
+         LA    R2,1(R2)
+         ST    R2,ALDINP
+         SPACE
+         CLC   =CL8'CATINDEX',L1SMFDSN
+         BE    INSERRL1               SKIP CATIND RECORD
+         SPACE
+         PUT   RPL=CATRPL
+         LTR   R15,R15
+         BNZ   INSERRLD
+         SPACE
+         L     R1,ALDOUT
+         LA    R1,1(R1)
+         ST    R1,ALDOUT
+         BAL   R14,REPORT
+         B     LOADG
+         SPACE 3
+*   CHECK, IF LOADLOG DATASET = IDCAMS EXPORT DATASET
+         SPACE
+EXPORT   EQU   *
+B2EXP    NOP   EXPORT2     --------> BRANCH AFTER FIRST TIME HERE
+         OI    B2EXP+1,X'F0'         MAKE NOP TO BRANCH
+         CLC   4(4,R1),=XL4'001CFFFF'     EXPORT DATASET?
+         BE    LOADG          YES, CONTROL RECORDS NEED TO BE SKIPPED
+         SPACE
+         NI    BEXP+1,X'0F'   ------> BR TO NOP - NEVER COME AGAIN
+         B     LOADG1           NORMAL PROCESSING, GO ON WITH RECORD
+         SPACE
+EXPORT2  EQU   *
+         CLC   4(3,R1),=XL3'000801'     LAST CONTROL RECORD?
+         BNE   LOADG                    NO, SKIP RECORD
+         NI    BEXP+1,X'0F'   ------> BR TO NOP - NEVER COME AGAIN
+         B     LOADG             GET FIRST DATA RECORD
+         EJECT
+*
+*   UNLOAD - PROCESSING
+*   -------------------
+*
+         SPACE
+UNLOAD   EQU   *
+         OI    CATRPL+40,KGE          KEY GREATER EQUAL
+         OI    CATRPL+40,SEQ
+         NI    CATRPL+40,255-DIR
+         SPACE
+         LA    R1,CAREA
+         STCM  R1,15,CATRPL+32        SAVE ADDR OF AREA
+         SPACE
+         LA    R1,SDSN
+         STCM  R1,15,CATRPL+36        SAVE ADDR OF ARGUMENT
+         XC    SDSN,SDSN              LOW KEY
+         SPACE
+         POINT RPL=CATRPL             POSITION AT BEGINNING
+         LTR   R15,R15
+         BNZ   UNLERR01               SERIOS ERROR
+         SPACE
+UNL1     EQU   *
+         GET   RPL=CATRPL
+         LTR   R15,R15
+         BNZ   GETERRS         SERIOUS GET ERROR
+         SPACE
+         L     R1,AUNLGET
+         LA    R1,1(R1)
+         ST    R1,AUNLGET
+         SPACE
+         MVC   L1ACAT(3),=CL3'UNL'  MARK UNLOAD IN REPORT
+         LA    R1,CAREA
+         MVC   L1CATDSN,9(R1)    SAVE DSN IN LIST
+         SPACE
+         XR    R2,R2
+         ICM   R2,3,0(R1)        GET LGTH OF CAT RECORD
+         LA    R2,4(R2)          ADD 4 FOR RDW
+         STCM  R2,3,CLGTH        LGTH OF RECORD
+         PUT   OUTDCB,COUT       RECORD TO OUT-DS
+         L     R1,AUNLOUT
+         LA    R1,1(R1)
+         ST    R1,AUNLOUT
+         SPACE
+         BAL   R14,REPORT
+         B     UNL1
+         EJECT
+*
+*   CLOSE
+*   -----
+*
+         SPACE
+CLOSE    EQU   *
+         CLOSE CATACB
+         SPACE
+         SETAUTH ON
+         SPACE
+         DEQ   (QNAME,RNAME,20,SYSTEMS),UCB=UCBADDR
+         LR    R3,R15         SAVE RETURN CODE
+         SPACE
+         LTR   R3,R3
+         BNZ   DEQERR
+         SPACE
+         LA    R15,SVCOKS            MAKE SWABABLE
+         SVC   250
+         SPACE
+         SETAUTH OFF
+         SPACE 3
+CLOSE2   EQU   *
+         TM    SW,SSYSIN            SYSIN DCB OPEN?
+         BNO   CLOSE3               NO
+         CLOSE (INDCB)              CLOSE INDCB
+         SPACE
+CLOSE3   EQU   *
+         TM    SW,SOUTLOG           OUTLOG-DCB OPEN?
+         BNO   CLOSE4               NO
+         CLOSE (OUTDCB)
+         SPACE
+CLOSE4   EQU   *
+         TM    SW,SLOAD             LOADLOG-DCB OPEN?
+         BNO   CLOSE5               NO
+         CLOSE (LOADDCB)
+         SPACE
+CLOSE5   EQU   *
+         TM    SW2,S2SMFLOG          SMFLOG-DCB OPEN?
+         BNO   CLOSE6                NO
+         CLOSE (LOGDCB)
+         SPACE
+CLOSE6   EQU   *
+         L     R1,RETCODE
+         CH    R1,=H'12'
+         BH    CLOSE6A
+         SPACE
+         AP    RPAGE,=P'+1'
+         MVC   RLPAGE-1(6),MASK5
+         ED    RLPAGE-1(6),RPAGE
+         PUT   REPDCB,H1
+         SPACE
+         CALL  OP020SUM                PRINT SUMMARY
+         SPACE
+CLOSE6A  EQU   *
+         CLOSE (REPDCB,,ERRDCB)
+         SPACE 3
+*        MVC   ADW0+5(3),RPAGE         GET PAGE COUNTS
+*        MVC   ADW0+13(3),EPAGE        IN FIRST TWO AST-COUNTS
+         SPACE 2
+*        LA    R3,ASTPARM
+*        TIOTSCAN (R3)                 AST WANTED?
+*        LTR   R15,R15
+*        BZ    NOAST                   NO, ASTPARM DD STMT MISSING
+         SPACE
+*        LA    R2,AVSMFALL              GET FIRST AST-SUM
+*        LA    R3,ADW                   ADDR OF AST-DW
+*        XR    R4,R4
+*        LA    R4,ANO                   NO OF AST-DW
+         SPACE
+AST      EQU   *                        CONVERT ALL SUMS
+*        L     R1,0(R2)                 GET SUM
+*        CVD   R1,0(R3)
+*        LA    R2,4(R2)
+*        LA    R3,8(R3)
+*        BCT   R4,AST
+*        SPACE
+*        CALL  COBAST,(RCODE,BZEIT,ADW0),VL
+         SPACE 3
+NOAST    EQU   *
+         L     R15,RETCODE        GET RETURN CODE
+         XRETURN (R15)
+         EJECT
+*
+*  SVC-ROUTINE FOR NONSWABABLE
+*
+         SPACE
+SVCNTS   EQU   *
+*        XR    R1,R1
+*        LA    R0,14
+*        SVC   95                SYSEVENT
+         BR    R14
+         SPACE 3
+*
+*  SVC-ROUTINE FOR SWABABLE
+*
+         SPACE
+SVCOKS   EQU   *
+*        XR    R1,R1
+*        LA    R0,42
+*        SVC   95                SYSEVENT
+         BR    R14
+         EJECT
+*
+* CHANGE DATE AND TIME  ---> PRINTABLE FORM
+* -----------------------------------------
+*
+         SPACE
+CALLPK   EQU   *
+         ST    R14,RETADDR
+         L     R6,LOGADDR
+         MVC   L1DATE,BLANK
+         UNPK  L1DATE(5),SMF61DTE+1(3)
+         OI    L1DATE+4,X'F0'
+         SPACE
+         MVC   ZTIME0,BLANK
+         UNPK  ZTIME0,SMF61TME(5)    UNPACK TIME
+         TR    ZTIME,TRANS           MAKE TIME PRINTABLE
+         MVC   L1TIME,ZTIME          MOVE TIME TO LIST
+         SPACE
+DATRET   EQU   *
+         L     R14,RETADDR
+         BR    R14
+         SPACE 3
+*
+*   REPORT
+*   ------
+*
+         SPACE
+REPORT   EQU   *
+         ST    R14,REPRET
+         LH    R1,RLCNT       REPORT LINE COUNT
+         CH    R1,=H'54'
+         BL    PUTRLINE
+         AP    RPAGE,=P'+1'
+         MVC   RLPAGE-1(6),MASK5
+         ED    RLPAGE-1(6),RPAGE
+         PUT   REPDCB,H1
+         PUT   REPDCB,H2
+         PUT   REPDCB,H2A
+         PUT   REPDCB,H2B
+         PUT   REPDCB,H3
+         PUT   REPDCB,H4
+         XC    RLCNT,RLCNT
+         MVI   L1S,C'0'
+PUTRLINE EQU   *
+         CLC   L1SMFDSN,ZLRDSN       SAME DSN AS IN LAST LINE?
+         BNE   PUTR1                 NO, PRINT IT
+         MVC   L1SMFDSN,BLANK
+         B     PUTR2
+PUTR1    EQU   *
+         MVC   ZLRDSN,L1SMFDSN
+PUTR2    EQU   *
+         PUT   REPDCB,L1
+         LH    R1,RLCNT
+         LA    R1,1(R1)
+         STH   R1,RLCNT
+         MVC   L1+2(L'L1-2),L1+1     CLEAR LINE
+         MVI   L1S,C' '
+         L     R14,REPRET
+         BR    R14                   RETURN
+         SPACE
+         EJECT
+*
+* ERROR  - ROUTINES
+* -----------------
+*
+         SPACE
+DATEERR  EQU   *                     ERROR FROM SUBPROG UMDATUM
+         LA    R3,MDATE
+         LA    R4,L'MDATE
+         L     R5,RETADDR           RETURN ADDR
+         LA    R1,4
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     ERRLST
+         SPACE
+PARMERR  EQU   *
+         BCTR  R2,0
+         EX    R2,PARMMVC
+         MVC   L1SMFDSN(L'MPARME),MPARME    INVALID PARAMETER
+         LA    R3,BLANK
+         LA    R4,L'L1ERROR
+         LA    R5,CLOSE2            RETURN ADDR
+         LA    R1,16
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     ERRLST
+PARMMVC  MVC   L1ASMF(0),2(R1)      MOVE PARM TO LIST
+         SPACE
+LOADERR  EQU   *                     LOADLOG DD STMT MISSING
+         MVC   L1SMFDSN(L'MLDE01),MLDE01
+         LA    R3,BLANK
+         LA    R4,L'L1ERROR
+         LA    R5,CLOSE2            RETURN ADDR
+         LA    R1,16
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     ERRLST
+         SPACE
+LOGERR   EQU   *                     SMFLOG DD STMT MISSING
+         MVC   L1SMFDSN(L'MLOGE01),MLOGE01
+         LA    R3,BLANK
+         LA    R4,L'L1ERROR
+         LA    R5,CLOSE2            RETURN ADDR
+         LA    R1,16
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     ERRLST
+         SPACE
+SYSINERR EQU   *                     SYSIN DD STMT MISSING
+         MVC   L1SMFDSN(L'MSYE01),MSYE01
+         LA    R3,BLANK
+         LA    R4,L'L1ERROR
+         LA    R5,CLOSE2            RETURN ADDR
+         LA    R1,16
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     ERRLST
+         SPACE
+INERR01  EQU   *                     LOGOUT DD STMT MISSING
+         MVC   L1SMFDSN(L'MINE01),MINE01
+         LA    R3,BLANK
+         LA    R4,L'L1ERROR
+         LA    R5,CLOSE2            RETURN ADDR
+         LA    R1,16
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     ERRLST
+         SPACE
+INERR02  EQU   *                     INVALID FUNCION
+         LA    R3,MINE02
+         LA    R4,L'MINE02
+         LA    R5,GETSYSIN          RETURN ADDR
+         LA    R1,8
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     ERRLST
+         SPACE
+INERR03  EQU   *                    READ COUNT NOT NUMERIC
+         LA    R3,MINE03
+         LA    R4,L'MINE03
+         LA    R5,GETSYSIN          RETURN ADDR
+         LA    R1,8
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     ERRLST
+         SPACE
+CATDDE   EQU   *                     CATLG DD STMT MISSING
+         MVC   L1SMFDSN(L'MCATE1),MCATE1
+         LA    R3,BLANK
+         LA    R4,L'L1ERROR
+         LA    R5,CLOSE2            RETURN ADDR
+         LA    R1,16
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     ERRLST
+         SPACE
+CATDDE2  EQU   *                     CATLG SYSOUT OR DUMMY DD STMT
+         MVC   L1SMFDSN(L'MCATE2),MCATE2
+         LA    R3,BLANK
+         LA    R4,L'L1ERROR
+         LA    R5,CLOSE2            RETURN ADDR
+         LA    R1,16
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     ERRLST
+         SPACE
+RESERR   EQU   *                     RESERVE ERROR
+         MVC   L1SMFDSN(L'MRESE),MRESE
+         LA    R3,BLANK
+         LA    R4,L'L1ERROR
+         LA    R5,RESERR2           RETURN ADDR
+         ST    R15,SAVERET          RETURN ADDR
+         LA    R1,16
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     ERRLST
+RESERR2  EQU   *
+         L     R15,SAVERET          RETURN ADDR
+         DC    F'0'                 DUMP FOR RES ERROR
+         SPACE
+DEQERR   EQU   *                     CATLG SYSOUT OR DUMMY DD STMT
+         MVC   L1SMFDSN(L'MDEQE),MDEQE
+         LA    R3,BLANK
+         LA    R4,L'L1ERROR
+         LA    R5,CLOSE2            RETURN ADDR
+         ST    R15,SAVERET          RETURN ADDR
+         LA    R1,16
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     ERRLST
+DEQERR2  EQU   *
+         L     R15,SAVERET          RETURN ADDR
+         DC    F'0'                 DUMP FOR DEQ ERROR?
+         SPACE 3
+*
+* VSAM - ERRORS
+*
+GETERR   EQU   *
+         L     R1,ANOTF
+         LA    R1,1(R1)
+         ST    R1,ANOTF
+         LA    R3,MGETNF           RECORD NOT FOUND
+         LA    R4,L'MGETNF         LGTH
+         LA    R5,GETLOG           RETURN ADDR
+         LA    R1,4
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     ERRLST
+         SPACE
+GETERRS  EQU   *
+         CLI   CATRPL+15,X'04'   EODAD OR KEY HIGHER THAN LAST KEY?
+         BNE   GETERRS1          NO
+         TM    SW,SSYSIN         SYSIN OPEN?
+         BO    GETSYSIN          YES
+         TM    SW,SUNLOAD        UNLOAD PROCESSING?
+         BO    CLOSE             YES, WORK OK
+         B     GETERR            NO, RECORD NOT FOUND
+GETERRS1 EQU   *
+         LA    R3,MGETE            SERIOS GET ERROR
+         LA    R4,L'MGETE          LGTH
+         LA    R5,CLOSE            RETURN ADDR
+         LA    R1,12
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     GETCODE
+         SPACE 3
+INSERRS  EQU   *
+         LA    R3,MINSE            SERIOS INSERT ERROR
+         LA    R4,L'MINSE          LGTH
+         LA    R5,CLOSE            RETURN ADDR
+         LA    R1,12
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     GETCODE
+         SPACE 3
+INSERRLD EQU   *                   FUNCTION = LOAD
+         CLI   CATRPL+15,X'08'     DUPLICATE RECORD?
+         BNE   INSERRS             NO, SERIOUS ERROR
+INSERRL1 EQU   *
+         L     R1,ALDDUP
+         LA    R1,1(R1)
+         ST    R1,ALDDUP
+         LA    R3,MINSLDE1
+         LA    R4,L'MINSLDE1       LGTH
+         LA    R5,LOADG            RETURN ADDR, NEXT RECORD
+         LA    R1,4
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     ERRLST
+         SPACE 3
+UNLERR01 EQU   *
+         MVC   L1SMFDSN(L'MUNLE01),MUNLE01
+         LA    R3,BLANK            NOT POSSIBLE TO POSITION
+         LA    R4,2                LGTH
+         LA    R5,CLOSE            RETURN ADDR
+         LA    R1,12
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     GETCODE
+         SPACE 3
+UPDERRS  EQU   *
+         LA    R3,MUPDE            SERIOS UPDATE ERROR
+         LA    R4,L'MUPDE          LGTH
+         LA    R5,CLOSE            RETURN ADDR
+         LA    R1,12
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     GETCODE
+         SPACE 3
+DELERRS  EQU   *
+         LA    R3,MDELE            SERIOS DELETE ERROR
+         LA    R4,L'MDELE          LGTH
+         LA    R5,CLOSE            RETURN ADDR
+         LA    R1,12
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     GETCODE
+         SPACE 3
+PNTERR   EQU   *
+         CLI   CATRPL+15,X'10'     RECORD NOT FOUND?
+         BE    PNTERR1             YES
+         LA    R3,MPNTE01          SERIOS POINT ERROR
+         LA    R4,L'MPNTE01
+         LA    R5,CLOSE            RETURN ADDR
+         LA    R1,12
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     GETCODE             GET FEEDBACK CODE
+         SPACE
+PNTERR1  EQU   *
+         L     R1,ANOTF
+         LA    R1,1(R1)
+         ST    R1,ANOTF
+         LA    R3,MGETNF           RECORD NOT FOUND
+         LA    R4,L'MGETNF         LGTH
+         LA    R5,GETSYSIN         RETURN ADDR
+         LA    R1,4
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     ERRLST
+         SPACE 3
+RENERR   EQU   *
+         LA    R3,MRENW            LAST RENAME NOT OK (WARNING)
+         LA    R4,L'MRENW          LGTH
+         LA    R5,GETLOG           RETURN ADDR
+         B     ERRLST
+         SPACE 3
+VOPENERR EQU   *
+         MVC   L1SMFDSN(L'ETOPEN),ETOPEN
+         LA    R3,BLANK
+         LA    R4,L'L1ERROR
+         LA    R5,CLOSE          RETURN ADDR
+         LA    R1,12
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     ACBCODE
+         SPACE 2
+VCLOSEER EQU   *
+         MVC   L1SMFDSN(L'ETCLOSE),ETCLOSE
+         LA    R3,BLANK
+         LA    R4,L'L1ERROR
+         LA    R5,CLOSE2         RETURN ADDR
+         LA    R1,12
+         ST    R1,RETCODE           SAVE RETURN CODE
+         B     ACBCODE
+         SPACE 2
+GETCODE  EQU   *              CONVERT VSAM FDBK-CODE
+         XR    R0,R0
+         IC    R0,CATRPL+15    GET FDBK-CODE
+         CVD   R0,DW
+         OI    DW+7,X'0F'      MAKE PRINTABLE
+         UNPK  FERR,DW+6(2)
+         B     ERRLST
+         SPACE 2
+ACBCODE  EQU   *              CONVERT VSAM ERROR CODE FROM ACB
+         XR    R0,R0
+         IC    R0,CATACB+49    GET ERROR CODE
+         CVD   R0,DW
+         OI    DW+7,X'0F'      MAKE PRINTABLE
+         UNPK  FERR,DW+6(2)
+         B     ERRLST
+         SPACE 3
+*
+*   ERROR LIST
+*
+         SPACE
+ERRLST   EQU   *
+         LH    R1,ELCNT       ERROR LINE COUNT
+         CH    R1,=H'54'
+         BL    PUTELINE
+         AP    EPAGE,=P'+1'
+         MVC   ELPAGE-1(6),MASK5
+         ED    ELPAGE-1(6),EPAGE
+         PUT   ERRDCB,E1
+         PUT   ERRDCB,H2
+         PUT   ERRDCB,H2A
+         PUT   ERRDCB,H2B
+         PUT   ERRDCB,E3
+         PUT   ERRDCB,H4
+         XC    ELCNT,ELCNT
+         MVI   L1S,C'0'
+PUTELINE EQU   *
+         BCTR  R4,0       LGTH FOR EXECUTE
+         EX    R4,MVCETXT
+         LA    R2,L1ERROR
+         LA    R2,2(R4,R2)
+         MVC   0(3,R2),FERR    MOVE ERROR CODE
+         CLC   L1SMFDSN,ZLEDSN       SAME DSN AS IN LAST LINE?
+         BNE   PUTE1                 NO, PRINT IT
+         MVC   L1SMFDSN,BLANK
+         B     PUTE2                 NO, PRINT IT
+PUTE1    EQU   *
+         MVC   ZLEDSN,L1SMFDSN
+PUTE2    EQU   *
+         PUT   ERRDCB,L1
+         LH    R1,ELCNT
+         LA    R1,1(R1)
+         STH   R1,ELCNT
+         MVC   L1+2(L'L1-2),L1+1     CLEAR LINE
+         MVI   L1S,C' '
+         MVC   FERR,BLANK
+         BR    R5                    RETURN
+         SPACE
+MVCETXT  MVC   L1ERROR(0),0(R3)
+         EJECT
+******************************************************************
+*                                                                *
+*                   DEFINITIONEN                                 *
+*                   ------------                                 *
+*                                                                *
+******************************************************************
+         SPACE 2
+DW       DC    D'0'
+DW1      DC    D'0'
+LOGADDR  DC    F'0'            ADDR OF LOGREC
+RECADDR  DC    F'0'            ADDR OF CATALOG RECORD
+UCBADDR  DC    F'0'            ADDR OF UCB (CATLG)
+TIOTADDR DC    F'0'            ADDR OF TIOT
+RETCODE  DC    F'0'            RETURN CODE
+RETADDR  DC    F'0'
+REPRET   DC    F'0'            RETURN FROM REPORT
+SAVERET  DC    F'0'            SAVE RETURN CODE
+PARMADDR DC    F'0'            ADDR OF PARAMETER
+         SPACE 2
+*   AST-PARM        (BASF - ABSTIMMUNG)
+*   DON'T CHANGE ORDER
+         SPACE
+AVSMFALL DC    F'0'           MUST BE FIRST COUNT
+ANOTCAT  DC    F'0'           RECORD SKIPPED, OTHER CAT
+AVSMF3D  DC    F'0'
+AVSMF41  DC    F'0'
+AVSMF42  DC    F'0'
+AVSMFBAD DC    F'0'
+         SPACE
+AREC     DC    F'0'            RECATALOG
+ARECOK   DC    F'0'
+ACAT     DC    F'0'
+ACATOK   DC    F'0'
+ACATDUP  DC    F'0'
+ADEL     DC    F'0'
+ADELOK   DC    F'0'
+ADELDUP  DC    F'0'
+AREN     DC    F'0'
+ANOTF    DC    F'0'
+         SPACE
+ASREAD   DC    F'0'        SYSIN  NO OF CARDS FOR READ
+ASGETR   DC    F'0'        SYSIN  NO OF RECORDS READ FOR R-CARDS
+ASDEL    DC    F'0'        SYSIN  NO OF CARDS FOR DELETE
+ASGETD   DC    F'0'        SYSIN  NO OF RECORDS READ FOR D-CARDS
+ASDELD   DC    F'0'        SYSIN  NO OF RECORDS DELETED
+ASROUT   DC    F'0'               NO OF RECORDS ON OUTLOG READ
+ASDOUT   DC    F'0'               NO OF RECORDS ON OUTLOG DELETE
+         SPACE
+ALDINP   DC    F'0'         LOAD  NO OF RECORDS FROM LOADLOG
+ALDOUT   DC    F'0'         LOAD  NO OF RECORDS IN CAT
+ALDDUP   DC    F'0'         LOAD  NO OF DUPLICATE RECORDS
+         SPACE
+AUNLGET  DC    F'0'       UNLOAD  NO OF RECORDS IN CAT
+AUNLOUT  DC    F'0'       UNLOAD  NO OF RECORDS ON OUTLOG
+         SPACE
+ANO      EQU   (*-AVSMFALL)/4     NO OF AST COUNTS WITHOUT PAGE CNT
+         SPACE
+ADW0     DC    2D'0'        PARM FOR PAGE-COUNT = ADDR FOR COBAST
+ADW      DC    28D'0'       PARM FOR OTHER AST-SUM
+*  ADWNO    DC    H'28'        NO OF AST-SUM WITHOUT PAGE-COUNT
+         SPACE
+RCODE    DC    H'0'         OTHER AST-PARM
+BZEIT    DC    CL15' '
+         SPACE
+***** END OF ASTPARM ****************************************
+         SPACE 3
+ASTPARM  DC    CL8'ASTPARM'    DDNAME FOR AST
+QNAME    DC    CL8'SYSIGGV2'   QNAME FOR CATALOG
+RNAME    DC    CL20' '              CATALOG NAME FOR RESERVE / DEQ
+         SPACE
+BLANK    DC    CL80' '
+         SPACE
+XDSN     DC    CL44' '
+RODSN    DC    CL44' '         SAVE DSN FOR RENAME
+ZLRDSN   DC    CL44' '         SAVE DSN FOR REPORT LINE
+ZLEDSN   DC    CL44' '         SAVE DSN FOR ERROR LINE
+         SPACE 2
+RLCNT    DC    H'60'           LINE COUNT FOR REPORT
+ELCNT    DC    H'60'           LINE COUNT FOR ERROR LIST
+RPAGE    DC    PL3'0'          PAGE COUNT FOR REPORT
+EPAGE    DC    PL3'0'          PAGE COUNT FOR ERROR LIST
+MASK5    DC    XL6'402020202020'
+FERR     DC    CL3' '          VSAM ERROR RET CODE PRINTABLE
+         SPACE 2
+ZTIME0   DS    0CL9
+ZTIME1   DC    CL2' '
+ZTIME    DC    CL6' '
+ZTIME2   DC    CL1' '
+         SPACE 2
+SW       DC    X'00'
+SDEL     EQU   X'10'           SECOND DEL REC FOR CLUSTER
+SENM     EQU   X'20'           DELETE OLD KEY (RENAME)
+SNNM     EQU   X'40'           INSERT NEW KEY (RENAME)
+SSYSIN   EQU   X'01'           SYSIN DD STATEMENT, OPEN OF INDCB
+SOUTLOG  EQU   X'02'           OUTLOG DCB OPEN
+SLOAD    EQU   X'04'           LOADLOG DCB OPEN, LOAD PROCESSING
+SUNLOAD  EQU   X'08'           UNLOAD PROCESSING
+         SPACE 2
+SW2      DC    X'00'
+S2SMFLOG EQU   X'10'           SMFLOG DCB OPEN, NORMAL PROCESSING
+         SPACE 3
+UPD      EQU   X'02'            UPDATE             (RPL+41)
+DIR      EQU   X'40'            DIRECT ACCESS      (RPL+40)
+SEQ      EQU   X'20'            SEQ ACCESS         (RPL+40)
+KGE      EQU   X'04'            KEY GREATER OR EQ  (RPL+40)
+GEN      EQU   X'02'            GENERIC KEY        (RPL+40)
+         SPACE 3
+IN       DS    0CL80            REGION FOR SYSIN
+SFCT     DC    C' '             FUNCTION
+SCOUNT   DC    CL3'0'           COUNT FOR READ
+SDSN     DC    CL44' '
+SDSNC    DC    CL3' '           45TH BYTE OF DSNKEY
+         DC    CL29' '
+         SPACE 3
+CATECB   DC    F'0'
+CATMSG   DC    CL130' '
+         SPACE 3
+*
+*   REPORT
+*
+         SPACE
+H1       DS    0CL133
+         DC    C'1 '
+         DC    CL20'OP02001L01'
+         DC    C'CHECK-LIST FOR CATALOG '
+H1CAT    DC    CL44' '
+         DC    CL19' '
+H1DATE   DC    CL10' '
+         DC    CL3' '
+         DC    CL7'PAGE:  '
+RLPAGE   DC    CL5' '
+         SPACE
+H2       DS    0CL133
+         DC    C'0 '
+         DC    CL30' '
+         DC    CL43'ACTION - SMF:          (S=SMF - C=CATALOG) '
+         DC    CL58'C=CATLG  R=RECAT  U=UNCAT'
+         SPACE
+H2A      DS    0CL133
+         DC    C'  '
+         DC    CL39' '
+         DC    CL50'SYSIN:        SR = SYSIN-READ   SD = SYSIN-DELETE'
+         DC    CL42' '
+         SPACE
+H2B      DS    0CL133
+         DC    C'  '
+         DC    CL39' '
+         DC    CL43'LOAD/UNLOAD:  LD = LOAD   UNL = UNLOAD'
+         DC    CL49' '
+         SPACE
+H3       DS    0CL133
+         DC    CL2'- '
+         DC    CL2'S'
+         DC    CL2'C'
+         DC    CL7'DATE'
+         DC    CL7'TIME'
+         DC    CL45'DSN FROM SMF / SYSIN'
+         DC    CL45'DSN FROM CATALOG-RECORD'
+         DC    CL23' '
+         SPACE
+H4       DS    0CL133
+         DC    CL2' '
+         DC    131C'-'
+         SPACE 2
+E1       DS    0CL133
+         DC    C'1 '
+         DC    CL20'OP02001L02'
+         DC    CL23'ERROR LIST FOR CATALOG '
+E1CAT    DC    CL44' '
+         DC    CL19' '
+E1DATE   DC    CL10' '
+         DC    CL3' '
+         DC    CL7'PAGE:  '
+ELPAGE   DC    CL5' '
+         SPACE
+E3       DS    0CL133
+         DC    CL2'- '
+         DC    CL2'S'
+         DC    CL2'C'
+         DC    CL7'DATE'
+         DC    CL7'TIME'
+         DC    CL45'DSN FROM SMF / SYSIN'
+         DC    CL45'DSN FROM CATALOG-RECORD'
+H3ERROR  DC    CL23'ERROR-REASON'
+         SPACE 2
+L1       DS    0CL133
+L1S      DC    CL2' '
+L1ASMF   DC    C' '              SMF-RECORD TYPE
+         DC    C' '
+L1ACAT   DC    C' '              ACTION AGAINST CATALOG
+         DC    C' '
+L1DATE   DC    CL6' '
+         DC    C' '
+L1TIME   DC    CL6' '
+         DC    C' '
+L1SMFDSN DC    CL44' '
+         DC    C' '
+L1CATDSN DC    CL44' '
+         DC    C' '
+L1ERROR  DC    CL23' '
+         SPACE 2
+CATRPL   RPL   ACB=CATACB,AM=VSAM,AREALEN=4096,                        *
+               ECB=CATECB,KEYLEN=45,                                   *
+               MSGAREA=CATMSG,MSGLEN=L'CATMSG,                         *
+               OPTCD=(KEY,DIR,NUP,KEQ,FKS,MVE)
+         SPACE 2
+CATACB   ACB   AM=VSAM,CATALOG=NO,DDNAME=CATLG,                        *
+               MAREA=CATMSG,MLEN=L'CATMSG,                             *
+               MACRF=(KEY,DIR,OUT)
+         SPACE 3
+         PRINT NOGEN
+LOGDCB   DCB   DDNAME=SMFLOG,DSORG=PS,MACRF=GL,BFTEK=A,                *
+               EODAD=CLOSE
+         SPACE 2
+REPDCB   DCB   DDNAME=REPORT,DSORG=PS,MACRF=PM,                        *
+               LRECL=133,RECFM=FBA,BLKSIZE=133
+         SPACE 2
+ERRDCB   DCB   DDNAME=ERROR,DSORG=PS,MACRF=PM,                         *
+               LRECL=133,RECFM=FBA,BLKSIZE=133
+         SPACE 2
+INDCB    DCB   DDNAME=SYSIN,DSORG=PS,MACRF=GM,                         *
+               LRECL=80,EODAD=CLOSE
+         SPACE 2
+OUTDCB   DCB   DDNAME=OUTLOG,DSORG=PS,MACRF=PM
+*              RECFM=VB
+         SPACE 2
+LOADDCB  DCB   DDNAME=LOADLOG,DSORG=PS,MACRF=GL,BFTEK=A,               *
+               EODAD=CLOSE
+         PRINT GEN
+         SPACE 3
+*
+* ERROR - MESSAGES
+* ----------------
+*
+         SPACE
+ETRCODE  DC    C'VSAM RETURN-CODE = '
+ETOPEN   DC    C'***** OPEN-ERROR DTA-DATASET *****'
+ETCLOSE  DC    C'***** CLOSE-ERROR DTA-DATASET *****'
+         SPACE
+MGETNF   DC    C'01 RECORD NOT FOUND'
+MGETE    DC    C'02 GET ERROR'
+MINSE    DC    C'03 INSERT ERROR'
+MUPDE    DC    C'04 UPDATE ERROR'
+MDELE    DC    C'05 DELETE ERROR'
+MPNTE01  DC    C'06 POINT ERROR'
+MINSLDE1 DC    C'07 DUPLICATE RECORD'
+         SPACE
+MDATE    DC    C'11 ERROR PDATK'
+MINE02   DC    C'12 INV FCT (R OR D)'
+MINE03   DC    C'13 COUNT NOT NUMERIC'
+         SPACE
+MCATE1   DC    C'***** CATLG DD STMT MISSING *****'
+MCATE2   DC    C'***** CATLG DD STMT SYSOUT OR DUMMY *****'
+MINE01   DC    C'***** OUTLOG DD STMT MISSING *****'
+MLDE01   DC    C'***** LOADLOG DD STMT MISSING *****'
+MLOGE01  DC    C'***** SMFLOG DD STMT MISSING *****'
+MSYE01   DC    C'***** SYSIN DD STMT MISSING *****'
+MRESE    DC    C'***** RESERVE ERROR *****'
+MDEQE    DC    C'***** DEQUEUE ERROR *****'
+MPARME   DC    C'***** INVALID PARAMETER, MUST BE SYSIN, LOAD OR UNLOAD*
+               *****'
+MUNLE01  DC    C'***** NOT POSSIBLE TO POSITION AT BEGINNING OF CATALOG*
+               *****   FEEDBACK CODE ='
+         SPACE
+MRENW    DC    C'21 LAST RENAME NOT OK'      WARNING ONLY
+         SPACE 3
+         LTORG
+         SPACE 3
+* TABLE TO CONVERT TIME ---> PRINTABLE FORM
+         SPACE
+TRANS1   EQU   *
+         DC    C'0123456789ABCDEF'
+TRANS    EQU   TRANS1-240
+         SPACE 3
+COUT     DS    0F
+CLGTH    DC    H'0'          ×  RDW FOR OUT
+         DC    H'0'          ×  RDW
+         SPACE
+CAREA    DC    4096X'00'
+         SPACE 3
+SMF61    DSECT
+         IFASMFI6 61
+         EJECT
+OP020SUM CSECT
+         SPACE
+*******************************************************************
+*                                                                 *
+*        PRINT SUMMARY                                            *
+*                                                                 *
+*******************************************************************
+         SPACE
+         XSAVE R12,XSVA,OP020SUM
+         SPACE 3
+         CNOP  0,4
+         BAL   R9,*+8
+         DC    V(OP020)
+         L     R9,0(R9)         SET ADDRESSABILITY
+         USING OP020,R9
+         SPACE 3
+         TM    SW2,S2SMFLOG     SMF?
+         BO    SUMSMF
+         SPACE
+         TM    SW,SSYSIN        SYSIN?
+         BO    SUMSYSIN
+         SPACE
+         TM    SW,SLOAD         LOAD?
+         BO    SUMLOAD
+         SPACE
+         TM    SW,SUNLOAD       UNLOAD?
+         BO    SUMUNL
+         SPACE
+         B     SUMRET
+         SPACE 3
+*
+*    SMF - SUMMARY
+*    -------------
+*
+         SPACE
+SUMSMF   EQU   *
+         MVC   STITLE(L'SUM),SUM
+         BAL   R14,PUTSH1
+         MVC   SPROC(L'SMFPROC),SMFPROC
+         BAL   R14,PUTSH1
+         MVC   SPROC(L'SMFTOT),SMFTOT
+         ICM   R1,15,AVSMFALL
+         BAL   R14,CVDCNT
+         BAL   R14,PUTSH1
+         MVI   SH1,C'0'
+         MVC   SPROC(L'SMFNOCAT),SMFNOCAT
+         ICM   R1,15,ANOTCAT
+         BAL   R14,CVDCNT
+         BAL   R14,PUTSH1
+         MVC   SPROC(L'SMFNOTYP),SMFNOTYP
+         ICM   R1,15,AVSMFBAD
+         BAL   R14,CVDCNT
+         BAL   R14,PUTSH1
+         MVC   SPROC(L'SMFNOTF),SMFNOTF
+         ICM   R1,15,ANOTF
+         BAL   R14,CVDCNT
+         BAL   R14,PUTSH1
+         SPACE
+         BAL   R14,PUTSH1
+         PUT   REPDCB,S1
+         PUT   REPDCB,S2
+         SPACE
+         MVC   SLTEXT(L'SMF#61),SMF#61          CATALOG
+         ICM   R1,15,AVSMF3D
+         LA    R2,SLSMF-1
+         BAL   R14,CVDCNT2
+         ICM   R1,15,ACAT
+         LA    R2,SLCAT-1
+         BAL   R14,CVDCNT2
+         ICM   R1,15,ACATOK
+         LA    R2,SLCATOK-1
+         BAL   R14,CVDCNT2
+         ICM   R1,15,ACATDUP
+         LA    R2,SLNOK-1
+         BAL   R14,CVDCNT2
+         MVC   SLMSG(L'SMFE61),SMFE61
+         LA    R3,SLINE
+         BAL   R14,PUTS1
+         SPACE
+         MVC   SLTEXT(L'SMF#65),SMF#65      UNCATALOG
+         ICM   R1,15,AVSMF41
+         LA    R2,SLSMF-1
+         BAL   R14,CVDCNT2
+         ICM   R1,15,ADEL
+         LA    R2,SLCAT-1
+         BAL   R14,CVDCNT2
+         ICM   R1,15,ADELOK
+         LA    R2,SLCATOK-1
+         BAL   R14,CVDCNT2
+         ICM   R1,15,ADELDUP
+         LA    R2,SLNOK-1
+         BAL   R14,CVDCNT2
+         MVC   SLMSG(L'SMFE65),SMFE65
+         LA    R3,SLINE
+         BAL   R14,PUTS1
+         SPACE
+         MVC   SLTEXT(L'SMF#66),SMF#66      ALTER
+         ICM   R1,15,AVSMF42
+         LA    R2,SLSMF-1
+         BAL   R14,CVDCNT2
+         ICM   R1,15,AREC
+         LA    R2,SLCAT-1
+         BAL   R14,CVDCNT2
+         ICM   R1,15,ARECOK
+         LA    R2,SLCATOK-1
+         BAL   R14,CVDCNT2
+         ICM   R1,15,AREN
+         LA    R2,SLNOK-1
+         BAL   R14,CVDCNT2
+         MVC   SLMSG(L'SMFE66),SMFE66
+         LA    R3,SLINE
+         BAL   R14,PUTS1
+         B     SUMRET
+         SPACE 3
+*
+*    SYSIN - SUMMARY
+*    ---------------
+*
+         SPACE
+SUMSYSIN EQU   *
+         MVC   STITLE(L'SUM),SUM
+         BAL   R14,PUTSH1
+         MVC   SPROC(L'SYSINPR),SYSINPR
+         BAL   R14,PUTSH1
+         PUT   REPDCB,SY1
+         SPACE
+         MVC   SL1TXT(L'SYSREAD),SYSREAD
+         ICM   R1,15,ASREAD
+         LA    R2,SYC1-1
+         BAL   R14,CVDCNT2
+         ICM   R1,15,ASGETR
+         LA    R2,SYC2-1
+         BAL   R14,CVDCNT2
+         ICM   R1,15,ASROUT
+         LA    R2,SYC4-1
+         BAL   R14,CVDCNT2
+         LA    R3,SYL1
+         BAL   R14,PUTS1
+         SPACE
+         MVC   SL1TXT(L'SYSDEL),SYSDEL
+         ICM   R1,15,ASDEL
+         LA    R2,SYC1-1
+         BAL   R14,CVDCNT2
+         ICM   R1,15,ASGETD
+         LA    R2,SYC2-1
+         BAL   R14,CVDCNT2
+         ICM   R1,15,ASDELD
+         LA    R2,SYC3-1
+         BAL   R14,CVDCNT2
+         ICM   R1,15,ASDOUT
+         LA    R2,SYC4-1
+         BAL   R14,CVDCNT2
+         LA    R3,SYL1
+         BAL   R14,PUTS1
+         B     SUMRET
+         SPACE 3
+*
+*    LOAD - SUMMARY
+*    --------------
+*
+         SPACE
+SUMLOAD  EQU   *
+         MVC   STITLE(L'SUM),SUM
+         BAL   R14,PUTSH1
+         MVC   SPROC(L'LDPROC),LDPROC
+         BAL   R14,PUTSH1
+         MVC   SPROC(L'LDLOG),LDLOG
+         ICM   R1,15,ALDINP
+         BAL   R14,CVDCNT
+         BAL   R14,PUTSH1
+         MVI   SH1,C'0'
+         MVC   SPROC(L'LDCAT),LDCAT
+         ICM   R1,15,ALDOUT
+         BAL   R14,CVDCNT
+         BAL   R14,PUTSH1
+         MVC   SPROC(L'LDDUP),LDDUP
+         ICM   R1,15,ALDDUP
+         BAL   R14,CVDCNT
+         BAL   R14,PUTSH1
+         B     SUMRET
+         SPACE 3
+*
+*    UNLOAD - SUMMARY
+*    ----------------
+*
+         SPACE
+SUMUNL   EQU   *
+         MVC   STITLE(L'SUM),SUM
+         BAL   R14,PUTSH1
+         MVC   SPROC(L'UNLPROC),UNLPROC
+         BAL   R14,PUTSH1
+         MVC   SPROC(L'UNLCAT),UNLCAT
+         ICM   R1,15,AUNLGET
+         BAL   R14,CVDCNT
+         BAL   R14,PUTSH1
+         MVI   SH1,C'0'
+         MVC   SPROC(L'UNLLOG),UNLLOG
+         ICM   R1,15,AUNLOUT
+         BAL   R14,CVDCNT
+         BAL   R14,PUTSH1
+         B     SUMRET
+         SPACE 3
+SUMRET   EQU   *
+         XRETURN (0)
+         SPACE 3
+CVDCNT   EQU   *
+         XC    DW,DW
+         CVD   R1,DW
+         OI    DW+7,X'0F'           MAKE PRINTABLE
+         MVC   SC1-1(6),MASK6
+         ED    SC1-1(6),DW+5
+         BR    R14
+         SPACE 3
+CVDCNT2  EQU   *
+         XC    DW,DW
+         CVD   R1,DW
+         OI    DW+7,X'0F'           MAKE PRINTABLE
+         MVC   0(6,R2),MASK6
+         ED    0(6,R2),DW+5
+         BR    R14
+         SPACE 3
+PUTSH1   EQU   *
+         ST    R14,SH1RET
+         PUT   REPDCB,SH1
+         MVC   SH1+2(L'SH1-2),SH1+1         CLEAR LINE
+         L     R14,SH1RET
+         BR    R14
+         SPACE 3
+PUTS1    EQU   *
+         ST    R14,SH1RET
+         PUT   REPDCB,(R3)
+         MVC   2(L'S1-2,R3),1(R3)        CLEAR LINE
+         L     R14,SH1RET
+         BR    R14
+         SPACE 3
+SH1RET   DC    F'0'
+MASK6    DC    XL6'402020202120'
+         SPACE
+SUM      DC    C'S U M M A R Y'
+         SPACE 3
+SMFPROC  DC    C'SMF - PROCESSING'
+SMFTOT   DC    C'TOTAL RECORDS FROM SMFLOG'
+SMFNOCAT DC    C'NOT SEL. - OTHER CATALOG'
+SMFNOTYP DC    C'CAT OK, BUT INV. SMF TYPE'
+SMFNOTF  DC    C'RECORDS NOT FOUND IN CAT'
+SMF#61   DC    C'SMFREC #61 - CATALOG'
+SMF#65   DC    C'SMFREC #65 - UNCATALOG'
+SMF#66   DC    C'SMFREC #66 - RECAT'
+         SPACE
+SMFE61   DC    C'ALREADY IN CAT, ACTION CHANGED TO RECAT'
+SMFE65   DC    C'ALREADY DELETED, SKIP RECORD'
+SMFE66   DC    C'RENAME'
+         SPACE 3
+SYSINPR  DC    C'SYSIN - PROCESSING'
+SYSREAD  DC    C'READ'
+SYSDEL   DC    C'DELETE'
+         SPACE 3
+LDPROC   DC    C'LOAD - PROCESSING'
+LDLOG    DC    C'RECORDS ON LOADLOG'
+LDCAT    DC    C'RECORDS INSERTED IN CAT'
+LDDUP    DC    C'DUPLICATE RECORDS'
+         SPACE 3
+UNLPROC  DC    C'UNLOAD - PROCESSING'
+UNLCAT   DC    C'RECORDS IN CATALOG'
+UNLLOG   DC    C'RECORDS ON OUTLOG'
+         SPACE 3
+SH1      DS    0CL133
+         DC    C'- '
+SPROC    DC    CL30' '
+         DC    CL5' '
+SC1      DC    CL5' '
+STITLE   DC    CL10' '
+         DC    CL81' '
+         SPACE
+S1       DS    0CL133
+         DC    C'- '
+S1TEXT   DC    CL30' '
+         DC    CL5' '
+S1T1     DC    CL5' SMF '
+         DC    CL5' '
+         DC    CL1' '
+S1T2     DC    CL7'CATALOG'
+         DC    CL3' '
+         DC    CL1' '
+S1T3     DC    CL6'CAT OK'
+         DC    CL4' '
+         DC    CL1' '
+S1T4     DC    CL7'SPECIAL'
+         DC    CL3' '
+         DC    CL1' '
+S1T5     DC    CL52'EXPLANATION TO LAST COLUMN'
+         SPACE
+S2       DS    0CL133
+         DC    CL2' '
+S2TEXT   DC    CL30' '
+         DC    CL5' '
+S2T1     DC    CL5'INPUT'
+         DC    CL5' '
+         DC    CL1' '
+S2T2     DC    CL7'ACTION'
+         DC    CL3' '
+         DC    CL1' '
+S2T3     DC    CL6' '
+         DC    CL4' '
+S2T4     DC    CL9'CONDITION'
+         DC    CL55' '
+         SPACE
+SLINE    DS    0CL133
+         DC    C'0 '
+SLTEXT   DC    CL30' '
+         DC    CL5' '
+SLSMF    DC    CL5' '
+         DC    CL5' '
+         DC    CL1' '
+SLCAT    DC    CL5' '
+         DC    CL5' '
+         DC    CL1' '
+SLCATOK  DC    CL5' '
+         DC    CL5' '
+         DC    CL1' '
+SLNOK    DC    CL5' '
+         DC    CL5' '
+         DC    CL1' '
+SLMSG    DC    CL52' '
+         SPACE
+SY1      DS    0CL133
+         DC    C'- '
+SYTEXT   DC    CL10' '
+         DC    CL8' '
+         DC    CL1' '
+SYT1     DC    CL11'SYSIN CARDS'
+         DC    CL6' '
+SYT2     DC    CL15'REC READ IN CAT'
+         DC    CL3' '
+SYT3     DC    CL14'REC DEL IN CAT'
+         DC    CL4' '
+         DC    CL6' '
+SYT4     DC    CL06'OUTLOG'
+         DC    CL47' '
+         SPACE
+SYL1     DS    0CL133
+         DC    C'0 '
+SL1TXT   DC    CL10' '
+         DC    CL8' '
+         DC    CL7' '
+SYC1     DC    CL5' '
+         DC    CL6' '
+         DC    CL7' '
+SYC2     DC    CL5' '
+         DC    CL6' '
+         DC    CL7' '
+SYC3     DC    CL5' '
+         DC    CL6' '
+         DC    CL07' '
+SYC4     DC    CL5' '
+         DC    CL47' '
+         SPACE 3
+         END
+//LKED.SYSLMOD DD DSN=XX.JOBLIB(OP020),DISP=SHR
+//

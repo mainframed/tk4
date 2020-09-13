@@ -1,0 +1,269 @@
+)F
+RAC Based Authentication and Authorization for FTPD
+---------------------------------------------------
+
+As distributed with TK4- the FTP daemon doesn't do any authentication
+or authorization checking on incoming connections. Each FTP session is
+granted full access to all datasets, which is how Jason Winter
+originally designed it.
+
+While this is very convenient for the typical "single user at home"
+TK4- system, it is a major security risk for multi user systems being
+fully exposed to the internet.
+
+To allow running the FTP daemon on internet accessible or on multi user
+systems at a reasonable risk, the most critical security weaknesses of
+Jason's original FTPD implementation have been hardened through a
+minimalistic integration into the MVS Resource Access Control (RAC)
+framework. To prevent unencrypted passwords from flowing across the
+internet it is recommended to use this RAC enhanced version of the FTP
+daemon together with a tunneling setup enforcing encryption on all
+incoming control connections. The resulting security level is then
+roughly comparable to using FTPS with encrypted control and clear text
+data paths on *i*x systems, which may well be regarded as conforming to
+the TCSEC C2 level, if an appropriately configured security package
+(like IBM's RACF(tm) or its surrogate RAKF) is active on the MVS system
+operating the FTP daemon. Providing an encrypted data path, however, is
+not within the scope of this enhancement.
+
+
+
+Configuration, Operation And Use
+--------------------------------
+
+RAC based authentication and authorization for FTPD requires making
+configuration decisions and observing operational requirements that
+cannot be predefined easily without in depth knowledge of the specific
+environment in which the FTPD instance is intended to be used. For that
+reason, this feature isn't provided "runnable out of the box" like most
+other TK4- features. Instead, the following topics must be understood
+and followed carefully to activate RAC based authentication and
+authorization for FTPD.
+
+
+Activation
+++++++++++
+
+To activate the RAC enhanced FTP daemon enter the following commands at
+a TSO READY PROMPT:
+
+pds 'sys2.linklib'
+delete ftpd
+alias ftpd-rac ftpd
+change 'sys2.proclib'
+delete ftpd
+alias ftpd-rac ftpd
+end
+
+
+RAC Configuration
++++++++++++++++++
+
+o Create a user named FTPD in group USER. This user must have access to
+  SVC 244 allowing it to run authorized at any time. On TK4- this is
+  accomplished by granting READ access to resource SVC244 in the
+  FACILITY class. With this very critical permission this user has a
+  high potential to put the whole system at risk. It should by all
+  means be ensured that _no one_ ever can use this user to logon or to
+  run batch jobs. So, choose a complex password, you will not need to
+  remember it, as it will nowhere be used explicitly. In particular,
+  this user does not need to be and thus should not be a TSO user. It
+  must, when running unauthorized, be able to read the VTOC of all
+  DASDs holding datasets and to list all catalogs containing datasets
+  to be served by the FTP daemon.
+
+o Create a resource named FTPAUTH in the FACILITY class and give all
+  users to be authorized to log in to the FTP daemon READ access to
+  this resource. Users not having READ access to the FTPAUTH resource
+  will not be allowed to log in even if they provide correct
+  credentials.
+
+
+MVS Configuration and Operation
++++++++++++++++++++++++++++++++
+
+o Create SYS1.PARMLIB(VATLSTFF) using the same format as VATLST00. This
+  list must contain the DASD volumes holding datasets to be served by
+  the FTP daemon. Datasets on volumes not being in this list can
+  neither be read nor written. Keep this list as small as possible in
+  the interest of short root directory rebuild times.
+
+o Configure the parameters in SYS2.PROCLIB(FTPD-RAC) as described in
+  the TCPIP TSO HELP member. Use a portnumber (SRVPORT parameter) above
+  1024 and set PASVADR to the comma separated IP address used by FTP
+  clients to connect to. The SRVIP parameter should be set to any or to
+  the same address used as PASVADR (dotted decimal format, however).
+
+The FTP daemon can now be started and stopped from the MVS console
+using the "S FTPD" and "P FTPD" commands, respectively. User HERC01 can
+also stop the FTP daemon from a client session using the "quote term"
+client command. This is hardcoded in the source; if another user is to
+be authorized for the term command, change the AUTH_USER preprocessor
+variable accordingly and rebuild the FTPD module (or simply patch the
+null terminated string HERC01 in the existing load module to the
+desired userid).
+
+
+Hercules Host Configuration
++++++++++++++++++++++++++++
+
+The FTP daemon will not accept connections originating from interfaces
+it is not listening to. That means only connections originating on the
+host running the Hercules instance for MVS are possible. This is a
+security measure to enforce using tunnels for external connections,
+given that the FTP daemon itself isn't able to handle encrypted
+channels.
+
+To allow external connections, an SSLv3 tunnel should be opened,
+forwarding the port FTP clients are connecting to to the port the FTP
+server is listening at. To accomplish this the freely available socat
+tool is recommended. Simply have the following command running in the
+backgroung on the Hercules host:
+
+socat OPENSSL-LISTEN:<extport>,bind=<address>,reuseaddr,fork, \
+                     cert=<certfile>,key=<keyfile>,verify=0,  \
+                     nodelay,max-children=0,                  \
+                     keepalive,keepcnt=0,keepintvl=900        \
+      TCP4:<address>:<intport>,bind=<address>,nodelay,        \
+                     keepalive,keepcnt=0,keepintvl=900        \
+
+where:
+
+<address>  is the IP address of a local network interface on the
+           Hercules host. All FTP clients will have to connect to this
+           address. It must be identical to the address used in the
+           PASVADR configuration parameter of the FTPD-RAC procedure on
+           MVS.
+
+<extport>  The port FTP clients will connect to. It must be different
+           from the SRVPORT configuration parameter of the FTPD-RAC
+           procedure.
+
+<intport>  The port to which the tunnel will forward connections coming
+           in on <extport>. It must be identical to the SRVPORT
+           configuration parameter of the FTPD-RAC procedure.
+
+<certfile> Name of the file holding the SSL certificate of the Hercules
+           host.
+
+<keyfile>  Name of the file holding the key to access the certificate.
+
+
+Usage
++++++
+
+o The control connection (aka the "FTP session") must be made using an
+  SSLv3 tunnel to port <extport> at address <address> as configured in
+  the tunnel on the Hercules host.
+
+o Incoming connections must authenticate using the username and the
+  password of a user having READ access to the FTPAUTH resource in the
+  FACILITY class.
+
+o The FTP client must use passive mode for all transfers.
+
+
+Tunneling the Control Connection
+++++++++++++++++++++++++++++++++
+
+Tunneling the control connection through SSLv3 means to create a tunnel
+"outside" the FTP protocol framework, through which a regular clear
+text connection is made. In particular, this is _not_ FTPS (which
+negotiates the encryption as part of the FTP control session setup) and
+it is _not_ SFTP which basically tunnels an "FTP like" session through
+ssh and as such has nothing to do at all with FTP.
+
+Many (if not most) FTP clients don't support tunneling the control
+connection as described above. In these cases it is necessary to
+explicitely create a tunnel before starting the FTP client. There exist
+quite a few tools to create an SSLv3 encrypted tunnel. One that works
+particularly well with FTPD is "socat", which is installed (or is
+available as a ready to install package) on most current Linux
+distributions. Windows and OS X versions can also be found on the
+internet. Instead of trying to find an FTP client that does the
+tunneling correctly it is recommended to install socat and use any
+regular clear text FTP client over it.
+
+Before connecting the first FTP client session issue the following
+socat command on the client system:
+
+socat TCP-LISTEN:<clientport>,bind=127.0.0.1,reuseaddr,fork,nodelay \
+      OPENSSL:<address>:<extport>,nodelay,verify=0
+
+where <clientport> is an arbitrary port on the client system to which
+the FTP client will connect, <extport> and <address> are as configured
+above on the Hercules host. Of course, DNS resolution is possible for
+<address>.
+
+Then the FTP session can be conducted as shown in the following
+example:
+
+$ ftp -n 127.0.0.1 <clientport>
+Connected to 127.0.0.1.
+220 *** MVS38j FTP Daemon on TK4- ***
+ftp> user juergen
+331 Okay, waiting for password.
+Password:
+230 You are now logged in.
+Remote system type is MVS.
+ftp> cd /jcc.ftpd-rac.asm
+250 CWD command successful
+ftp> ls
+227 Entering Passive Mode (129,132,252,105,204,4)
+150 Now opening data connection
+total 00005
+-r-xr-xr-x   1 user     group        1024 Aug 05  2016 FTPAUTH
+-r-xr-xr-x   1 user     group        1024 Aug 05  2016 FTPDXCTL
+-r-xr-xr-x   1 user     group        1024 Aug 05  2016 FTPLGOUT
+-r-xr-xr-x   1 user     group        1024 Aug 05  2016 FTPLOGIN
+-r-xr-xr-x   1 user     group        1024 Aug 05  2016 FTPSU
+226 Transfer complete!
+ftp> quit
+221 Bye!
+
+Note that the date shown by ls or dir commands is basically arbitrary.
+Often (but not always) it simply is the current date or close to it.
+
+
+
+Rebuilding from Source
+----------------------
+
+Source and build jobs for the RAC based authentication and
+authorization feature for FTPD can be found in the following datasets:
+
+JCC.FTPD-RAC.ASM      -- RAC interface routines
+JCC.FTPD-RAC.CNTL     -- build jobs
+JCC.FTPD-RAC.INCLUDE  -- include file for directory list handling
+JCC.FTPD-RAC.SRC      -- source of RAC enhanced FTP daemon
+
+
+FTPD
+++++
+
+Much of the FTPD functionality is hardcoded in the source. So, it may
+well be that at times the sources found in the ASM, SRC and INCLUDE
+datasets will need to be modified. Once having modified any member of
+these datasets (except FTPDXCTL), rebuild the FTP daemon by submitting
+job MAKEFTPD from the CNTL dataset. A return code of zero is expected
+for all steps.
+
+Note that the MAKEFTPD job will create the load module in SYS2.LINKLIB
+using FTPD@RAC as a membername. To activate this module assign it an
+alias of FTPD. It is not recommended to overwrite the original FTPD-RAC
+module, as this might be needed for reference purposes in the case of
+problems.
+
+
+FTPDXCTL
+++++++++
+
+FTPDXCTL is a wrapper called from the FTPD-RAC procedure. Its only
+purpose is to give up STC/STCGROUP in favour of FTPD/USER privileges
+before transfering control to the FTP daemon. The only thing that might
+need change here is the user (FTPD) and group (USER) the daemon is to
+run under in case FTPD/USER would not match local requirements. The
+FTPDXCTL module can be rebuilt by submitting job MAKEXCTL from the CNTL
+dataset.
+)X
+)O

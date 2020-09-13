@@ -1,0 +1,27 @@
+.*#-------------------------------------------------------------------*
+.*#     GLOBALS FOR MACROS FOR STRUCTURED PROGRAMMING                 *
+.*#-------------------------------------------------------------------*
+.*
+         GBLC  &IFFALSE(50)    -IFGLO-     TABELLE DER FALSE IDENTIF.
+         GBLC  &IFENDLB(50)    -IFGLO-     TABELLE DER ENDIF ID.
+         GBLC  &DOSTART(50)    -IFGLO-     TABELLE DER START ID.
+         GBLC  &DOFALSE(50)    -IFGLO-     TABELLE DER FALSE ID.
+         GBLC  &DOENDLB(50)    -IFGLO-     TABELLE DER ENDDO ID.
+         GBLC  &DOFROM(50)     -IFGLO-     TABELLE DER DO LOOP REG
+         GBLC  &DONAME(50)     -IFGLO-     TABELLE DER DO LOOP NAMEN
+.*                             -IFGLO-
+         GBLC  &IFPRAEF        -IFGLO-     PRAFIX ZUR LABEL ERZEUGUNG
+         GBLC  &IFTRUE         -IFGLO-     TRUE LABEL FOR AND /OR
+         GBLC  &DOTRUE         -IFGLO-     TRUE LABEL FOR AND/OR
+.*                             -IFGLO-
+         GBLA  &IFLEVEL        -IFGLO-     NESTING LEVEL
+         GBLA  &DOLEVEL        -IFGLO-     NESTING LEVEL
+         GBLA  &IFLABEL        -IFGLO-     ELSE ID (COUNTS UP)
+         GBLA  &IFLIMIT        -IFGLO-     ENDIF ID (COUNTS DOWN)
+.*                             -IFGLO-
+         GBLB  &IFINIT         -IFGLO-     INIT SWITCH
+         GBLB  &IFDEBUG        -IFGLO-     DEBUG MODE
+.*       SBU                   -IFGLO-
+.*                             -IFGLO-
+         GBLC  &MACNA          -IFGLO-     MACRO NAME
+.*--------------------------------------------------------------------*

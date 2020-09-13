@@ -1,0 +1,1626 @@
+         TITLE 'IEEVSTAR-- START SYNTAX CHECK'
+***********************************************************************
+*
+*  MODULE NAME = IEEVSTAR
+*
+*  DESCRIPTIVE NAME = START COMMAND SYNTAX CHECK ROUTINE
+*
+*  COPYRIGHT = NONE
+*
+*  STATUS = OS/VS2 RELEASE 037                                 @ZA30542
+*           IN THIS MODULE, SU16 SUPPORTS                      @G16APPJ
+*           VPSS SUPPORT (SU 29 - @G29AN2F) AND                @G16APPJ
+*           RACF VERSION 2 (SU 32 - @G32MPPJ).                 @G16APPJ
+*
+*
+*
+*  FUNCTION = SYNTAX CHECK THE START COMMAND PARAMETERS AND BUILD
+*             A START DESCRIPTOR TABLE (SDT) CONTAINING THE INTERNAL
+*             JCL FOR THE TASK TO BE STARTED.
+*
+*    OPERATION = GET CSCB POINTER FROM THE ASCB.                 Y02669
+*
+*              . ISSUE GETMAIN FOR THE SDT.
+*
+*              . SET LENGTH FIELDS IN SDT TO ZERO; INITIALIZE REST
+*                OF SDT WITH BLANKS.
+*
+*              . CHECK IF ANY START COMMAND PARAMETERS WERE SPECIFIED.
+*                IF NO PARAMETERS, SET ERROR CODE AND GO TO ERROR
+*                EXIT ROUTINE.
+*
+*              . SYNTAX CHECK START COMMAND PARAMETERS. (FOR ERROR
+*                CONDITIONS, SET ERROR CODE AND ENTER THE ERROR
+*                EXIT ROUTINE):
+*
+*                -BUILD THE JOB CARD JCL STATEMENT IN THE SDT.  IF
+*                 THE PROCNAME SPECIFIED ON THE START COMMAND IS
+*                 VALID, IT IS USED AS THE JOBNAME.  PROCNAME IS ALSO
+*                 SAVED IN THE CSCB.
+*
+*                -SET POINTER TO THE CSCB JOBNAME FIELD(JOBNAME  Y02677
+*                 IS THE START COMMAND PROCNAME) IN THE ASCB.    Y02677
+*
+*                -BUILD THE EXEC CARD JCL STATEMENT IN THE SDT.
+*                 IF AN ID (TASKNAME) HAS BEEN SPECIFIED ON THE
+*                 START COMMAND AND IS VALID, USE ID AS STEP NAME
+*                 ON THE EXEC CARD.  SAVE ID IN THE CSCB.  IF NO
+*                 TASKNAME IS SPECIFIED ON START COMMAND, USE
+*                 'STARTING' AS STEPNAME ON EXEC CARD AND IN CSCB.
+*
+*                -IF UNIT PARAMETER HAS BEEN SPECIFIED ON START
+*                 COMMAND AND IS VALID, BUILD '//IEFPROC.IEFDRER DD'
+*                 CARD TO OVERIDE IEFRDER CARD IN THE STARTING
+*                 PROCEDURE.
+*
+*                -IF VOLUME SERIAL HAS BEEN SPECIFIED AND IS VALID,
+*                 MOVE IT TO SDT IEFRDER DD CARD.
+*
+*                -SCAN FOR AND SYNTAX CHECK KEYWORD=OPTION
+*                 PARAMETERS.  MAJOR DD KEYWORDS ON THE START
+*                 COMMAND ARE MOVED TO THE SDT IEFRDER DD CARD.
+*                 OTHER KEYWORDS ARE ASSUMED TO BE SYMBOLIC
+*                 PARAMETERS AND ARE MOVED TO THE SDT EXEC CARD.
+*
+*              . A COMMAND INPUT BUFFER IS GOTTEN AND INITIALIZED
+*                WITH 'PARMVALUE' IF SPECIFIED ON THE START
+*                COMMAND.  ENQUEUE ON THE CSCB RESOURCE WHEN     Y02651
+*                UPDATING THE POINTER TO THE CIB IN THE CSCB.    Y02651
+*
+*              . AT THE END OF THE PARAMETER SCAN:
+*
+*                -SET SDT SIZE.
+*
+*                -UPDATE CSCB WITH START COMMAND RELATED INFORMATION.
+*
+*                -CLEAR CANCEL AND CHAIN ECBS IN CSCB; INITIALIZE
+*                 CHAIN ECB POINTER.
+*
+*                -GET AND INITIALIZE IEEVJCL PARAMETER LIST.
+*
+*                -BRANCH TO IEEVJCL - THE JOB CONTROL LANGUAGE
+*                 SET BUILD ROUTINE, WITH REGISTER 1 POINTING
+*                 TO THE PARAMETER LIST.
+*
+*              . IF AN ERROR HAS BEEN DETECTED WHILE SYNTAX CHECKING
+*                START COMMAND PARAMETERS, THE ERROR EXIT ROUTINE:
+*
+*                -STORES THE ERROR CODE IN THE EXTENDED SAVE AREA
+*                 (XSA), WHICH OVERLAYS THE CORE GOTTEN FOR THE SDT.
+*
+*                -MOVES THE VERB (START) INTO THE XSA FOR MESSAGE FILL.
+*
+*                -LINKS TO IEE0503D MESSAGE MODULE TO ISSUE MESSAGE.
+*
+*                -FREES THE START DESCRIPTOR TABLE.
+*
+*                -XCTLS TO IEEPRTN2 FREE REGION ROUTINE TO CLEAN UP
+*                 STARTED TASK CONTROL RESOURCES.  REGISTER 1    Y02669
+*                 POINTS TO THE ASCB FOR THIS MEMORY.            Y02669
+*
+*  NOTES:
+*    DEPENDENCIES = CSCB ENQUEUE RESOURCE SYSIEFSD/Q10           Y02651
+*      CHARACTER-CODE DEPENDENCIES = EBCDIC
+*    RESTRICTIONS = NONE
+*    REGISTER CONVENTIONS = STANDARD (SEE CODE FOR REGISTER EQUATES)
+*                           IEEVSTAR DOES NOT SAVE OR RESTORE REGISTERS
+*    PATCH-LABEL = STCPATCH - RESERVED FOR FUTURE USE.
+*
+*  MODULE TYPE = CSECT
+*    PROCESSOR = ASSEMBLER
+*    MODULE SIZE = APPROXIMATELY D00 BYTES.
+*    ATTRIBUTES = PAGED LPA, KEY ZERO, SUPERVISOR STATE,
+*                 REENTRANT, REFRESHABLE
+*
+*  ENTRY POINT = IEEVSTAR
+*    PURPOSE = SEE FUNCTION ABOVE
+*    LINKAGE = XCTL FROM IEEPRWI2 - STC GET REGION ROUTINE
+*    INPUT = REGISTER 1 POINTS TO ASCB FOR STC'S MEMORY          Y02669
+*
+*  EXIT-NORMAL = IEEVJCL, JCLS BUILD ROUTINE, VIA BRANCH
+*    CONDITIONS = VALID START COMMAND WITH INTERNAL JCL BUILT
+*                 IN SDT.
+*    OUTPUT = REGISTER 1 POINTS TO PARAMETER LIST CONTAINING:    Y02669
+*              WORD 1 - SUBPOOL NUMBER AND PARAMETER LIST LENGTH Y02669
+*              WORD 2 - ASCB POINTER                             Y02669
+*              WORD 3 - SDT POINTER                              Y02669
+*              WORD 4 - RESERVED                                 Y02669
+*    RETURN CODES = NONE
+*
+*  EXIT-ERROR = IEEPRTN2, STC FREE REGION ROUTINE, VIA XCTL
+*    CONDITIONS = START COMMAND SYNTAX ERROR.  EXIT TO CLEAN
+*                 UP STC RESOURCES.
+*    OUTPUT = REGISTER 1 POINTS TO ASCB FOR STC'S MEMORY         Y02669
+*    RETURN CODES = NONE
+*
+*  EXTERNAL REFERENCES:
+*    ROUTINES = IEE0503D, MESSAGE MODULE, VIA LINK
+*               ISSUE START COMMAND ERROR MESSAGES.
+*    DATA AREAS = PARAMETER LIST PASSED TO IEEVJCL (SUBPOOL 0)   Y02669
+*    CONTROL BLOCKS = ASCB  - READ                               YO2669
+*                     CSCB  - READ, WRITE
+*                     CIB   - CREATE(SUBPOOL 245),WRITE
+*                     CVT   - READ                             @G29AN2F
+*                     SDT   - CREATE(SUBPOOL   0),WRITE
+*                     SUBIT - READ                             @G29AN2F
+*                     XSA   - WRITE
+*
+*  TABLES = XSA MAPS SDT CORE AS WORK AREA FOR ERROR MESSAGE
+*           PROCESSING.
+*
+*  MACROS = GETMAIN, FREEMAIN, LINK, XCTL, ENQUEUE, DEQUEUE      Y02669
+*    SERIALIZATION = SYSIEFSD/Q10 (CSCB ENQUEUE RESOURCE)        Y02651
+*
+*  CHANGE ACTIVITY = YO2669, Y02677, YO2651, Y30LPTV, Y30OPTV, Z40MPSS
+*                    ZA03646, G29AN2E, G29AN2F, G32HPPJ        @G32HPPJ
+*                    ZA17322, ZA28715, ZA30542                 @ZA30542
+*  ABEND CODES = NONE
+*
+***********************************************************************
+* A 12950904-12968004                                          @Z40MPSS
+* C CHANGE HYPHEN TO VALID CHAR                                @ZA17322
+* C - VST500 - EXTEND CSCB ENQ OVER FULL INITIALIZATION        @ZA28715
+* THIS APAR SUPPORTS MERGE OF SU 10,16 CODE TO REL 037 BASE    @ZA30542
+         EJECT
+IEEVSTAR CSECT
+***********************************************************************
+*  REGISTER ASSIGNMENTS
+***********************************************************************
+R0       EQU   0                  PARAMETER PASS REGISTER.
+R1       EQU   1                  INPUT PTR TO CHAIN - USED IN TRT INST
+R2       EQU   2                  FUNCTION BYTE RETURN FROM TRT.
+R3       EQU   3                  WORK REGISTER.
+R4       EQU   4                  WORK REGISTER.
+R5       EQU   5                  WORK REGISTER.
+R6       EQU   6                  WORK REGISTER.
+R7       EQU   7                  WORK REGISTER.
+R8       EQU   8                  WORK REGISTER.
+R9       EQU   9                  WORK REGISTER.
+R10      EQU   10                 SDT BASE REGISTER.
+R11      EQU   11                 CHAIN BASE REGISTER.
+RBASE    EQU   12                 BASE REGISTER.
+R13      EQU   13                                                  I272
+R14      EQU   14                 RETURN REGISTER.
+R15      EQU   15                 LINK REGISTER.
+D0       EQU   0                   USED FOR OFFSETS,LENGTHS,ETC.   I272
+D1       EQU   1                                                   I272
+D2       EQU   2                                                   I272
+D3       EQU   3                                                   I272
+D4       EQU   4                                                   I272
+D5       EQU   5                                                   I272
+D8       EQU   8                                                   I272
+D23      EQU   23                                                  I272
+D24      EQU   24                                                  I272
+D128     EQU   128                                                 I272
+D256     EQU   256                                                 I272
+CBLANK   EQU   C' '                                                I272
+POSTBIT  EQU   X'40'               POST ECB BIT                  A26309
+         EJECT
+         BALR  RBASE,0            BASE
+         USING *,RBASE                 REGISTER.
+         MODID BR=YES                                            Y01886
+VSTAR00  DS    0H                                                Y01113
+         SPACE
+         LR    R2,R1              SAVE ASCB POINTER              Y02669
+         USING ASCB,R2                                           Y02669
+         L     R11,ASCBCSCB       SET CSCB POINTER               Y02669
+         DROP  R2                                                Y02669
+         USING CHAIN,R11
+         SPACE
+***********************************************************************
+*               GETMAIN FOR START DESCRIPTOR TABLE
+***********************************************************************
+         GETMAIN R,LV=SDTLN        GET CORE FOR SDT              Y02669
+         SPACE
+         LR    R10,R1             START DESCRIPTER TABLE
+         USING SDTSD,R10                BASE REGISTER
+***********************************************************************
+*  INITIALIZE START DESCRIPTOR TABLE (SDT)
+*     ZERO OUT ALL LENGTH SLOTS
+*     BLANK OUT REST OF START DESCRIPTOR TABLE
+***********************************************************************
+         SPACE
+         MVI   SDTJCLS1,C' '      BLANK GOTTEN CORE
+         MVC   SDTJCLS1+1(221),SDTJCLS1
+         MVI   SDTJCLS4,C' '
+         MVC   SDTJCLS4+1(221),SDTJCLS4
+         MVI   SDTJCLS7,C' '                                    OCIP39A
+         MVC   SDTJCLS7+1(73),SDTJCLS7                          OCIP39A
+         SR    R3,R3
+         STH   R3,SDTSIZE         *
+         STH   R3,SDTJCLS1        *
+         STH   R3,SDTJCLS2        * ZERO OUT ALL LENGTH SLOTS
+         STH   R3,SDTJCLS3        *
+         STH   R3,SDTJCLS4        *
+         STH   R3,SDTJCLS5        *
+         STH   R3,SDTJCLS6
+         STH   R3,SDTJCLS7                                      OCIP39A
+         SR    R0,R0               SET PARMVALUE INDICATOR TO 0    I272
+         ST    R2,SDTWORK          SAVE ASCB ADDRESS             Y02669
+         EJECT
+***********************************************************************
+*
+*   CHECK CSCB BUFFER FOR NO PROCNAME,PROCNAME LONGER THAN 8       I272
+*   CHARACTERS,1ST CHARACTER OF PROCNAME NON-ALPHABETIC. ANY       I272
+*   OF THESE IS AN ERROR.                                          I272
+*                                                                     *
+***********************************************************************
+         SPACE
+         CLI   CHBUF,C' '         IS PROCNAME SPECIFIED ON COMMAND
+         BE    VSTERR4            NO, PARAMETER MISSING
+         LA    R8,CHBUF           START OF SCAN OF PROCNAME
+         LA    R2,9                MAX FIELD LENGTH + 1         YA00929
+         LR    R1,R8              INIT R1 TO START OF PROCNAME  YA00929
+         BAL   R15,VST070BA       SCAN THE PROCNAME             YA00929
+         CR    R8,R1              IS FIRST CHARACTER NON-ALPHABETIC
+         BNE   VST070AA           NO                            YA00929
+         CH    R2,NAT9            IS IT A NATIONAL CHARACTER    YA00929
+         BNE   VSTERR1            NO, SPELLING ERROR            YA00929
+VST070AA TM    0(R8),C'0'         IS IT NUMERIC                 YA00929
+         BO    VSTERR1            YES, ERROR
+         BALR  R15,R0             SET BASE FOR POSSIBLE RETURN  YA00929
+         SR    R3,R3              CLEAR R3                      YA00929
+         IC    R3,VSTBT6-1(R2)    GET BRANCH INDEX              YA00929
+         LA    R2,9               MAX FIELD LENGTH + 1          YA00929
+         B     *+4(R3)                                          YA00929
+         B     VSTERR2            DELIMITER ERROR               YA00929
+         B     VST070E            COMMA OR BLANK                YA00929
+         B     VST070B            NATIONAL CHARACTER, RESCAN    YA00929
+         CLI   0(R1),C'.'         WAS IT A PERIOD               YA00929
+         BNE   VSTERR2            NO, DELIMITER ERROR           YA00929
+VST070E  MVC   CHUNIT(D3),VBLANKS BLANK OUT UNITNAME            YA00929
+***********************************************************************
+*                                                                     *
+*   JOB STATEMENT SET UP IN START DESCRIPTOR TABLE -                  *
+*      -SET JOB STATEMENT INDICATOR                                   *
+*      -MOVE JOB JCL TO SDT                                           *
+*      -MOVE PROCNAME TO JOB STATEMENT AS JOBNAME                     *
+*                                                                     *
+***********************************************************************
+         SPACE
+         OI    SDTJCLS1,SDTJOB1   SET JOB INDICATOR
+         MVC   SDTJCL1(L'VSTJOB),VSTJOB MOVE JOB JCL TO SDT
+         LR    R7,R1              MOVE DELIMITER PTR TO REGISTER 7
+         SR    R7,R8              MOVE LENGTH OF PROCNAME TO REG 7
+         LA    R3,SDTJCL1
+         BCTR  R7,0               MINUS FOR EX MOVE
+         EX    R7,VSTMOVE1        PROCNAME TO SDT AS JOBNAME
+         LA    R7,1(R7)           RESTORE LENGTH
+         EJECT
+***********************************************************************
+*                                                                     *
+*   TEST START COMMAND BUFFER FOR -
+*              PERIOD (TASKNAME,OR ID,PRESENT)                     I272
+*                                                                     *
+***********************************************************************
+         SPACE
+         LR    R8,R7               PROCNAME LEN INTO R8            I272
+         CLI   0(R1),C'.'        WAS DELIMITER A PERIOD         YA00929
+         BNE   VST075            NO, SKIP TASKNAME              YA00929
+         SPACE
+***********************************************************************
+*                                                                     *
+*   SINCE TASKNAME IS PRESENT IN COMMAND BUFFER -                     *
+*      -CHECK TASKNAME FOR EIGHT CHARACTERS OR LESS (IF GREATER THAN  *
+*       EIGHT, TERM LENGTH ERROR)                                     *
+*      -CHECK FOR NON-ALPHABETIC 1ST CHARACTER                     I272
+*      -MOVE TASKNAME TO CHKEY IN CSCB                                *
+*                                                                     *
+***********************************************************************
+         SPACE
+         LA    R6,1(R1)           POINT R6 AT TASKNAME
+         LA    R2,9              MAX FIELD LENGTH + 1           YA00929
+         LR    R1,R6             INIT R1 TO START OF TASKNAME   YA00929
+         BAL   R15,VST070BA      SCAN THE TASKNAME              YA00929
+         CR    R6,R1              IS FIRST CHARACTER NONALPHABETIC
+         BE    VSTERR1            YES, TASKNAME MISPELLED
+         TM    0(R6),C'0'         IS THE FIRST CHARACTER NUMERIC
+         BO    VSTERR1            YES, ERROR
+         BALR  R15,R0            SET BASE FOR POSSIBLE RETURN   YA00929
+VST070C  SR    R3,R3                                              M0090
+         IC    R3,VSTBT1-1(R2)    PICK UP RETURN CODE FROM BRANCH TABLE
+         LA    R2,9              MAX FIELD LENGTH + 1           YA00929
+         B     *+4(R3)            COMMA/BLANK ONLY LEGAL           AAAA
+         B     VSTERR2            ERROR, NO COMMA/BLANK            AAAA
+         B     VST070B            BRANCH CHECK FOR POUND,DOLLAR   M0090
+*                                 OR AT SIGN                      M0090
+         LR    R5,R1               PTR TO DELIMITER INTO R5        I272
+         SR    R5,R6              MOVE TASKNAME LENGTH TO R5
+VST070A  LA    R8,D1(R5,R8)       TASKNAME LEN +PROCNAME LEN      M0090
+*                                 + 1 FOR PERIOD                  M0090
+         B     VST100           SET UP SDT EXEC STATEMENT       YA00929
+         SPACE
+****************************************************************YA00929
+*                                                               YA00929
+*    COMMON TRANSLATE AND TEST ROUTINE TO ALLOW NATIONAL        YA00929
+*    CHARACTERS (# @ $) IN PROCNAME, TASKNAME, AND VOLUME SERIALYA00929
+*        ON ENTRY, R1 CONTAINE THE ARGUMENT ADDRESS             YA00929
+*                  R2 CONTAINS THE MAXIMUM LENGTH + 1 OF THE    YA00929
+*                     ARGUMENT FIELD                            YA00929
+*        AT EXIT,  R1 CONTAINS THE ARGUMENT ADDRESS WHERE THE   YA00929
+*                     TRANSLATE AND TEST STOPPED BECAUSE OF A   YA00929
+*                     NON-ZERO FUNCTION BYTE                    YA00929
+*                  R2 CONTAINS THE FUNCTION BYTE FROM THE       YA00929
+*                     TRANSLATE TABLE                           YA00929
+*                                                               YA00929
+****************************************************************YA00929
+         SPACE
+VST070BA LR    R5,R1              PICK UP CHAR ADDRESS            M0090
+         B     VST070BB         AFTER INIT ENTRY, R5 POINTS     YA00929
+*                               TO THE BEGINNING OF THE FIELD   YA00929
+VST070B  EQU   *                ENTRY IF LAST CHARACTER         YA00929
+*                               TRANSLATED WAS NATIONAL         YA00929
+         LA    R1,1(R1)         GET PAST CHARACTER TO           YA00929
+*                               CONTINUE SCAN                   YA00929
+VST070BB SR    R1,R5            LENGTH PROCESSED                YA00929
+         SR    R2,R1            LENGTH TO PROCESS               YA00929
+         BZ    VSTERR3          ERROR, FIELD TO LONG            YA00929
+         AR    R1,R5            POINT TO BEGINNING OF ARGUMENT  YA00929
+         BCTR  R2,R0            DECREMENT R2 FOR EXECUTE        YA00929
+         EX    R2,TRANS         SCAN THE FIELD                  YA00929
+         BC    8,VSTERR3          FIELD LONGER THAN ALLOWED       M0090
+         BR    R15              RETURN                          YA00929
+TRANS    TRT   0(1,R1),VSTTRTAB                                   M0090
+VSTMOVE1 MVC   2(1,R3),0(R8)
+VSTMOVE2 MVC   0(1,R3),0(R6)
+VSTMOVE3 MVC   0(1,R3),0(R2)
+VSTMOVE4 MVC   0(1,R6),0(R4)
+VSTMOVE5 MVC   0(1,R6),0(R5)
+VSTMOVE6 MVC   CIBDATA-CIBNEXT(0,R1),0(R4)
+         EJECT
+***********************************************************************
+*                                                                     *
+*   SINCE TASKNAME IS NOT PRESENT IN COMMAND BUFFER -                 *
+*      -'STARTING' WILL BE STEPNAME ON SDT EXEC CARD               I272
+*      -SCAN FOR UNIT NAME PRESENT                                    *
+*      -IF FOUND,SYNTAX CHECK UNIT PARAM                           I272
+*                                                                     *
+***********************************************************************
+         SPACE
+VST075   EQU   *
+         CLI   0(R1),C' '         ARE ANY PARAMETERS PRESENT
+         BE    VST087              NO. GO SET UP EXEC CARD         I272
+         LA    R1,1(R1)           POINT REG 1 TO FIRST CHARACTER OF
+*                                   UNIT
+         CLI   0(R1),C' '          DOES BLANK FOLLOW COMMA
+         BE    VSTERR2            YES, DELIMITER ERROR
+         CLI   0(R1),C','         IS UNIT PRESENT IN COMMAND BUFFER
+         BE    VST086              NO. GO SET UP EXEC STATEMENT    I272
+         LR    R6,R1              POINT REG 6 AT BEGINNING OF UNIT
+        LR    R9,R1              POINT REG 9 AT BEGINNING OF UNIT
+         SR    R2,R2
+         TRT   0(9,R9),VSTTRTAB   SCAN UNIT
+         BC    8,VSTERR3          TERM LENGTH ERROR
+         SR    R3,R3
+         IC    R3,VSTBT2-1(R2)    PICK UP RETURN CODE FROM BRANCH TABLE
+         B     *+4(R3)
+         B     VSTERR2
+         B     VST085              , - PROCESS KEYWORDS            I272
+VST080   EQU  *
+         LR    R5,R1              POINT REG 5 AT DELIMITER
+         LR    R1,R9              POINT REG 1 AT DELIMITER
+         SR    R5,R6              LENGTH OF UNIT TO REG 5
+         B     VST086             SET UP 'STARTING' FOR EXEC STMNT
+         SPACE
+***********************************************************************
+*                                                                     *
+*        MOVE 'STARTING' TO CSCB AND SET UP EXEC STATEMENT           *
+*                                                                     *
+***********************************************************************
+         SPACE
+VST085   EQU   *                                                   I272
+         LR    R1,R9              =, POINT BACK TO DELIMITER
+VST086   EQU   *
+         BCTR  R1,0               POINT REG 1 TO CHARACTER AFTER COMMA
+VST087   LA    R6,VSTSTING         PTR TO 'STARTING' DC            I272
+         LA    R5,L'VSTSTING       LEN OF 'STARTING'               I272
+         EJECT
+***********************************************************************
+*                                                                     *
+*   EXEC STATEMENT SETUP IN START DESCRIPTOR TABLE -                  *
+*      -SET EXEC STATEMENT INDICATOR                                  *
+*      -MOVE EXEC JCL TO SDT                                          *
+*     -INSERT STEPNAME TO SDT EXEC STATEMENT                          *
+*      -MOVE PROCNAME TO EXEC STATEMENT IN SDT                        *
+*                                                                     *
+***********************************************************************
+         SPACE
+VST100   EQU   *
+         OI    SDTJCLS2,SDTEXEC2  SET EXEC INDICATOR
+         MVC   SDTJCL2(L'VSTEXEC),VSTEXEC MOVE EXEC JCL TO SDT
+         LA    R3,SDTJCL2+SIXTEEN  ADDRESS FOR PROCNAME MOVE    OCIP39A
+         BCTR  R7,0                PROCNAME LEN LESS 1
+         LA    R2,SDTJCL1+2
+         EX    R7,VSTMOVE3         PROCNAME TO SDT JOB CARD
+         LA    R7,1(R7)            RESTORE PROCNAME LEN
+         BCTR  R5,0                TASKNAME OR STARTING LEN LESS 1
+         LA    R3,SDTJCL2+2
+         EX    R5,VSTMOVE2         TASKNAME OR STARTING TO SDT
+         LA    R5,1(R5)            RESTORE TASKNAME LEN
+         CLI   0(R1),C' '         ANY PARAMETERS LEFT
+         BE    VST500A            NO, GET CIB CORE & EXIT
+         LA    R1,1(R1)           POINT REG 1 TO DELIMITER
+         SPACE
+*****                                                             *****
+*                 SCAN FOR ONLY PARMVALUE PRESENT                     *
+*               IF FOUND, NO DD STATEMENT NECESSARY                   *
+*****                                                             *****
+         SPACE
+         LA    R8,1(R8)           ADD ONE FOR COMMA AFTER PROC/TASK
+         LR    R9,R8              LENGTH OF PROC /AND TASKNAME TO REG 9
+         CLI   0(R1),C' '         DOES BLANK FOLLOW COMMA
+         BE    VSTERR2            YES DELIMITER ERROR
+         CLI   0(R1),C','         IS UNIT PARAMETER SPECIFIED
+         BNE   VST200             YES, BUILD DD STATEMENT IN SDT
+         CLI   1(R1),C' '         DOES BLANK FOLLOW COMMA
+         BE    VSTERR2            YES DELIMITER ERROR
+         CLI   1(R1),C','         IS VOL SER PARAMETER SPECIFIED
+         BNE   VST200             YES, BUILD DD STATEMENT IN SDT
+         CLI   2(R1),C' '         DOES BLANK FOLLOW COMMA
+         BE    VSTERR2            YES DELIMITER ERROR
+         CLI   2(R1),C','         IS PARMVALUE SPECIFIED
+         BE    VST200             NO, BUILD DD STATEMENT
+         LA    R4,2(R1)           POINT REG 4 AT BEGINNING OF PARMVALUE
+         LA    R8,2(R8)           ADD NUMBER OF COMMAS
+         SR    R5,R5              ZERO REG 5 FOR LENGTH OF PARMVALUE
+         CLI   0(R4),C' '         IS PARMVALUE SPECIFIED
+         BE    VSTERR2            DELIMITER ERROR
+         CLI   0(R4),C'('         IS PARMVALUE ENCLOSED IN PARENS
+         BE    VST180             YES, SCAN FOR RIGHT PAREN NO EQUAL
+VST170   LA    R4,D1(R4)           BUMP CM BUFFER PTR              I272
+         LA    R5,1(R5)           INCREMENT PARMVALUE LENGTH BY ONE
+         LA    R8,1(R8)           INCREMENT BUFFER LENGTH BY ONE
+         CLI   0(R4),C' '         IS KEYWORD PRESENT
+         BE    VST425             NO, DON'T BOTHER BUILDING DD JCL
+         CLI   0(R4),C'='         IS IT A KEYWORD
+        BE    VST200              YES, BUILD A  DD STATEMENT
+         CLI   0(R4),C','         IS KEYWORD SPECIFIED
+         BE    VST200             YES, BUILD DD STATEMENT IN SDT
+         CL    R8,VST124          HAS END OF BUFFER BEEN REACHED
+         BH    VST425             YES, GET CORE FOR CIB
+         B     VST170              GO BACK TO BUMP PTRS AND CHECK  I272
+VST180   EQU   *
+         LA    R3,1                INITIALIZE PAREN CNT REGISTER   I241
+         LA    R4,1(R4)           INCREMENT COMMAND BUFFER PTR
+         LA    R8,1(R8)           INCREMENT BUFFER LENGTH
+         CLI   0(R4),C' '         IS PARMVALUE SPECIFIED
+         BE    VSTERR2            NO, DELIMITER ERROR
+         CLI   0(R4),C')'         IS PARMVALUE SPECIFIED
+         BE    VSTERR2            NO, DELIMITER ERROR
+VST185   EQU   *
+         LA    R8,1(R8)           POINT AT NEXT CHARACTER
+         LA    R5,1(R5)           ADD ONE TO PARMVALUE LENGTH
+         LA    R4,1(R4)           ADD ONE TO CHBUF LENGTH
+         CLI   0(R4),C' '         IS KEYWORD PRESENT
+         BE    VSTERR2            ERROR, RIGHT PAREN NOT PRESENT
+         CLI   0(R4),C'('          IS CHAR LEFT PAREN              I241
+         BNE   VST185A             NO BRANCH AND CONTINUE          I241
+         LA    R3,1(R3)            ADD ONE TO PAREN COUNT          I241
+         B     VST185B                                             I241
+VST185A  EQU   *                                                   I241
+         CLI   0(R4),C')'         IS IT END OF PARMVALUE
+         BNE   VST185B             NO BRANCH AND CONTINUE          I241
+         BCTR  R3,0                SUBTRACT 1 FROM PAREN CNT       I241
+         LTR   R3,R3               IS PAREN CNT ZERO               I241
+         BZ    VST190              YES CHECK FOR KEYWORDS          I241
+VST185B  EQU   *                                                   I241
+         CL    R8,VST124          HAS END OF BUFFER BEEN REACHED
+         BE    VSTERR2            YES, DELIMITER ERROR
+         B     VST185             GO TRY AGAIN
+VST190   EQU   *
+         LA    R4,1(R4)           POINT REG 4 TO CHARACTER AFTER )
+         CLI   0(R4),C','         ARE KEYWORDS PRESENT
+         BE    VST200             YES BUILD DD STATEMENT
+         CLI   0(R4),C' '         IS BLANK FOLLOWING
+         BE    VST420             YES, YOU ARE IN GOOD SHAPE
+         B     VSTERR2            DELIMITER ERROR - BAD SHAPE
+         EJECT
+***********************************************************************
+*                                                                     *
+*   DD STATEMENT SET UP IN THE START DESCRIPTOR TABLE -               *
+*      -SET DD STATEMENT INDICATOR                                    *
+*      -MOVE DD NAME TO JCL IMAGE IN SDT                              *
+*                                                                     *
+***********************************************************************
+         SPACE
+VST200   EQU   *
+         LR    R8,R9
+         SR    R5,R5              ZERO SDT DD STATEMENT LENGTH REG
+         OI    SDTJCLS3,SDTDD3    SET DD STATEMENT INDICATOR FLAG
+         MVC   SDTJCL3(L'VSTDD),VSTDD MOVE DD JCL TO SDT
+         LA    R5,L'VSTDD(0)      LENGTH TO REG 5
+         LA    R6,SDTJCL3
+         AR    R6,R5              POSITION REG 6 FOR PARAMETER MOVE
+         SPACE
+***********************************************************************
+*                                                                     *
+*                         POSITIONAL PARAMETER SCAN                   *
+*                                                                     *
+***********************************************************************
+         SPACE
+         SR    R2,R2              SET REG2 TO ZERO FOR IC INSTRUCTION
+         LR    R4,R1              POINT REG 4 AT CHARACTER AFTER COMMA
+         TRT   0(9,R4),VSTTRTAB   SCAN POSITIONAL PARAMETERS
+         BC    8,VSTERR3          TERM LENGTH ERROR
+         SR    R3,R3
+         IC    R3,VSTBT2-1(R2)    PICK UP INDEX CODE FROM TABLE 2
+         B     *+4(R3)
+         B    VSTERR2             DELIMITER ERROR
+         B     VST345             EQUAL SIGN
+         EJECT
+*****                                                             *****
+*                                                                     *
+*            THIS ROUTINE PROCESSES THE UNIT PARAMETER ON THE         *
+*                              START COMMAND                          *
+*                                                                     *
+*****                                                             *****
+         SPACE
+         CLI   0(R1),C' '         IS IT A BLANK
+         BE    VST650             CHECK FOR BLANK RIGHT AFTER COMMA
+VST250   EQU   *
+         CR    R4,R1              IS UNIT PARAMETER SPECIFIED
+         BE    VST600             NO, CHECK VOLUME SERIAL NUMBER
+         LR    R3,R1
+         SR    R3,R4              MOVE LENGTH OF UNIT TO REG3
+         AR    R8,R3              INCREMENT BUFFER COUNT BY UNIT LENGTH
+         MVC   0(L'VSTUNIT,R6),VSTUNIT MOVE UNIT= TO SDT
+         LA    R5,L'VSTUNIT(0)    POINT REG 6 AT NEXT EMPTY SPACE
+         AR    R6,R5
+         BCTR  R3,0
+         EX    R3,VSTMOVE4        MOVE UNIT TO SDT
+         LA    R3,1(R3)
+         LA    R1,1(R1)           POINT R1 TO POSITION AFTER COMMA
+         AR    R6,R3              POSITION REG 6 AFTER UNIT
+         LTR   R9,R9              ARE ANY PARAMETERS LEFT
+         BZ    VST500A            NO, BUILD CIB AND EXIT
+         EJECT
+*****                                                             *****
+*                                                                     *
+*             THIS ROUTINE PROCESSES THE VOLUME SERIAL PARAMETER      *
+*                     ON THE START COMMAND                            *
+*                                                                     *
+*****                                                             *****
+         SPACE
+VST275   EQU   *
+         LA    R8,1(R8)           INCREMENT BUFFER LENGTH CT FOR COMMA
+         LA    R2,7             MAX FIELD LENGTH + 1            YA00929
+         LR    R4,R1              POINT REG4 AT CHARACTER AFTER COMMA
+         BAL   R15,VST070BA     GO SCAN THE SERIAL              YA00929
+         SR    R3,R3
+         IC    R3,VSTBT3-1(R2)    PICK UP INDEX CODE FROM TABLE 3
+         LA    R2,7             MAX FIELD LENGTH + 1            YA00929
+         B     *+4(R3)
+         B     VSTERR2            NO, DELIMITER ERROR
+         B     VST345             EQUAL SIGN
+         B     VST070B          NATIONAL CHARACTER RESCAN       YA00929
+         CLI   0(R1),C' '         IS DELIMITER A BLANK
+         BE    VST675             YES, CHECK FOR ERROR
+         SPACE
+VST300   EQU   *
+         CR    R4,R1              IS VOL SER PARAMETER SPECIFIED
+         BE    VST625             NO, CHECK FOR PARM VALUE
+         LR    R3,R1
+         SR    R3,R4              MOVE LENGTH OF VOL SER TO REG 3
+         AR    R8,R3              ADD VOL SER LENGTH TO BUFFER COUNT
+         BCTR  R6,0               SUBTRACT ONE FROM REG 6
+         CLI   0(R6),C' '         WAS UNIT SPECIFIED
+         BE    VST301             NO, DON'T MOVE COMMA
+         LA    R6,1(R6)           RESTORE DD STATEMENT POINTER
+         MVI   0(R6),C','         MOVE COMMA AFTER UNIT PARAMETER
+VST301   EQU   *
+         LA    R6,1(R6)           POINT REG 6 AT CHARACTER AFTER COMMA
+         MVC   0(L'VSTVOL,R6),VSTVOL  MOVE VOLUME=SER= TO SDT
+         LA    R5,L'VSTVOL(0)
+         AR    R6,R5              POINT REG 6 AT NEXT EMPTY SPACE
+         BCTR  R3,0
+         EX    R3,VSTMOVE4        MOVE VOL SER TO SDT
+         LA    R3,1(R3)
+         LA    R1,1(R1)           POINT REG 1 TO CHARACTER AFTER COMMA
+         AR    R6,R3              REG 6 TO CHARACTER AFTER VOL SER
+         LTR   R9,R9              ARE ANY PARAMETERS LEFT
+         BZ    VST500A            NO, BUILD CIB AND EXIT
+         LA    R8,1(R8)           INCREMENT COUNT BY ONE
+         EJECT
+*****                                                             *****
+*        SCAN  FOR  ONLY PARMVALUE PRESENT OR PARMVALUE AND           *
+*                     KEYWORDS PRESENT                            *****
+*****
+         SPACE
+VST325   EQU   *
+         CLI   0(R1),C' '          DOES BLANK FOLLOW COMMA
+         BE    VSTERR2            YES, DELIMITER ERROR
+         CLI   0(R1),C','         IS PARMVALUE SPECIFIED
+         BE    VST750             NO, SCAN KEYWORDS
+         LR    R9,R8              LENGTH TO REG 9
+         LA    R8,1(R8)           INCREMENT COUNT BY ONE
+         SR    R5,R5
+         LR    R4,R1
+         CLI   0(R4),C'('
+         BE    VST331
+VST330   EQU   *
+         LA    R5,1(R5)           ADD ONE FOR FIRST CHARACTER
+         LA    R4,1(R4)
+         CLI   0(R4),C' '         IS ONLY PARMVALUE SPECIFIED
+         BE    VST700             YES, GET CORE FOR CIB
+         CLI   0(R4),C','         ARE KEYWORDS SPECIFIED TOO
+         BE    VST725             YES, GET CORE FOR CIB AND PROCESS
+         CLI   0(R4),C'='       **Q. KEYWORD
+         BE    VST330A          ** BR - YES
+         LA    R8,1(R8)
+        CL    R8,VST124
+         BH    VST700
+         B     VST330
+VST330A  EQU   *                **
+         LR    R8,R9            **RESTORE BUFFER COUNT
+         BCTR  R1,0             **
+         B     VST750           **EXIT TO KEYWORD ROUTINE
+VST331   EQU   *
+         LA    R3,1                INITIALIZE PAREN CNT REGISTER   I241
+         LA    R1,1(R1)           POINT REG 1 TO FIRST CHARACTER
+         LR    R4,R1              POINT REG 4
+         CLI   0(R4),C')'         IS PARMVALUE PRESENT
+         BE    VSTERR2            NO, YOU LOOSE - ERROR
+         CLI   0(R4),C' '         IS PARMVALUE PRESENT
+         BE    VSTERR2            (3, DELIMITER ERROR
+VST332   EQU   *
+         LA    R8,1(R8)           INCREMENT BUFFER LENGTH COUNT
+         LA    R5,1(R5)           ADD ONE TO PARMVALUE COUNT
+         LA    R4,1(R4)           POINT REG 4 TO NEXT CHARACTER
+         CLI   0(R4),C' '         IS IT RIGHT PAREN
+         BE    VSTERR2            NO RIGHT PAREN - ERROR
+         CLI   0(R4),C'('          IS CHAR LEFT PAREN              I241
+         BNE   VST332A             NO BRANCH AND CONTINUE          I241
+         LA    R3,1(R3)            ADD ONE TO PAREN CNT            I241
+         B     VST332B                                             I241
+VST332A  EQU   *                                                   I241
+         CLI   0(R4),C')'         IS IT END OF PARMVALUE
+         BNE   VST332B             NO BRANCH AND CONTINUE          I241
+         BCTR  R3,0                SUBT 1 FROM PAREN CNT           I241
+         LTR   R3,R3               IS PAREN CNT ZERO               I241
+         BZ    VST333              YES, CHECK FOR KEYWORDS         I241
+VST332B  EQU   *                                                   I241
+         CL    R8,VST124          HAS END OF BUFFER BEEN REACHED
+         BE    VSTERR2            YES, DELIMITER ERROR
+         B     VST332             TRY AGAIN
+VST333   EQU   *
+         LA    R4,1(R4)           POINT REG 4 AT CHARACTER AFTER )
+         CLI   0(R4),C','         ARE KEYWORDS PRESENT
+         BE    VST725             YES, MOVE CIB AND PROCESS
+         CLI   0(R4),C' '         IS IT BLANK
+         BE    VST700             YES, YOU ARE O K
+         B    VSTERR2             DELIMITER ERROR
+         EJECT
+*****
+*                             KEYWORD  SCAN
+*****
+         SPACE
+VST335   EQU   *
+         LR    R9,R7              POINT REG 9 TO KEYWORD
+         LA    R8,1(R8)           INCREMENT COUNT BY ONE
+         BCTR  R6,0               POINT REG 6 AT LAST CHARACTER
+         CLI   0(R6),C' '         WAS THERE A LAST CHARACTER
+         BE    VST341B             NO,SKIP THE COMMA MOVE       OCIP39A
+         LA    R6,1(R6)           POINT REG 6 AT CURRENT SLOT
+         MVI   0(R6),C','         MOVE COMMA TO DELIMIT KEYWORDS
+VST341B  LA    R6,1(R6)             INCREMENT POINTER           OCIP39A
+         BAL   R15,VSTINIT                                      OCIP39A
+VST341A  EQU   *                                                OCIP39A
+         SR    R2,R2
+         TRT    0(9,R9),VSTTRTAB   SCAN KEYWORD
+         BC    8,VSTERR3          TERM LENGTH ERROR
+         LA    R3,CHBUF+124       END OF BUFFER ADDRESS        @ZA03646
+         CR    R1,R3              END OF BUFFER EXCEEDED?      @ZA03646
+         BH    VSTERR3            YES, TERM LENGTH ERROR       @ZA03646
+         SR    R3,R3
+         IC    R3,VSTBT4-1(R2)    PICK UP CODE INDEX FROM TABLE 4
+         B     *+4(R3)
+         B     VSTERR2            NOT EQUAL SIGN - DELIMITER ERROR
+         B     VST350             CONTINUE PROCESSING KEYWORDS
+VST345   EQU   *
+         LR    R9,R4              POINT REG 9 TO FIRST KEYWORD
+         BCTR  R6,0               SEE IF ANY OTHER PARAMETERS
+         CLI   0(R6),C' '         WERE THEY
+         BE    VST346             NO, YOU ARE O K
+         LA    R8,1(R8)           ADD ONE FOR LEFT COMMA
+         LA    R6,1(R6)
+         MVI   0(R6),C','
+VST346   EQU   *
+         LA    R6,1(R6)           REPOSITION REG 6
+         BAL   R15,VSTINIT                                      OCIP39A
+         EJECT
+*****                                                             *****
+*                                                                     *
+*                   START OF GENERAL SCAN                             *
+*                                                                     *
+********                                              *****     OCIP39A
+VST350   EQU   *                                                OCIP39A
+         CR    R9,R1              IS = FIRST CHARACTER          OCIP39A
+         SPACE
+         BE    VSTERR2            YES, DELIMITER ERROR
+         L     R7,SDTPAREN                                      OCIP39A
+         LTR   R7,R7                                            OCIP39A
+         BZ    VST350B        BR.IF VALUE NOT  ENCLOSED         OCIP39A
+*                                   INPARENTHESES               OCIP39A
+         SR    R7,R7               END OF MAJOR KEYWORD         OCIP39A
+**                       ENCLOSED IN PARENTHESES REACHED        OCIP39A
+         ST    R7,SDTPAREN         SET SDTPAREN = 0             OCIP39A
+VST350B  EQU   *                   SEARCH TABLE OF DD KEYWORDS  OCIP39A
+**                                                              OCIP39A
+**  R1 PTS. TO = DELIMITER                                      OCIP39A
+**  R9 PTS. TO FIRST CHAR.OF KEYWORD                            OCIP39A
+         LA    R7,DDTAB            PTR TO LIST OF DD KEYWORDS   OCIP39A
+         LR    R5,R1               PTR TO = DELIMITER           OCIP39A
+         LR    R15,R1                                           OCIP39A
+         SR    R15,R9              COMPUTE CHAR LENGTH          OCIP39A
+**  R15 CONTAINS LENGTH OF KEYWORD(INCLUDING =                  OCIP39A
+**             SIGN) MINUS 1(FOR CLC)                           OCIP39A
+         SR    R4,R4               CLEAR REGISTER               OCIP39A
+         B     EQRD3               TRANSFER                     OCIP39A
+EQRD1    DS    0H                  ENTRY                        OCIP39A
+         CLC   1(0,R7),0(R9)       IS KEYWORD IN TABLE          OCIP39A
+EQRD2    DS    0H                                               OCIP39A
+         AR    R7,R4               BUMP TO NEXT KEYWORD         OCIP39A
+EQRD3    DS    0H                                               OCIP39A
+         IC    R4,ZERO(R7)  GET KEYWORD LENGTH(INCL. = SIGN)    OCIP39A
+         LTR   R4,R4               TABLE END                    OCIP39A
+         BZ    EQRL                YES,TRANSFER                 OCIP39A
+         EX    R15,EQRD1           EXECUTE KEYWORD COMPARE      OCIP39A
+         BC    NOTEQU,EQRD2        TRANSFER BACK NOT FOUND      OCIP39A
+         B     VST350A                                          OCIP39A
+EQRL     SR    R2,R2               ENTRY NOT FOUND-KEYWORD IS A OCIP39A
+         IC    R2,SDTJCLS7         SYMBOLIC PARAMETER           OCIP39A
+         LTR   R2,R2                                            OCIP39A
+         BZ    VT2E                                             OCIP39A
+         IC    R2,SDTJCLS6                                      OCIP39A
+         LTR   R2,R2                                            OCIP39A
+         BZ    VT7E                                             OCIP39A
+         IC    R2,SDTJCLS5                                      OCIP39A
+         LTR   R2,R2                                            OCIP39A
+         BZ    VT6E                                             OCIP39A
+         LA    R4,SDTJCL5                                       OCIP39A
+EXSCAN   EQU   *                                                OCIP39A
+         L     R6,SDTEXPT          R6 PTS.TO NEXT SLOT          OCIP39A
+**                                  IN SDT EXEC STMT            OCIP39A
+         BAL   R15,VST351          STORE KEYWORD IN SDT         OCIP39A
+         LA    R6,1(R6)                                         OCIP39A
+         ST    R6,SDTEXPT          UPDATE POINTER               OCIP39A
+         B     VST341A             CONTINUE SCAN                OCIP39A
+VST350A  EQU   *                  DD KEYWORD PROCESSING         OCIP39A
+**  FOR KEYWORDS WHICH ARE NEW FOR SU'S, CHECK TO SEE IF THE SU IS
+**  INSTALLED. IF NOT THEN THIS KEYWORD IS ACTUALLY A SYMBOLIC @G32HPPJ
+         L     R2,16              LOCATE CVT                   @G32HPPJ
+         USING CVTMAP,R2          SET UP MAPPING               @G32HPPJ
+         L     R2,CVTIHASU        GET SUBIT STRING ADDRESS     @G32HPPJ
+         DROP  R2                 FREE CVT MAPPING             @G32HPPJ
+         USING SUBITS,R2          SET UP SUBIT MAPPING         @G32HPPJ
+         CLC   SUBSYS(6),0(R9)    IS THIS SUBSYS KEY?          @G32HPPJ
+         BE    VST350C            YES, CHECK FOR SU29          @G32HPPJ
+         CLC   PROTECT(7),0(R9)   NO, IS IT PROTECT KEY?       @G32HPPJ
+         BE    VST350D            YES, CHECK FOR SU32          @G32HPPJ
+         CLC   MODIFY(6),0(R9)    NO, IS IT MODIFY KEYWORD     @G16APPJ
+         BE    VST350E            YES, CHECK FOR SU10          @G16APPJ
+         CLC   FLASH(5),0(R9)     NO, IS IT FLASH KEYWORD      @G16APPJ
+         BE    VST350E            YES, CHECK FOR SU10          @G16APPJ
+         CLC   BURST(5),0(R9)     NO, IS IT BURST KEYWORD      @G16APPJ
+         BE    VST350E            YES, CHECK FOR SU10          @G16APPJ
+         CLC   CHARS(5),0(R9)     NO, IS IT CHARS, KEYWORD     @G16APPJ
+         BE    VST350E            YES, CHECK FOR SU10          @G16APPJ
+         B     VST350F            NO, CONTINUE                 @G16APPJ
+VST350C  DS    0H                                              @G16APPJ
+         TM    SUBYTE4,SU29BIT    IS SU29 INSTALLED?           @G16APPJ
+         BNO   EQRL               NO, TREAT AS SYMBOLIC        @G16APPJ
+         B     VST350F            YES, TREAT AS DD KEYWORD     @G16APPJ
+VST350E  DS    0H                                              @G16APPJ
+         TM    SUBYTE2,SU10BIT    IS SU10 INSTALLED            @G16APPJ
+         BNO   EQRL               NO, TREAT AS SYMBOLIC        @G16APPJ
+         B     VST350F            YES, TREAT AS DD KEYWORD     @G16APPJ
+VST350D  DS    0H                                              @G32HPPJ
+         TM    SUBYTE5,SU32BIT    IS SU32 INSTALLED?           @G32HPPJ
+         BNO   EQRL               NO TREAT AS SYMBOLIC
+         DROP  R2                                              @G32HPPJ
+VST350F  DS    0H                 PROCESS DD KEYWORDS          @G32HPPJ
+         SR    R2,R2
+         IC    R2,SDTJCLS4
+         LTR   R2,R2
+         BZ    VT3
+         IC    R2,SDTJCLS5
+         LTR   R2,R2
+         BZ    VT4
+         IC    R2,SDTJCLS6
+         LTR   R2,R2
+         BZ    VT5
+         LA    R4,SDTJCL6
+DDSCAN   EQU   *                                                OCIP39A
+         L     R6,SDTDDPT     R6 PTS.TO NEXT SLOT IN SDT DD STMTOCIP39A
+         BAL   R15,VST351          STORE KEYWORD IN SDT         OCIP39A
+RETDD    EQU   *                                                OCIP39A
+         LA    R6,1(R6)                                         OCIP39A
+         ST    R6,SDTDDPT          UPDATE POINTER               OCIP39A
+         B     VST341A             CONTINUE SCAN                OCIP39A
+         EJECT
+**                                                              OCIP39A
+** * * * SUBROUTINE TO STORE KEYWORD IN SDT * * * * * * * *     OCIP39A
+VST351  EQU   *
+         LR    R7,R6
+         SR    R7,R4  NUMBER OF CHARS.IN THIS SDT SO FAR        OCIP39A
+         LR    R5,R9              SAVE START OF SCAN
+         LA    R9,1(R1)           POINT REG 9 TO 1ST CHARACTER AFTER =
+         CLI   0(R9),FAPOST                                     OCIP39A
+         BE    VSTQUO             BR.IF FIRST CHAR.IS A QUOTE   OCIP39A
+         CLI   0(R9),LEFTPAR                                    OCIP39A
+         BE    VSTLPAR             BRANCH IF FIRST CHAR.IS A    OCIP39A
+**                                   LEFT PAREN                 OCIP39A
+VST355   EQU   *
+         SR    R2,R2
+         TRT   0(45,R9),VSTTRTAB  SCAN CHARACTER AFTER KEYWORD
+         BC    8,VSTERR3          TERM LENGTH ERROR
+         LA    R3,CHBUF+124       END OF BUFFER ADDRESS        @ZA03646
+         CR    R1,R3              END OF BUFFER EXCEEDED?      @ZA03646
+         BH    VSTERR3            YES, TERM LENGTH ERROR       @ZA03646
+         BE    VST359             AT END OF BUFFER             @ZA03646
+         SR    R3,R3
+         IC    R3,VSTBT5-1(R2)    PICK UP CODE INDEX FROM TABLE 5
+         B     *+4(R3)
+         B     VST376             DELIMITER NOT SIGNIFICANT
+         B     VST360             BLANK
+         LA    R9,1(R1)
+         TRT   0(45,R9),VSTTRTAB LOOK FOR AN EQUAL SIGN
+         BC    8,VSTERR3          TERM LENGTH ERROR
+         LA    R3,CHBUF+124       END OF BUFFER ADDRESS        @ZA03646
+         CR    R1,R3              END OF BUFFER EXCEEDED?      @ZA03646
+         BH    VSTERR3            YES, TERM LENGTH ERROR       @ZA03646
+         SR    R3,R3
+         IC    R3,VSTBT4-1(R2)    PICK UP CODE INDEX FROM TABLE 4
+         B     *+4(R3)
+         B     VST376             NOT A DELIMITER COMMA
+         LA    R3,67              LENGTH CHECK FOR KEYWORD      YM06145
+         LR    R1,R5              BEGINNING OF SCAN TO REG 1
+         BCTR R9,0
+         SR    R9,R1              LENGTH OF THIS KEYWORD
+         CR    R9,R3    KEYWORD LONGER THAN ALLOWED             OCIP39A
+         BNL   VSTERR3       YES- TERM LENGTH ERROR             OCIP39A
+         LA    R3,71          LENGTH FOR CHECK CURRENT SDT      YM06145
+         AR    R7,R9              TOTAL NEW LENGTH
+         CR    R7,R3    IS IT TOO LONG FOR CURRENT SDT ENTRY    OCIP39A
+         BNL   VST380        YES - GET NEW SLOT
+VST356   EQU   *
+         BCTR  R9,0
+         EX    R9,VSTMOVE5        NO, MOVE IN KEYWORD
+         LA    R9,1(R9)
+         AR    R6,R9              POINT REG 6 AT NEXT SLOT
+         MVI   0(R6),C','
+         AR    R8,R9              ADD KEYWORD LENGTH TO BUFFER LENGTH
+         CL    R8,VST124          HAS END OF BUFFER BEEN REACHED
+         BL    VST385
+         B     VST361A                                          OCIP39A
+**   ***END OF SUBROUTINE TO STORE KEYWORD IN SDT* * * * * * *  OCIP39A
+**                                                              OCIP39A
+         EJECT
+** * * * * * *SUBROUTINE FOR PROCESSING VALUES IN APOSTROPHES   OCIP39A
+VSTQUO   EQU   *    PROCESSING FOR VALUE IN APOSTROPHES         OCIP39A
+         LA    R1,1(R9)   R1 PTS.TO CHAR AFTER FIRST QUOTE      OCIP39A
+         LA    R2,CHBUF           BEGINNING OF BUFFER           OCIP39A
+         A     R2,VST124                                        OCIP39A
+         BCTR  R2,0               R2 PTS TO LAST CHAR IN BUF   @ZA03646
+         SR    R9,R9              R9 IS TEST REGISTER           OCIP39A
+NEXT     CLI   0(R1),FAPOST       IS NEXT CHAR. AN APOSTROPHE   OCIP39A
+         BNE   CLEAR              NO- BRANCH                    OCIP39A
+         X     R9,VSTONE          EX OR TEST REGISTER           OCIP39A
+         BZ    BXLE               BRANCH IF EVEN NUMBER OF      OCIP39A
+**                   SUCCESSIVE QUOTES(EXCLUDING INITIAL        OCIP39A
+**                                      QUOTE) R9 NOW = 0       OCIP39A
+**                                                              OCIP39A
+**                                R9 NOW EQUALS 1               OCIP39A
+         CLI   1(R1),FAPOST       IS THE NEXT CHAR IN THE       OCIP39A
+**                              BUFFER ALSO AN APOSTROPHE       OCIP39A
+         BNE   MOVE                 NO - END OF VALUE           OCIP39A
+         B     BXLE                                             OCIP39A
+CLEAR    SR    R9,R9               CLEAR TEST REGISTER          OCIP39A
+BXLE     LA    R1,1(R1)              UPDATE CHAR.POINTER        OCIP39A
+         CR    R1,R2   HAS END OF BUFFER BEEN REACHED           OCIP39A
+         BL    NEXT                  NO-  BRANCH                OCIP39A
+         CLI   0(R1),FAPOST                                     OCIP39A
+         BNE   VSTERR2               DELIMITER ERROR            OCIP39A
+MOVE     LA    R9,1(R1)                                         OCIP39A
+         B     VST355                                           OCIP39A
+** * * * * END SUBROUTINE FOR PROCESSING VALUES IN APOTROPHES*  OCIP39A
+**                                                              OCIP39A
+         EJECT
+VT3      EQU   *
+         LA    R4,SDTJCL3
+         B     DDSCAN                                           OCIP39A
+VT4      EQU   *
+         LA    R4,SDTJCL4
+         B     DDSCAN                                           OCIP39A
+VT5      EQU   *
+         LA    R4,SDTJCL5
+         B     DDSCAN                                           OCIP39A
+VT2E     EQU   *                                                OCIP39A
+         LA    R4,SDTJCL2                                       OCIP39A
+         B     EXSCAN                                           OCIP39A
+VT7E     EQU   *                                                OCIP39A
+         LA    R4,SDTJCL7                                       OCIP39A
+         B     EXSCAN                                           OCIP39A
+VT6E     EQU   *                                                OCIP39A
+         LA    R4,SDTJCL6                                       OCIP39A
+         B     EXSCAN                                           OCIP39A
+VST359   EQU   *                                               @ZA03646
+         LA    R1,CHBUF+124                                    @ZA03646
+VST360   EQU   *
+         LA    R3,67              KEYWORD ALLOWABLE LENGTH      YM06145
+         LR    R9,R1
+         LR    R1,R5              SET REG 9 TO LENGTH OF KEYWORD
+         SR    R9,R1              LENGTH OF THIS KEYWORD
+         CR    R9,R3    KEYWORD LONGER THAN ALLOWED             OCIP39A
+         BNL   VSTERR3       YES- TERM LENGTH ERROR             OCIP39A
+         LA    R3,71        TOTAL ALLOWABLE LENGTH              YM06145
+         AR    R7,R9              TOTAL NEW LENGTH
+         CR    R7,R3    IS IT TOO LONG FOR CURRENT SDT ENTRY    OCIP39A
+         BH    VST364             YES
+VST361   EQU   *
+         BCTR  R9,0
+         EX    R9,VSTMOVE5
+         LA    R9,1(R9)
+         B     VST361A             BRANCH TO SCAN CLEANUP AND   OCIP39A
+**                         ,        TERMINATE                   OCIP39A
+         EJECT
+*                                                               OCIP39A
+*       SUBROUTINE FOR PROCESSING VALUES ENCLOSED IN PARENS     OCIP39A
+*                                                                YM2369
+*              -VALUE MAY BE EITHER A MAJOR DD KEYWORD           YM2369
+*               OR A SYMBOLIC PARAMETER                          YM2369
+*                                                                YM2369
+VSTLPAR  EQU   *                                                OCIP39A
+         LA    R2,RETDD            RETURN ADDRESS IF DD KEYWORD OCIP39A
+         LA    R1,0(R15)                                        OCIP39A
+         CR    R1,R2                                            OCIP39A
+         BNE   VST355              BRANCH IF NOT A              OCIP39A
+**   MAJOR DD KEYWORD-THIS IS AN ERROR WHICH WILL BE CAUGHT BY  OCIP39A
+**                                  THE R/I                     OCIP39A
+         L     R1,SDTPAREN         ARE MINOR KEYWORDS(IE.       OCIP39A
+**  KEYWORDS ENCLOSED IN PARENTHESES) BEING                     OCIP39A
+         LTR   R1,R1                 PROCESSED                  OCIP39A
+         BNE   VST355              YES-SDTPAREN NOT ZERO - BR.  OCIP39A
+**  * *  *  DD MAJOR KEYWORD VALUE IS ENCLOSED IN PARENTHESES-  OCIP39A
+**   SCAN ENTIRE KEYWORD,CHECKING FOR BALANCED PARENS           OCIP39A
+         LA    R1,1(R9)  R1 PTS.TO CHAR AFTER LEFT PAREN.       OCIP39A
+         LA    R2,CHBUF            BEGINNING OF INPUT BUFFER    OCIP39A
+         A     R2,VST124                                        OCIP39A
+         BCTR  R2,0                R2 PTS.TO LAST CHAR.OF BUFFEROCIP39A
+         LA    R9,1                R9 CONTAINS BALANCED         OCIP39A
+**  PAREN.INDICATOR.SET TO 1 FOR FIRST LEFT PAREN.              OCIP39A
+         B     VSTPAR5            START RIGHT PAREN SCAN         YM2369
+VSTPAR2  CR    R1,R2               HAS END OF BUFFER BEEN REACH OCIP39A
+         BNL   VSTERR2             YES-DELIMITER ERROR -         YM2369
+*                                  UNBALANCED PARENTHESES        YM2369
+         LA    R1,1(R1)            UPDATE CHARACTER POINTER     OCIP39A
+VSTPAR5  EQU   *                                                 YM2369
+         CLI   D0(R1),CBLANK      EMBEDDED BLANK WITHIN PARENS-  YM2369
+         BE    VSTERR2            YES-DELIMITER ERROR            YM2369
+         CLI   0(R1),RIGHTPAR                                   OCIP39A
+         BE    VSTPAR3             BRANCH IF RIGHT PARENTHESIS  OCIP39A
+         CLI   0(R1),LEFTPAR                                    OCIP39A
+         BNE   VSTPAR2            BRANCH IF NOT LEFT PARENTHESISOCIP39A
+         LA    R9,1(R9)            ADD 1 - LEFT PAREN.          OCIP39A
+         B     VSTPAR2                                          OCIP39A
+VSTPAR3  BCT   R9,VSTPAR2          SUBTRACT 1 - RIGHT PAREN.    OCIP39A
+**                                  BRANCH IF NOT ZERO          OCIP39A
+VSTPAR4  EQU   *                    BALANCED PARENTHESES         YM2369
+         LA    R9,1(R1)            R9 PTS TO CHAR AFTER LAST    OCIP39A
+**   RIGHT PAREN (SHOULD BE A COMMA DELIMITER)                  OCIP39A
+         LA    R1,2(R1)                                         OCIP39A
+         ST    R1,SDTPAREN         SDTPAREN PTS TO LAST         OCIP39A
+**                                   RIGHT PAREN PLUS TWO       OCIP39A
+**    (SHOULD BE BEGINNING OF NEXT MAJOR KEYWORD)               OCIP39A
+         B     VST355              RETURN TO STORE FIRST        OCIP39A
+**   SUB-PAREMETER INTO SDT                                     OCIP39A
+** * * *END OF SUBR.TO PROCESS VALUES ENCLOSED IN PARENS.       OCIP39A
+**                                                              OCIP39A
+         EJECT
+** * * * **                                                     OCIP39A
+** CLEANUP AND TERMINATION OF KEYWORD SCAN                      OCIP39A
+VST361A  EQU   *                                                OCIP39A
+         LA    R5,RETDD           RETURN ADDRESS IF DD KEYWORD  OCIP39A
+         LA    R4,0(R15)                                        OCIP39A
+         CR    R4,R5                                            OCIP39A
+         BE    VST361B            BR.IF DD KEYWORD JUST SCANNED OCIP39A
+         L     R5,SDTDDPT         FIX DD STMT.                  OCIP39A
+         B     VST361C                                          OCIP39A
+VST361B  L     R5,SDTEXPT         FIX EXEC CARD                 OCIP39A
+VST361C  BCTR  R5,0                                             OCIP39A
+         MVI   0(R5),C' '          MAKE LAST CHAR. A BLANK      OCIP39A
+         LA    R4,L'VSTDD(0)       LENGTH TO REG 4              OCIP39A
+         LA    R3,SDTJCL3                                       OCIP39A
+         AR    R3,R4               POSITION R6 TO 1ST PARAMETER OCIP39A
+**        ON IEFRDER OVERRIDE DD                                OCIP39A
+         CLI   ZERO(R3),C' '       IS IT A BLANK                OCIP39A
+         BNE   VST500              NO,FINISHED                  OCIP39A
+         SR    R4,R4                                            OCIP39A
+         IC    R4,SDTJCLS4                                      OCIP39A
+         LTR   R4,R4              ARE THERE PARAMETERS          OCIP39A
+**                                 ON THE DD CONT. STMT.        OCIP39A
+         BNE   VST361D            YES, BRANCH                   OCIP39A
+         SR    R3,R3              NO PARAMETERS ON THE DD STMT. OCIP39A
+         STH   R3,SDTJCLS3         ZERO OUT LENGTH              OCIP39A
+         B     VST500                                           OCIP39A
+VST361D  MVI   ZERO(R3),C','                                    OCIP39A
+         B     VST500             YOU ARE FINISHED
+** * * * ** END CLEANUP AND TERMINATION OF KEYWORDS  SCANNING   OCIP39A
+**                                                              OCIP39A
+         EJECT
+VST364   EQU   *
+         LR    R3,R4              R4 PTS.TO BEGINNING OF        OCIP39A
+         BCTR  R3,ZERO    CURRENT STMT IN SDT                   OCIP39A
+         BCTR  R3,ZERO            R3 PTS.TO BEG.OF CURRENT SDT  OCIP39A
+         TM    ZERO(R3),SDTDD+SDTCONT                           OCIP39A
+         BZ    VST364A             BR.IF NOT DD OR DD CONTIN.   OCIP39A
+         LA    R3,VST361
+         B     VST365             GET NEW SLOT FOR DD CONTIN.   OCIP39A
+VST364A   LA   R3,VST361                                        OCIP39A
+         B     VST356B                                          OCIP39A
+VST365   EQU   *
+         SR    R2,R2
+         IC    R2,SDTJCLS4
+         LTR    R2,R2             IS 4TH DD STATEMENT USED
+         BZ    VST370             NO, USE IT
+         SR    R2,R2
+         IC    R2,SDTJCLS5        IS FIFTH DD STATEMENT USED
+         LTR   R2,R2              NO, USE IT
+         BZ    VST375
+         OI    SDTJCLS6,SDTCONT6  SET DD CONTINUATION
+         MVC   SDTJCL6(2),VSTDD   MOVE // TO SDT
+         LA    R6,SDTJCL6+FOUR     POINT R6 AT COLUMN 4         OCIP39A
+         BR    R3
+VST370   EQU   *                  FOURTH SDT SLOT
+         OI    SDTJCLS4,SDTCONT4  SET DD CONTINUATION FLAG
+         MVC   SDTJCL4(2),VSTDD   MOVE // TO SDT
+         LA    R6,SDTJCL4+FOUR     POINT R6 AT COLUMN 4         OCIP39A
+         BR    R3
+VST375   EQU   *                  FIFTH SDT SLOT
+         OI    SDTJCLS5,SDTCONT5   SET DD CONTINUATION FLAG
+         MVC   SDTJCL5(2),VSTDD   MOVE // TO CONTINUATION SLOT
+         LA    R6,SDTJCL5+FOUR     POINT R6 AT COLUMN 4         OCIP39A
+         BR    R3
+VST376   EQU   *
+         LA    R9,1(R1)           POINT REG 9 AFTER DELIMITER
+         B     VST355
+VST380   EQU   *
+         LR    R3,R4               R4 PTS.TO BEGINNING OF       OCIP39A
+         BCTR  R3,ZERO         CURRENT STMT IN SDT              OCIP39A
+         BCTR  R3,ZERO     R3 PTS.TO BEG.OF CURRNT SDT ENTRY    OCIP39A
+         TM    ZERO(R3),SDTDD+SDTCONT                           OCIP39A
+         BZ    VST356A             BR IF NOT DD OR DD CONT.     OCIP39A
+         LA    R3,VST356                                        OCIP39A
+         B     VST365              GET NEW SLOT FOR DD CONTIN.  OCIP39A
+VST356A  LA    R3,VST356                                        OCIP39A
+**                       GET SLOT FOR EXEC CONTINUATION STMT    OCIP39A
+VST356B  SR    R2,R2                                            OCIP39A
+         IC    R2,SDTJCLS7                                      OCIP39A
+         LTR   R2,R2               IS STMT BEING USED           OCIP39A
+         BZ    VST370A             NO,USE IT                    OCIP39A
+         IC    R2,SDTJCLS6                                      OCIP39A
+         LTR   R2,R2                                            OCIP39A
+         BZ    VST375A             USE IT                       OCIP39A
+         OI    SDTJCLS5,SDTEXCON   SET EXEC CONTINUATION        OCIP39A
+         MVC   SDTJCL5(2),VSTDD    MOVE // TO SDT               OCIP39A
+         LA    R6,SDTJCL5+FOUR     POINT 6 AT COLUMN 4          OCIP39A
+         BR    R3                                               OCIP39A
+VST370A  EQU   *                                                OCIP39A
+         OI    SDTJCLS7,SDTEXCON   SET EXEC CONTINUATION STMT   OCIP39A
+         MVC   SDTJCL7(2),VSTDD    MOVE // TO SDT               OCIP39A
+         LA    R6,SDTJCL7+FOUR     POINT R6 AT 4TH COLUMN       OCIP39A
+         BR    R3                                               OCIP39A
+VST375A  EQU   *                                                OCIP39A
+         OI    SDTJCLS6,SDTEXCON   SET EXEC CONT. STMT          OCIP39A
+         MVC   SDTJCL6(2),VSTDD    MOVE // TO SDT               OCIP39A
+         LA    R6,SDTJCL6+FOUR     POINT R6                     OCIP39A
+         BR    R3                                               OCIP39A
+VST385   EQU   *
+         AR    R5,R9              POINT REG 5 AT DELIMITER
+         LA    R9,1(R5)          POINT REG 9 AT CHARACTER AFTER COMMA
+         BR    R15                 RETURN                       OCIP39A
+         EJECT
+**                                                              OCIP39A
+** * * * * * * * INITIALIZATION FOR KEYWORD SCAN* * * * *       OCIP39A
+VSTINIT  EQU   *                                                OCIP39A
+         ST    R6,SDTDDPT          PT.TO NEXT SLOT IN DD STMT.  OCIP39A
+         SR    R7,R7                                            OCIP39A
+         ST    R7,SDTPAREN         STORE 0 TO INDICATE KEYWORD  OCIP39A
+**  VALUE IS NOT ENCLOSED IN PARENTHESES                        OCIP39A
+         LA    R5,L'VSTEXEC(0)                                  OCIP39A
+         LA    R7,SDTJCL2                                       OCIP39A
+         AR    R7,R5               PT.TO NEXT SLOT IN EXEC STMT.OCIP39A
+VSTINIT2 CLI   0(R7),C' '                                       OCIP39A
+         BE    VSTINIT3                                         OCIP39A
+         LA    R7,1(R7)                                         OCIP39A
+         B     VSTINIT2                                         OCIP39A
+VSTINIT3 MVI   0(R7),C','          MOVE COMMA TO DELIMIT KEYWORDOCIP39A
+         LA    R7,1(R7)                                         OCIP39A
+         ST    R7,SDTEXPT                                       OCIP39A
+         BR    R15                                              OCIP39A
+         SPACE
+VST420   EQU   *
+         LA    R9,VST500          EXIT RTN ADDRESS TO REG 9
+         LA    R4,3(R1)           POINT REG 4 TO BEGINNING OF BUFFER
+         B     VST450
+         SPACE
+VST425   EQU   *
+         LA    R9,VST500          SET BRANCH REGISTER TO EXIT RTN
+         LA    R4,2(R1)           POINT REG 4 AT BEGINNING OF BUFFER
+         EJECT
+***********************************************************************
+*                                                                     *
+*   THIS ROUTINE GETS CORE FOR THE COMMAND INPUT BUFFER FROM SUBPOOL
+*   245. IT -
+*        -SAVES THE POINTER TO THIS CORE IN REG 0
+*        -MOVES THE LENGTH COUNT OF THE PARMVALUE INTO THE FIRST TWO
+*         BYTES OF THE NEWLY ACQUIRED CORE
+*        -MOVES THE START VERB CODE INTO THE THIRD BYTE
+*        -MOVES THE PARMVALUE INTO THE REMAINING CORE
+*   IT THEN BRANCHES TO CONTINUE ITS PROCESSING
+*                                                                     *
+***********************************************************************
+         SPACE
+VST450   EQU   *
+         LA    R0,CIBDATA-CIBNEXT(R5)  ADD LENGTH OF CIB CONTROL AREA
+*                                  TO LENGTH OF DATA
+         O     R0,SUBPOOL              SET SUBPOOL ID TO 245      20030
+         GETMAIN R,LV=(0)          GET OCRE FOR CIB
+         USING VSTARCIB,R1         ESTABLISH CIB ADDRESSIBILITY
+         XC    CIBNEXT(CIBDATA-CIBNEXT),CIBNEXT  CLEAR CONTROL AREA
+         LA    R0,CIBDATA-CIBNEXT+7(R5)  SET CIB LGTH IN DUBL WRDS 2336
+         SRL   R0,3                DIVIDE LENGTH BY 8
+         STC   R0,CIBLEN           STORE NO. FO DOUBLE WORDS IN CIB
+         LR    R0,R1               SAVE CIB ADDRESS
+         MVI   CIBVERB,CIBSTART    SET VERB CODE TO START
+         MVC   CIBCONID,CHUCMP     MOVE CONSOLE ID TO C&B
+         STH   R5,CIBDATLN         STORE EXACT DATA EENGTH
+         LTR   R3,R5               WAS A PARMVALUE GIVEN
+         BZ    VST475              NO
+         BCTR  R3,0                REDUCE LENGTH FOR EXECUTE
+         EX    R3,VSTMOVE6         MOVE DATA TO CIB
+VST475   EQU   *
+         BR    R9                 CONTINUE PROCESSING
+VST500A  EQU   *
+         LA    R9,VST500          EXIT ROUTINE
+         SR    R5,R5               ZERO PARMVALUE LEN REG          I272
+         B     VST450             BUILD CIB
+         EJECT
+***********************************************************************
+*  SCAN CLEANUP ROUTINE - THIS ROUTINE IS USED WHEN THE SCAN PROCEDURE
+*  IS COMPLETED - IT-
+*      .STORES RELEVANT INFORMATION IN THE START DESCRIPTOR TABLE
+*      .SETS CHAIN ECB TO ZERO
+*      .STORES RELEVANT INFORMATION IN THE CSCB
+*      .SETS UP IEEVJCL PARAMETER AREA                           Y02669
+*      .ISSUES BRANCH TO IEEVJCL - JCL EDIT ROUTINE (WITH REGISTER 1
+*       POINTING TO THE PARAMETER AREA)                          Y02669
+***********************************************************************
+VST500   EQU   *
+         SPACE
+*
+* ENQUEUE ON CSCB RESOURCE FOR FIELD INITIALIZATION            @ZA28715
+*
+         LR    R4,R0              SAVE CIB PTR.                @ZA28715
+         LA    R0,ENQLNG          ENQ/DEQ LIST LENGTH          @ZA28715
+         GETMAIN R,LV=(0)         GET LIST STORAGE             @ZA28715
+         ST    R1,CHSAVWD1        SAVE GETMAIN ADDR.           @ZA28715
+         MVC   D0(ENQLNG,R1),ENQLIST  INIT ENQ LIST            @ZA28715
+         ENQ   ,MF=(E,(1))        ENQ ON CSCB CHAIN            @ZA28715
+         LR    R0,R4              RESTORE CIB PTR.             @ZA28715
+         LA    R4,SDTLN           SET LENGTH OF SDT              Y02669
+         STH   R4,SDTSIZE         STORE SIZE IN SDT.
+         XC    CHSWT,CHSWT        CLEAR COMMUNICATIONS SWITCHES    I272
+         NI    CHACT,CHAIFX+CHIFY LEAVE MFTII BITS ALONE           AAAA
+         XC    CHSTS,CHSTS        CLEAR STATUS FLAGS             A40890
+         XC    CHTYPE,CHTYPE      CLEAR STATUS FLAGS             Y01012
+         XC    CHRPRTY(8),CHRPRTY ZERO OUT RESET PRTY & RESERVE  A48304
+         XC    CHECB,CHECB              CLEAR COMMUNICATIONS ECB   I272
+         XC    CHCECB,CHCECB            CLEAR CANCEL ECB           I272
+         MVC   CHKEY,SDTJCL2+D2         TASKNAME OR 'STARTING'     I272
+*                                       INTO CSCB ID FIELD         I272
+         XC    CHRGNSZ,CHRGNSZ      CLEAR RGN FIELD             YM01581
+         XC    CHRGNAD,CHRGNAD      CLEAR RGN FIELD             YM01581
+         MVC   CHCLS,SDTJCL1+D2    PROCNAME INTO CSCB              I272
+         LA    R14,CHECB          PTR TO COMMUNICATIONS ECB       20032
+         ST    R14,CHECBP         MOVE INTO CSCB COMM. AREA       20032
+         XC    CHJCL(4),CHJCL     ZERO OUT JCL PTR SLOT.
+         LTR   R0,R0              WAS PARMVALUE SPECIFIED ON COMMAND
+         BNZ   VST510             PARM VALUE SPECIFIED           Y02669
+         LA    R9,VST510          SET BRANCH REGISTER
+         SR    R5,R5
+         B     VST450
+VST510   EQU   *
+         ST    R0,CHCIBP          CIB POINTER TO CSCB          @ZA28715
+         L     R1,CHSAVWD1        ADDR. OF DEQ LIST STORAGE    @ZA28715
+         MVC   D0(DEQLNG,R1),DEQLIST  INIT DEQ LIST            @ZA28715
+         DEQ   ,MF=(E,(1))        DEQ FROM CSCB CHAIN          @ZA28715
+         L     R1,CHSAVWD1        RESTORE ADDR FOR FREEMAIN    @ZA28715
+         LA    R0,ENQLNG
+         FREEMAIN R,LV=(0),A=(1)  FREE LIST                      Y02651
+         SPACE
+         L     R4,SDTWORK         GET ASCB POINTER               Y02669
+         USING ASCB,R4                                           Y02669
+         LA    R5,CHCLS           SET POINTER TO START PROCNAME  Y02677
+         ST    R5,ASCBJBNS        SAVE FOR GTF RECORD PROCESSING Y02677
+         SPACE
+         TM    CHCECB,POSTBIT      IS CANCEL POSTED              A26309
+         BO    VST527              YES, BRANCH AROUND            A26309
+         XC    CHSPC,CHSPC         INITIALIZE COMP. CODE FIELD   A26309
+         EJECT
+VST527   EQU   *                                                 A26309
+*                                                                Y02669
+*  GET (SUBPOOL 0) AND INITIALIZE IEEVJCL PARAMETER AREA.        Y02669
+*  AREA WILL BE FREED BY IEEVJCL.                                Y02669
+*                                                                Y02669
+         LA    R0,STCSIZE         SET PARM AREA SUBPOOL (0)      Y02669
+*                                 AND SIZE                       Y02669
+         GETMAIN R,LV=(0)                                        Y02669
+         SPACE
+         USING STCPARM,R1         SET ADDRESSABILITY             Y02669
+         XC    STCBEGIN(STCSIZE),STCBEGIN CLEAR AREA             Y02669
+         MVI   STCLEN+D2,STCSIZE  SET PARM AREA LENGTH           Y02669
+         ST    R4,STCASCB         SET ASCB POINTER               Y02669
+         ST    R10,STCSDT         SET SDT POINTER                Y02669
+         DROP  R1                                                Y02669
+         DROP  R4                                                Y02669
+         SPACE
+         L     R15,VSTVJCL        BRANCH TO IEEVJCL              Y02669
+         BR    R15                                               Y02669
+         EJECT
+***                                                                 ***
+*                                                                     *
+*             NO UNIT PARAMETER SPECIFIED, SO INITIALIZE PTR          *
+*                 AND SCAN FOR VOLUME SERIAL NUMBER                   *
+*                                                                     *
+***                                                                 ***
+         SPACE
+VST600   EQU   *
+         LA    R1,1(R1)           POINT REG1 TO POSITION AFTER COMMA
+         B     VST275             BRANCH TO VOL SER CHECKING RTN
+*                                                                     *
+*             NO VOLUME SERIAL PARAMETER SPECIFIED, SO INITIALIZE     *
+*                 POINTER AND SCAN FOR PARMVALUE                      *
+*                                                                     *
+         SPACE
+VST625   EQU   *
+         LA    R8,1(R8)           INCREMENT BUFFER LENGTH COUNT
+         LA    R1,1(R1)           POINT REG 1 TO CHARACTER AFTER COMMA
+         B     VST325             BRANCH TO PARM VALUE SCAN
+VST650   EQU   *
+         CR    R4,R1              IS BLANK RIGHT AFTER COMMA
+         BE    VSTERR2            YES, DELIMITER ERROR
+         SR    R9,R9              ZERO REG 9, NO PARAMETERS LEFT
+         B     VST250             OK, CONTINUE PROCESSING
+VST675   EQU   *
+         CR    R4,R1              IS BLANK RIGHT AFTER COMMA
+         BE    VSTERR2            YES, DELIMITER ERROR
+         SR    R9,R9              ZERO REG 9, NO PARAMETERS LEFT
+         B     VST300             OK, CONTINUE PROCESSING
+VST700   EQU   *
+         LA    R9,VST500          SET BRANCH REG TO EXIT ROUTINE
+         LR    R4,R1              SET REG 4 TO BEGINNING OF PARMVALUE
+         B     VST450             SET UP CIB
+VST725   EQU   *
+         LA    R9,VST335          SET REG 9 TO KEYWORD SCAN
+         LA    R7,1(R4)           POINT REG 7 TO BEGINNING KEYWORD
+         LR    R4,R1              SET REG 4 TO BEGINNING OF BUFFER
+         B     VST450             GET CORE FOR CIB
+VST750   EQU   *
+         LA    R7,1(R1)           POINT REG 7 TO FIRST KEYWORD
+         LA    R9,VST335
+         SR    R5,R5              ZERO COUNT (NO PARMVALUE)
+         B     VST450             PROCESS CIB
+         EJECT
+***********************************************************************
+*  ERROR MESSAGE ROUTINES
+***********************************************************************
+VSTERR1  EQU   *                   KEYWORD MISPELLED.
+         LA    R4,9               ERROR CODE TO R4.
+         B     VSTERXT
+         SPACE
+VSTERR2  EQU   *                   DELIMITER ERROR.
+         LA    R4,7               ERROR CODE TO R4.
+         B     VSTERXT
+         SPACE
+VSTERR3  EQU   *                   TERM LENGTH ERROR.
+         LA    R4,8               ERROR CODE TO R4.
+         B     VSTERXT
+         SPACE
+VSTERR4  EQU   *                   PARAMETER MISSING.
+         LA    R4,11              ERROR CODE TO R4.
+         EJECT
+***********************************************************************
+*  ERROR EXIT ROUTINE - THIS ROUTINE-
+*      .STORES THE ERROR CODE IN THE EXTENDED SAVE AREA
+*      .MOVES THE VERB INTO THE MESSAGE MODULE WORK SPACE
+*      .LINKS TO IEE0503D (MESSAGE MODULE)
+*              -IEE0503D DESTROYS REGISTERS 0,1,3,4,5
+*              -INPUT = REGISTER 2 POINTS TO THE XSA
+*      .FREES THE START DESCRIPTOR TABLE
+*      .XCTLS TO IEEPRTN TO DELETE CSCB,FREE PARTITION             I272
+*       AND RETURN TO THE REGION CONTROL TASK                    Y02669
+*                                                                  I272
+VSTERXT  EQU   *                  ERROR EXIT ROUTINE.
+         LR    R2,R10             USE SDT FOR MSG MOD WORK SPACE.
+         USING VSTXSA,R2
+         STC   R4,XAE             STORE ERROR CODE.
+         MVC   XAV(8),VSTVERB     STORE VERB INTO MESSAGE MODULE.
+         XC    XAA(2),XAA         CLEAR ASCB FIELD               Y02669
+         MVC   XAU(1),CHUCMP      SET UP CONSOLE ID FOR MSG MOD   M0243
+         SPACE
+         LINK  EP=IEE0503D        LINK TO MESSAGE MODULE.
+         SPACE
+         L     R4,SDTWORK         SAVE ASCB ADDRESS              Y02669
+         LR    R1,R10             SDT ADDRESS.
+         FREEMAIN R,LV=SDTLN,A=(1)                               Y02669
+         SPACE
+         LR    R1,R4              SET ASCB POINTER               Y02669
+         DROP  R2                                                Y02669
+         DROP  R10                                               Y02669
+         SPACE
+         XCTL  EP=IEEPRTN          EXIT AND FREE PARTITION         565
+         EJECT
+         DS    0D
+VSTVJCL  DC    V(IEEVJCL)
+VSTSTING DC    C'STARTING'
+VSTJOB   DC    C'//         JOB MSGLEVEL=1'                     OCIP39A
+VSTEXEC  DC    C'//         EXEC '                              OCIP39A
+VSTDD    DC    C'//IEFPROC.IEFRDER DD '                         OCIP39A
+VSTUNIT  DC    C'UNIT='
+VSTVOL   DC    C'VOL=SER='                                      OCIP39A
+VSTVERB  DC    CL8'START   '
+VSTBT1   DC    XL9'000808000000000004' TASKNAME SCAN            YA00929
+VSTBT2   DC    XL9'000808040000000800' POSITIONAL PARAMETER     YA00929
+VSTBT3   DC    XL9'000C0C040000000008' VOLUME SERIAL SCAN       YA00929
+VSTBT4   DC    XL9'000000040000000000'                          YA00929
+VSTBT5   DC    XL9'000408000000000000'                          YA00929
+VSTBT6   DC    XL9'0004040000000C0008' PROCNAME SCAN            YA00929
+         SPACE
+VSTONE   DC    F'01'
+CF4      DC    F'4'                WORK CONSTANT                   I272
+CF256    DC    F'256'              WORK CONSTANT                   I272
+SUBPOOL  DC    XL1'F5'                 SUBPOOL 245 FOR CIB        20030
+         DC    XL3'000000'
+VBLANKS  DC    CL8' '              BLANKS FOR PADDING              I272
+VST124   DC    F'124'
+NAT9     DC    H'9'            NATIONAL CHARACTER TRT VALUE     YA00929
+ZERO     EQU   0                   CONSTANT ZERO                OCIP39A
+FOUR     EQU   4                   CONSTANT FOUR                OCIP39A
+NOTEQU   EQU   7                   NOT EQUAL                    OCIP39A
+SIXTEEN  EQU   16                  CONSTANT SIXTEEN             OCIP39A
+SDTEL    EQU   74                  LENGTH OF AN ENTRY IN SDT    OCIP39A
+FAPOST   EQU   C''''               APOST                        OCIP39A
+LEFTPAR  EQU   C'('                LEFT PARENTHESIS             OCIP39A
+RIGHTPAR EQU   C')'                RIGHT PARENTHESIS            OCIP39A
+         EJECT
+**************************************************              OCIP39A
+*                                                               OCIP39A
+**************************************************              OCIP39A
+** NEW MAJOR DD KEYWORDS SHOULD BE ADDED TO THIS TABLE         OCIP39A
+**  THE REASON FOR THIS IS THE FOLLOWING:                      OCIP39A
+*        WHEN USING SYMBOLIC PARAMETERS ON THE START COMMAND,  OCIP39A
+*        MAJOR DD KEYWORDS PARAMETERS CANNOT BE USED TO        OCIP39A
+*        DEFINE SYMBOLIC PARAMETERS                            OCIP39A
+*                                                               OCIP39A
+DDTAB    DS    0C                  TABLE OF MAJOR DD KEYWORDS   OCIP39A
+A0151    DS    0C                                               OCIP39A
+         DC    AL1(B0151-A0151)                                 OCIP39A
+         DC    C'AFF='                                          OCIP39A
+B0151    DS    0C                                               OCIP39A
+A0152    DS    0C                                               OCIP39A
+         DC    AL1(B0152-A0152)                                 OCIP39A
+         DC    C'SEP='                                          OCIP39A
+B0152    DS    0C                                               OCIP39A
+A0153    DS    0C                                               OCIP39A
+         DC    AL1(B0153-A0153)                                 OCIP39A
+         DC    C'DCB='                                          OCIP39A
+B0153    DS    0C                                               OCIP39A
+A0154    DS    0C                                               OCIP39A
+         DC    AL1(B0154-A0154)                                 OCIP39A
+         DC    C'DSN='                                          OCIP39A
+B0154    DS    0C                                               OCIP39A
+A0155    DS    0C                                               OCIP39A
+         DC    AL1(B0155-A0155)                                 OCIP39A
+         DC    C'VOL='                                          OCIP39A
+B0155    DS    0C                                               OCIP39A
+A0156    DS    0C                                               OCIP39A
+         DC    AL1(B0156-A0156)                                 OCIP39A
+         DC    C'UNIT='                                         OCIP39A
+B0156    DS    0C                                               OCIP39A
+A0157    DS    0C                                               OCIP39A
+         DC    AL1(B0157-A0157)                                 OCIP39A
+         DC    C'DISP='                                         OCIP39A
+B0157    DS    0C                                               OCIP39A
+A0158    DS    0C                                               OCIP39A
+         DC    AL1(B0158-A0158)                                 OCIP39A
+         DC    C'SPACE='                                        OCIP39A
+B0158    DS    0C                                               OCIP39A
+A0159    DS    0C                                               OCIP39A
+         DC    AL1(B0159-A0159)                                 OCIP39A
+         DC    C'LABEL='                                        OCIP39A
+B0159    DS    0C                                               OCIP39A
+A0160    DS    0C                                               OCIP39A
+         DC    AL1(B0160-A0160)                                 OCIP39A
+         DC    C'SPLIT='                                        OCIP39A
+B0160    DS    0C                                               OCIP39A
+A0161    DS    0C                                               OCIP39A
+         DC    AL1(B0161-A0161)                                 OCIP39A
+         DC    C'DSNAME='                                       OCIP39A
+B0161    DS    0C                                               OCIP39A
+A0163    DS    0C                                               OCIP39A
+         DC    AL1(B0163-A0163)                                 OCIP39A
+         DC    C'SYSOUT='                                       OCIP39A
+B0163    DS    0C                                               OCIP39A
+A0164    DS    0C                                               OCIP39A
+         DC    AL1(B0164-A0164)                                 OCIP39A
+         DC    C'VOLUME='                                       OCIP39A
+B0164    DS    0C                                               OCIP39A
+A0165    DS    0C                                               OCIP39A
+         DC    AL1(B0165-A0165)                                 OCIP39A
+         DC    C'DDNAME='                                       OCIP39A
+B0165    DS    0C                                               OCIP39A
+A0166    DS    0C                                               OCIP39A
+         DC    AL1(B0166-A0166)                                 OCIP39A
+         DC    C'UCS='                                          OCIP39A
+B0166    DS    0C                                               OCIP39A
+A0167    DS    0C                                               OCIP39A
+         DC    AL1(B0167-A0167)                                 OCIP39A
+         DC    C'SUBALLOC='                                     OCIP39A
+B0167    DS    0C                                               OCIP39A
+A0168    DS    0C                  BEGINNING OF ENTRY             19028
+         DC    AL1(B0168-A0168)    LENGTH OF ENTRY                19028
+         DC    C'OUTLIM='          OUTLIM KEYWORD                 19028
+B0168    DS    0C                  END OF ENTRY                   19028
+A0171    DS    0C                      BEGINNING OF QNAME ENTRY   20002
+         DC    AL1(B0171-A0171)        LENGTH OF QNAME ENTRY      20002
+         DC    C'QNAME='               QNAME= DD KEYWORD          20002
+B0171    DS    0C                      END OF QNAME ENTRY         20002
+A0172    DS    0C                 BEGINNING OF ENTRY              20E15
+         DC    AL1(B0172-A0172)   LENGTH OF ENTRY                 20E15
+         DC    C'FCB='            FCB KEYWORD                     20E15
+B0172    DS    0C                 END OF ENTRY                    20E15
+A0173    DS    0C                 BEGINNING OF ENTRY              21009
+         DC    AL1(B0173-A0173)   LENGTH OF ENTRY                 21009
+         DC    C'DLM='            DLM KEYWORD                     21009
+B0173    DS    0C                 END OF ENTRY                    21009
+A0174    DS    0C                 BEGINNING OF ENTRY             Y01113
+         DC    AL1(B0174-A0174)   LENGTH OF ENTRY                Y01113
+         DC    C'AMP='            AMP KEYWORD                    Y01113
+B0174    DS    0C                 END OF ENTRY                   Y01113
+A0175    DS    0C                 BEGINNING OF ENTRY             Y02670
+         DC    AL1(B0175-A0175)   LENGTH OF ENTRY                Y02670
+         DC    C'FREE='           FREE KEYWORD                   Y02670
+B0175    DS    0C                 END OF ENTRY                   Y02670
+A0176    DS    0C                                                Y02668
+         DC    AL1(B0176-A0176)   LENGTH OF ENTRY                Y02668
+         DC    C'DEST='           DEST KEYWORD                   Y02668
+B0176    DS    0C                 END OF ENTRY                   Y02668
+A0177    DS    0C                 START OF ENTRY                 Y02668
+         DC    AL1(B0177-A0177)   LENGTH OF ENTRY                Y02668
+         DC    C'COPIES='         COPIES KEYWORD                 Y02668
+B0177    DS    0C                 END OF ENTRY                   Y02668
+A0178    DS    0C                                                Y02668
+         DC    AL1(B0178-A0178)                                  Y02668
+         DC    C'HOLD='           'HOLD' KEYWORD                 Y02668
+B0178    DS    0C                                                Y02668
+A0179    DS    0C                                              @Y30OPTV
+         DC    AL1(B0179-A0179)                                @Y30OPTV
+         DC    C'DSID='           DSID KEYWORD FOR ERIC        @Y30OPTV
+B0179    DS    0C                                              @Y30OPTV
+A0180    DS    0C                                              @Y30LPTV
+         DC    AL1(B0180-A0180)                                @Y30LPTV
+         DC    C'MSVGP='          MSVGP KEYWORD FOR MSS SUPPORT@Y30LPTV
+B0180    DS    0C                                              @Y30LPTV
+A0181    DS    0C                                              @Z30JPSQ
+         DC    AL1(B0181-A0181)                                @Z30JPSQ
+         DC    C'CHKPT='          CHECKPOINT KEYWORD           @Z30JPSQ
+B0181    DS    0C                                              @Z30JPSQ
+A0182    DS    0C                                              @Z40MPSS
+         DC    AL1(B0182-A0182)   LENGTH OF ENTRY              @Z40MPSS
+BURST    DC    C'BURST='          BURST KEYWORD                @G16APPJ
+B0182    DS    0C                                              @Z40MPSS
+A0183    DS    0C                                              @Z40MPSS
+         DC    AL1(B0183-A0183)   LENGTH OF ENTRY              @Z40MPSS
+FLASH    DC    C'FLASH='          FLASH KEYWORD                @G16APPJ
+B0183    DS    0C                                              @Z40MPSS
+A0184    DS    0C                                              @Z40MPSS
+         DC    AL1(B0184-A0184)   LENGTH OF ENTRY              @Z40MPSS
+MODIFY   DC    C'MODIFY='         MODIFY KEYWORD               @G16APPJ
+B0184    DS    0C                                              @Z40MPSS
+A0185    DS    0C                                              @Z40MPSS
+         DC    AL1(B0185-A0185)   LENGTH OF ENTRY              @Z40MPSS
+CHARS    DC    C'CHARS='          CHARS KEYWORD                @G16APPJ
+B0185    DS    0C                                              @Z40MPSS
+A0186    DS    0C                                              @G29AN2E
+         DC    AL1(B0186-A0186)   LENGTH OF ENTRY              @G29AN2E
+SUBSYS   DC    C'SUBSYS='         SUBSYS KEYWORD               @G29AN2F
+B0186    DS    0C                                              @G29AN2E
+A0187    DS    0C                                              @G32HPPJ
+         DC    AL1(B0187-A0187)   LENGTH OF ENTRY              @G32HPPJ
+PROTECT  DC    C'PROTECT='        PROTECT KEYWORD              @G32HPPJ
+B0187    DS    0C                                              @G32HPPJ
+         DC    AL1(ZERO)          END OF TABLE INDICATOR        OCIP39A
+         TITLE 'TRANSLATE AND TEST TABLE'
+VSTTRTAB DS    0F
+         DC    XL25'01010101010101010101010101010101010101010101010101'
+         DC    XL25'01010101010101010101010101010101010101010101010101'
+         DC    XL14'0101010101010101010101010101'
+         DC    XL1'02'                 BLANK
+         DC    XL10'01010101010101010101'
+         DC    XL1'07'                 PERIOD
+         DC    XL1'01'
+         DC    XL1'05'                 LEFT PAREN
+         DC    XL1'08'                 PLUS
+         DC    XL1'01'
+         DC    XL1'07'                 AMPERSAND
+         DC    XL10'01010101010101010101'
+         DC    XL1'09'                 DOLLAR SIGN              YA00929
+         DC    XL1'07'                 ASTERISK
+         DC    XL1'06'                 RIGHT PAREN
+         DC    XL1'07'                 SEMICOLON
+         DC    XL1'01'
+         DC    XL1'00'                 HYPHEN                  @ZA17322
+         DC    XL1'01'                 SLASH
+         DC    XL9'010101010101010101'
+         DC    XL1'03'                 COMMA
+         DC    XL1'08'                 PERCENT
+         DC    XL14'0101010101010101010101010101'
+         DC    XL1'09'                 POUND SIGN               YA00929
+         DC    XL1'09'                 AT SIGN                  YA00929
+         DC    XL1'07'                 SINGLE QUOTE
+         DC    XL1'04'                 EQUAL SIGN
+         DC    XL25'01010101010101010101010101010101010101010101010101'
+         DC    XL25'01010101010101010101010101010101010101010101010101'
+         DC    XL16'01010101010101010101010101010101'
+         DC    XL9'00'                 A THRU I
+         DC    XL7'01010101010101'
+         DC    XL9'00'                 J THRU R
+         DC    XL8'0101010101010101'
+         DC    XL8'00'                 S THRU Z
+         DC    XL6'010101010101'
+         DC    XL10'00'                0 THRU 9
+         DC    XL6'010101010101'
+VSTABEND EQU   *
+VSTABLNG EQU   VSTABEND-VSTTRTAB
+         EJECT
+*                                                                Y02651
+*  ENQUEUE/DEQUEUE PARAMETER LISTS FOR UPDATING CIB POINTER IN   Y02651
+*  THE CSCB.                                                     Y02651
+*                                                                Y02651
+         DS    0D
+ENQLIST  ENQ   (SYSNAME,RNAME,E,3,SYSTEM),RET=HAVE,MF=L          Y02651
+ENQEND   EQU   *                                                 Y02651
+         DS    0D
+DEQLIST  DEQ   (SYSNAME,RNAME,3,SYSTEM),RET=HAVE,MF=L            Y02651
+DEQEND   EQU   *                                                 Y02651
+         SPACE
+ENQLNG   EQU   ENQEND-ENQLIST     ENQUEUE LIST LENGTH            Y02651
+DEQLNG   EQU   DEQEND-DEQLIST     DEQUEUE LIST LENGTH            Y02651
+         SPACE
+SYSNAME  DC    C'SYSIEFSD'        MAJOR NAME                     Y02651
+RNAME    DC    C'Q10'             MINOR NAME                     Y02651
+         SPACE
+STCPATCH DC    CL190'* * * IEEVSTAR PATCH AREA'                @G29AN2F
+         TITLE 'IEEVSTAR--ASCB MAP'
+         IHAASCB
+         TITLE 'IEEVSTAR--CSCB MAP'
+VSTRCHAN DSECT
+         IEECHAIN
+         TITLE 'IEEVSTAR--SDT MAP'
+SDTSD    DSECT
+         IEESDT
+         TITLE 'COMMAND INPUT BUFFER'
+VSTARCIB DSECT
+         IEZCIB
+         TITLE 'IEEVJCL PARAMETER AREA'
+         IEEZB800
+         TITLE 'IEEVSTAR--XSA MAP'
+VSTXSA   DSECT
+         IEEXSA
+         TITLE 'IEEVSTAR--CVT MAP'                             @G29AN2F
+         CVT                                                   @G29AN2F
+         TITLE 'IEEVSTAR--SU BITS MAP'                         @G29AN2F
+         IHASUBIT                                              @G29AN2F
+         END
+CLR8291 DUPLICATE ENTRY FOR SEQUENCE # 002808

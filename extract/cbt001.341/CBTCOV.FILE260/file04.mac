@@ -1,0 +1,541 @@
+./ ADD LIST=ALL,NAME=UNUPDTE
+         PRINT GEN
+*
+*  PROGRAM NAME - UNUPDTE
+*
+*  FUNCTION     - CREATE A SEQUENTIAL DATASET FROM A PDS, WITH
+*                 INTERSPERSED ./ ADD CARDS.
+*
+*  FILES:
+*    SYSPRINT   - MESSAGES, INFORMATIONAL AND DIAGNOSTIC
+*    SYSUT1     - INPUT PDS. EACH MEMBER AND/OR ALIAS WILL BE
+*                 COPIED TO THE OUTPUT FILE.
+*    SYSUT2     - OUTPUT SEQUENTIAL DATA SET. ALL MEMBERS ARE PLACED
+*                 IN SEQUENTIAL FORM, WITH A PRECEDING ./ ADD LINE.
+*                 DCB PARAMETERS MUST BE SUPPLIED.
+*
+*  RESTRICTIONS - THE RECORD FORMATS OF SYSUT1 AND SYSUT2 MUST BE THE
+*                 SAME.
+*
+UNUPDTE  CSECT
+         USING *,R15
+         SAVE  (14,12),,*
+         LA    R2,SAVE001              SET UP SAVEAREA LINKAGE
+         ST    R13,SAVE001+4           *
+         ST    R2,8(,R13)              *
+         LR    R13,R2                  *
+         DROP  R15
+         USING SAVE001,R13
+         B     SAVE001A                GO TO REAL PROGRAM
+SAVE001  DS    18F
+*
+*   CHECK FOR THE  KEYWORD NODOT IN AS THE PARM.  IF FOUND SET THE
+*   FLAG TO SUPPRESS THE GENERATION OF THE ./ADD COMMANDS.
+*
+*   THEN OPEN THE INPUT AND OUTPUT FILES.
+*
+SAVE001A DS    0H
+         MVI   NODOT,X'00'             SHOW NORMAL ./ CARD GENERATION
+         L     R1,0(R1)                POINT TO OS PARM
+         LH    R15,0(R1)               GET LENGTH OF THE PARM
+         LTR   R15,R15                 IS IT ZERO?
+         BZ    PARMDONE                IF SO, THE IS NO NODOT PARM.
+         SPACE
+         CLC   2(5,R1),=CL5'NODOT'     IS THE PARM NODOT?
+         BNE   PARMDONE                IF NOT LEAVE THE FLAG ALONE
+         SPACE
+         MVI   NODOT,X'FF'             SHOW NO ./ CARDS
+*
+PARMDONE DS    0H
+         OPEN  (SYSPRINT,(OUTPUT),SYSUT1,(INPUT),DIRECTRY,(INPUT))
+         LA    R12,SYSUT1              THE INPUT DCB ADDRESS
+         USING IHADCB,R12              TELL THE ASSEMBLER
+         MVC   ALLDONE,DCBRECFM        TEST THE RECFM FOR VALIDITY
+         NI    ALLDONE,X'C0'           ONLY THE F/V BITS
+         TM    ALLDONE,X'C0'           *
+         BNM   FAIL1                   *
+         TM    DCBRECFM,X'80'          *IS IT FIXED?
+         BO    FB1                     *BRANCH IF IT IS
+         LA    R11,SYSUT2V             FOR LATER USE AS A BASE
+         OPEN  (SYSUT2V,(OUTPUT))
+         B     CM1                     AND CONTINUE ON THE COMMON PATH
+FB1      DS    0H
+         LA    R11,SYSUT2F             AGAIN FOR A BASE LATER
+         OPEN  (SYSUT2F,(OUTPUT))
+         CLC   DCBLRECL,DCBLRECL-IHADCB(R11)
+         BE    CM1                     IF THEY ARE THE SAME LRECL
+         PUT   SYSPRINT,WMSG1          TELL HIM THEY ARE DIFFERENT
+CM1      DS    0H
+         NC    ALLDONE,DCBRECFM-IHADCB(R11)
+         BZ    FAIL2                   IF THEY'RE NOT THE SAME TELL HIM
+         MVI   ALLDONE,0               A FLAG FOR LATER
+NXTDIR   DS    0H
+         GET   DIRECTRY                GET THE NEXT DIRECTORY BLOCK
+         LR    R2,R1                   A POINTER TO NEXT MEMBER NAME
+         LH    R9,0(,R2)               GET THE NUMBER OF BYTES USED
+         S     R9,=F'2'                IT STARTS OUT COUNTING IT SELF
+         LA    R2,2(,R2)               POINT TO CORRECT STARTING LOC
+         BNP   NXTDIR                  IF NO DATA IN THIS DIRBLK
+NEXTMEM  DS    0H
+         CLI   0(R2),X'FF'             ARE WE DONE WITH THIS BLOCK?
+         BE    NXTDIR                  BRANCH IF WE ARE
+         MVC   MEMBADD,0(R2)           SAVE THE MEMBER NAME
+         CLI   NODOT,X'FF'             WAS THE NO DOT PARM SPECIFIED?
+         BE    CM2                     IF SO, SKIP THE ./ CARD
+         SPACE
+         TM    DCBRECFM,X'80'          FIXED?
+         BO    FB2                     BRANCH IF SO
+         PUT   SYSUT2V,VADDLINE        WRITE THE ADD RECORD
+         B     CM2                     AND REJOIN THE COMMON STREAM
+FB2      DS    0H
+         PUT   SYSUT2F                 GET A BUFFER FOR OUTPUT
+         MVI   0(R1),C' '              CLEAR FIRST BYTE
+         LH    R5,DCBLRECL-IHADCB(R12) SET UP CLEARING MVCL
+         BCTR  R5,0                    *
+         LA    R4,1(,R1)               *
+         LA    R15,1                   *
+         O     R15,=X'40000000'        *
+         LR    R14,R1                  *
+         MVCL  R4,R14                  *
+         MVC   0(29,R1),FADDLINE       PUT THE ADD LINE IN BUFFER
+CM2      DS    0H
+         MVC   TTR,8(R2)               POINT TO THE RIGHT PLACE IN PDS
+         POINT SYSUT1,TTR              *
+         SR    R8,R8                   RECORD COUNTER
+NXTBLOCK DS    0H
+         READ  DECB,SF,SYSUT1,BLOCKIN
+         CHECK DECB                    DID IT GET HERE OK?
+         TM    DCBRECFM,X'80'          FIXED?
+         BO    FB3                     GO IF SO
+         L     R4,=A(BLOCKIN)          THE FIRST RECORD ADDRESS
+         LH    R3,0(,R4)               GET THE LENGTH
+         LA    R4,4(,R4)               MOVE TO THE 1ST RECORD
+         S     R3,=F'4'                CORRECT FOR BCW
+NEXTLINV DS    0H
+*----------------------------------------------------------------------
+* PATCH INSERTED BY BILL BENJAMIN TO PROCESS VARIABLE LENGTH RECORDS
+* WHICH ONLY HAVE THE HEADER PART OF THE RECORD. QSAM WILL READ THESE
+* RECORDS BUT IT WILL NOT WRITE THEM BACK OUT.
+*
+* THE FOLLOWING CODE WAS ADDED:
+*
+*        LH    R0,0(,R4)               CHECK SIZE OF THE OUTPUT RECORD
+*        LA    R1,4                    FIND NULL RECORDS (HEADER ONLY)
+*        CR    R0,R1                   COMPARE THE SIZE TO A VALUE OF 4
+*        BNE   FULLREC                 THIS RECORD HAS REAL DATA
+*        PUT   SYSUT2V,DUMMY           MAINTAIN RECORD COUNT & ADD DATA
+*        B     NULLREC                 ONLY DO ONE OUTPUT
+*
+* THE FOLLOWING LABELS WERE ADDED:
+*
+*              FULLREC
+*              NULLREC
+*              DUMMY
+*
+* THE DATA ITEM DUMMY WAS ADDED:
+*
+*     DUMMY    DC    X'0005000040'
+*
+*     THIS DATA ITEM IS USED TO REPLACE THE HEADER ONLY RECORD FOUND.
+*
+*
+*----------------------------------------------------------------------
+         LH    R0,0(,R4)               CHECK SIZE OF THE OUTPUT RECORD
+         LA    R1,4                    FIND NULL RECORDS (HEADER ONLY)
+         CR    R0,R1                   COMPARE THE SIZE TO A VALUE OF 4
+         BNE   FULLREC                 THIS RECORD HAS REAL DATA
+         PUT   SYSUT2V,DUMMY           MAINTAIN RECORD COUNT & ADD DATA
+         B     NULLREC                 ONLY DO ONE OUTPUT
+*----------------------------------------------------------------------
+FULLREC  PUT   SYSUT2V,(R4)            WRITE THE OUTPUT RECORD
+NULLREC  LA    R8,1(,R8)               COUNT THE OUTPUT RECORDS
+         LH    R15,0(,R4)              MOVE TO THE NEXT RECORD
+         AR    R4,R15                  *
+         SR    R3,R15                  *
+         BP    NEXTLINV                *GO IF THERE IS MORE IN BLOCK
+         B     NXTBLOCK                ELSE GET ANOTHER BLOCK
+FB3      DS    0H
+         L     R4,=A(BLOCKIN)          FIRST RECORD ADDRESS
+         L     R1,DECB+16              THE IOB ADDRESS
+         LH    R3,DCBBLKSI             THE MAXIMUM BLOCK SIZE
+         SH    R3,14(,R1)              THE RESIDUAL COUNT
+NEXTLINF DS    0H
+         LH    R5,DCBLRECL             SOURCE RECORD LENGTH
+         PUT   SYSUT2F                 GET AN OUTPUT BUFFER
+         LR    R6,R1                   SAVE THE BUFFER ADDRESS
+         LH    R7,DCBLRECL-IHADCB(,R11)     THE TARGET LENGTH
+         O     R5,=X'40000000'         FILL CHARACTER
+         MVCL  R6,R4                   MOVE INPUT RECORD TO OUTPUT BUFF
+         LA    R8,1(,R8)               COUNT THE OUTPUT RECORDS
+         SH    R3,DCBLRECL-IHADCB(,R11)
+         BP    NEXTLINF                ANY DATA LEFT IN BUFFER
+         B     NXTBLOCK                ELSE GET ANOTHER BLOCK
+ENDMEM   DS    0H
+         MVC   PRTMEM,0(R2)            PRINT AN INFORMATION LINE
+         CVD   R8,DUBL                 *
+         MVC   PRTCTR,=X'402020202020' *
+         ED    PRTCTR,DUBL+5           *
+         PUT   SYSPRINT,OUTLINE        *
+         IC    R1,11(,R2)              THE NUMBER OF USER HALFWORDS
+         N     R1,=F'31'               KILL THE TRASH BITS
+         SLL   R1,1                    DOUBLE IT FOR BYTES
+         LA    R1,12(,R1)              COMPUTE THE NEXT MEMBER'S DISP
+         AR    R2,R1                   GET THE ADDRESS
+         SR    R9,R1                   NUMBER OF BYTES REMAINING IN BLK
+         BP    NEXTMEM                 IF SOME LEFT
+         B     NXTDIR                  OTHERWISE
+ENDDIR   DS    0H
+         PUT   SYSPRINT,ALLDNMSG       SAY GOOD-BYE
+         CLOSE (SYSUT1,,(R11),,SYSPRINT,,DIRECTRY)
+         L     R13,4(,R13)             GO BACK TO THE CALLER(OS?)
+         LM    R14,R12,12(R13)         *
+         SR    R15,R15                 *
+         BR    R14                     *
+FAIL1    DS    0H
+         PUT   SYSPRINT,MSG1           TELL WHY
+         ABEND 1111,DUMP
+FAIL2    PUT   SYSPRINT,MSG2           SAY WHY
+         ABEND 2222,DUMP
+SYNAD1   DS    0H
+         LR    R5,R15                  ESTABLISH ADDRESSABILITY
+         USING SYNAD1,R5               TELL THE ASSEMBLER
+         SYNADAF ACSMETH=BPAM          GET THE DIAGNOSTIC MESSAGE
+         MVC   SYNADLIN+1(62),50(R1)   MAKE IT PRINTABLE
+         PUT   SYSPRINT,SYNADLIN       PRINT IT
+         ABEND 999,DUMP
+SYSPRINT DCB   BLKSIZE=121,LRECL=121,RECFM=FA,DSORG=PS,                *
+               DDNAME=SYSPRINT,MACRF=PM
+SYSUT1   DCB   DDNAME=SYSUT1,DSORG=PO,MACRF=R,EODAD=ENDMEM,            *
+               SYNAD=SYNAD1
+DIRECTRY DCB   BLKSIZE=256,LRECL=256,RECFM=F,DDNAME=SYSUT1,            *
+               MACRF=GL,DSORG=PS,EODAD=ENDDIR
+SYSUT2F  DCB   DDNAME=SYSUT2,DSORG=PS,MACRF=PL
+SYSUT2V  DCB   DDNAME=SYSUT2,DSORG=PS,MACRF=PM
+DUMMY    DC    X'0005000040'
+ALLDONE  DC    X'00'
+NODOT    DC    X'00'
+SYNADLIN DC    CL121' '
+ALLDNMSG DC    CL50'0',CL71'ALL PROCESSING COMPLETE'
+VADDLINE DC    H'33,0'
+FADDLINE DC    CL29'./ ADD LIST=ALL,NAME=????????'
+         ORG   *-8
+MEMBADD  DS    CL8
+         ORG
+         DS    0F
+TTR      DC    XL3'00'
+         DC    X'00'
+OUTLINE  DC    CL121' '
+         ORG   OUTLINE+1
+         DC    C'MEMBER '
+PRTMEM   DC    CL8' '
+         DC    C' COPIED. NUMBER OF RECORDS'
+PRTCTR   DC    CL6' '
+         ORG
+WMSG1    DC    CL121' TRUNCATION/PADDING WILL OCCUR. LRECL''S UNEQUAL'
+MSG1     DC    CL121' RECRM NOT V OR F IN SYSUT1'
+MSG2     DC    CL121' RECFM''S NOT THE SAME IN SYSUT1 AND SYSUT2'
+DUBL     DC    D'0'
+         LTORG
+BLOCKIN  DS    CL32767
+         DCBD   DSORG=PO
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         END
+         PUNCH ' NAME UNUPDTE(R) '
+         END
+./ ADD LIST=ALL,NAME=UPDTE
+         PRINT GEN
+*
+*  PROGRAM NAME - UPDTE
+*
+*  FUNCTION     - RECREATE A PDS FROM A SEQUENTIAL DATASET
+*
+*  FILES:
+*    SYSPRINT   - MESSAGES, INFORMATIONAL AND DIAGNOSTIC
+*    SYSUT2     - OUTPUT PDS. MEMBERS ARE REPLACED IF THEY ALREADY
+*                 EXIST, OTHERWISE THEY ARE ADDED. OLD MEMBERS ARE
+*                 NOT DELETED IF NOT REPLACED.
+*    SYSIN      - AN INPUT STREAM THAT LOOKS LIKE THAT FOR AN IEBUPDTE
+*                 RECREATION OF A LIBRARY. HOWEVER, VARIABLE LENGTH
+*                 RECORDS ARE SUPPORTED AS WELL AS NON-80 BYTE FIXED
+*                 LENGTH RECORDS.
+*
+*  RESTRICTIONS - THE RECORD FORMATS OF SYSIN AND SYSUT2 MUST BE THE
+*                 SAME, AND THE BLOCKSIZE OF SYSUT2 MUST BE GREATER
+*                 THAN THE LRECL OF SYSIN. RENUMBERING IS NOT SUPPORTED
+*
+*  UPDATE BY R. E. STYMA (GTE NETWORK SYSTEMS - AUT) 08/04/83
+*                 CHANGE TO ./ ADD CARD SCANNING CODE TO PROPERLY
+*                 HANDLE VB RECORDS WHICH HAVE BEEN EDITED AND HAD
+*                 THE TRAILING BLANKS REMOVED
+*
+*
+*
+*
+*
+UPDTE    CSECT
+         USING UPDTE,R15
+         SAVE  (14,12),,*
+         LA    R2,SAVE001              *SET UP SAVEAREA LINKAGE
+         ST    R13,SAVE001+4           *
+         ST    R2,8(,R13)              *
+         LR    R13,R2                  *
+         DROP  R15
+         USING SAVE001,R13
+         B     SAVE001A
+SAVE001  DS    18F
+SAVE001A EQU   *
+         OPEN  (SYSPRINT,(OUTPUT),SYSUT2,(OUTPUT),SYSIN,(INPUT))
+         LA    R12,SYSUT2              THE OUTPUT DCB ADDRESS
+         USING IHADCB,R12              TELL THE ASSEMBLER WHERE IT IS
+         LA    R7,SYSIN                WE NEED THIS FOR F/FB TYPES
+         MVC   ALLDONE,DCBRECFM        CHECK OUT ERROR CONDITIONS
+         NI    ALLDONE,X'C0'           ALL BUT RECFM BITS
+         TM    ALLDONE,X'C0'           IS IT A VALID RECFM?
+         BNM   ALLFAIL4                IF RECFM U, HE BLEW IT
+         NC    ALLDONE,DCBRECFM-IHADCB(R7)
+         BZ    ALLFAIL5                IF NOT THE SAME, HE BLEW IT
+         TM    ALLDONE,X'80'           IS IT FB?
+         BZ    CM0                     BRANCH IF NOT
+         MVC   HLDBLKSI,DCBBLKSI  SAVE THE MAXIMUM BLOCK FOR LATER
+         CLC   DCBLRECL,DCBLRECL-IHADCB(R7)
+         BE    CM0                     IF THEY ARE THE SAME, NO MSG
+         PUT   SYSPRINT,WMSG1          WARN HIM
+CM0      DS    0H
+         MVI   ALLDONE,X'00'           CLEAR THE FLAG FOR EOF TEST
+         LM    R10,R11,OUTPARMS        INITIALIZE THE OUTPUT LOOP
+         GET   SYSIN
+HEADER   DS    0H
+         TM    DCBRECFM-IHADCB(R7),X'80'
+         BZ    VB1
+         LA    R2,7(,R1)               1ST POSSIBLE ADDRESS FOR 'NAME='
+         LH    R3,DCBLRECL-IHADCB(,R7) MAXIMUM NUM OF STARTS FOR NAME=
+         S     R3,=F'12'               12 = 7(./ADD) + 5(NAME=)
+         B     CM1
+VB1      DS    0H
+         LA    R2,11(,R1)              1ST POSSIBLE ADDRESS FOR 'NAME='
+         LH    R3,0(,R1)               MAXIMUM NUM OF STARTS FOR NAME=
+         S     R3,=F'16'               16 = 7(./ADD) + 4(RDW) +5(NAME=)
+CM1      DS    0H
+FINDNAME DS    0H
+         CLC   0(5,R2),=C'NAME='       IS THIS THE PLACE?
+         BE    FOUNDNM                 BRANCH IF SO
+         LA    R2,1(,R2)               ELSE TRY NEXT PLACE
+         BCT   R3,FINDNAME             *
+ALLFAIL3 DS    0H
+         PUT   SYSPRINT,MSG3           WE DIDN'T FIND NAME=
+         ABEND 3333,DUMP
+FOUNDNM  DS    0H
+         C     R3,=F'8'                IS THE REMAINDER GREATER THAN 8
+         BNH   SKIP1                   IF NOT, USE THIS VALUE
+         SPACE
+         LA    R3,8                    IF SO, USE 8 AS THE MAX LEN
+         SPACE
+SKIP1    DS    0H
+         LA    R2,5(,R2)               THE ADDRESS OF THE MEMBER NAME
+         LA    R4,0(,R2)               FIRST PLACE TO LOOK FOR DELIM
+SCANNAME DS    0H
+         CLI   0(R4),C' '              IS IT A DELIMITER?
+         BE    SCANEND                 *
+         CLI   0(R4),C','              *
+         BE    SCANEND                 *
+         LA    R4,1(,R4)               TRY THE NEXT CHARACTER
+         BCT   R3,SCANNAME             *
+SCANEND  DS    0H
+         SR    R4,R2                   COMPUTE LENGTH AND MOVE NAME
+         BCTR  R4,0                    *
+         MVC   MEMBNAME,=CL8' '        *
+         EX    R4,MOVEMNM              *
+         NOTE  SYSUT2                  *
+         ST    R1,MEMBADDR             *
+GETNEXT  DS    0H
+         GET   SYSIN                   MAIN LOOP START
+         TM    DCBRECFM-IHADCB(R7),X'80'
+         BZ    VB2
+         CLC   0(7,R1),=C'./ ADD '     IS IT ANOTHER HEADER???
+         B     CM2
+VB2      DS    0H
+         CLC   4(7,R1),=C'./ ADD '     IS IT ANOTHER HEADER???
+CM2      DS    0H
+         BE    STOWIT                  BRANCH IF IT IS
+         BAL   R9,PUTIT                PUT THE RECORD IN OUTPUT BLOCK
+         B     GETNEXT                 AND GO AROUND FOR NEXT INPUT
+STOWIT   DS    0H
+         LR    R2,R1              SAVE THE RECORD ADDRESS
+         BAL   R8,WRITEBLK        WRITE THE LAST BLOCK
+         STOW  SYSUT2,MEMBNAME,R
+         B     *+4(R15)                TEST RETURN CODE
+         B     STOWEDR                 STOWED AS A REPLACE
+         B     ALLFAIL1                ERROR CONDITION
+         B     STOWEDA                 STOWED AS AN ADD
+         B     ALLFAIL1                ERROR CONDITION
+         B     ALLFAIL1                ERROR CONDITION
+         B     ALLFAIL1                ERROR CONDITION
+         B     ALLFAIL1                ERROR CONDITION
+STOWEDR  DS    0H
+         MVC   STOWMODE,=CL8'REPLACED'
+         B     ENDTEST
+STOWEDA  DS    0H
+         MVC   STOWMODE,=CL8'ADDED'
+ENDTEST  DS    0H
+         MVC   OUTMEM,MEMBNAME         BUILD AND PRINT A MESSAGE
+         UNPK  OUTTTR,MEMBADDR         *
+         NC    OUTTTR,=7X'0F'          *
+         TR    OUTTTR,=C'0123456789ABCDEF'
+         MVI   OUTTTR+6,C' '           *
+         PUT   SYSPRINT,OUTLINE        *
+         CLI   ALLDONE,1               ARE WE FINISHED?
+         LR    R1,R2              RESTORE THE RECORD ADDRESS
+         BNE   HEADER
+         PUT   SYSPRINT,ALLDNMSG
+         CLOSE (SYSIN,,SYSUT2,,SYSPRINT)
+         L     R13,4(,R13)             *GO BACK TO THE CALLER
+         LM    R14,R12,12(R13)         *
+         SR    R15,R15                 *
+         BR    R14                     *
+ALLFAIL1 DS    0H
+         PUT   SYSPRINT,MSG1           PRINT AN INDICATION
+         ABEND 1111,DUMP
+EOF      DS    0H
+         MVI   ALLDONE,1               REMEMBER WE'RE ALL DONE
+         B     STOWIT
+PUTIT    DS    0H
+         LTR   R10,R10                 IS IT THE FIRST TIME?
+         BNM   NOT1ST                  *
+         LH    R10,DCBBLKSI            INITIALIZE THE LOOP ELEMENTS
+         L     R11,=A(OUTBLOCK)        *
+         TM    DCBRECFM,X'80'          *
+         BO    CM3                     *
+         S     R10,=F'4'               *
+         LA    R11,4(,R11)             *
+CM3      DS    0H
+NOT1ST   DS    0H
+         TM    DCBRECFM,X'80'
+         BZ    VB4
+         CH    R10,DCBLRECL            IS THERE ENOUGH ROOM?
+         BNL   MOVEIN                  BRANCH IF THERE IS
+         B     CM4
+VB4      DS    0H
+         CH    R10,0(,R1)              IS THERE ENOUGH ROOM
+         BNL   MOVEIN                  BRANCH IF THERE IS
+         CLC   DCBBLKSI,0(R1)          COULD THERE BE ENOUGH ROOM?
+         BL    ALLFAIL2                BRANCH IF NOT
+CM4      DS    0H
+         LA    R8,MOVEIN               NORMAL USAGE
+WRITEBLK DS    0H
+         L     R11,=A(OUTBLOCK)        BEGINNING OF THE BLOCK
+         LR    R2,R1                   SAVE THE RECORD ADDRESS
+         LCR   R10,R10                 THE AMOUNT LEFT UNUSED
+         AH    R10,DCBBLKSI            COMPUTE THE AMOUNT USED
+         TM    DCBRECFM,X'80'
+         BZ    VB5
+         STH   R10,DCBBLKSI            CALL IT BLOCK SIZE
+         WRITE DECBFB,SF,SYSUT2,(R11),'S'
+         CHECK DECBFB
+         MVC   DCBBLKSI,HLDBLKSI       RESTORE THE ORIGINAL BLKSIZE
+         B     CM5
+VB5      DS    0H
+         STH   R10,0(,R11)             AND CALL IT BLOCK SIZE
+         WRITE DECB,SF,SYSUT2,(R11)
+         CHECK DECB                    MAKE SURE THE RECORD IS OUT OK
+CM5      DS    0H
+         LH    R10,DCBBLKSI            RE-INITIALIZE THE LOOP
+         L     R11,=A(OUTBLOCK)        *
+         TM    DCBRECFM,X'80'          *
+         BO    CM6                     *
+         S     R10,=F'4'               *
+         LA    R11,4(,R11)             *
+CM6      DS    0H
+         LR    R1,R2                   RESTORE THE RECORD ADDRESS
+         BR    R8                      GO BACK TO USER
+MOVEIN   DS    0H
+         LR    R2,R1                   SET UP THE FOUR REGS FOR MVCL
+         LR    R4,R11                  *
+         TM    DCBRECFM,X'80'          *
+         BO    FB7                     *
+         LH    R3,0(,R2)               *
+         LR    R5,R3                   *
+         LR    R15,R5                  SAVE THE LENGTH
+         B     CM7                     *
+FB7      DS    0H                      *
+         LH    R3,DCBLRECL-IHADCB(R7)  *
+         LH    R5,DCBLRECL             *
+         LR    R15,R5                  SAVE THE LENGTH
+         O     R5,=X'40000000'         *
+CM7      DS    0H                      *
+         MVCL  R4,R2                   PUT THE RECORD IN THE OUTPUT
+         AR    R11,R15                 ADJUST THE LOOP REGISTERS
+         SR    R10,R15                 *
+         BR    R9                      GO BACK TO THE MAIN ROUTINE
+ALLFAIL2 DS    0H
+         PUT   SYSPRINT,MSG2           SOME INDICATION
+         ABEND 2222,DUMP
+ALLFAIL4 DS    0H
+         PUT   SYSPRINT,MSG4
+         ABEND 444,DUMP
+ALLFAIL5 DS    0H
+         PUT   SYSPRINT,MSG5
+         ABEND 555,DUMP
+SYSPRINT DCB   BLKSIZE=121,LRECL=121,RECFM=FBA,DDNAME=SYSPRINT,        *
+               DSORG=PS,MACRF=PM
+SYSIN    DCB   DDNAME=SYSIN,DSORG=PS,EODAD=EOF,MACRF=GL
+SYSUT2   DCB   DDNAME=SYSUT2,DSORG=PO,MACRF=W
+OUTPARMS DC    F'-1,-1'
+MEMBNAME DC    CL8' '
+MEMBADDR DC    F'0'
+MOVEMNM  MVC   MEMBNAME(0),0(R2)
+OUTLINE  DC    CL121' '
+         ORG   OUTLINE+1
+         DC    C'MEMBER NAME '
+OUTMEM   DC    CL8' '
+         DC    C'   TTR '
+OUTTTR   DC    CL7' '
+         DC    C'    '
+STOWMODE DC    CL8' '
+         ORG
+WMSG1    DC    CL121' WARNING: TRUNCATION OR PADDING OF RECORDS WILL OC*
+               CUR BECAUSE LRECL''S ARE NOT THE SAME'
+HLDBLKSI DC    H'0'
+MSG1     DC    CL121'-BAD RETURN CODE FROM STOW. SEE R15 IN DUMP'
+MSG2     DC    CL121'-BAD LRECL/BLKSIZE MATCH. SEE RECORD AT 2R%'
+MSG3     DC    CL121'-INVALID ./ ADD. NO "NAME=" FOUND.'
+MSG4     DC    CL121'-INVALID RECFM. NOT F OR V'
+MSG5     DC    CL121'-RECFM''S NOT THE SAME IN SYSIN AND SYSUT2'
+ALLDNMSG DC    CL60' ',CL61'               ALL PROCESSING COMPLETED'
+ALLDONE  DC    X'00'
+         LTORG
+OUTBLOCK DS    CL32767
+         IHADCB DSORG=PO
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         END
+         PUNCH ' NAME UPDTE(R) '
+         END

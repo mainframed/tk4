@@ -1,0 +1,180 @@
+ /* COPYRIGHT 1983 BY THOMAS GLEN SMITH */
+ /* ABESCI */
+ ABESCI:  PROC(MPNLCALL,RHHDRPT,SUBENT);
+ /* NOTE:  EXTENSIVE CODING CHANGES MADE TO BYPASS BUG WHEN USING
+           REFER OPTION */
+         DFT RANGE(*) STATIC;
+         % DCL @PROCNAME CHAR;
+         % @PROCNAME = '';
+         % INCLUDE ABESUB;
+         DCL 1 MPNLCALL UNALIGNED,
+           2 MCURPNL FIXED BIN(15,0),
+           2 MNXTPNL FIXED BIN(15,0),
+           2 MARYPTR PTR,
+           2 MAID BIT(8),
+           2 MCURLOC FIXED BIN(15,0),
+           2 MCHGCURS FIXED BIN(15,0),
+           2 MCALLFLGS BIT(8);
+         DCL ERRCNT FIXED BIN(15,0) INIT(0);
+         DCL EOF CHAR(80) VAR;
+         DCL GPCODE FIXED BIN(15,0) INIT(16); /* GET-POST */
+         DCL GCODE FIXED BIN(15,0) STATIC INIT(4); /* GET */
+         DCL RETCODE FIXED BIN(31,0);
+         DCL PGMNAME CHAR(8) STATIC INIT('ABESCR');
+         DCL SYSATTN ENTRY;
+         DCL HITSW BIT(1);
+         DCL ATNECB FIXED BIN(31,0) STATIC INIT(0);
+         DCL ATNCTR FIXED BIN(15,0) STATIC INIT(0);
+         DCL STRPARS ENTRY(CHAR(*) VAR,FIXED BIN(15,0),
+           CHAR(1),CHAR(*) VAR);
+         DCL (OFF,LOFF) FIXED BIN(15,0);
+         DCL NLCHARDF BIT(8) STATIC INIT('00010101'B), /* X'15' */
+             NLCHAR CHAR(1) DEF NLCHARDF;
+         DCL RECORD CHAR(256) VAR;
+         DCL SYSPOST ENTRY(,FIXED BIN(31,0));
+         DCL SYSATTA ENTRY;
+         DCL (SYSWAIS,SYSWAIT) ENTRY;
+         DCL CNT FIXED BIN(15,0) STATIC INIT(1);
+         DCL 1 ECBPRM UNALIGNED,
+               2 ECBP(25) PTR;
+         DCL 1 ECBPRMDF UNALIGNED DEF ECBPRM,
+               2 ECBPDF(25),
+                 3 ECBPDH BIT(1),
+                 3 ECBPDHR BIT(31);
+         DCL 1 WPBITS UNALIGNED BASED(WPPTR),
+           2 WAITBIT BIT(1),
+           2 POSTBIT BIT(1);
+         DCL RHPS(25) PTR;
+         DCL RHP PTR;
+         DCL 1 MYSDV UNALIGNED,
+           2 SDVPT PTR,
+           2 SDVLN FIXED BIN(15,0),
+           2 SDVBIT BIT(16) INIT('1'B);
+         DCL STR CHAR(30000) VAR BASED(SDVPT);
+         DCL SYSCALL ENTRY;
+         ON CONDITION(TIOERR) BEGIN;
+           RHPS(I)->CMODEFLAG='0'B;
+           EOF='EOF';
+           STR='';
+           END;
+         IF ^RHCVTSW /* HAS VT INIT BEEN DONE? */
+           THEN DO;
+             CALL SYSATTA(PGMNAME,RHSUBECB,RHSUBTCB,RHECBP,RHECBW,
+               MPNLCALL);
+             CALL SYSATTN(ATNCTR,ATNECB);
+             RHCVTSW = '1'B;
+             END;
+         RHECBW = 0;
+         IF (RHSYNSW × RHTYNSW)
+           THEN DO;
+             RHTYNSW='0'B;
+             MCALLFLGS='10000000'B;
+             CALL SYSPOST(RHECBP,0); /* TELL ABESCR TO WRITE ONLY */
+             ECBP(1)=ADDR(CNT);
+             ECBP(2)=ADDR(RHECBW);
+             ECBPDH(2)='1'B;
+             CALL SYSWAIS(ECBPRM);
+             MCALLFLGS='10000000'B;
+             RHECBW=0;
+             END;
+           ELSE DO;
+             MCALLFLGS='0'B;
+             CALL SYSPOST(RHECBP,0); /* TELL ABESCR TO WRITE & READ */
+             END;
+         ECBP(1) = ADDR(CNT);
+         ECBP(2) = ADDR(RHECBW);
+         ECBP(3) = ADDR(ATNECB);
+         I = 3;
+         DO RHP=NXTRHEL REPEAT RHP->RHNXT WHILE(RHP^=NULL);
+           IF RHP->TERMFLAG /* IS IT VIRTUAL TERMINAL? */
+             THEN DO;
+               I = I + 1;
+               ECBP(I) = ADDR(RHP->TERMECB);
+               RHPS(I) = RHP; /* SAVE RHPTR */
+               END;
+           END;
+         ECBPDH(I) = '1'B; /* INDICATE END OF ECB LIST */
+         DO UNTIL((ECBP(2)->POSTBIT)  /* DO UNTIL POSTED BY ABESCR */
+           × (HITSW & (MCALLFLGS='10000000'B)));
+           CALL SYSWAIS(ECBPRM);
+             /* CALL SYSWAIT(CNT,RHECBW); */
+           IF ECBP(3)->POSTBIT /* IS IT ATTENTION? */
+             THEN DO;
+               ATNECB,ATNCTR=0;
+               IF SUBSTR(MCALLFLGS,1,1) /* WAS IT WRITE-ONLY? */
+                 THEN DO;
+                   MCALLFLGS='00000010'B;
+                   CALL SYSPOST(RHECBP,0);
+                   END;
+                 ELSE SIGNAL CONDITION(MYATTN);
+               END;
+           HITSW = '0'B;
+           DO I = 4 TO HBOUND(ECBP,1) UNTIL(ECBPDH(I));
+             IF ECBP(I)->POSTBIT
+               THEN DO UNTIL(EOF='EOF');
+                 HITSW = '1'B;
+                 SDVPT = ADDR(RHPS(I)->BUFPTR->BUF);
+                 SDVLN = RHPS(I)->BUFPTR->BUFLN;
+                 CALL SYSCALL(RHPS(I)->TERMEP,GPCODE,SDVPT,
+                   RHPS(I)->MSGDATA,RETCODE,RHPS(I)->TERMECB);
+                     /*CALL VTAMIO TO DO GET-POST AND FILL DATA BUFFER*/
+                 ECBP(I)->POSTBIT = '0'B;
+                 EOF=RHPS(I)->MSGDATA;
+                 IF RETCODE^=0 × (RHPS(I)->MSGDATA^='' &
+                   RHPS(I)->MSGDATA^='EOF')
+                   THEN DO;
+                     ERRCNT = ERRCNT + 1;
+                     IF ERRCNT > 99
+                       THEN SIGNAL CONDITION(TIOERR);
+                     END;
+                   ELSE DO;
+                     MYRPTR = RHPS(I)->LSTHDR; /* ADDR LAST RECORD */
+                     IF SUBSTR(STR,1,1)=NLCHAR
+                       THEN OFF=1;
+                       ELSE OFF=0;
+                     LB=LENGTH(STR);
+                     DO UNTIL(OFF>LB);
+                       LOFF = OFF;
+                       CALL STRPARS(STR,OFF,NLCHAR,RECORD);
+                       CALL #ABETR(RECORD); /* CALL DENTTR */
+                       IF MYRPTR=RHPS(I)->HDPTR × LOFF ^= 0
+                         THEN DO;
+                           IF MYRPTR = RHPS(I)->HDPTR
+                             THEN ADDSEQ=1;
+                             ELSE ADDSEQ=MYRPTR->RECSEQ+1;
+                           CALL #ADD(RHPS(I),RHHDRPT,MYRPTR,
+                             MYRPTR,ADDSEQ,RECORD,RHPPTR,0);
+                           END;
+                         ELSE MYRPTR->RECSTR=MYRPTR->RECSTR××RECORD;
+                       END;
+                     END;
+                 IF ERRCNT<=99
+                   THEN DO;
+                     RHPS(I)->MSGDATA='';
+                     DO UNTIL(RETCODE=0 & RHPS(I)->MSGDATA='' ×
+                       ERRCNT>99);
+                       CALL SYSCALL(RHPS(I)->TERMEP,GCODE,SDVPT,
+                         RHPS(I)->MSGDATA,RETCODE,RHPS(I)->TERMECB);
+                         /*CALL VTAMIO TO REESTABLISH
+                           OUTSTANDING GET */
+                       IF RETCODE^=0 × RHPS(I)->MSGDATA^=''
+                         THEN ERRCNT=ERRCNT+1;
+                       END;
+                     IF ERRCNT>99
+                       THEN SIGNAL CONDITION(TIOERR);
+                     END;
+                 IF ERRCNT<=99
+                   THEN DO;
+                     /* NOW SET RECPTR */
+                     J = RHPS(I)->RHCEN-RHPS(I)->RHCST-1;
+                     DO MYRPTR=MYRPTR REPEAT MYRPTR->LSTPTR WHILE(J>0)
+                       UNTIL(MYRPTR->LSTPTR=RHPS(I)->HDPTR);
+                       J=J-1;
+                       END;
+                     RHPS(I)->RECPTR = MYRPTR;
+                     RHPS(I)->CURSEQ = MYRPTR->RECSEQ;
+                     END;
+                 END;
+             END;
+           END;
+         END ABESCI;

@@ -1,0 +1,213 @@
+*----------------------------------------------------------------------
+*                                                                     *
+*  THIS PROGRAM WAS WRITTEN BY MICHAEL GEARING, A SOFTWARE CONSULTANT *
+*  FOR FIRST INTERSTATE SERVICES OF PORTLAND, OREGON.  THE SOURCE FOR *
+*  THIS PROGRAM WAS PUBLISHED IN THE NATIONAL SYSTEMS PROGRAMMERS     *
+*  ASSOCIATION PUBLICATION "TECHNICAL SUPPORT", VOL. 1, NO. 8, DATED  *
+*  DECEMBER, 1987.  THE ARTICLE WAS TITLED "PTF'S IN ERROR".  NOTE    *
+*  THAT THIS PROGRAM IS DEPENDENT UPON THE LAYOUT OF THE GLOBAL CSI   *
+*  AND THE TARGET ZONE CSI.  THE RECORD DESCRIPTIONS FOR THE VARIOUS  *
+*  RECORDS CONTAINED IN THE SMP/E CSI VSAM DATASET ARE NOT DOCUMENTED *
+*  SINCE SMP/E IS OBJECT CODE ONLY (OCO).  THE AUTHOR RELIED ON DUMP- *
+*  ING THE CSI AND STUDYING IT'S STRUCTURE TO OBTAIN ENOUGH DETAIL TO *
+*  MAKE THIS PROGRAM WORK.                                            *
+*                                                                     *
+*  THE INTENT OF THIS PROGRAM IS TO IDENTIFY ANY SYSMODS THAT ARE     *
+*  MARKED IN ERROR THAT ARE INSTALLED ON A TARGET SYSTEM.             *
+*                                                                     *
+*  ... WILLIAM SMITH, SYNTEX TECHNICAL SUPPORT, 08DEC87               *
+*      . TESTED WITH MVS/XA 2.1.3 AND SMP/E 1.4.09, PUT 8707          *
+*      . SAMPLE JCL FOLLOWS...                                        *
+*                                                                     *
+*      //$UWJSSMP JOB (ACCT),'TEST SMP/E HOLDPGM',CLASS=A             *
+*      //HOLDPGM  EXEC PGM=HOLDPGM,REGION=2048K,                      *
+*      //         PARM='XATARG'  <=== TARGET ZONE "NAME"              *
+*      //SYSUDUMP  DD  SYSOUT=*                                       *
+*      //SYSOUT    DD  SYSOUT=*                                       *
+*      //REPORT    DD  SYSOUT=*,DCB=BLKSIZE=80                        *
+*      //GLBLCSI   DD  DISP=SHR,DSN=SYS1.XASMPE.GLOBAL.CSI            *
+*      //TARGCSI   DD  DISP=SHR,DSN=SYS1.XATARG.CSI                   *
+*                                                                     *
+*----------------------------------------------------------------------
+HOLDPGM  CSECT
+         SAVE      (14,12)        STANDARD LINKAGE CONVENTIONS
+         LR        12,15
+         USING     HOLDPGM,12
+         ST        13,SAVE+4
+         LA        14,SAVE
+         ST        14,8(13)
+         LR        13,14
+*----------------------------------------------------------------------
+*        PROCESS INPUT PARM                                           *
+*----------------------------------------------------------------------
+         L         3,0(,1)        LOAD RED 3 WITH POINTER TO PARM
+         LH        4,0(,3)        LOAD REG 4 WITH LENGTH OF PARM
+         BCTR      4,0            SUBTRACT 1 FOR EXEC MVC LENGTH
+         B         EXECWTO        BRANCH AROUND EXECUTE TARGET
+EXMVC1   MVC       WTOPARM+15(0),2(3)  EXEC TARGET
+EXECWTO  EX        4,EXMVC1       MOVE PARM TO WTO
+WTOPARM  WTO       'PARM =          '  WTO THE TARGET ZONE NAME
+         B         EXCPARM             BRANCH AROUND EXECUTE TARGET
+EXMVC2   MVC       ZONENAME(0),2(3)    EXECUTE TARGET
+EXCPARM  EX        4,EXMVC2       MOVE ZONE NAME TO KEY
+         OPEN      (GLBLCSI,(INPUT),TARGCSI,(INPUT),REPORT,(OUTPUT))
+         LTR       15,15          TEST FOR GOOD RETURN CODE
+         BNZ       ERROR          IF BAD RETURN CODE, ABEND
+*----------------------------------------------------------------------
+*        FIND THE TARGET ZONE RECORD THAT HAS A HEX NUMBER IN IT THAT *
+*        IS USED AS PART OF THE KEY TO THAT TARGET ZONE.              *
+*----------------------------------------------------------------------
+FINDZONE GET       RPL=TARGSEQ    GET RECORD
+         LTR       15,15          TEST FOR GOOD RETURN CODE
+         BNZ       ERROR          IF BAD RETURN CODE, ABEND
+         CLC       TARGETZ,=X'000002'  TEST IF WE'RE PAST ZONE RECORDS
+         BNH       FINDZON2       IF WE ARE, TELL US
+         WTO       'THERE IS NO TARGET ZONE TO MATCH YOUR INPUT PARM'
+         B         STOP2          GO FINISH UP
+FINDZON2 CLC       ZONENAME,TARGETS  COMPARE PARM AND ZONE IN RECORD
+         BNE       FINDZONE       IF NO MATCH, KEEP LOOKING
+         MVC       TARGHEX,TARGETH  MOVE THE ZONE HEX NUMBER TO KEY
+*----------------------------------------------------------------------
+*        POSITION OURSELVES INTO THE GLOBAL ZONE AT THE FIRST GLOBAL  *
+*        ZONE SYSMOD RECORD.                                          *
+*----------------------------------------------------------------------
+SETUP    POINT     RPL=GLBLSEQ    POSITION TO GLOBAL ZONE START
+         LTR       15,15          TEST FOR GOOD RETURN CODE
+         BNZ       ERROR          IF BAD RETURN CODE, ABEND
+*----------------------------------------------------------------------
+*        LOOK AT EACH GLOBAL ZONE SYSMOD RECORD TO SEE IF IT IS A     *
+*        HOLD TYPE SYSMOD.                                            *
+*----------------------------------------------------------------------
+READGLB  GET       RPL=GLBLSEQ    GET RECORD
+         LTR       15,15          TEST FOR GOOD RETURN CODE
+         BNZ       ERROR          IF BAD RETURN CODE, ABEND
+         CLC       GLOBALK,ZONE26 LAST GLOBAL SYSMOD RECORD ?
+         BNE       STOP           IF LAST SYSMOD RECORD, END
+         CLI       GLOBALF,X'F4'  HOLD TYPE SYSMOD ?
+         BNE       READGLB        IF NOT, KEEP LOOKING
+*----------------------------------------------------------------------
+*        ONCE WE HAVE A HOLD TYPE SYSMOD, SEE IF IT IS APPLIED IN OUR *
+*        TARGET ZONE.                                                 *
+*----------------------------------------------------------------------
+         MVC       TARGSYS,GLOBALP  MOVE HOLD PTF
+         GET       RPL=TARGDIR    FIND OUT IF THE HOLD PTF IS IN THE
+         LTR       15,15          TARGET ZONE
+         BNZ       READGLB        IF IT'S ON, FALL THRU
+*----------------------------------------------------------------------
+*        JUST BECAUSE THE HELD PTF IS APPLIED DOESN'T MEAN IT IS ON   *
+*        IN ERROR.  THE APAR NUMBER THAT THE PTF IS BEING HELD FOR    *
+*        MAY HAVE BEEN VALIDLY SUPERCEDED BY ANOTHER PTF.  TO         *
+*        INVESTIGATE THIS SITUATION, SEE IF THE APAR IN ERROR HAS     *
+*        BEEN APPLIED IN OUR TARGET ZONE.  IF IT HAS BEEN APPLIED,    *
+*        THEN WE KNOW THAT THE HELD  PTF IS IN ERROR.                 *
+*----------------------------------------------------------------------
+         MVC       TARGSYS,GLOBALE  MOVE ERROR APAR
+         GET       RPL=TARGDIR    FIND OUT IF THE ERROR APAR IS IN THE
+         LTR       15,15          TARGET ZONE
+         BZ        READGLB        IF IT'S NOT ON, FALL THRU
+         MVC       REPRTS,GLOBALP BUILD REPORT ENTRY
+         MVC       REPRTE,GLOBALE
+         PUT       REPORT,REPRT   WRITE REPORT ENTRY
+         AP        COUNT,=P'1'    ADD ONE TO COUNTER
+         B         READGLB        KEEP ON PROCESSING
+STOP     UNPK      WTO+23(8),COUNT  UNPACK COUNT INTO WTO
+         OI        WTO+30,B'00110000'  FIX LAST DIGIT SIGN
+WTO      WTO       'RECORD COUNT = XXXXXXXX'
+         CLOSE     (GLBLCSI,,TARGCSI,,REPORT)
+STOP2    L         13,SAVE+4
+         RETURN    (14,12),RC=0   DONE
+*---------------------------------------------------------------------*
+ERROR    ABEND     16,DUMP        DUMP WITH USER CODE 16
+*
+ZONE26   DC        XL3'000026'
+*
+GLOBAL   DS        0CL142
+GLOBALK  DS        CL3
+GLOBALP  DS        CL7
+         DS        CL2
+GLOBALF  DS        CL1
+         DS        CL2
+GLOBALE  DS        CL7
+         DS        CL1
+         DS        CL119
+*
+ZONENAME DC        CL7' '
+*
+TARGKEY  DS        0CL10
+         DC        XL1'00'
+TARGHEX  DS        XL1
+         DC        XL1'26'
+TARGSYS  DS        CL7
+*
+TARGET   DS        0CL142
+TARGETZ  DS        CL3
+TARGETE  DS        CL7
+         DS        CL5
+TARGETS  DS        CL7
+         DS        CL1
+         DS        CL119
+*
+         ORG       TARGET
+         DS        CL4
+TARGETH  DS        XL1
+         ORG
+*
+REPRT    DS        0CL80
+         DC        CL2'  '
+REPRTS   DS        CL7
+         DC        CL2'  '
+REPRTE   DS        CL7
+         DC        CL62' '
+*
+SAVE     DS        18F'0'         STANDARD SAVE AREA
+COUNT    DC        PL8'0'         RECORD COUNTER
+*
+GLBLCSI  ACB   AM=VSAM,                                                X
+               MACRF=(KEY,SEQ,DIR,IN),                                 X
+               STRNO=1,                                                X
+               BUFNI=4,                                                X
+               BUFND=11,                                               X
+               DDNAME=GLBLCSI,                                         X
+               EXLST=CSIEXIT
+*
+TARGCSI  ACB   AM=VSAM,                                                X
+               MACRF=(KEY,SEQ,DIR,IN),                                 X
+               STRNO=1,                                                X
+               BUFNI=4,                                                X
+               BUFND=2,                                                X
+               DDNAME=TARGCSI,                                         X
+               EXLST=CSIEXIT
+*
+GLBLSEQ  RPL   ACB=GLBLCSI,                                            X
+               AM=VSAM,                                                X
+               OPTCD=(KEY,SEQ,KEQ,GEN,MVE),                            X
+               KEYLEN=3,                                               X
+               ARG=ZONE26,                                             X
+               AREA=GLOBAL,                                            X
+               AREALEN=142
+*
+TARGDIR  RPL   ACB=TARGCSI,                                            X
+               AM=VSAM,                                                X
+               OPTCD=(KEY,DIR,MVE,GEN,KEQ),                            X
+               KEYLEN=10,                                              X
+               ARG=TARGKEY,                                            X
+               AREA=TARGET,                                            X
+               AREALEN=142
+*
+TARGSEQ  RPL   ACB=TARGCSI,                                            X
+               AM=VSAM,                                                X
+               OPTCD=(KEY,SEQ,MVE),                                    X
+               KEYLEN=10,                                              X
+               AREA=TARGET,                                            X
+               AREALEN=142
+*
+CSIEXIT  EXLST AM=VSAM,                                                X
+               EODAD=STOP
+*
+REPORT   DCB   DDNAME=REPORT,                                          X
+               DSORG=PS,                                               X
+               RECFM=FB,                                               X
+               LRECL=80,                                               X
+               MACRF=PM
+*
+         END   HOLDPGM

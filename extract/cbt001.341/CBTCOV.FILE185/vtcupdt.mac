@@ -1,0 +1,424 @@
+VTCU     TITLE 'VTCUPDT -- SERVICE ROUTINE TO UPDATE VTOC'
+         SPACE 3
+*                                  JOSH AUERBACH, YALE COMPUTER CENTER
+*                                  LAST ALTERATION, JANUARY 31, 1979
+         SPACE 3
+*****************************************************************
+*                                                               *
+*        THIS ROUTINE REQUIRES A SYSTEM KEY CALLER.  IT         *
+*        UPDATES A SINGLE DSCB REFERENCED BY ITS 44 BYTE KEY    *
+*        OR BY ITS CCHHR.                                       *
+*        THE UPDATE MUST NOT BE SUCH AS TO REQUIRE              *
+*        SIMULTANEOUS UPDATE OF FREE SPACE DSCBS (AS WOULD      *
+*        OCCUR IF EXTENT DESCRIPTIONS WERE ALTERED)             *
+*        THIS ROUTINE OBTAINS THE VTOC ENQ BUT NOT THE DSNAME   *
+*        ENQ.                                                   *
+*        DATASET LEVEL ENQ'S MUST BE OBTAINED BY THE CALLER     *
+*        THE CALLER SHOULD EITHER (1) ENQ ON SYSDSN/DSNAME      *
+*        EXCLUSIVE IF THE VOLUME IS PERMANENTLY RESIDENT OR     *
+*        (2) ALLOCATE THE DATASET EXCLUSIVE IF THE VOLUME IS    *
+*        NOT PERMANENTLY RESIDENT, THUS ASSURING THAT IT STAYS  *
+*        MOUNTED.                                               *
+*        THE CALLER MUST BE ENABLED, UNLOCKED, TASK MODE        *
+*        AND SYSTEM KEY.  APF OR SUPERVISOR MODE IS OPTIONAL.   *
+*                                                               *
+*        AT ENTRY:                                              *
+*        R1--> PARMLIST                                         *
+*          +0 --> UCB OF UNIT ON WHICH VOLUME IS MOUNTED        *
+*          +4 --> CL44 KEY OR 5 BYTE CCHHR                      *
+*              CCHHR FORM IS INDICATE BY B'10000000' IN HIGH    *
+*              BYTE OF POINTER                                  *
+*          +8 HAS TWO BYTE OFFSET INTO DSCB OF FIELD TO BE      *
+*              ALTERED (KEY IS INCLUDED IN COMPUTING OFFSET)    *
+*          +A HAS TWO BYTE LENGTH OF DATA TO BE ALTERED         *
+*          +C --> OLD DATA FOR VERIFICATION OR ZERO IF NO       *
+*              VERIFICATION IS TO BE PERFORMED                  *
+*          +10 --> NEW DATA TO BE SUBSTITUTED                   *
+*          +14 0 TO N REPETITIONS OF FIELDS +8 - +10 TERMINATED *
+*              BY X'FFFF'.                                      *
+*                                                               *
+*        AT RETURN R15 HAS RETCODE                              *
+*          0:  ALL CHANGES PERFORMED SUCCESSFULLY               *
+*          4:  ONE OR MORE VERIFICATIONS FAILED, NO ALTERATIONS *
+*          8:  ERRO IN READING OR WRITING DSCB OR NO KEY MATCH  *
+*         12:  INPUT PARAMETER ERROR                            *
+*                                                               *
+*****************************************************************
+         EJECT
+INPARMS  DSECT ,                   INPUT PARAMETERS
+UCBPTR   DS    A
+KEYPTR   DS    0A
+KEYTYPE  DS    X
+TYPCCHHR EQU   B'10000000'
+         DS    AL3
+FIELDOFS DS    H
+FIELDLEN DS    H
+OLDDTPTR DS    A
+NEWDTPTR DS    A
+         SPACE 3
+DSA      DSECT ,                   DYNAMICALLY ACQUIRED STORAGE
+         DS    18F                 SAVE AREA
+WKADEB   DS    F                   × THESE FIELDS ARE COPIED
+DCB      DS    11F                 × FROM DEFINITIONS IN IGG03002
+DEBPTR   DS    F                   ×
+ECB      DS    F                   ×
+IOB      DS    8F                  ×
+SEEK     DS    D                   V
+VTOCDSCB DS    0XL96
+         PRINT NOGEN
+         IECSDSL1 (4)
+ENQAREA  DS    4F
+MJNAME   DS    CL8
+MINNAME  DS    CL6
+CCW1     DS    D                   × FROM IGG03001
+CCW2     DS    D                   ×
+CCW3     DS    D                   ×
+CCW4     DS    D                   ×
+CCW5     DS    D                   ×
+CCW6     DS    D                   ×
+CCW7     DS    D                   ×
+CCW8     DS    D                   ×
+CCW9     DS    D                   ×
+CCW10    DS    D                   ×
+CCW11    DS    D                   ×
+CCW12    DS    D                   ×
+F1DSCB   DS    0XL140              ×
+         IECSDSL1 (1)              ×
+         PRINT GEN                 V
+LOCSAVE  DS    5F                  LOCAL SAVE AREA FOR REGS 9-13
+NEWCCHHR DS    XL5
+         DS    0F
+STAELIST DS    XL12                ESTAE LIST AREA
+STAEPARM DS    A                   ESTAE PARM AREA
+DSALEN   EQU   *-DSA
+         EJECT
+         PRINT NOGEN
+         IEFUCBOB
+         CVT   DSECT=YES
+         IHASDWA
+         PRINT GEN
+         EJECT
+VTCUPDT  CSECT
+         YREGS
+AVTDISP  EQU   29                  × THESE FIELDS ARE COPIED FROM
+DEBSIZE  EQU   48                  × IGG03002
+UNRELATD EQU   X'02'               ×
+UCBADDR  EQU   32                  ×
+DEVMOD   EQU   X'C0'               V
+         SAVE (14,12),,*
+         LR    R12,R15             ESTABLISH BASE
+         LR    R11,R1              SAVE PARAMETER PTR
+         L     R10,CVTPTR          --> CVT
+         USING VTCUPDT,R12
+         USING INPARMS,R11
+         USING CVT,R10
+         GETMAIN RU,SP=229,LV=DSALEN   ACQUIRE WORKING STORAGE
+         ST    13,4(,R1)           CHAIN BACK
+         LR    R13,R1              ADDRESS WORKING STORAGE
+         USING DSA,R13
+         SPACE 3
+*        VALIDATE PARAMETER LIST
+         SPACE 1
+         L     R9,UCBPTR           --> UCB
+         USING UCBCMSEG,R9
+         CLI   UCBID,X'FF'         TEST FOR APPARENT UCB
+         BNE   PARMERR
+         TM    UCBDVCLS,UCB3DACC   TEST FOR DIRECT ACCESS
+         BNO   PARMERR
+         TM    UCBSTAT,UCBONLI     TEST FOR ONLINE
+         BNO   PARMERR
+         TM    UCBSTAT,UCBUNLD     TEST FOR PENDING UNLOAD
+         BO    PARMERR
+         TM    UCBDMCT,UCBMOUNT    TEST FOR UNVERIFIED MOUNT
+         BO    PARMERR
+         TM    UCBFLA,UCBNRY       TEST FOR UNREADY STATE
+         BO    PARMERR
+         TM    UCBVOLI,X'C0'       TEST FOR SEEMINGLY EBCDIC,
+*                                  NONBLANK, VOLSER
+         BNO   PARMERR
+         LA    R3,140              COUNTER LIMITS LOOPING
+         LR    R4,R11              SAVE PARMLIST PTR
+TESTONE  LH    R5,FIELDOFS         GET FIELD OFFSET
+         CH    R5,=H'-1'           TEST
+         BE    TESTDONE            TERMINATOR
+         BL    PARMERR
+         LH    R6,FIELDLEN         GET LENGTH
+         LTR   R6,R6               TEST
+         BNP   PARMERR
+         AR    R6,R5
+         CH    R6,=H'140'          TEST AGAINST MAX
+         BH    PARMERR
+         LA    R11,12(,R11)        --> NEXT ELEMENT
+         BCT   R3,TESTONE
+         B     PARMERR             COUNTER EXHAUSTED: NO TERMINATOR
+TESTDONE CH    R3,=H'140'          COUNTER EVER DECREMENTED?
+         BE    PARMERR             NO, ERROR
+         LR    R11,R4              RESTORE POINTER
+         SPACE 3
+*        BUILD DEB, DCB, AND IOB FOR READING VTOC.  NOTE:
+*        THIS CODE IS COPIED FROM IGG03002, THE RENAME SECOND LOAD
+         SPACE 1
+         XC    WKADEB(DEBSIZE),WKADEB
+         MVC   WKADEB+AVTDISP(3),CVTXAPG+1
+         LA    R1,WKADEB
+         MVI   16(R1),X'01'
+         LA    R3,DCB
+         ST    R3,24(,R1)
+         MVI   24(R1),X'0F'
+         MVI   28(R1),X'04'
+         MVC   42(6,R1),EXTCONST
+         ST    R1,DEBPTR
+         OI    IOB,UNRELATD
+         LA    R14,ECB
+         ST    R14,IOB+4
+         LA    R14,CCW1
+         LA    R15,DCB
+         STM   R14,R15,IOB+16
+         ST    R9,WKADEB+UCBADDR   STORE UCB ADDRESS
+         MVI   WKADEB+UCBADDR,DEVMOD
+         SPACE 3
+*        SELECT AND BUILD APPROPRIATE CHANNEL PROGRAM
+         SPACE 1
+         TM    KEYTYPE,TYPCCHHR     IS IT CCHHR REQUEST?
+         BO    CCHHRWAY            YES, TAKE PATH
+         SPACE 1
+*        KEY-TYPE REQUEST.  FOLLOWING CODE IS COPIED FROM IGG03001
+         SPACE 1
+         L     R15,CVTPCNVT
+         L     R0,SRTEFSCT
+         LA    R1,WKADEB
+         LA    R2,SEEK
+         LR    R3,R13
+         STM   R9,R13,LOCSAVE      SAVE VOLATILE REGS LOCALLY
+         BALR  R14,R15             CALL TTR CONVERT ROUTINE
+         LM    R9,R13,LOCSAVE-DSA(R3) RESTORE REGS
+         LM    R0,R7,CHANPROG
+         AR    R0,R13
+         AR    R2,R13
+         AR    R4,R13
+         AR    R6,R13
+         STM   R0,R7,CCW1
+         LA    R15,CCW9-CCW1
+         AR    R2,R15
+         STM   R2,R3,CCW5
+         LA    R15,CCW11-CCW9
+         AR    R2,R15
+         STM   R2,R3,CCW8
+         LM    R0,R7,CHANPROG+32
+         L     R15,KEYPTR
+         LA    R15,0(,R15)         R15-->KEY
+         MVC   DS1DSNAM,0(R15)     MOVE KEY FOR LATER
+         AR    R0,R15
+         AR    R2,R13
+         AR    R4,R13
+         AR    R6,R13
+         STM   R0,R7,CCW9
+         STM   R0,R1,CCW6
+         STM   R4,R5,CCW7
+         MVI   CCW7+4,X'30'        SET SLI AND SKIP BITS
+         B     ENQ                 PROCEED
+         SPACE 1
+*        CCHHR CASE--USE DIFFERENT CHANNEL PROGRAM
+         SPACE 1
+CCHHRWAY LM    R0,R4,CHANPROG
+         AR    R0,R13
+         AR    R2,R13
+         STM   R0,R4,CCW1
+         LA    R15,F1DSCB
+         ST    R15,CCW3
+         MVI   CCW3,X'0E'          READ KEY AND DATA
+         LA    R15,140             GET LENGTH AND NULL FLAGS
+         ST    R15,CCW3+4
+         L     R15,KEYPTR          --> 'KEY'
+         MVC   SEEK+3(5),0(R15)    MOVE TO SEEK ADDRESS
+         SPACE 3
+*        ENQ ON THE VTOC
+         SPACE 1
+ENQ      XC    STAELIST,STAELIST   CLEAR ESTAE LIST
+         ESTAE ESTAE,PARAM=STAEPARM,MF=(E,STAELIST) ESTABL. PROT.
+         MVC   MJNAME(8),=CL8'SYSVTOC' SET QNAME
+         MVC   MINNAME(6),UCBVOLI  SET RNAME
+         MVI   ENQAREA,X'FF'       INITIALIZE FOR RESERVE
+         XC    ENQAREA+2(2),ENQAREA+2
+         LA    R15,ENQAREA         --> ENQ AREA
+         ST    R15,STAEPARM        SAVE ADDRESS FOR ESTAE
+         RESERVE (MJNAME,MINNAME,E,6,SYSTEMS),                         *
+               MF=(E,ENQAREA),UCB=WKADEB+32  ENQ ON THE VTOC
+         SPACE 3
+*        READ THE DSCB
+         SPACE 1
+         MVI   DS1FMTID,X'00'      ZERO THE FMT ID
+         BAL   R14,EXCP            EXECUTE CHANNEL PROGRAM
+         L     R2,IOB+8           GET CCW ADDR
+         LA    R2,0(,R2)           CLEAR
+         LA    R3,CCW8             --> CCW8
+         CLR   R2,R3               CHANNEL PROG. ENDED AT CCW8?
+         BE    NODSCB              YES, NO DSCB
+         CLI   DS1FMTID,0          HAVE SOMETHING?
+         BE    NODSCB              NO, SOME SORT OF ERROR
+         SPACE 3
+*        CHECK THE DSCB TO SEE IF IT PASSES VERIFICATION
+         SPACE 1
+         LR    R4,R11              SAVE PARMLIST ADDRESS
+VERONE   LH    R2,FIELDOFS         GET AN OFFSET
+         LTR   R2,R2               TEST IT
+         BM    VERDONE             NEGATIVE, ALL VERIFIED
+         L     R5,OLDDTPTR         --> OLD DATA
+         LTR   R5,R5               TEST
+         BZ    THSVERDN
+         LA    R2,F1DSCB(R2)       --> VERIFICATION LOCATION
+         LH    R3,FIELDLEN         GET A LENGTH
+         BCTR  R3,0                FOR EXECUTE
+         CLC   0(0,R2),0(R5)       (EXECUTED)
+         EX    R3,*-6              VERIFY FIELD
+         BNE   VERREJCT
+THSVERDN LA    R11,12(,R11)        NEXT
+         B     VERONE
+VERDONE  LR    R11,R4              RESTORE PARM PTR
+         SPACE 3
+*        UPDATE THE DSCB
+         SPACE 1
+         LR    R4,R11              SAVE PARMLIST ADDRESS
+UPDATONE LH    R2,FIELDOFS         GET AN OFFSET
+         LTR   R2,R2               TEST IT
+         BM    UPDADONE            NEGATIVE, ALL DONE
+         L     R5,NEWDTPTR         --> NEW DATA
+         LA    R2,F1DSCB(R2)       -->  LOCATION
+         LH    R3,FIELDLEN         GET A LENGTH
+         BCTR  R3,0                FOR EXECUTE
+         MVC   0(0,R2),0(R5)       (EXECUTED)
+         EX    R3,*-6              UPDATE FIELD
+         LA    R11,12(,R11)        NEXT
+         B     UPDATONE
+UPDADONE LR    R11,R4              RESTORE PARM PTR
+         SPACE 3
+*        REWRITE DSCB.  SOME CODE IS COPIED FROM IGG03001
+         SPACE 1
+         TM    KEYTYPE,TYPCCHHR    IS IT CCHHR TYPE?
+         BO    WRITE               YES, NEED NOT CONSTRUCT CCHHR
+         SLR   R15,R15             CLEAR REG
+         IC    R15,NEWCCHHR+4      GET R OF NEXT RECORD
+         BCT   R15,NOTLAST         DECREMENT TO CURRENT RECORD
+         IC    R15,DS4DEVDT        BUT HANDLE END OF TRACK CASE
+NOTLAST  STC   R15,NEWCCHHR+4      UPDATE CCHHR
+         MVC   SEEK+3(5),NEWCCHHR
+WRITE    LA    R15,F1DSCB          -->KEY-DATA
+         LA    R0,140
+         ICM   R15,B'1000',=X'0D'   WRITE KEY AND DATA
+         ICM   R0,B'1000',=B'01000000' COMMAND CHAIN
+         STM   R15,R0,CCW3
+         MVC   CCW4(8),CCW1
+         LA    R15,CCW4
+         SR    R0,R0
+         ICM   R15,B'1000',=X'08'   TIC
+         STM   R15,R0,CCW5
+         MVC   CCW6(8),CHALPROG
+         LA    R15,CCW1
+         ST    R15,IOB+16
+         BAL   R14,EXCP
+         ESTAE 0
+         LA    R1,ENQAREA
+         SVC   48                  RELEASE VTOC
+         SLR   R15,R15             CLEAR RETURN CODE
+         B     EXIT
+         SPACE 3
+*        VARIOUS ERROR CONDITIONS
+         SPACE 1
+PARMERR  LA    R15,12
+         B     EXIT
+NODSCB   ESTAE 0
+         LA    R1,ENQAREA
+         SVC   48
+         LA    R15,8
+         B     EXIT
+VERREJCT ESTAE 0
+         LA    R1,ENQAREA
+         SVC   48
+         LA    R15,4
+         SPACE 3
+*        RETURN TO CALLER
+         SPACE 1
+EXIT     LR    R2,R13
+         LR    R14,R15             SAVE RETURN CODE
+         L     R13,4(,R2)          GET FORMER SAVE AREA
+         FREEMAIN RU,SP=229,A=(2),LV=DSALEN
+         LM    R0,R12,20(R13)      RESTORE R0-R12
+         LR    R15,R14             SET RETURN CODE
+         L     R14,12(,R13)        RESTORE R14
+         BR    R14                 RETURN TO CALLER
+         SPACE 3
+*        ISSUE EXCP
+         SPACE 1
+EXCP     EXCP  IOB
+         WAIT  1,ECB=ECB
+         TM    ECB,X'20'
+         BZ    NODSCB
+         MVI   ECB,0
+         BR    R14
+         SPACE 3
+*        ESTAE ROUTINE
+         SPACE 1
+ESTAE    DS    0H
+         DROP  ,
+         USING ESTAE,R15
+         CH    R0,=H'12'           HAVE SDWA?
+         BNE   HAVESDWA            YES, USE SDWA ASSUMPTIONS
+         L     R1,0(,R2)           NO, GET ENQAREA ADDRESS
+         SVC   48                  DEQ VTOC
+         SLR   R15,R15             INDICATE PERCOLATION
+         BR    R14
+HAVESDWA SAVE  (14,1)              SAVE SOME REGS
+         L     R1,SDWAPARM-SDWA(,R1) --> PARM LIST
+         L     R1,0(,R1)           --> ENQAREA
+         SVC   48                  DEQ VTOC
+         L     R1,24(,R13)         RESTORE SDWA ADDRESS
+         SETRP REGS=(14,1),RC=0    RETURN WITH PERCOLATION
+         EJECT
+*        CONSTANTS
+         SPACE 1
+EXTCONST DC    X'FFFFFFFF7FFF'
+CHANPROG DS    0F                  × THESE DEFINITIONS ARE ADAPTED
+*CCW1                              × FROM IGG03001
+         DC    X'31'               ×
+         DC    AL3(3+SEEK-DSA)     ×
+         DC    X'4000'             ×
+         DC    H'5'                ×
+*CCW2                              ×
+         DC    X'08'               ×
+         DC    AL3(0+CCW1-DSA)     ×
+         DC    F'0'                ×
+*CCW3                              ×
+         DC    X'06'               ×
+         DC    AL3(VTOCDSCB-DSA)   ×
+         DC    X'4000'             ×
+         DC    H'96'               ×
+*CCW4                              ×
+         DC    X'B1'               ×
+         DC    AL3(0+DS4HPCHR-DSA) ×
+         DC    X'4000'             ×
+         DC    H'5'                ×
+*CCW9  (CCWS 5-8 ARE BUILT DYNAMICALLY)
+         DC    X'29'               ×
+         DC    AL3(0)              ×
+         DC    X'6000'             ×
+         DC    H'44'               ×
+*CCW10                             ×
+         DC    X'08'               ×
+         DC    AL3(0+CCW4-DSA)     ×
+         DC    F'0'                ×
+*CCW11                             ×
+         DC    X'06'               ×
+         DC    AL3(DS1FMTID-DSA)   ×
+         DC    X'4000'             ×
+         DC    H'96'               ×
+*CCW12                             ×
+         DC    X'12'               ×
+         DC    AL3(0+NEWCCHHR-DSA) ×
+         DC    X'2000'             ×
+         DC    H'5'                ×
+CHALPROG DC    X'0E'               ×
+         DC    AL3(0)              ×
+         DC    X'1000'             ×
+         DC    H'140'              V
+         LTORG
+         END

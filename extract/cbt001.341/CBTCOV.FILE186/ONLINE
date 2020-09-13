@@ -1,0 +1,898 @@
+00032850*PROCESS ESD,INCLUDE,GN,NMI,OPT(2),MAP,SMSG;
+00032860 /*********** ONLINE COMMAND ************/
+00032870/**********************************************************************
+00032880* //ONLINE JOB (YCC203,2M,20000L),SYSTEM,NOTIFY=STEVE                 *
+00032890* // EXEC PLIXCL,REGION.PLI=512K                                      *
+00032900* //PLI.SYSIN DD DSN=SYSTEM.SOURCLIB.PLI(ONLINE),DISP=SHR             *
+00032910* //LKED.SYSLMOD DD DSN=SYSTEM.TEMP.LOAD(ONLINE),DISP=(,CATLG),       *
+00032920* //   UNIT=DISK,SPACE=(TRK,(5,5,1),RLSE)                             *
+00032930*  ENTRY PLICALLA                                                     *
+00032940*      ALL EXTERNAL ENTRIES (E. G.                                    *
+00032950*            GETUSER                                                  *
+00032960*            TELL                                                     *
+00032970*            VTCREAD (VTOC READING ROUTINE EXCERPTED FROM "SPACE")    *
+00032980*            FOLD (CALL TO FOLD ADDED 3/28/78, REPLACES UPCASE)       *
+00032990*     ARE IN YCC1.PL1LIB                                              *
+00033000*  EXCEPT FOR DECDATE WHICH IS IN ACCOUNT.OBJLIB.LOAD
+00033010* MODIFIED 01MAR78 TO INCLUDE DATA01 IN AUTO.VOL.SEARCH LIST       SR *
+00033020* MODIFIED 27AUG79 TO HANDLE VSAM AND DYNAMICALLY DETERMINE DEFAULT 
+00033030* VOLUME LIST          SBB
+00033040* MODIFIED 03JUL80 TO INCLUDE RACF INFO AS PART OF HISTORY SUBCOMMAND *
+00033050*                      AMK                                            *
+00033060**********************************************************************/
+00033070ONLINE:  PROC /*GENERALIZED ONLINE DATASET INFORMATION RETRIEVAL*/
+00033080         (IDUM)OPTIONS(MAIN)REORDER;
+00033090            DCL PLIXOPT EXTERNAL CHAR(20) VAR INIT('NOSTAE NOSPIE');
+00033100         DCL I,J,I1,I2,IDUM,
+00033110         (P,Q,DSCBPTR,X)PTR,
+00033120                   (TRANSLATE,UNSPEC,MOD,MIN,PLIRETV,REPEAT)BUILTIN,
+00033130         (PARSBUF,SUBLIST) CHAR(100)VAR, FOLD  ENTRY(*) EXT,
+00033140              1 ARGUMENT BASED(P),
+00033150                   2 (LEN,OFFSET)FIXED BIN,
+00033160                   2 CHARS CHAR(100),
+00033170              COMMAND CHAR(100)BASED(Q),
+00033180              (INDEX,SUBSTR,ADDR,LENGTH)BUILTIN;
+00033190         P=ADDR(IDUM);
+00033200         /*ARGUMENT IS A GENERALIZED STRUCTURE SUITABLE FOR BOTH NON CP
+00033210           AND COMMAND PROCESSOR ARGUMENT FORMS.  PLICALLA MUST BE THE ENTRY POINT
+00033220            TO ACHIEVE THIS GENERALITY*/
+00033230         DCL CP BIT(1);
+00033240         IF(OFFSET<=0|OFFSET>ARGUMENT.LEN)THEN DO;  /*NON CP CASE*/
+00033250              CP='0'B;
+00033260              Q=ADDR(OFFSET); /*OFFSET NOT REAL...PART OF STRING*/
+00033270              PARSBUF=SUBSTR(COMMAND,1,ARGUMENT.LEN);
+00033280              END;
+00033290              ELSE DO;  /*COMMAND PROCESSOR CASE*/
+00033300                   CP='1'B;
+00033310                   Q=ADDR(CHARS);
+00033320                   PARSBUF=SUBSTR(COMMAND,OFFSET+1,ARGUMENT.LEN-OFFSET);
+00033330                   END;
+00033340         /*PARSBUF SHOULD NOW CONTAIN THE COMMAND STRING, IN EITHER ENVIRONMENT*/
+00033350         CALL FOLD(PARSBUF);             /* FOLD TO UPPER CASE */
+00033360     /*PARSING SEQUENCE EMPLOYS THE PROCS PARS, REALDSN AND SUBPARM*/
+00033370 %SKIP;
+00033380 /*************** VOLIST IS INITIALIZED TO ALL
+00033390                  ONLINE VOLUMES UNLESS USER
+00033400                  SUPPLIES VOLS              ***********/
+00033410         DCL (NVOL INIT(0),IINF INIT(0),FINGER1,FINGER2)FIXED BIN,
+00033420           VOL(25)CHAR(6) ,
+00033430              (DATASET,LEVEL,DSLIST,LEVARG,VOLIST,SPACE,ATTRIB,CHARGED,CHPARM,
+00033440              UVOL,PROJECT,HISTORY,VTOC,CATALOG)BIT(1)INIT('0'B),
+00033450              TEMPBITS BIT(64),PSEARCH BIT(48),
+00033460              USERID CHAR(8),USERDOT CHAR(44)VAR;
+00033470         DCL GETUSER ENTRY(CHAR(8)),GOTUSER BIT(1)INIT('0'B);
+00033480              DCL 1 DSCB BASED(DSCBPTR),
+00033490                     2 DSCBODY,
+00033500 %INCLUDE DSCB1;
+00033510                     2 DS1FILL CHAR(44); /* FILLER FOR OBTAIN */
+00033520         DCL 1 INFO(300),
+00033530              2 VOLUM CHAR(6),
+00033540              2 TYPE CHAR(1),
+00033550              2 DSCBDATA LIKE DSCB.DSCBODY;
+00033560          DCL SVC ENTRY(FIXED BIN,*) OPTIONS(ASM INTER RETCODE);
+00033570REALDSN: PROC(RAWDSN)RETURNS (CHAR(44)VAR);/*TAKES CARE OF TSO NAMING CONVENTIONS */
+00033580         DCL RAWDSN CHAR(44)VAR,I;
+00033590         I=INDEX(RAWDSN,'''');
+00033600         IF (I=0)THEN DO;
+00033610              IF GOTUSER THEN RETURN(USERDOT||RAWDSN);
+00033620              ELSE DO;
+00033630                  CALL GETUSER(USERID);
+00033640                  I=INDEX(USERID,' ');
+00033650                  IF (I=0)THEN I=8;
+00033660                       ELSE I=I-1;
+00033670                  USERDOT=SUBSTR(USERID,1,I)||'.';
+00033680                   GOTUSER='1'B;
+00033690                   RETURN(USERDOT||RAWDSN);
+00033700                   END;
+00033710              END;
+00033720         ELSE IF(I=1)THEN DO;
+00033730              RAWDSN=SUBSTR(RAWDSN,2,LENGTH(RAWDSN)-2);
+00033740              IF(0=LENGTH(RAWDSN)|0^=INDEX(RAWDSN,''''))THEN GO TO PARSFAIL;
+00033750              ELSE RETURN(RAWDSN);
+00033760              END;
+00033770         ELSE GO TO PARSFAIL;
+00033780         END REALDSN;
+00033790PARS:    PROC(INSTR)RETURNS (FIXED BIN);/*STRIPS LEADING DELIMS FINDS END OF 1ST TOKEN*/
+00033800         DCL J, INSTR CHAR(100)VAR,K CHAR(1);
+00033810         J=1;
+00033820         DO WHILE (J<=LENGTH(INSTR));
+00033830              K=SUBSTR(INSTR,J,1);
+00033840              IF(K='(')THEN DO;
+00033850                   IF(J>1)THEN RETURN(J-1);/*OPEN PAREN MARKS END OF TOKEN*/
+00033860                   ELSE J=INDEX(INSTR,')');/*TOKEN IS A SUPARM FIELD*/
+00033870                   IF(J=0)THEN GO TO PARSFAIL;
+00033880                   ELSE RETURN(J);
+00033890                   END;
+00033900              ELSE IF(K^=' '&K^=',')THEN J=J+1;/*NOT DELIM, CREEP ALONG*/
+00033910              ELSE IF(J=1)THEN INSTR=SUBSTR(INSTR,2,LENGTH(INSTR)-1);
+00033920                        /*STRIP LEADING DELIM*/
+00033930              ELSE RETURN(J-1);/*DELIM MARKS END OF TOKEN*/
+00033940              END;
+00033950         RETURN(LENGTH(INSTR));/*DELIM NOT FOUND*/
+00033960         END PARS;
+00033970SUBPARM: PROC;/*TESTS SUBPARM FIELD VALIDITY AND TAKES OFF PARENS*/
+00033980         SUBLIST=SUBSTR(PARSBUF,1,FINGER1);
+00033990         IF(1^=INDEX(SUBLIST,'(')|LENGTH(SUBLIST)^=INDEX(SUBLIST,')'))
+00034000              THEN GO TO PARSFAIL;
+00034010         SUBLIST=SUBSTR(SUBLIST,2,LENGTH(SUBLIST)-2);
+00034020         RETURN;
+00034030         END SUBPARM;
+00034040         DO WHILE (0<LENGTH(PARSBUF));/*MAIN PARSE LOOP*/
+00034050              FINGER1=PARS(PARSBUF);
+00034060              IF (FINGER1=0)THEN LEAVE;
+00034070              IF(LEVARG)THEN DO;/*LAST TOKEN WAS LEVEL, GET ARG*/
+00034080                   DCL 1 LEVSTR,
+00034090                        2 LEN BIT(8),
+00034100                        2 LEVNAME CHAR(44),
+00034110                   ISTQ BIT(1)INIT('0'B),
+00034120                   TQ CHAR(44)VAR;
+00034130                   CALL SUBPARM;
+00034140                   IF(44<LENGTH(SUBLIST)|0=LENGTH(SUBLIST))THEN GO TO PARSFAIL;
+00034150                   I=INDEX(SUBLIST,'*');
+00034160                   IF(I=0)THEN DO;
+00034170                        I=INDEX(SUBLIST,' ');
+00034180                        IF(I=0)THEN I=LENGTH(SUBLIST);
+00034190                        ELSE I=I-1;
+00034200                        LEVNAME=SUBSTR(SUBLIST,1,I)||'.';
+00034210                        LEVSTR.LEN=SUBSTR(UNSPEC(I+1),25,8);
+00034220                        END;
+00034230                   ELSE DO;
+00034240                        LEVNAME=SUBSTR(SUBLIST,1,I-1);
+00034250                        LEVSTR.LEN=SUBSTR(UNSPEC(I-1),25,8);
+00034260                        SUBLIST=SUBSTR(SUBLIST,I+1,LENGTH(SUBLIST)-I);
+00034270                        I=INDEX(SUBLIST,' ');
+00034280                        IF(I=0)THEN I=LENGTH(SUBLIST);
+00034290                        ELSE I=I-1;
+00034300                        TQ=SUBSTR(SUBLIST,1,I);
+00034310                        ISTQ='1'B;
+00034320                        END;
+00034330                   LEVARG='0'B;
+00034340                   END;
+00034350              ELSE IF(VOLIST)THEN DO;/*LAST TOKEN WAS VOLUMES, BUILD LIST*/
+00034360                   CALL SUBPARM;
+00034370                   NVOL=0;
+00034380                   DO WHILE (0<LENGTH(SUBLIST));
+00034390                        FINGER2=PARS(SUBLIST);
+00034400                        IF(FINGER2=0)THEN LEAVE;
+00034410                        IF(6<FINGER2)THEN GO TO PARSFAIL;
+00034420                        NVOL=NVOL+1;
+00034430                        VOL(NVOL)=SUBSTR(SUBLIST,1,FINGER2);
+00034440                        SUBLIST=SUBSTR(SUBLIST,FINGER2+1,LENGTH(SUBLIST)-FINGER2);
+00034450                        END;
+00034460                   VOLIST='0'B;
+00034470                   END;
+00034480              ELSE IF(DSLIST)THEN DO;/*LAST TOKEN WAS DATASET, GET LIST*/
+00034490                   CALL SUBPARM;
+00034500                   DO WHILE (0<LENGTH(SUBLIST));
+00034510                        FINGER2=PARS(SUBLIST);
+00034520                        IF(FINGER2=0)THEN LEAVE;
+00034530                        IINF=IINF+1;
+00034540                        INFO.DS1DSNAM(IINF)=REALDSN(SUBSTR(SUBLIST,1,FINGER2));
+00034550                        SUBLIST=SUBSTR(SUBLIST,FINGER2+1,LENGTH(SUBLIST)-FINGER2);
+00034560                        INFO.DS1FMTID(IINF)='*';
+00034570                        INFO.TYPE(IINF)='A'; /*DEFAULT TO NON-VSAM*/
+00034580                        END;
+00034590                   DSLIST='0'B;
+00034600                   END;
+00034610              ELSE IF(CHPARM)THEN DO;
+00034620                   CALL SUBPARM;
+00034630                   IF(8<LENGTH(SUBLIST)|0=LENGTH(SUBLIST))THEN GO TO PARSFAIL;
+00034640                   TEMPBITS=UNSPEC(SUBSTR(SUBLIST,1,LENGTH(SUBLIST)));
+00034650                   PSEARCH=SUBSTR(TEMPBITS,3,6)||SUBSTR(TEMPBITS,11,6)||
+00034660                   SUBSTR(TEMPBITS,19,6)||SUBSTR(TEMPBITS,27,6)||SUBSTR(TEMPBITS,35,6)||
+00034670                   SUBSTR(TEMPBITS,43,6)||SUBSTR(TEMPBITS,51,6)||SUBSTR(TEMPBITS,59,6);
+00034680                   DCL SAVEPROJ CHAR(8) INIT(' ');
+00034690                   SAVEPROJ=SUBLIST;   /* GSAM VSINF HAS UNCRUNCHED PROJ */
+00034700                   CHPARM='0'B;
+00034710                   END;
+00034720              ELSE SELECT(SUBSTR(PARSBUF,1,2));/*KEYWORD PARAMETER*/
+00034730                   WHEN('DA') DATASET,DSLIST='1'B;
+00034740                   WHEN('VO') VOLIST,UVOL='1'B;
+00034750                   WHEN('LE') LEVEL,LEVARG='1'B;
+00034760                   WHEN('SP') SPACE='1'B;
+00034770                   WHEN('AT') ATTRIB='1'B;
+00034780                   WHEN('PR') PROJECT='1'B;
+00034790                   WHEN('HI') HISTORY='1'B;
+00034800                   WHEN('VT') VTOC='1'B;
+00034810                   WHEN('CA');
+00034820                   WHEN('BO') VTOC,CATALOG='1'B;
+00034830                   WHEN('CH') CHARGED,CHPARM='1'B;
+00034840                   OTHERWISE GO TO PARSFAIL;
+00034850                   END;
+00034860              PARSBUF=SUBSTR(PARSBUF,FINGER1+1,LENGTH(PARSBUF)-FINGER1);
+00034870              END;
+00034880         /*ESTABLISH DEFAULTS NOT ALREADY SET*/
+00034890         IF(^LEVEL&^DATASET&^CHARGED)THEN DO;/*DEFAULT IS LEVEL(USERID)*/
+00034900              CALL GETUSER(USERID);
+00034910              FINGER1=INDEX(USERID,' ');
+00034920              IF(FINGER1=0)THEN FINGER1=8;
+00034930              ELSE FINGER1=FINGER1-1;
+00034940              LEVNAME=SUBSTR(USERID,1,FINGER1)||'.';
+00034950              LEVSTR.LEN=SUBSTR(UNSPEC(FINGER1+1),25,8);
+00034960              LEVEL='1'B;
+00034970              END;
+00034980         IF(^VTOC&^CATALOG)THEN CATALOG='1'B;
+00034990         IF(CHARGED)THEN DO;
+00035000              VTOC='1'B;
+00035010              CATALOG='1'B;
+00035020              END;
+00035030 %SKIP;
+00035040 /******** FIRST GET DEVTABLE INFO AND INITIALIZE VOLIST IF
+00035050           NOT SPECIFIED BY USER                ************/
+00035060 %SKIP;
+00035070 DCL GETDASD ENTRY(*), DASDLIMIT FIXED BIN INIT(25);
+00035080 DCL 1 DASDLIST UNAL,
+00035090       2 ONVOL FIXED BIN INIT(DASDLIMIT),
+00035100       2 DASDENT(DASDLIMIT),
+00035110         3 OVOL CHAR(6),
+00035120         3 VTOC_CCHH,
+00035130           4 (CC, HH) FIXED BIN,
+00035140         3 OTPC FIXED BIN,
+00035150         3 USE_ATTR  CHAR(4),
+00035160         3 MOUNT_STATUS  CHAR(4),
+00035170         3 UCBNAME CHAR(3); /* UNIT NAME FOR DYN ALLOC */
+00035180%SKIP(1);
+00035190DCL  VOLSTR CHAR(130) VAR INIT('STATISTICS FOR VOLUMES: ');
+00035200DCL  WARNING CHAR(130) VAR 
+00035210       INIT('WARNING: VTOC/CHARGED OPTION MAY BE EXPENSIVE WHEN VOLUMES NOT SPECIFIED');
+00035220 %SKIP(2);
+00035230   CALL GETDASD(DASDLIST);
+00035240   IF ONVOL<0 THEN GO TO DASDFAIL;
+00035250 %SKIP;
+00035260   IF ^ (UVOL) THEN DO;
+00035270         NVOL=0;
+00035280      DO I=1 TO ONVOL;
+00035290         IF MOUNT_STATUS(I) = 'PRM ' THEN DO;
+00035300             NVOL=NVOL+1;
+00035310           VOL(NVOL)=OVOL(I);
+00035320             END;
+00035330         END;
+00035340      END;
+00035350%SKIP(1);
+00035360    IF (VTOC&^UVOL) THEN 
+00035370      IF (CP) THEN CALL TELL(WARNING);
+00035380      ELSE PUT FILE(LISTING)SKIP LIST(WARNING);
+00035390    DO I=1 TO NVOL;
+00035400       VOLSTR=VOLSTR||VOL(I)||' ';
+00035410       END;
+00035420    IF (CP) THEN CALL TELL(VOLSTR);
+00035430    ELSE PUT FILE(LISTING) SKIP LIST(VOLSTR);
+00035440 %SKIP(2);
+00035450         /*ACCUMULATE BASIC INFO IN THE INFO STRUCTURE*/
+00035460               DCL 1 REGS, /*ARGUMENTS FOR SVC ROUTINE*/
+00035470                   2 R0 CHAR(4),
+00035480                   2 R1 PTR,
+00035490                   2 R15 CHAR(4),
+00035500               1 LOCPARMS, /*ARGUMENTS FOR SVC26, ORDINARY LOCATE BY NAME*/
+00035510                   2 FLAGS BIT(32)INIT((32)'0'B),
+00035520                   2 DSNTTR PTR,
+00035530                   2 CVOLPTR PTR INIT(ADDR(CVOL)),
+00035540                   2 WK PTR INIT((ADDR(CATBLOCK)));
+00035550         DCL CATBLOCK(34)FLOAT(14),
+00035560              1 CATENTRY BASED(WK), /*MAPS CRITICAL PART OF CATALOG BLOCK*/
+00035570                   2 PAD CHAR(6),
+00035580                   2 VOLSER CHAR(6),
+00035590              CVOL CHAR(6)INIT('USER01'),
+00035600              (LOW,HIGH)BUILTIN;
+00035610 %PAGE;
+00035620 /***********************************************************
+00035630 *
+00035640 *   NOW INPUT IS PARSED
+00035650 *
+00035660 *      FIRST - HANDLE GENERIC LOCATE
+00035670 *              LOCTE BY NAME
+00035680 *              AND GSAM SCAN IF CATALOG/BOTH OR CHARGED
+00035690 *
+00035700 *      CHARGED IS NOW HANDLED AS SPECIAL CASE OF BOTH
+00035710 *
+00035720 *************************************************************/
+00035730 %SKIP;
+00035740         IF(CATALOG)THEN DO; /*THIS PHASE TAKES CARE OF ALL CATALOGUE BASED PROCESSING*/
+00035750              IF(LEVEL)THEN DO; /*THE CATALOGUE-LEVEL COMBINATION MEANS GENERIC LOCATE*/
+00035760              DCL 1 GENLOCPARMS,
+00035770                   2 FLAGS BIT(32)INIT('00000101000000000001000100000000'B),
+00035780                   2 LEVADDR PTR INIT(ADDR(LEVSTR)),
+00035790                   2 NULLADDR BIT(32)INIT((32)'0'B),
+00035800                   2 WKADDR PTR,
+00035810                   2 NULLFLDS(3) FIXED BIN(31)INIT(0);
+00035820              DCL 1 WKAREA BASED(WKADDR), /*WORK AREA REQUIRED BY GENERIC LOCATE*/
+00035830                   2 LEN FIXED BIN INIT(13504), /*TOTAL LENGTH*/
+00035840                   2 OFFS FIXED BIN INIT(4), /*INITIAL OFFSET*/
+00035850                   2 NAMES(300),
+00035860                        3 TYPE CHAR(1),
+00035870                        3 DSNAME CHAR(44);
+00035880              ALLOCATE WKAREA;
+00035890              R1=ADDR(GENLOCPARMS);
+00035900              CALL SVC(26,REGS); /*ISSUE GENERIC LOCATE SVC*/
+00035910              IF(PLIRETV^=0)THEN GO TO CATERROR;
+00035920              I=(OFFS-4)/45; /*I SHOULD NOW CONTAIN THE NUMBER OF ENTRIES*/
+00035930              IF ISTQ THEN DO J=1 TO I; /*ISTQ MEANS  EMBEDDED ASTERISK CASE*/
+00035940                   IF(TQ=SUBSTR(DSNAME(J),INDEX(DSNAME(J),' ')-LENGTH(TQ),LENGTH(TQ)))
+00035950                   THEN DO; /*ONLY IF TQ MATCHES*/
+00035960                        IINF=IINF+1; /*INCREMENT INFO COUNT*/
+00035970                        INFO.DS1DSNAM(IINF)=DSNAME(J); /*STOW DSNAME*/
+00035980                        INFO.TYPE(IINF)=NAMES.TYPE(J); /*AND TYPE */
+00035990                        INFO.DS1FMTID(IINF)='*';/*FLAG DSCB AS NOT YET FOUND*/
+00036000                        END;
+00036010                   END;
+00036020              ELSE DO; /*SIMPLER VERSION FOR NO EMBEDDED ASTERISK*/
+00036030                   DO J=1 TO I;
+00036040                        INFO.DS1DSNAM(J)=DSNAME(J);
+00036050                        INFO.TYPE(J)=NAMES.TYPE(J);
+00036060                        INFO.DS1FMTID(J)='*';
+00036070                        END;
+00036080                   IINF=I;
+00036090                   END;
+00036100              FREE WKAREA;
+00036110              END; /*END OF LEVEL ROUTINE. FOLLOWING GETS EXE'ED FOR LEVEL OR DATASET*/
+00036120              IF(CHARGED) THEN DO;     /* SCAN VSINFO FOR MATCHING PROJECT */
+00036130 %INCLUDE GSAMHI;
+00036140                    DCL NULL BUILTIN;
+00036150                  DCL 1 GSAMID,
+00036160                        2 GSAMPOOL FIXED BIN(31) INIT(5),
+00036170                        2 GSAMNAME CHAR(8) INIT('VSAMINFO'),
+00036180                        2 GSAMRESV PTR INIT(NULL),
+00036190                      GSAMLRECL FIXED BIN(31) INIT(150),
+00036200                      GSAMRC    FIXED BIN(31) INIT(0),
+00036210                      1 VSINFO,
+00036220                        2 VSDSNAM CHAR(44),
+00036230                        2 VSCAT CHAR(44),
+00036240                        2 VSPROJ  BIT(64) ALIGNED,
+00036250                        2 VSLASTCH BIT(24) ALIGNED,
+00036260                        2 VSLAST10 BIT(8) ALIGNED,
+00036270                        2 VSMODD  BIT(24) ALIGNED,
+00036280                        2 VSMODT  BIT(16) ALIGNED,
+00036290                        2 VSREFD  BIT(24) ALIGNED,
+00036300                        2 VSREST CHAR(54); /*FILLER TO MAXSIZE*/
+00036310                        DCL CHARPROJ CHAR(8) BASED(CHPTR);
+00036320                        DCL VDATE BASED(VDPTR) FIXED DECIMAL(5);
+00036330                        DCL WTYPE CHAR(1); /*TYPE OF DATASET*/
+00036340                        DCL VSAMTYP EXTERNAL ENTRY OPTIONS(ASSEMBLER, INTER, RETCODE);
+00036350                        DCL (CHPTR, VDPTR) PTR INIT(NULL);
+00036360                      CALL VOPEN(GSAMID,VSINFO,GSAMLRECL,GSAMRC);
+00036370                      IF (GSAMRC^=0) THEN GO TO GSAMFAIL;
+00036380                      CALL VREAD(GSAMID,VSINFO,GSAMLRECL,GSAMRC);
+00036390                      I=0;
+00036400                      CHPTR=ADDR(VSPROJ);
+00036410 READVSINF:           DO WHILE(GSAMRC=0);
+00036420                         IF (SAVEPROJ=CHARPROJ) THEN DO;
+00036430                               I=I+1;
+00036440                            INFO.DS1DSNAM(I)=VSDSNAM;
+00036450                            INFO.DS1PROJ(I)=VSPROJ;
+00036460                            INFO.DS1CREDT(I)=VSLASTCH;
+00036470                            INFO.DS1MODD(I)=VSMODD;
+00036480                            INFO.DS1REFD(I)=VSREFD;
+00036490                            INFO.DS1DSORG(I,13)='1'B;
+00036500                            CALL VSAMTYP (VSDSNAM,WTYPE,VSCAT);
+00036510                             IF PLIRETV=0 THEN INFO.TYPE(I)=WTYPE;
+00036520                                          ELSE INFO.TYPE(I)='*';
+00036530                            END;
+00036540                         CALL VREAD(GSAMID,VSINFO,GSAMLRECL,GSAMRC);
+00036550                       END READVSINF;
+00036560                       IF(GSAMRC^=40004) THEN GO TO GSAMFAIL; /* NOT EOF */
+00036570                       CALL VCLOSE(GSAMID,VSINFO,GSAMLRECL,GSAMRC);
+00036580                       IF (GSAMRC^=0) THEN GO TO GSAMFAIL;
+00036590                       IINF=I;
+00036600                       END; /* END OF CHARGED ROUTINE */
+00036610 %SKIP;
+00036620              DO I=1 TO IINF; /*NOW LOCATE BY NAME ALL VOLUMES FROM CATALOGUE*/
+00036630                   DSNTTR=ADDR(INFO.DS1DSNAM(I));
+00036640                   R1=ADDR(LOCPARMS);
+00036650                   CALL SVC(26,REGS);
+00036660                   IF(PLIRETV=0)THEN 
+00036670   LOCOK:              DO;
+00036680                        DO J=1 TO NVOL UNTIL (VOL(J)=VOLSER);
+00036690                          END;
+00036700                       IF VOL(J) = VOLSER THEN VOLUM(I) = VOLSER;
+00036710                       ELSE VOLUM(I) = 'X';
+00036720                       END LOCOK;
+00036730                    ELSE VOLUM(I) = '*'; /* NOT IN CATALOG */
+00036740                   END;
+00036750              END; /* OF CATALOGUE ROUTINE*/
+00036760         ELSE DO I=1 TO IINF;/*FILL IN BLANK VOLUMES IF NO CATALOGUE SEARCH*/
+00036770              VOLUM(I)=' ';
+00036780              END;
+00036790         NEW=IINF; /*NEW WILL BE USED TO KEEP TRACK OF INFO ENTRIES ADDED BY VTOC SEARCH*/
+00036800 %PAGE;
+00036810 /*********************************************************
+00036820 *
+00036830 *   NEXT SECTION HANDLES OPTION VTOC OR BOTH OR CHARGED
+00036840 *
+00036850 ************************************************************/
+00036860 %SKIP;
+00036870         IF(VTOC)THEN
+00036880              IF(LEVEL|CHARGED)THEN DO ; /*USE VTCREAD TO GET ALL THE DOPE*/
+00036890                   DCL VTCREAD ENTRY(FIXED BIN(31),CHAR(8),PTR,FIXED BIN(31)),
+00036900                   (L,IMAX,IMID,IMIN,NEW) FIXED BIN, RET FIXED BIN(31);
+00036910                     DCL PTROUT ENTRY(FIXED BIN(31)) RETURNS(PTR);
+00036920                     DCL PTRIN  ENTRY(PTR) RETURNS(FIXED BIN(31));
+00036930                   DCL 1 S99PARMS UNALIGNED, /*DYNAM ALLOC PARMS, 
+00036940                                  COURTESY H.GILBERT'S DYNALLOC*/
+00036950                        2 S99PRMBLK,
+00036960                           3 S99PLEN BIT(8) INIT('00010100'B),
+00036970                           3 S99VERB BIT(8) INIT('00000001'B),
+00036980                           3 S99FLG1 BIT(16) INIT('0'B),
+00036990                           3 S99ERROR BIT(16) INIT('0'B),
+00037000                           3 S99INFO BIT(16) INIT('0'B),
+00037010                           3 S99PRTP PTR INIT((ADDR(S99PARMS.S99PTRS))),
+00037020                           3 S99RSVD BIT(32) INIT('0'B),
+00037030                           3 S99FLG2 BIT(32) INIT('0'B),
+00037040                        2 S99TEXTFLDS,
+00037050                           3 S99FILE,
+00037060                              4 S99KEY FIXED BIN INIT( 1),
+00037070                              4 S99COUNT FIXED BIN INIT( 1),
+00037080                              4 S99LEN FIXED BIN INIT(6),
+00037090                              4 S99DATA CHAR( 8),
+00037100                           3 S99SER,
+00037110                              4 S99KEY FIXED BIN INIT( 16),
+00037120                              4 S99COUNT FIXED BIN INIT( 1),
+00037130                              4 S99LEN FIXED BIN INIT(6),
+00037140                              4 S99DATA CHAR( 6),
+00037150                           3 S99UNIT,
+00037160                              4 S99KEY FIXED BIN INIT( 21),
+00037170                              4 S99COUNT FIXED BIN INIT( 1),
+00037180                              4 S99LEN FIXED BIN INIT( 4),
+00037190                              4 S99DATA CHAR( 8) INIT('DISK'),
+00037200                           3 S99DISP1,
+00037210                              4 S99KEY FIXED BIN INIT( 4),
+00037220                              4 S99COUNT FIXED BIN INIT( 1),
+00037230                              4 S99LEN FIXED BIN INIT(1),
+00037240                              4 S99DATA BIT(8) INIT('00000001'B),
+00037250                           3 S99CONVERT,
+00037260                              4 S99KEY FIXED BIN INIT(83),
+00037270                              4 S99COUNT FIXED BIN INIT(0),
+00037280                           3 S99PTRS,
+00037290                              4 S99FILEP PTR INIT((ADDR(S99PARMS.S99FILE))),
+00037300                              4 S99SERP PTR INIT((ADDR(S99PARMS.S99SER))),
+00037310                              4 S99UNITP PTR INIT((ADDR(S99PARMS.S99UNIT))),
+00037320                              4 S99DISP1P PTR INIT((ADDR(S99PARMS.S99DISP1))),
+00037330                              4 S99ENDP BIT(32) INIT(('1'B|
+00037340                                  UNSPEC(ADDR(S99PARMS.S99CONVERT))));
+00037350                   DCL ARGPTR PTR;
+00037360                   ARGPTR=ADDR(S99PARMS);
+00037370                   UNSPEC(ARGPTR)=UNSPEC(ARGPTR)|'1'B;
+00037380                   IF(LEVEL)THEN USERDOT=SUBSTR(LEVNAME,1,INDEX(LEVNAME,' ')-1);
+00037390                             /*EXTRACT NONBLANK PART OF LEVEL NAME*/
+00037400                   DO I=1 TO NVOL;
+00037410                       R1=ADDR(ARGPTR);
+00037420                       S99PARMS.S99FILE.S99DATA =VOL(I);
+00037430                       S99PARMS.S99SER.S99DATA =VOL(I);
+00037440                        DO J=1 TO ONVOL UNTIL (VOL(I)=OVOL(J));
+00037450                        END;
+00037460                       S99PARMS.S99UNIT.S99DATA = UCBNAME(J);
+00037470                       CALL SVC(99,REGS); /*DYNAMICALLY ALLOCATE VTOC*/
+00037480                       IF (PLIRETV^=0) THEN GO TO ALLOCFAIL;
+00037490                        CALL VTCREAD(1,VOL(I),DSCBPTR,RET); /*OPEN VTOC*/
+00037500                        DO WHILE(RET=0);
+00037510                             CALL VTCREAD(0,VOL(I),DSCBPTR,RET); /*GET DSCB*/
+00037520                             DSCBPTR=PTROUT(PTRIN(DSCBPTR)+8);
+00037530                             IF(DSCB.DS1FMTID='1')THEN
+00037540                             IF(LEVEL&USERDOT=SUBSTR(DSCB.DS1DSNAM,1,LENGTH(USERDOT))&
+00037550            (^ISTQ|TQ=SUBSTR(DSCB.DS1DSNAM,INDEX(DSCB.DS1DSNAM,' ')-LENGTH(TQ),LENGTH(TQ)))
+00037560                                |CHARGED&PSEARCH=SUBSTR(DSCB.DS1PROJ,9,48)) THEN
+00037570  MATCHDSCB:                 DO;
+00037580                                  IF(CATALOG&^CHARGED) THEN
+00037590  CAT:                            DO;/*BINARY SEARCH FOR EXISTING ENTRY*/
+00037600                                       IMIN=0;
+00037610                                       IMAX=IINF;
+00037620                                       DO WHILE(IMAX>=IMIN);
+00037630                                            IMID=(IMAX+IMIN)/2;
+00037640                                     IF(INFO.DS1DSNAM(IMID)<DSCB.DS1DSNAM)THEN IMIN=IMID+1;
+00037650                                ELSE IF(INFO.DS1DSNAM(IMID)>DSCB.DS1DSNAM)THEN IMAX=IMID-1;
+00037660                                            ELSE IF(VOLUM(IMID)=VOL(I))THEN  DO;
+00037670                             /*FOUND*/
+00037680                                                 DSCBDATA(IMID)=DSCBODY;
+00037690                                                 LEAVE MATCHDSCB;
+00037700                                                 END; 
+00037710                                            ELSE LEAVE CAT;/*NOT REALLY FOUND*/
+00037720                                            END;
+00037730                                       END CAT;
+00037740                                    IF (DSCB.DS1DSORG(13)) THEN /*IF VSAM*/
+00037750                                       IF(CHARGED) THEN LEAVE MATCHDSCB;
+00037760                                       ELSE /* MAKE DSCB PHONY */
+00037770                                           DSCB.DS1CREDT,
+00037780                                            DSCB.DS1EXPDT,
+00037790                                            DSCB.DS1MODD,
+00037800                                            DSCB.DS1MODT,
+00037810                                            DSCB.DS1PROJ,
+00037820                                            DSCB.DS1REFD='0'B;
+00037830                                  NEW=NEW+1;/*DSCB DOEN'T MATCH EXISTING ENTRY*/
+00037840                                  VOLUM(NEW)=VOL(I);
+00037850                                  DSCBDATA(NEW)=DSCBODY;
+00037860                                   INFO.TYPE(NEW)='A';
+00037870                                  END MATCHDSCB;
+00037880                             END;
+00037890                        CALL VTCREAD(2,VOL(I),DSCBPTR,RET);
+00037900                        DSCBPTR=PTROUT(PTRIN(DSCBPTR)+8);
+00037910                        END;
+00037920                   END;/*OF VTCREAD SEQUENCE*/
+00037930              ELSE DO;/*VTOC WITH DATASET LIST...OBTAIN BY DSNAME*/
+00037940                   DCL 1 OBPARMS,
+00037950                        2 OBTN BIT(7)INIT('1100000'B),
+00037960                        2 WHICH BIT(2),
+00037970                        2 REST BIT(23)INIT((23)'0'B),
+00037980                        2 DPTR PTR,
+00037990                        2 VOLPTR PTR,
+00038000                        2 WKPTR PTR;
+00038010                   WHICH='10'B;
+00038020                   ALLOCATE DSCB;
+00038030                   WKPTR=ADDR(DSCBODY.DS1FMTID);/* USE UNUSED SLOT FOR DSCB*/
+00038040                   DPTR=ADDR(DSCB.DS1DSNAM);
+00038050                   DO I=1 TO IINF;
+00038060                        DSCB.DS1DSNAM=INFO.DS1DSNAM(I); /* INIT DSCB NAME */
+00038070                        DO J=1 TO NVOL;
+00038080                             VOLPTR=ADDR(VOL(J));
+00038090                             R1=ADDR(OBPARMS);
+00038100                             CALL SVC(27,REGS);/*ISSUE OBTAIN BY DSNAME*/
+00038110                             IF(PLIRETV=0)THEN DO;/*IF REALLY THE SAME DATASET, 
+00038120                   WE MOVE THE DSCB TO THE RIGHT INFO SLOT.
+00038130                   OTHERWISE, WE MAKE ITS LOCATION INTO A NEW SLOT BY ADDING DSNAME AND 
+00038140                   VOLUME*/
+00038150                                  IF(VOLUM(I)=' ')THEN VOLUM(I)=VOL(J);
+00038160                                  IF(VOLUM(I)=VOL(J))THEN DO; DSCBDATA(I)=DSCBODY;
+00038170                                                        INFO.TYPE(I)='A';
+00038180                                                        END;
+00038190                                  ELSE DO;
+00038200                                       NEW=NEW+1;
+00038210                                       DSCBDATA(NEW)=DSCBODY;
+00038220                                       INFO.TYPE(NEW)='A';
+00038230                                       VOLUM(NEW)=VOL(J);
+00038240                                       END;
+00038250                                  END;
+00038260                             END;
+00038270                        END;
+00038280                   END;
+00038290 /*************************************************************
+00038300 *
+00038310 *     CONTINUATION FOR CATALOG/BOTH PROCESSING
+00038320 *
+00038330 *             FILL IN DSCBS NOT YET FOUND
+00038340 *
+00038350 ***************************************************************/
+00038360 %SKIP(2);
+00038370         IF ((CATALOG&^CHARGED)  & (ATTRIB|HISTORY|PROJECT|SPACE)) THEN DO;
+00038380              ALLOCATE DSCB;
+00038390               CALL VOPEN(GSAMID,VSINFO,GSAMLRECL,GSAMRC);
+00038400               IF GSAMRC^=0 THEN GO TO GSAMFAIL;
+00038410               DO I=1 TO IINF;
+00038420                IF INFO.VOLUM(I)^='X' THEN
+00038430               IF INFO.DS1FMTID(I)='*' THEN DO;
+00038440                     SELECT (INFO.TYPE(I));
+00038450                         WHEN( 'A' )DO; /* REGULAR NONVSAM */
+00038460 SELECTYPE:
+00038470                         WHICH='10'B;
+00038480                         WKPTR=ADDR(DSCB.DS1FMTID);
+00038490                         DPTR=ADDR(DSCB.DS1DSNAM);
+00038500                         IF(VOLUM(I)^='*')THEN DO;
+00038510                              DSCB.DS1DSNAM=INFO.DS1DSNAM(I);
+00038520                              VOLPTR=ADDR(VOLUM(I));
+00038530                              R1=ADDR(OBPARMS);
+00038540                              CALL SVC(27,REGS);
+00038550                              IF(PLIRETV=0)THEN DSCBDATA(I)=DSCBODY;
+00038560                              ELSE IF(PLIRETV>4)THEN INFO.DS1FMTID(I)='X';
+00038570                              END;
+00038580                         END;
+00038590 %SKIP;
+00038600                         WHEN( 'G','C' )DO;  /* GET CLUSTER INFO FROM GSAM*/
+00038610                              VSDSNAM=INFO.DS1DSNAM(I);
+00038620                              CALL VGET(GSAMID,VSINFO,GSAMLRECL,GSAMRC);
+00038630                              IF GSAMRC^=0 THEN GO TO GSAMFAIL;
+00038640                               IF VSDSNAM=INFO.DS1DSNAM(I) THEN DO;
+00038650                                  INFO.DS1FMTID(I)='1';
+00038660                                  INFO.DS1PROJ(I)=VSPROJ;
+00038670                                  INFO.DS1CREDT(I)=VSLASTCH;
+00038680                                  INFO.DS1MODD(I)=VSMODD;
+00038690                                  INFO.DS1MODT(I)=VSMODT;
+00038700                                  INFO.DS1REFD(I)=VSREFD;
+00038710                                  INFO.DS1DSORG(I,13)='1'B;
+00038720                                  END;
+00038730                             ELSE INFO.TYPE(I)='*';
+00038740                               END;
+00038750                         WHEN( 'D','I','R','Y' )DO;
+00038760                               INFO.DS1DSORG(I,13)='1'B;
+00038770                               INFO.DS1FMTID(I)='1';
+00038780                               END;
+00038790                          OTHERWISE;
+00038800                      END ;
+00038810                END;
+00038820                  END; /*END OF LOOP*/
+00038830                FREE DSCB;
+00038840                CALL VCLOSE(GSAMID,VSINFO,GSAMLRECL,GSAMRC);
+00038850                IF GSAMRC^=0 THEN GO TO GSAMFAIL;
+00038860             END;  /* END OF CAT/BOTH CONTINUATION */
+00038870 %PAGE;
+00038880 /***************************************************
+00038890 *
+00038900 *     NOW FORMAT THE REPORT
+00038910 *
+00038920 *****************************************************/
+00038930                              
+00038940         /*CREATE HEADING*/
+00038950         DCL HEAD CHAR(130)VAR INIT('VOLUME DATASET');
+00038960         DCL SEC CHAR(16);  /*  SECURITY INFO - AMK  */
+00038970         IF(SPACE)THEN HEAD=' TRKS USED EXTS '||HEAD;
+00038980         IF(PROJECT)THEN HEAD='PROJECT '||HEAD;
+00038990         IF(HISTORY) THEN HEAD=
+00039000             'LAST CHRGD LAST USED READ-SEC-WRITE  '||HEAD;
+00039010         IF(ATTRIB) THEN HEAD='DSORG RECFM LRECL BLKSIZE '||HEAD;
+00039020         DCL LISTING FILE STREAM OUTPUT PRINT;
+00039030         DCL TELL ENTRY(*);
+00039040         IF(CP)THEN CALL TELL(HEAD);
+00039050         ELSE DO;
+00039060              OPEN FILE(LISTING)LINESIZE(130);
+00039070              PUT FILE(LISTING)SKIP LIST(HEAD);
+00039080              END;
+00039090 /******************************************************
+00039100 *
+00039110 *           LOOP THRU WHOLE ARRAY OF INFO
+00039120 *
+00039130 *******************************************************/
+00039140         DO I=1 TO NEW;
+00039150              IF (VOLUM(I)^='X') THEN
+00039160              IF(VOLUM(I)=' ')THEN HEAD='DATASET NOT FOUND: ';
+00039170              ELSE IF(VOLUM(I)='*')THEN HEAD='DATASET NOT IN CATALOG: ';
+00039180              ELSE IF((INFO.DS1FMTID(I)='*') & (ATTRIB|HISTORY|PROJECT|SPACE))THEN  DO;
+00039190                   HEAD='DATASET NOT ONLINE: ';
+00039200                   IF VTOC THEN DO J=1 TO NVOL;
+00039210                        IF(VOLUM(I)=VOL(J))THEN HEAD='ERRONEOUS CATALOG ENTRY FOR  ';
+00039220                        END;
+00039230               ELSE IF (INFO.TYPE(I)='*') THEN HEAD='NO VSAMINFO FOR CL/AIX ';
+00039240                        ELSE; END;
+00039250              ELSE IF(INFO.DS1FMTID(I)='X')THEN HEAD='ERRONEOUS CATALOG ENTRY FOR ';
+00039260              ELSE DO;
+00039270                   HEAD='';
+00039280 /********************************************************
+00039290 *
+00039300 *          FORMAT ATTRIBUTES
+00039310 *
+00039320 *********************************************************/
+00039330                   IF ATTRIB THEN DO;
+00039340                        IF INFO.DS1DSORG(I,2)THEN HEAD=HEAD||'  PS';
+00039350                        ELSE IF INFO.DS1DSORG(I,7)THEN HEAD=HEAD||'  PO';
+00039360                        ELSE IF INFO.DS1DSORG(I,3)THEN HEAD=HEAD||'  DA';
+00039370                        ELSE IF INFO.DS1DSORG(I,1)THEN HEAD=HEAD||'  IS';
+00039380                        ELSE IF INFO.DS1DSORG(I,13)THEN HEAD=HEAD||'VSAM';
+00039390                        ELSE HEAD=HEAD||'  ??';
+00039400                        IF INFO.DS1DSORG(I,8)THEN HEAD=HEAD||'U ';
+00039410                        ELSE HEAD=HEAD||'  ';
+00039420                        IF INFO.DS1RECFM(I,1)&INFO.DS1RECFM(I,2) THEN HEAD=HEAD||' U';
+00039430                        ELSE IF INFO.DS1RECFM(I,1)THEN HEAD=HEAD||' F';
+00039440                        ELSE IF INFO.DS1RECFM(I,2) THEN HEAD=HEAD||' V';
+00039450                          ELSE IF INFO.DS1DSORG(I,13) THEN
+00039460                               SELECT (INFO.TYPE(I));
+00039470                                 WHEN( 'D' )HEAD=HEAD||'DATA';
+00039480                                 WHEN( 'I' )HEAD=HEAD||'INDX';
+00039490                                 WHEN( 'G' )HEAD=HEAD||'AIX ';
+00039500                                 WHEN( 'C' )HEAD=HEAD||'CLUS';
+00039510                                 WHEN( 'R' )HEAD=HEAD||'PATH';
+00039520                                 WHEN( 'Y' )HEAD=HEAD||'UPGD';
+00039530                                 WHEN( '*' )HEAD=HEAD||'????';
+00039540                                 OTHERWISE;
+00039550                               END;
+00039560                        ELSE HEAD=HEAD||' ?';
+00039570                        IF INFO.DS1RECFM(I,3)THEN HEAD=HEAD||'T';
+00039580                        IF INFO.DS1RECFM(I,4)THEN HEAD=HEAD||'B';
+00039590                        IF INFO.DS1RECFM(I,5)THEN HEAD=HEAD||'S';
+00039600                        IF INFO.DS1RECFM(I,6)THEN HEAD=HEAD||'A';
+00039610                        ELSE IF INFO.DS1RECFM(I,7)THEN HEAD=HEAD||'M';
+00039620                        IF(12>LENGTH(HEAD))THEN HEAD=HEAD||REPEAT(' ',11-LENGTH(HEAD));
+00039630                        DCL TDUMB CHAR(16);
+00039640                        PUT STRING(TDUMB)EDIT(INFO.DS1LRECL(I),INFO.DS1BLKL(I))
+00039650                        (F(5),F(8));
+00039660                        HEAD=HEAD||SUBSTR(TDUMB,1,14);
+00039670                        END;
+00039680 /*********************************************************
+00039690 *
+00039700 *          FORMAT DATES FOR HISTORY
+00039710 *
+00039720 *********************************************************/
+00039730                   IF HISTORY THEN DO;
+00039740                      SEC='                '; /* INITIALIZE SEC FIELD */
+00039750                      SELECT (INFO.TYPE(I)); /*VSAM DATES ARE PACKED DEC*/
+00039760                            WHEN ('C','G') DO; /* CLUSTER AND AIX */
+00039770                            DCL CHARDATE CHAR(10);
+00039780                            DCL DECDATE ENTRY(FIXED DEC(7), FIXED DEC(7)) EXT,
+00039790                               UNPSTR PIC '9999999',
+00039800                               UNPDATE CHAR(7) BASED(ADDR(UNPSTR)),
+00039810                               INDATE FIXED DEC(7),
+00039820                               OUTDATE FIXED DEC(7) ;
+00039830                            VDPTR=ADDR(INFO.DS1CREDT(I));
+00039840                             INDATE=VDATE;
+00039850                             CALL DECDATE(INDATE,OUTDATE);
+00039860                             UNPSTR=OUTDATE; /*UNPACK IT*/
+00039870                             CHARDATE='  '||SUBSTR(UNPDATE,3,2)||'/'||
+00039880                                     SUBSTR(UNPDATE,5,2)||'/'||SUBSTR(UNPDATE,1,2);
+00039890                            HEAD=HEAD||CHARDATE||
+00039900            CVDAT(SUBSTR(INFO.DS1REFD(I),1,8),SUBSTR(INFO.DS1REFD(I),9,16))
+00039910                ||' '||SEC;
+00039920                            END;
+00039930                            WHEN ('A') DO;  /* REGULATION NON-VSAM*/
+00039940                                IF (SUBSTR(INFO.DS1DSIND(I),2,1)) THEN DO;
+00039950                                    I2=1;   /* OUTPUT STRING PTR */
+00039960   SECLOOP:                         DO I1 = 1 TO 5 BY 4; 
+00039970                                        SELECT(SUBSTR(INFO.DS1RAC(I),I1+2,2));
+00039980                                            WHEN('11'B) SUBSTR(SEC,I2,4)='PBLC';
+00039990                                            WHEN('10'B) SUBSTR(SEC,I2,4)='DEPT';
+00040000                                            WHEN('01'B) SUBSTR(SEC,I2,4)='PROJ';
+00040010                                            OTHERWISE SUBSTR(SEC,I2,4)='OWNR';
+00040020                                            END;
+00040030                                        SELECT(SUBSTR(INFO.DS1RAC(I),I1,2));
+00040040                                            WHEN('11'B) SUBSTR(SEC,I2+4,3)='-LN';
+00040050                                            WHEN('10'B) SUBSTR(SEC,I2+4,3)='-N ';
+00040060                                            WHEN('01'B) SUBSTR(SEC,I2+4,3)='-L ';
+00040070                                            OTHERWISE SUBSTR(SEC,I2+4,3)='   ';
+00040080                                            END;
+00040090                                        I2=10;  /* SET OUTPUT PTR TO 2ND PART OF MSG */
+00040100                                    END SECLOOP;
+00040110                                END;
+00040120                                ELSE SEC='NONE     NONE   ';
+00040130        HEAD=HEAD||CVDAT(SUBSTR(INFO.DS1CREDT(I),1,8),SUBSTR(INFO.DS1CREDT(I),9,16))||
+00040140            CVDAT(SUBSTR(INFO.DS1REFD(I),1,8),SUBSTR(INFO.DS1REFD(I),9,16))
+00040150                ||' '||SEC;
+00040160            END;
+00040170                            OTHERWISE HEAD=HEAD||'                     '||SEC;
+00040180                            END;
+00040190                        END;
+00040200CVDAT:   PROC(I,J)RETURNS (CHAR(10));
+00040210         DCL (I,J,K)FIXED BIN,
+00040220              1  TABL,
+00040230                   2 X CHAR(2)INIT('  '),
+00040240                   2 MO PIC '99',
+00040250                   2 Y CHAR(1)INIT('/'),
+00040260                   2 DAY PIC '99',
+00040270                   2 Z CHAR(1)INIT('/'),
+00040280                   2 YR PIC '99',
+00040290         MOTAB(13)FIXED BIN STATIC INIT(0,31,59,90,120,151,181,212,
+00040300                   243,273,304,334,1000),
+00040310              RSTRING CHAR(10)BASED(ADDR(TABL));
+00040320               IF ((I=0)&(J=0)) THEN RETURN('          ');
+00040330         YR=I;
+00040340         IF(0=MOD(I,4))THEN DO;
+00040350              IF(J=60)THEN DO;
+00040360                   MO=2;
+00040370                   DAY=29;
+00040380                   RETURN (RSTRING);
+00040390                   END;
+00040400              ELSE IF(J>60)THEN J=J-1;
+00040410              END;
+00040420         K=1+J/29;
+00040430         DO WHILE(MOTAB(K)>=J);
+00040440              K=K-1;
+00040450              END;
+00040460         MO=K;
+00040470         DAY=J-MOTAB(K);
+00040480         RETURN(RSTRING);
+00040490         END CVDAT;
+00040500 /********************************************************
+00040510 *
+00040520 *            FORMAT PROJECT
+00040530 *
+00040540 *******************************************************/
+00040550                   IF PROJECT THEN  DO;
+00040560                        DCL PROJID CHAR(8)VAR,C BIT(2)INIT('11'B), TEMPCHAR CHAR(1);
+00040570                        IF INFO.DS1DSORG(I,13) THEN 
+00040580                              IF INFO.DS1PROJ(I)='0'B THEN PROJID='          ';
+00040590                               ELSE DO;
+00040600                             CHPTR=ADDR(INFO.DS1PROJ(I)); /* ALREADY UNCR IF VSAM */
+00040610                              PROJID=CHARPROJ;
+00040620                              END;
+00040630                        ELSE DO; /* OTHERWISE UNCRUNCH IT */
+00040640                        PROJID='';
+00040650                        DO J=1 TO 8;
+00040660                        UNSPEC(TEMPCHAR)=C||SUBSTR(SUBSTR(INFO.DS1PROJ(I),9,48),(J*6)-5,6);
+00040670                             PROJID=PROJID||TEMPCHAR;
+00040680                             END;
+00040690                        IF SUBSTR(SUBSTR(INFO.DS1PROJ(I),9,48),37,12)='000000000000'B  THEN
+00040700                             SUBSTR(PROJID,7,2)=' ';
+00040710                        END;
+00040720                        HEAD=HEAD||PROJID;
+00040730                         END;
+00040740 /**********************************************************
+00040750 *
+00040760 *             FORMAT SPACE INFO
+00040770 *
+00040780 ************************************************************/
+00040790                   IF SPACE THEN SELECT (INFO.TYPE(I));
+00040800                         WHEN( 'A' )
+00040810   NVSPACE:                DO;
+00040820 /****************************************************
+00040830 *      GET TPC FROM DEVICE TABLE
+00040840 ******************************************************/
+00040850 %SKIP;
+00040860                     DCL TPC      FIXED BIN;             /* TRACKS PER CYLINDER */
+00040870                           DO J=1 TO ONVOL UNTIL (OVOL(J)=VOLUM(I));
+00040880                              END;
+00040890                           IF OVOL(J)^=VOLUM(I) THEN DO;
+00040900                              HEAD='NO TPC FOR VOLUME '; /*THIS CANT HAPPEN*/
+00040910                              LEAVE NVSPACE;
+00040920                              END;
+00040930                           TPC=OTPC(J);
+00040940 %SKIP;
+00040950                        DCL (TRK INIT(0),USED,EXT)FIXED BIN;
+00040960                        USED=INFO.DS1LSTAR.TT(I)+(0<INFO.DS1LSTAR.R(I));
+00040970                        EXT=INFO.DS1NOEPV(I);
+00040980                        TRK=0;
+00040990                        DO J=1 TO 3 WHILE (INFO.DS1EXT.TYPE(I,J)^='00000000'B);
+00041000                          TRK=TRK+TPC*(INFO.DS1EXT.UL.CC(I,J)-INFO.DS1EXT.LL.CC(I,J))
+00041010                                  +(INFO.DS1EXT.UL.HH(I,J)-INFO.DS1EXT.LL.HH(I,J))+1;
+00041020                             END;
+00041030                        IF(EXT>3)THEN DO;
+00041040                             WHICH='01'B;
+00041050                             DCL 1 FMT3,
+00041060                                  2 KKKCHAR CHAR(4),
+00041070                                  2 EXA (4)LIKE DSCB.DS1EXT,
+00041080                                  2 CHA CHAR(1),
+00041090                                  2 EXB (9)LIKE DSCB.DS1EXT,
+00041100                                    2 FMT3FILL CHAR(5);
+00041110                             VOLPTR=ADDR(VOLUM(I));
+00041120                             WKPTR=ADDR(FMT3);
+00041130                             DPTR=ADDR(INFO.DS1PTRDS(I));
+00041140                             R1=ADDR(OBPARMS);
+00041150                             CALL SVC(27,REGS);
+00041160                             IF (PLIRETV^=0)THEN GO TO SPACEFAIL;
+00041170                             DO J=1 TO 4 WHILE(EXA.TYPE(J)^='00000000'B);
+00041180                                  TRK=TRK+TPC*(EXA.UL.CC(J)-EXA.LL.CC(J))
+00041190                                       +(EXA.UL.HH(J)-EXA.LL.HH(J))+1;
+00041200                                  END;
+00041210                             IF(EXT>7)THEN DO J=1 TO 9 WHILE  (EXB.TYPE(J)^='00000000'B);
+00041220                                  TRK=TRK+TPC*(EXB.UL.CC(J)-EXB.LL.CC(J))
+00041230                                       +(EXB.UL.HH(J)-EXB.LL.HH(J))+1;
+00041240                                  END;
+00041250                             END;
+00041260                        PUT STRING(TDUMB)EDIT(TRK,USED,EXT)(F(5),F(5),F(5));
+00041270                        HEAD=HEAD||TDUMB;
+00041280                        END;
+00041290                    WHEN( 'D','I' )DO;
+00041300                          DCL VSAMUSE EXT ENTRY OPTIONS(ASSEMBLER,RETCODE,INTER);
+00041310                          DCL (VTRKS,VEXTS) FIXED BIN(31) INIT(0),
+00041320                              FILL CHAR(6);
+00041330                          CALL VSAMUSE(INFO.DS1DSNAM(I),VTRKS,VEXTS,FILL);
+00041340                          PUT STRING(TDUMB) EDIT(VTRKS,0,VEXTS) (F(5),F(5),F(5));
+00041350                          HEAD=HEAD||TDUMB;
+00041360                          END;
+00041370                      OTHERWISE HEAD=HEAD||'                ';
+00041380                  END; /* END OF SPACE */
+00041390                 END; /* END OF FORMATTING WHEN NO ERROR */
+00041400              IF(CATALOG&^CHARGED&I=IINF+1)THEN IF(CP)THEN CALL TELL('UNCATALOGUED:');
+00041410              ELSE PUT FILE(LISTING)SKIP LIST('UNCATALOGUED:');
+00041420              IF VOLUM(I)^='X' THEN /* VOL = X MEANS NOT IN LIST - IGNORE*/
+00041430              IF(CP)THEN CALL TELL(HEAD||VOLUM(I)||' '||INFO.DS1DSNAM(I));
+00041440              ELSE PUT FILE(LISTING)SKIP LIST(HEAD||VOLUM(I)||' '||INFO.DS1DSNAM(I));
+00041450              END;
+00041460         RETURN;
+00041470 DASDFAIL: IF (CP) THEN CALL TELL('GETDASD FAILED - MORE THAN 25 VOLS');
+00041480           ELSE PUT FILE(LISTING) SKIP LIST('GETDASD FAILED - MORE THAN 25 VOLS');
+00041490            RETURN;
+00041500 GSAMFAIL: IF (CP) THEN
+00041510                CALL TELL('GSAM FAILED RC='||GSAMRC);
+00041520           ELSE PUT FILE(LISTING) SKIP LIST('GSAM FAILED RC='||GSAMRC);
+00041530           CALL VCLOSE(GSAMID,VSINFO,GSAMLRECL,GSAMRC);
+00041540           RETURN;
+00041550ALLOCFAIL:    IF CP THEN CALL TELL('PROBLEM ALLOCATING VTOC ON '||VOL(I));
+00041560         ELSE PUT FILE(LISTING)LIST('PROBLEM ALLOCATING VTOC ON '||VOL(I));
+00041570         RETURN;
+00041580PARSFAIL:IF(CP)THEN DO;
+00041590              CALL TELL('UNINTERPRETABLE COMMAND LINE');
+00041600              CALL TELL('PARSE BUFFER CONTAINED: '||PARSBUF);
+00041610              CALL TELL('SUBLIST AND USERDOT WERE: '||SUBLIST||USERDOT);
+00041620              END;
+00041630         ELSE DO;
+00041640              PUT FILE(LISTING)SKIP LIST('UNINTERPRETABLE COMMAND LINE');
+00041650              PUT FILE(LISTING)SKIP LIST('PARSE BUFFER CONTAINED: '||PARSBUF);
+00041660              PUT FILE(LISTING)SKIP LIST('SUBLIST AND USERDOT WERE: '||SUBLIST||USERDOT);
+00041670              END;
+00041680         RETURN;
+00041690SPACEFAIL:IF(CP)THEN 
+00041700              CALL TELL('PROBLEM OBTAINING FMT3 DSCB. OBTAIN RETURN CODE WAS'||PLIRETV);
+00041710         ELSE PUT FILE(LISTING)
+00041720               LIST('PROBLEM OBTAINING FMT3 DSCB. OBTAIN RETURN CODE WAS'||PLIRETV);
+00041730         RETURN;
+00041740CATERROR:IF(CP) THEN DO;
+00041750              CALL TELL('PROBLEM SEARCHING OR ACCESSING CATALOG');
+00041760              CALL TELL('LOCATE RETURN CODE WAS'||PLIRETV);
+00041770              END;
+00041780         ELSE DO;
+00041790              PUT FILE(LISTING)SKIP LIST('PROBLEM SEARCHING OR ACCESSING CATALOG');
+00041800              PUT FILE(LISTING)SKIP LIST('LOCATE RETURN CODE WAS'||PLIRETV);
+00041810              END;
+00041820         END ONLINE;

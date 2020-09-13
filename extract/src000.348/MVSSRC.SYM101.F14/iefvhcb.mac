@@ -1,0 +1,932 @@
+***********************************************************************
+*
+*   MODULE NAME= IEFVHCB
+*
+*   DESCRIPTIVE NAME= VERB IDENTIFIER
+*
+*   COPYRIGHT= N/A
+*
+*   STATUS= OS/VS2 RELEASE 3.0 AND 3.7 PTF                     @ZA14932
+*
+*   FUNCTION= 1. IDENTIFIES VERB OF STATEMENT
+*             2. PERFORMS MERGE OF STATEMENTS FROM JCL DATA SET AND
+*                PROCEDURE LIBRARY
+*             3. WRITES INTERNAL TEXT FOR THE PRIOR STATEMENT TO
+*                THE TEXT DATA SET
+*     OPERATION= 1. MODULE CHECKS FOR A STATEMENT NAME AND VERB ON THE
+*                   CARD IMAGE, IDENTIFIES THE VERB AND BUILDS A
+*                   STATEMENT PARAMETER LIST IN FIELD RSTMT FOR STATE-
+*                   MENTS FROM THE JCL DATA SET, AND IN FIELD PSTMT FOR
+*                   STATEMENTS FROM THE PROCEDURE LIBRARY
+*                2. MODULE MERGES JCL DATA SET AND PROCEDURE LIBRARY
+*                   STATEMENTS AS FOLLOWS: IT SAVES THE QUALIFIED NAME
+*                   (PROCSTEPNAME.DDNAME) FOR A DD STATEMENT READ FROM
+*                   THE JCL DATA SET. IT THEN CHECKS FOR A MATCH ON
+*                   PROCSTEPNAME AGAINST THE NAME ON EACH EXEC STATE-
+*                   MENT READ FROM THE PROCEDURE LIBRARY. WHEN SUCH A
+*                   MATCH IS FOUND, IT THEN CHECKS FOR A MATCH ON
+*                   DDNAME AGAINST EACH DD STATEMENT FOR THAT STEP.
+*                   WHEN SUCH A MATCH IS FOUND, AN OVERRIDE SITUATION
+*                   EXISTS, AND APPROPRIATE SWITCHES ARE SET.
+*                  .ON AN OVERRIDE SITUATION, THE DD STATEMENT FROM THE
+*                   JCL DATA SET IS PROCESSED FIRST, THEN THE DD FROM
+*                   THE PROCEDURE LIBRARY. THE OVERRIDDEN STATEMENT IS
+*                   MARKED BY CHANGING // TO X/.
+*                  .IF NO MATCH ON DDNAME IS FOUND PRIOR TO THE NEXT
+*                   EXEC STATEMENT IN THE PROCEDURE, OR TO PROCEDURE
+*                   END OF FILE, THE JCL DATA SET DD IS SIMPLY ADDED TO
+*                   THE DD'S FOR THE STEP.
+*                3. THE MODULE PROVIDES CHECKPOINT/RESTART SUPPORT AS
+*                   FOLLOWS: A STEP OR CHECKPOINT RESTART IS SIGNIFIED
+*                   BY THE SPECIFICATION OF THE RESTART PARAMETER CON-
+*                   TAINING A CHECKPOINT IDENTIFIER. IF SUCH A SPECI-
+*                   FICATION HAS BEEN MADE, THE MODULE CHECKS FOR A
+*                   DD STATEMENT WITH THE NAME 'SYSCHK' PRIOR TO THE
+*                   FIRST EXEC STATEMENT FOR THE JOB. FINDING THE
+*                   SYSCHK DD, THE MODULE SETS FLAG 'CPFLG' IN THE CWA
+*                   TO INDICATE TO IEFVHEB THAT A PSEUDO EXEC STATEMENT
+*                   MUST BE GENERATED AND PROCESSED PRIOR TO THE SYSCHK
+*                   DD, BUT THE JOB HAS STEP BIT MUST NOT BE   @ZA09485
+*                   TURNED ON FOR THIS PSEUDO EXEC STATEMENT.  @ZA09485
+*                  .THE MODULE ALSO CHECKS IF A FLUSH TO STEPNAME HAS
+*                   BEEN REQUESTED IN THE RESTART PARAMETER. IF SO,
+*                   FLAG 'CPSTPFL' IN THE CWA IS SET ON. WHEN THE
+*                   CORRECT STEP HAS BEEN FOUND BY THIS MODULE, THE
+*                   FLAG IS CLEARED.
+*                4. THE MODULE PROVIDES INSTREAM PROCEDURE SUPPORT
+*                   AS FOLLOWS: IT CHECKS FOR A PROC STATEMENT FROM THE
+*                   JCL DATA SET, WHICH SIGNIFIES THE BEGINNING OF AN
+*                   INSTREAM PROCEDURE. FOR THE FIRST INSTREAM PROCE-
+*                   DURE OF A JOB, THE MODULE WILL OBTAIN STORAGE FOR
+*                   A 352 BYTE WORK AREA, AND FOR A QMPA FOR INSTREAM
+*                   ROUTINE IEFVINA. (THIS STORAGE MUST BE OBTAINED BY
+*                   IEFVHCB, RATHER THAN BY IEFVINA, TO PREVENT FRAG-
+*                   MENTATION, INASMUCH AS IEFVINA MAY EXIT IN A WAY
+*                   THAT MIGHT PREVENT IT FROM FREEING THE WORK AREAS.)
+*                   THE MODULE THEN BRANCHES TO IEFVINA.
+*                5. THE MODULE WRITES INTERNAL TEXT FOR THE PRIOR
+*                   STATEMENT TO THE TEXT DATA SET, AND SAVES THE RBA
+*                   FOR THE JOB AND LAST EXEC TEXT STRING WRITTEN. AT
+*                   THE END OF A STEP, IF AN EXEC HAS BEEN WRITTEN,
+*                   THE MODULE READS BACK THE EXEC STRING WITH THE
+*                   SAVED RBA AS A GET ARGUEMENT, UPDATES THE
+*                   PREFIX AND WRITES THE STRING BACK.  AT THE END
+*                   OF JOB, THE JOB AND EXEC PREFIXES ARE UPDATED
+*                   BY MEANS OF THE RBA TO PICK UP ANY BITS SET
+*                   DURING PROCESSING. IT ALSO INDICATES (VIA A BIT
+*                   IN THE EXEC PREFIX) THAT STEP HAS NO DD'S AND
+*                   (VIA A BIT IN THE DD PRIFIX) THAT A DD IS THE
+*                   LAST DD IN THE STEP.
+*
+*   NOTES
+*      CHARACTER CODE DEPENDENCIES= EBCDIC
+*      DEPENDENCIES= NONE
+*      RESTRICTIONS= NONE
+*      REGISTER CONVENTIONS=
+*                            R9- CARD IMAGE POINTER
+*                            RA- STATEMENT PARAMETER LIST POINTER
+*                            RB- BASE REGISTER
+*                            RC- CWA POINTER
+*                            RD- SAVE AREA POINTER
+*      PATCH-LABEL= PATCH
+*
+*   MODULE TYPE= BAL
+*      PROCESSOR= ASSEMBLER
+*      ATTRIBUTES= NCAL,LET,LIST,XREF,REFR,RENT
+*
+*   ENTRY POINT= IEFVHCB
+*      PURPOSE= VERB IDENTIFICATION
+*      LINKAGE= BRANCH ON REGISTER
+*      INPUT DATA= JCL STATEMENT
+*                  CONVERTER WORK AREA
+*                  R9- POINTS TO JCL STATEMENT
+*                  RA- POINTS TO STATEMENT PARAMETER LIST
+*                  RC- POINTS TO CWA
+*      REGISTERS SAVED= NONE
+*      REGISTER CONTENTS DURING PROCESSING= SEE REGISTER CONVENTIONS
+*      REGISTERS RESTORED= NONE
+*
+*   EXIT - NORMAL= BRANCH TO IEFVHEB
+*      CONDITIONS= STATEMENT CONTAINS JOB, EXEC OR DD VERB
+*      OUTPUT DATA= UPDATED FIELDS IN CWA
+*                   STATEMENT PARAMETER LIST
+*                   RA- POINTER TO STATEMENT PARAMETER LIST
+*      RETURN CODES= NONE
+*
+*   EXIT - NORMAL= BRANCH TO IEFVHL
+*      CONDITION= NULL STATEMENT FOUND
+*      OUTPUT DATA= NONE
+*      RETURN CODES= NONE
+*
+*   EXIT - NORMAL= BRANCH TO IEFVINA
+*      CONDITIONS= JCL DATA SET STATEMENT CONTAINS A PROC VERB
+*      OUTPUT DATA= OBTAINED STORAGE FOR WORK AREA
+*                   CWAWKBF- ADDRESS OF WORK AREA
+*                   OBTAINED STORAGE FOR INSTREAM QMPA
+*                   WKQMPAPT- ADDRESS OF INSTREAM QMPA
+*      RETURN CODES= NONE
+*
+*   EXIT - NORMAL= BRANCH TO IEFVHM
+*      CONDITIONS= STATEMENT CONTAINS UNRECOGNIZABLE VERB
+*      OUTPUT= NONE
+*      RETURN CODES= NONE
+*
+*   EXIT - NORMAL= BRANCH TO IEFVHA
+*      CONDITIONS= PROCEDURE LIBRARY INPUT BUFFER IS TO BE PRIMED
+*      OUTPUT= NONE
+*      RETURN CODES= NONE
+*
+*   EXIT - ERROR= BRANCH TO IEFVHA
+*      CONDITIONS= STATEMENT CONTAINS NO VERB
+*      OUTPUT= ERROR MESSAGE WRITTEN TO MESSAGE DATA SET
+*      RETURN CODES= NONE
+*
+*   EXTERNAL REFERENCES=
+*      ROUTINES= BRANCH TO IEFVGM - WRITE ERROR MSG TO MSG DATA SET
+*                BRANCH TO IEFVHEB TO LIST ILLEGAL OP STMTS
+*      DATA AREAS= JCL DATA SET INPUT BUFFER
+*                  PROCEDURE LIBRARY INPUT BUFFER
+*                  CWA, INSTREAM PROC WORK AREA (WORKAREA)
+*      CONTROL BLOCKS= QMPA, RPL
+*      TABLES= NONE
+*      MACROS= IEFVMCWA, DCBD, IEFQMNGR, IEFVKEYS, IFGRPL, GETMAIN
+*      ENQUEUE RESOURCES= NONE
+*      CHANGE LEVEL= OZ01932,OZ05638,OZ06806,OZ09485,OZ14932   @ZA14932
+*
+*   MESSAGES= IEF601I INVALID STATEMENT IN PROCEDURE
+*             IEF605I UNIDENTIFIED OPERATION FIELD
+*             IEF611I OVERRIDDEN STEP NOT FOUND
+*             IEF617I NO NAME ON FIRST DD STATEMENT AFTER      @ZA14932
+*                     EXEC STATEMENT                           @ZA14932
+*             IEF658I PROC VERB STATEMENT OUT OF SEQUENCE
+*             IEF659I MISPLACED SYSCHK DD STATEMENT
+*             IEF660I MISSING SYSCHK DD STATEMENT
+*
+***********************************************************************
+         EJECT
+         IEFCOMWA                                                Y02668
+         IEFCVRWA                                                Y02668
+         EJECT
+         IEFQMNGR
+QMPADDR  DS    CL4                     ADDRESS OF WORK BUFFER
+QMPATTR  DS    CL3                     TTR OF JOB QUEUE RECORD
+QMPAZER  DS    CL1  N                  RESERVED FIELD
+         EJECT
+WORKAREA DSECT
+WKTTR    DS    CL4                     POINTER TO NEXT RECORD
+WKQMPAPT DS    CL4                     ADDRESS OF QMPA
+WKRECORD DS    CL168                   COMPRESSED RECORD          O106
+WKPTR1   DS    CL4                     POINTER TO ITSELF
+WKCT     DS    CL1                     NUMBER OF ENTRIES MADE IN
+*                                      THIS SEGMENT OF THE DIRECTORY
+WKPTR2   DS    CL3                     HOLDER OF TTR FROM QUEUE   O106
+*                                      MANAGER                    O106
+WKPROCN1 DS    CL8                     PROCEDURE NAME
+WKTTR1   DS    CL3                     TTR OF FIRST RECORD
+WKPROCN2 DS    CL8                     PROCEDURE NAME
+WKTTR2   DS    CL3                     TTR OF FIRST RECORD
+WKPROCN3 DS    CL8                     PROCEDURE NAME
+WKTTR3   DS    CL3                     TTR OF FIRST RECORD
+WKPROCN4 DS    CL8                     PROCEDURE NAME
+WKTTR4   DS    CL3                     TTR OF FIRST RECORD
+WKPROCN5 DS    CL8                     PROCEDURE NAME
+WKTTR5   DS    CL3                     TTR OF FIRST RECORD
+WKPROCN6 DS    CL8                     PROCEDURE NAME
+WKTTR6   DS    CL3                     TTR OF FIRST RECORD
+WKPROCN7 DS    CL8                     PROCEDURE NAME
+WKTTR7   DS    CL3                     TTR OF FIRST RECORD
+WKPROCN8 DS    CL8                     PROCEDURE NAME
+WKTTR8   DS    CL3                     TTR OF FIRST RECORD
+WKPROCN9 DS    CL8                     PROCEDURE NAME
+WKTTR9   DS    CL3                     TTR OF FIRST RECORD
+WKPROCNA DS    CL8                     PROCEDURE NAME
+WKTTRA   DS    CL3                     TTR OF FIRST RECORD
+WKPROCNB DS    CL8                     PROCEDURE NAME
+WKTTRB   DS    CL3                     TTR OF FIRST RECORD
+WKPROCNC DS    CL8                     PROCEDURE NAME
+WKTTRC   DS    CL3                     TTR OF FIRST RECORD
+WKPROCND DS    CL8                     PROCEDURE NAME
+WKTTRD   DS    CL3                     TTR OF FIRST RECORD
+WKPROCNE DS    CL8                     PROCEDURE NAME
+WKTTRE   DS    CL3                     TTR OF FIRST RECORD
+WKPROCNF DS    CL8                     PROCEDURE NAME
+WKTTRF   DS    CL3                     TTR OF FIRST RECORD
+         EJECT
+         EJECT                                                     AACA
+NEL      DSECT                                                     AACA
+         IEFNEL SUBCOM=C
+         EJECT
+         IEFVKEYS                                                A40034
+         EJECT
+         IEFTXTFT
+         EJECT                                                   A40034
+         IEFVMCWA                                                A40034
+         EJECT                                                   A40034
+         IFGRPL                                                  Y02668
+         EJECT
+IEFVHCB  CSECT
+* A 036630,036660,039030-039120,0611700                        @ZA01932
+* C 058960,058980                                              @ZA00841
+* C 018530,018840                                              @ZA05638
+* C LABEL B223C OUT OF MAINLINE FOR DDOVERRIDE FOLLOWED BY //  @ZA06806
+* A LABEL B223CA WHERE LABEL B223C WAS BEFORE                  @ZA06806
+* C PUT INTERNAL TEXT ROUTINE DONT SET JHS FOR PSEUDO EXEC     @ZA09485
+* A AFTER LABEL B380 FOR NULL DDNAME AFTER EXEC PROC           @ZA14932
+*                   R9 = PTR TO STMT
+*                   RA = PTR TO STMT PARM LIST
+*                   RD=PTR TO CURRENT REG SAVE AREA
+         BALR  RB,0                                              Y02668
+         USING *,RB
+*****************************************************************Y02668
+* MODULE TRACE CODE - FOR TESTING.                               Y02668
+         L     RF,TRACEV           LOAD TRACE RTNE ADDR.         Y02668
+         BALR  RE,RF               ENTER MOD ID IN TRACE RECORD. Y02668
+TRACEV   DC    V(TRACE)            TRACE RTNE ADDR.              Y02668
+         DC    C'VHCB'             MOD ID USED BY TRACE.         Y02668
+* TRACE RETURNS HERE.                                            Y02668
+*****************************************************************Y02668
+         B     B1                      BRANCH AROUND CONSTANTS   A27782
+         MODID BR=NO                                             Y01886
+         DC    C'REL3'              FUNCTION ID AND              Y02668
+*        DC    C'02' LEV # (CONCAT DS OVERRID W/SAME DDNAME)   @ZA01932
+*        DC    C'03' LEV # (STEPCAT NOT INDICATED IN EXEC PFX) @ZA05638
+*        DC    C'04' LEV # (DD OVERRIDE FOLLOWED BY //NULL)    @ZA06806
+*        DC    C'05' LEV #(NO EXEC IN DEFERRED RESTART JOB)    @ZA09485
+         DC    C'06' LEV #(JCL ERROR ON NULL DDNAME AFTER EXEC PROC)
+*                                                              @ZA14932
+CLEARVB  EQU   7                                                 Y02668
+         DROP  RA                  RELEASE USING ON LWA         YM00387
+B1       DS    0H                                                A27782
+         TM    SWE,PREF                Q. PROC END OF FILE ?     A27782
+         BNO   B2                      NO                        A27782
+         OI    SWE,SEQUENCE            YES, SET SWITCH FOR USE   A27782
+*                                      LATER - TEST FOR ADDITION A27782
+*                                      OUT OF SEQUENCE           A27782
+B2       DS    0H
+*                                       SET UP FOR SCAN
+         LA    R1,1(0,R9)               START OF SCAN-1   COL2
+         LA    R7,1(0,R1)               SAVE TO CALC NAME LENGTH
+*                                       SET UP TO SCAN FOR A BLANK
+         LA    R8,B282             LOAD ERROR EXIT ADDR.           AACA
+         LA    R4,B279               **EXIT IF NOT FOUND
+         LA    R5,B22                     EXIT IF FOUND
+         LA    R6,X'70'                   COND CODE
+B20      DS    0H                                                  AACA
+         LA    R2,1                     INCREMENT                  AACA
+         LA    R3,70(0,R9)              COL 71 LAST SCAN POSITON   AACA
+B21      DS    0H                       SCAN ROUTINE
+         BXH   R1,R2,0(R4)                EXIT IF CHAR NOT FOUND
+         CLI   0(R1),C' '                 TEST CHAR
+         EX    R6,B212                  LOOP IF CHAR NOT FOUND
+         BR    R5                       EXIT IF CHAR FOUND
+B212     BC    0,B21                    EXECUTED BR
+B22      DS    0H
+         LR    0,R1
+         SR    0,R7                     CALC NAME LENGTH
+         STC   0,NAMEL(0,RA)            SAVE LENGTH IN PARM LIST
+*                                       SET TO SCAN FOR NON-BLANK
+         BNE   B222                     BR IF NAME IS PRESENT
+         LA    R4,B223                    EXIT IF A NULL
+B222     DS    0H
+         LA    R5,B23                     EXIT IF VERB FOUND
+         LA    R6,X'80'                   COND CODE
+         B     B21                        GO TO SCAN
+B223     DS    0H
+         NI    VERB(RA),255-7           SET VERB ID = 0
+         TM    SWE,PROC            PROCESSING A PROC ?          YM08107
+         BZ    B2235               NO - GO TO WRITE TEXT        YM08107
+         TM    SWE,PRCV            PROC BUFFER CONTAIN A CARD ? YM08107
+         BO    B224                NO - GO TO EOF RTN           YM08107
+         LA    RA,PSTMT            YES - POINT TO PROC PARMS    YM08107
+B2235    DS    0H                                               YM08107
+         BAL   R7,AOIORTN          WRITE TEXT FOR PRIOR STMT.    Y02668
+         TM    SWE,PROC            PROC BEING PROCESSED ?       YM02703
+         BO    B223C               YES GO TO UPDATE EXEC PREFIX@ZA05638
+         TM    SWB,CXPN            CONT EXP & NOT RECV?         YM00387
+         BZ    B223A               NO GO TO UPDATE PREFIXES     YM00387
+         L     R7,TLENP            YES GET PTR TO NEXT TXT BYTE YM00387
+         MVI   0(R7),ENDK          PUT END KEY IN TEXT          YM00387
+         LA    R7,1(R7)            INCREMENT FOR END KEY        YM00387
+         L     R1,TEXTBUFP         GET TEXT POINTER             YM00387
+         SR    R7,R1               CALCULATE TEXT LENGTH        YM00387
+         USING TEXT,R1             GET ADDRESSABILITY TO PREFIX YM00387
+         STH   R7,STRLTH           PUT TEXT LENGTH IN PREFIX    YM00387
+         DROP  R1                                               YM00387
+         OI    AOSW1,AOTXTWRT      SET TEXT WRTIE SW.           YM00387
+         BAL   R7,AOIORTN          GO TO WRITE TEXT             YM00387
+B223A    DS    0H                                               YM00387
+         TM    SWA,JHS             DOES JOB HAVE A STEP?        YM00387
+         BO    B223B               YES GO TO UPDATE PREFIXES    YM00387
+         L     R2,CTRLWAP          GET LWA ADDR                 YM00387
+         USING CWA,R2              SET ADDRESSABILITY           YM00387
+         XC    MSGKEY,MSGKEY       TELL VGM NO SECONDARY MSG    YM00387
+         DROP  R2                                               YM00387
+         LA    R2,MSG7             NO GET JOB HAS NO STEP KEY   YM00387
+         L     RF,IEFVGMV          GET MSG RTNE ADDR            YM00387
+         BALR  RE,RF               GO TO WRITE MSG              YM00387
+         LA    R7,WAJOBPFX         GET JOB PFX ADDR             YM00387
+         USING TEXT,R7             GET TEXT ADDRESSABILITY      YM00387
+         OI    STRJINDC,JTXJOBFL   SET JOB FAIL IN PFX          YM00387
+         DROP  R7                                               YM00387
+B223B    DS    0H                                               YM00387
+         LA    R0,WAJOBRBA         GET JOB TEXT TTR             YM00387
+         BAL   R7,AOIOPFXP         GO TO UPDATE JOB PREFIX      YM00387
+B223CA   TM    SWA,JHS             DOES A STEP EXIST? NEW LABEL@ZA06806
+         BZ    B224                NO GO TO NULL EXIT           YM00387
+         LA    R0,WAEXCRBA         GET EXEC TEXT TTR            YM00387
+         BAL   R7,AOIOPFXP         GO TO UPDATE EXEC PFX        YM00387
+B224     DS    0H                                               YM00387
+         L     RF,IEFVHLV                                       YM00387
+         BR    RF                  EXIT TO NULL RTNE            YM00387
+B223C    TM    SWZ,DDOV           IS DD OVERRIDE IN PROGRESS   @ZA06806
+         BO    B224               YES, DONOT UPDATE EXEC PRFX  @ZA06806
+         B     B223CA             NO. GO UPDATE EXEC PRFX NOW  @ZA06806
+B23      DS    0H
+         CLC   JOB,0(R1)                JOB STMT
+         BE    B2375                    BR YES
+         CLC   PEND,0(R1)              IS THIS A PEND VERB         4387
+         BE    B2355                   PEND VERB OUT OF SEQ        4387
+         CLC   DD,0(R1)                 DD STMT
+         BNE   B2377                    BR NO
+         TM    SWH,CPSTPFL         Q. CKPT/REST STEP FLUSH ON      AACA
+         BO    B2308                BR - YES                       AACA
+         TM    SWH,CPFLGXX         Q. RESTART FLAG ON              AACA
+         BZ    B2308                BR - NO                        AACA
+         CLC   2(7,R9),SYSCHK      Q. 'SYSCHK' DD NAME             AACA
+         BNE   B2308                BR - NOT SYSCHK DD NAME        AACA
+         NI    SWH,255-CPFLGXX     CLEAR RESTART FLAG              AACA
+*** RESTART RELEASE.                                             Y02668
+         LA    R8,WAJOBPFX         ADDR OF PSEUDO JOB PFX.       Y02668
+         USING TEXT,R8             PREFIX ADDRESSABILITY.        Y02668
+         OI    STRJINDC,JTXSYSCK   SET SYSCHK DD RECVD BIT.      Y02668
+         CLI   CWACHIDL,0          CHECKID LENGTH = 0?           Y02668
+         BE    B2304                BR - YES  IF DD NAME IS        AACA
+*                                   SYSCHK, AN EXEC STMT MUST      AACA
+*                                   HAVE BEEN RCVD.                AACA
+         TM    SWD,FEXRCV          Q. 1ST EXEC STMT RCVD           AACA
+         BO    B2306                BR - YES                       AACA
+         OI    CRSW1,CPFLG         SET CKPT/REST FLAG              AACA
+         TM    CRSW1,CRRES1        RESTART FIRST STEP?           Y02668
+         BE    B2308                BR - YES                       AACA
+         TM    STRJINDC,JTXJOBFL   JOB ALREADY FAILED?           Y02668
+         BO    B2308                BR - YES                       AACA
+         OI    SWH,CPSTPFL         SET WORK AREA STEP FLUSH BIT. Y02668
+         OI    STRJINDC,JTXCPSTF   SET C/R STEP FLUSH FLAG. THIS Y02668
+*                                  FLAG SIGNIFIES TO EXEC STMT     AACA
+*                                  PROCESSOR (IEFVEA) TO CHECK FOR AACA
+*                                  THE CORRECT RESTART STEP. WHEN  AACA
+*                                  FOUND, THIS FLAG IS CLEARED.    AACA
+         B     B2308               CONTINUE SCAN OF DD STMT        AACA
+B2304    DS    0H                                                  AACA
+         TM    SWD,FEXRCV          Q. 1ST EXEC STMT RCVD           AACA
+         BO    B2308                BR - YES                       AACA
+         TM    STRJINDC,JTXJOBFL   JOB ALREADY FAILED?           Y02668
+         BO    B2308                BR - YES                       AACA
+B2306    DS    0H                                                  AACA
+         MVI   VERB(RA),CRE+4      SET C/R ERR FLG & DD VERB       AACA
+         OI    STRJINDC,JTXJOBFL   SET JOB FAILED BIT.           Y02668
+         DROP  R8                                                Y02668
+         B     B231                                                AACA
+B2308    DS    0H                                                  AACA
+         MVI   VERB(RA),4          DD VERB ID                      AACA
+B231     DS    0H                                                  AACA
+         LA    R1,2(R1)            UPDATE SCAN PTR                 AACA
+B232     DS    0H
+B233     DS    0H                       FIND STMT OPERAND LIST
+         LA    R4,B234                    EXIT IF NO LIST
+         LA    R6,X'80'                   COND CODE TO FIND A NON-BLANK
+         BAL   R5,B20                   SET EXIT & GO TO SCAN      AACA
+B234     DS    0H
+         SR    R1,R9                    CALC REL LIST PTR
+         STC   R1,LISTPTR(0,RA)    SAVE REL PTR IN PARM LIST     Y02668
+AOB01    DS    0H                                                Y02668
+         TM    VERB(RA),1          IS THIS A JOB CARD?           Y02668
+         BZ    AOB10               BRANCH IF NOT.                Y02668
+         OI    SWA,JTOP            INDICATE JOB CARD FOUND.      Y02668
+AOB10    DS    0H                                                Y02668
+         TM    VERB(RA),8              Q. PROC VERB               M4268
+         BZ    B234A                   IF NO, CHECK IF PROCEDURE  M4268
+*                                      BEING PROCESSED            M4268
+         TM    SWE,GPI                 IS PROC STMT FROM PROCLIB  M4268
+         BO    B3                      IF YES,CHECK IT'S POSITION M4268
+*                                      IN THE PROCEDURE           M4268
+         TM    IWAPARM,INSTPR          IS AN INSTREAM PROCEDURE   M4268
+*                                      BEING EXPANDED             M4268
+         BZ    B281A                   IF NO, GO TO INSTREAM      M4268
+*                                      PROCEDURE COMPRESS ROUTINE M4268
+         TM    SWE,PRCV                ANY STMT IN PROC BUFFER   A41878
+         BZ    B451                    YES - PROCESS IT BEFORE   A43603
+*                                      READING FROM INPUT STREAM A43603
+         B     B380                    EXIT TO GET ROUTINE        M4268
+B234A    DS    0H                                                 M4268
+         TM    SWE,PROC                Q.PROCEDURE BEING PROCESSEDM4268
+         BO    B3                      IF YES,CHECK VERB POSITIONSM4268
+         TM    SWE,PREF                 PROC EOF
+         BO    B24                      BR YES
+B235     DS    0H
+         BAL   R7,AOIORTN          WRITE TEXT FOR PRIOR STMT     Y02668
+         CLI   VERB(RA),2          HAS AN EXEC BEEN READ?        Y02668
+         BNE   B235A               NO CONTINUE PROCESSING        Y02668
+         LA    R7,WAEXCPFX         GET BASE FOR EXEC PFX SVAREA  Y02668
+         USING TEXT,R7             SET ADDRESSABILITY
+         TM    STRINDCS,EXECSTR    HAS AN EXEC PREFIX BEEN SAVED Y02668
+         BZ    B235A               NO CONTINUE PROCESSING        Y02668
+         DROP  R7                                                Y02668
+         LA    R0,WAEXCRBA         GET EXEC TEXT TTR             Y02668
+         BAL   R7,AOIOPFXP         GO TO UPDATE EXEC PREFIX      Y02668
+B235A    DS    0H                                                Y02668
+         L     RF,IEFVHEB          EXIT TO                       Y02668
+         BR    RF                  PRE-SCAN ROUTINE.             Y02668
+B2355    DS    0H                                                  4387
+         LA    R2,PENDERR          ERR MSG - PEND OUT OF SEQ     Y02668
+         L     RE,IEFVHAV          SET EXIT ADDR TO GO BACK&READ Y02668
+         B     B28                     CREATE SMB FOR ERROR MSG    4387
+B2375    DS    0H                       JOB STMT
+         LA    R1,3(0,R1)               SET SCAN PTR
+         MVI   VERB(RA),1               VERB ID IN PARM LIST  (JOB)
+         B     B233
+B2376    CLC   2(0,R9),PPSN             COMPARE JOBNAME WITH START NAME
+B2377    DS    0H
+         CLC   EXEC,0(R1)               EXEC STMT
+         BE    B2380                 ** BR-YES
+         CLC   PROCA,0(R1)           **Q. PROC STMT
+         BNE   B284                  ** BR-NO GO SCAN FOR COMMAND
+         LA    R1,4(R1)              **UPDATE THE SCAN PTR
+         MVI   VERB(RA),8            **VERB ID TO PARM LIST
+         B     B232                                                AACA
+B2380    TM    SWH,CPSTPFL         Q. C/R STEP FLUSH FLAG ON       AACA
+         BO    B2386                BR - YES                       AACA
+         TM    SWH,CPFLGXX         Q. RESTART FLAG ON              AACA
+         BZ    B2386                BR - NO                        AACA
+         NI    SWH,255-CPFLGXX     CLEAR RESTART FLAG              AACA
+         CLI   CWACHIDL,0          CHECKID LENGTH = 0?           Y02668
+         BE    B2384                BR - YES                       AACA
+         LA    R8,WAJOBPFX         ADDR OF PSEUDO JOB PFX.       Y02668
+         USING TEXT,R8             PREFIX ADDRESSABILITY.        Y02668
+         TM    STRJINDC,JTXSYSCK   SYSCHK DD RECEIVED?           Y02668
+         BO    B2386                BR - YES                       AACA
+         OI    STRJINDC,JTXSYSCK   SET SYSCHK DD RECVD FLAG.     Y02668
+         LA    R3,MSG60            LOAD ERROR MESSAGE INDEX        AACA
+         OI    STRJINDC,JTXJOBFL   SET JOB FAILED BIT.           Y02668
+         BAL   R8,B281             OUTPUT MESSAGE                  AACA
+         B     B2386                                               AACA
+B2384    DS    0H                                                  AACA
+         TM    CRSW1,CRRES1        RESTART FIRST STEP?           Y02668
+         BE    B2386                BR - YES                       AACA
+         LA    R8,WAJOBPFX         ADDR OF PSEUDO JOB PFX.       Y02668
+         TM    STRJINDC,JTXJOBFL   JOB FAILED?                   Y02668
+         BO    B2386                BR - YES                       AACA
+         OI    SWH,CPSTPFL         WORK AREA C/R STEP FLUSH FLAG.Y02668
+         OI    STRJINDC,JTXCPSTF   SET C/R STEP FLUSH FLAG. THIS Y02668
+*                                  FLAG SIGNIFIES TO EXEC STMT     AACA
+*                                  PROCESSOR (IEFVEA) TO CHECK FOR AACA
+*                                  THE CORRECT RESTART STEP. WHEN  AACA
+*                                  FOUND, THIS FLAG IS CLEARED.    AACA
+B2386    DS    0H                                                  AACA
+         LA    R1,4(R1)                 SET SCAN PTR
+         MVI   VERB(RA),2               VERB ID IN PARM LIST  (EXEC)
+         B     B232
+B24      DS    0H                       IF PROC EOF ON AND
+         TM    VERB(RA),4            **Q. THIS A RDR DD STMT
+         BZ    B235                   **(BRANCH NO) THEN TEST THE PROC
+*                                       MERGE CONTROL FOR DD SEQUENCE
+         BAL   R8,B6                      BREAKOUT QUAL NAMES TO REG
+         CLI   20(RD),C' '                SAVE AREA - STEPNAME PRESENT
+         BE    B235                       BR NO
+         CLC   PSNM(8),20(RD)             STEPNAME = PROC STEPNAME
+         BE    B235                       BR YES
+         OI    VERB(RA),SSE               SET DD STMT SEQ ERR
+         LA    R8,WAJOBPFX         ADDR OF PSEUDO JOB PFX.       Y02668
+         OI    STRJINDC,JTXJOBFL   SET JOB FAILED BIT.           Y02668
+         B     B235
+B279     DS    0H                    **
+         L     R2,CTRLWAP          GET LOCAL WORK AREA PTR       Y02668
+         USING CWA,R2              SET BASE                      Y02668
+         XC    MSGKEY,MSGKEY       ZERO SECONDARY MSG. KEY       Y02668
+         DROP  R2                                                Y02668
+         LA    R2,MSG5             UNIDENTIFIED OPERATION FIELD  Y02668
+         L     RE,IEFVHAV          SET EXIT ADDR                 Y02668
+B28      DS    0H
+         LA    R8,WAJOBPFX         ADDR OF PSEUDO JOB PFX.       Y02668
+         OI    STRJINDC,JTXJOBFL   SET JOB FAILED BIT.           Y02668
+         DROP  R8                                                Y02668
+         OI    AOSW1,AOPRTSW       TELL VHEB TO PRINT STMT       Y02668
+         OI    AOSW1,AOILGLOP      TELL VHEB IT'S A MSG          Y02668
+         L     RF,IEFVHEB          GO TO PRINT                   Y02668
+         BR    RF                  THE STMT                      Y02668
+B281     DS    0H
+         LR    R2,R3                 **SET UP MESS. INDEX
+         L     RF,IEFVGMV          LOAD MSG RTN ADDR               AACA
+         BALR  RE,RF                    MSG TO SMB
+         SPACE 1                                                 A40034
+***********************************************************************
+* UPON RETURN FROM IEFVGM THE SECONDARY MSG FIELD(MSGKEY) MUST BE     *
+* CLEARED TO PREVENT ANY FURTHER USAGE OF SECONDARY MSG.S. IN THE     *
+* CONTROL RTN.S.                                                      *
+***********************************************************************
+         SPACE 1                                                 A40034
+         L     R2,CTRLWAP          ESTABLISH CWA ADDRESSABILITY  A40034
+         USING CWA,R2                                            A40034
+         XC    MSGKEY,MSGKEY       INITIALIZE SECONDARY MSG KEY  A40034
+         DROP  R2                  RELEASE  ADDRESS. TO CWA      A40034
+         SPACE 1                                                 A40034
+         BR    R8                  RETURN                          AACA
+         SPACE
+B281A    DS    0H                                                 O106
+***********************************************************************
+*                                                                     *
+*  AN IN-LINE PROCEDURE WAS BEEN ENCOUNTERED.  GET CORE FOR A     O106*
+*  WORK AREA AND A QMPA IF THEY ARE NEEDED.  XCTL TO IEFVINA      O106*
+*                                                                     *
+***********************************************************************
+         L     R3,IWAWKBF              ADDRESS OF WORK AREA       O106
+         LTR   R3,R3                   SEE IF CORE WAS GOTTEN     O106
+         BNZ   B281AA                  EXIT FOR IEFVINA           O106
+         SPACE
+         LA    R0,WORKLN               LENGTH OF WORK AREA        O106
+         GETMAIN R,LV=(0)
+         XC    DISPL0(MAXLIN,R1),DISPL0(R1) CLEAR THE WORK AREA   O106
+         LR    R7,R1                   SAVE ADDRESS OF WORKAREA   O106
+         USING WORKAREA,R7                                        O106
+         ST    R1,IWAWKBF              ADDRESS OF WORK AREA
+         LA    R1,QPARM            GET QMPA ADDRESS              Y02668
+         ST    R1,WKQMPAPT             ADDRESS OF QMPA
+         SPACE
+B281AA   DS    0H                                                 O106
+         L     RF,IEFVINAV         INSTREAM PROC RTNE ADDR.      Y02668
+         BR    RF                  BRANCH.                       Y02668
+         SPACE
+B282     DS    0H
+         L     RF,IEFVHAV
+         BR    RF             EXIT TO GET STMT
+B284     DS    0H
+         LR    R5,R1                    PTR TO VERB
+         L     RF,IEFVHMV
+         BR    RF             EXIT TO SCAN COMMAND
+B3       DS    0H        PROCEDURE STMT MERGE ROUTINE
+         TM    VERB(RA),8            **Q. PROC VERB
+         BO    B32                   ** BRANCH - YES
+         NI    SWD,255-SYMPRC        **CLEAR 1ST ACCESS FLAG
+         TM    VERB(RA),4               DD STMT
+         BZ    B35                      BR NO
+         TM    SWE,GPI                  PROC STMT
+         BO    B35                      BR YES
+         CLI   NAMEL(RA),0              NAME PRESENT
+         BNE   B35                      BR YES
+         OI    SWE,CONCAT               CONCATINATION ON
+B31      DS    0H                                              @ZA01932
+         MVC   RDNM(8),BLANKS       BLANK READER DDNAME        @ZA01932
+         B     B38
+B32      DS    0H                    **
+         TM    SWD,SYMPRC            **Q. 1ST ACCESS OF THIS PROC
+         BZ    B325                  ** BR-NO
+         NI    SWD,255-SYMPRC        **CLEAR 1ST ACCESS OF PROC
+         B     B235                GO TO PRE SCAN EXIT          YM00382
+B325     DS    0H                    **
+         NI    SWD,255-SYMPRC        **CLEAR 1ST ACCESS OF PROC
+         LA    R2,MSG13            PROC VERB OUT OF SEQUENCE     Y02668
+         L     RE,IEFVHAV          SET UP EXIT ADDR              Y02668
+         B     B28                   **
+B35      DS    0H
+         BAL   R8,B6                    BREAKOUT STMT NAMES
+         TM    SWE,GPI                  PROC STMT
+         BZ    B351                     BR NO
+         TM    VERB(RA),1               JOB
+         BO    B57                      BR YES
+         TM    VERB(RA),2               EXEC
+         BO    B40                      BR YES
+B351     DS    0H
+         CLI   NAMEL(RA),0              NAME BLANK
+         BNE   B36                  NO, BRANCH                 @ZA01932
+         TM    SWE,GPI              PROC STMT                  @ZA01932
+         BZ    B31                  NO, BRANCH                 @ZA01932
+         MVC   PDNM(8),BLANKS       BLANK PROC DDNAME          @ZA01932
+         B     B38                  THEN BRANCH                @ZA01932
+B36      DS    0H
+         TM    SWE,GPI                  PROC STMT
+         BZ    B37                      BR NO
+         MVC   PDNM(8),28(RD)           PROC DDNAME
+         B     B38
+B37      DS    0H
+         CLI   20(RD),C' '              STEPNAME BLANK
+         BE    B372                     BR YES
+         MVC   RSNM(8),20(RD)           RDR STEPNAME
+B372     DS    0H
+         MVC   RDNM(8),28(RD)           RDR DD NAME
+B38      DS    0H
+         TM    SWE,PRCV                 PRIME PROC BUFFER
+         BZ    B45                      BR NO
+B380     DS    0H                                                 M4268
+         NI    SWE,255-PRCV             PRCV OFF
+         OI    SWE,GPI               **SET GET PROC INPUT AND
+         OI    SWD,SYMPRC            ** 1ST ACCESS FLAGS
+         TM    VERB(RA),4         IS THIS A DD STATEMENT?      @ZA14932
+         BZ    B381               NO, BRANCH                   @ZA14932
+         CLI   NAMEL(RA),0        IS DDNAME LENGTH ZERO?       @ZA14932
+         BNE   B381               NO, BRANCH                   @ZA14932
+*
+* CONDITION DETECTED OF DD STATEMENT WITH NO NAME FOLLOWING    @ZA14932
+* EXEC PROC STATEMENT. FAIL WITH MSG IEF617I.                  @ZA14932
+* NO NAME ON DD STATEMENT AFTER EXEC PGM= STATEMENT IS         @ZA14932
+* DETECTED IN INTERPRETER MODULE IEFVDA                        @ZA14932
+         LA    R2,MSG17           CODE FOR MSG IEF617I         @ZA14932
+         L     RE,IEFVHAV         SET EXIT ADDR                @ZA14932
+         B     B28                GO PUT OUT MSG FIRST         @ZA14932
+B381     DS    0H                                              @ZA14932
+         L     RF,IEFVHAV
+         BR    RF             EXIT TO GET STMT
+B40      DS    0H                       PROCEDURE EXEC STMT
+         OI    SWE,SEQUENCE            TURN SWITCH ON EACH TIME  A27782
+*                                     PROC 'EXEC' IS ENCOUNTERED A27782
+         MVC   PPSN(8),PSNM             SAVE PREVIOUS STEPNAME
+         MVC   PSNM(8),28(RD)           CURRENT STEPNAME
+         MVI   PDNM,C' '                INITIALIZE PROC DD NAME
+         MVI   PDNM+1,C'@'              SPECIAL CHARACTER
+         CLI   RSNM,0                   RDR STEPNAME=0
+         BNE   B38                      BR NO
+         MVC   RSNM(8),PSNM             SET STEPNAMES EQUAL
+         NI    SWE,255-CONCAT           CONCATINATION OFF
+         B     B38
+B45      DS    0H
+         TM    SWE,POVRD                OVERRIDDEN STMT
+         BZ    B48                      BR NO
+B451     DS    0H                                                A43603
+         NI    SWE,255-POVRD            OVERRIDE OFF
+B46      DS    0H
+         LA    RA,PSTMT                 PROC PARM LIST
+         L     R9,PSTMT                 PROC STMT
+         OI    SWE,GPI                  GET PROC STMT ON
+         B     B235
+B48      DS    0H
+         CLC   PSNM(8),RSNM             STEPNAMES EQUAL
+         BNE   B55                      BR NO
+         NI    SWE,NOT-SEQUENCE        TURN SWITCH OFF EACH TIME A27782
+*                                      DDNAMES ARE EQUAL         A27782
+         CLC   PDNM(8),RDNM             DDNAMES EQUAL
+         BNE   B52                      BR NO
+         TM    RSTMT+VERB,4             RDR HAVE A DD
+         BZ    B46                      BR NO
+         OI    SWE,POVRD                OVERRIDE ON
+         L     R9,PSTMT      POINT R9 TO STATEMENT...           YA59657
+B505     MVI   1(R9),C'/'         MARK OVERRIDDEN STMT            20817
+B51      DS    0H                                                 20817
+         NI    SWE,255-CONCAT-GPI       CONCATINATION OFF & GPI OFF
+         LA    RA,RSTMT                 RDR PARM LIST
+         L     R9,RSTMT                 RDR STMT
+         B     B235                     GO TO JOB CONTROL
+B52      DS    0H
+         TM    SWE,CONCAT               CONCATINATION IN RDR
+         BZ    B46                      BR NO
+         B     B51                     BR IF YES                 A29458
+B55      DS    0H
+         NI    SWE,255-CONCAT           CONCAT OFF
+         TM    RSTMT+VERB,4             RDR A DD
+         BZ    B46                      BR NO
+         CLC   RSNM(8),PPSN             STEP EQL PREV PROC STEP
+         BNE   B46                      BR NO
+         TM    SWE,SEQUENCE            TEST FOR ADDITION OUT OF  A27782
+*                                      SEQUENCE                  A27782
+         BO    B51                     --NO--VALID ADDITION TO  YA59657
+*                                      PREVIOUS PROC STEP--      A27782
+*                                      ---PROCESS READER---      A27782
+         B     B46                     --YES-ADDITION MAY BE OUT A27782
+*                                     OF SEQUENCE OR THE STEP TO A27782
+*                                      BE OVERRIDDEN IS NOT IN   A27782
+*                                      THIS PROCEDURE--PROCESS   A27782
+*                                      THE PROC. STATEMENT       A27782
+B57      DS    0H
+         NI    VERB(RA),255-CLEARVB SET VERB ID = 0              Y02668
+         LA    R2,MSG1             JOB STMT IN PROCEDURE         Y02668
+         L     RE,IEFVHLV          SET EXIT ADDR                 Y02668
+         B     B28                                               Y02668
+B6       DS    0H                  BREAKOUT QUAL NAMES
+*                                  QUALIFIER TO 20(RD)
+*                                  UNQUAL NAME TO 28(RD)
+         MVI   20(RD),C' '              BLANKS TO WORK AREA
+         MVC   21(15,RD),20(RD)
+         CLI   NAMEL(RA),0              NAME BLANK
+         BCR   8,R8                     RETURN YES
+         MVI   28(RD),0                 DDNAME ON ERR RETURN
+B61      DS    0H
+         LA    R1,2(0,R9)               NAME
+         LA    R2,1                     INCREMENT
+B611     DS    0H
+         LA    R3,8(0,R1)               END OF SCAN
+         SR    R4,R4                    LENGTH COUNTER
+         LR    R5,R1                    1ST CHAR OF NAME
+B612     DS    0H
+         BXH   R1,R2,B622               LONG NAME ERROR MSG RTN  A40034
+         CLI   0(R1),C' '               BLANK FOUND
+         BE    B62                      BR YES
+         CLI   0(R1),C'.'               . FOUND
+         BE    B63                      BR YES
+         AR    R4,R2                    COUNTER
+         B     B612
+B62      DS    0H                       MOVE DDNAME
+         EX    R4,B625
+         BR    R8                  EXIT
+         SPACE 5
+***********************************************************************
+*  THE FOLLOWING IS AN ERROR MSG SETUP RTN THAT ESTABLISHES CWA       *
+* ADDRESSABILITY, AND SETS THE SECONDARY MSG FIELD FOR IEFVGM.        *
+*  - THE EXIT FROM THIS RTN IS TO A GENERALIZED MSG INTERFACE RTN, AND*
+* UPON RETURN FROM THE MSG RTN THE EXIT IS MADE TO IEFVHA TO READ A   *
+* NEW CARD IMAGE.                                                     *
+***********************************************************************
+         SPACE 1                                                 A40034
+B622     L     R6,CTRLWAP               ESTABLISH ADDRESS TO CWA A40034
+         USING CWA,R6                                            A40034
+         TM    VERB(RA),DDVERB          WAS THIS A DD STMT. ?    A40034
+         BO    B623DD                   INDICATE DD VERB         A40034
+         MVI   MSGKEY,EXECK             EXEC STMT KEY TO CWA     A40034
+         B     B6MSG                    GO SET PRIMARY MSG UP    A40034
+B623DD   MVI   MSGKEY,DDK               DD STMT KEY TO CWA       A40034
+B6MSG    LA    R2,MSG42                 MSG IEF642I FOR ERROR  @ZA00841
+         L     RE,IEFVHAV             EXIT TO IEFVHA FROM VHEB @ZA00841
+         B     B28                      CREATE SMB FOR ERROR MSG A40034
+         DROP  R6                       RELEASE CWA ADDRESS.     A40034
+B625     MVC   28(1,RD),0(R5)           DDNAME
+B63      DS    0H                       MOVE STEPNAME
+         EX    R4,B635
+         AR    R1,R2                    PTR TO NEXT SCAN CHAR
+         B     B611                     SCAN FOR DDNAME
+**********************************************************************
+*  PREFIX UPDATE SUBROUTINE                                      Y02668
+**********************************************************************
+AOIOPFXP DS    0H                                                Y02668
+         L     R6,WANELPTR         GET BASE FOR NEL              Y02668
+         USING NEL,R6              SET ADDRESSIBILITY            Y02668
+         LA    R2,RPLADDR          GET BASE FOR RPL              Y02668
+         USING IFGRPL,R2           SET ADDRESSIBILITY            Y02668
+         MVI   RPLREQ,RPLGET       OPERATION TO BE A GET         Y02668
+         MVC   RPLDACB,NELTXTCB    MOVE IN ACB POINTER           Y02668
+         MVC   RPLAREA,TEXTBUFP    POINTER TO BUFFER             Y02668
+         ST    R0,RPLARG           TTR OF RECORD                 Y02668
+         MVI   RPLOPT1,RPLDIR      OPERATION TO BE DIRECT        Y02668
+         MVI   RPLOPT2,RPLUPD      OPERATION TO BE WITH UPDATE   Y02668
+         LH    R0,TXTBUFLT         GET BUFFER LENGTH             Y02668
+         ST    R0,RPLBUFL          MAXIMUM BUFFER 4K             Y02668
+         XC    RPLRLEN(4),RPLRLEN  ZERO FIELD                    Y02668
+         XC    RPLDDDD(4),RPLDDDD  ZERO FIELD                    Y02668
+         DROP  R6                                                Y02668
+         ST    RD,IWASACHN         SAVE SAVE AREA POINTER        Y02668
+         LA    RD,IWAIOSA          SAVE AREA FOR ACCESS METHOD   Y02668
+         LR    R1,R2               POINT TO RPL                  Y02668
+         GET   RPL=(1)
+         L     RD,IWASACHN         RESTORE SAVE AREA POINTER     Y02668
+         LTR   RF,RF               TEST RETURN CODE              Y02668
+         BNZ   AOIOERRT            BR NON-ZERO TO ERROR RTNE.    Y02668
+         L     R6,TEXTBUFP         GET BASE FOR TEXT PREFIX      Y02668
+         USING TEXT,R6             SET ADDRESSABILITY            Y02668
+         TM    STRINDCS,JOBSTR     IS THIS JOB TEXT?             Y02668
+         BZ    AOIOEXMV            NO GO TO MOVE IN EXEC PREFIX  Y02668
+         MVC   TEXT(STRJPFXL),WAJOBPFX  UPDATE JOB PREFIX        Y02668
+         B     AOIOPTXT            GO TO PUT TEXT                Y02668
+AOIOEXMV DS    0H                                                Y02668
+         MVC   TEXT(STREPFXL),WAEXCPFX  UPDATE JOB PREFIX        Y02668
+AOIOPTXT DS    0H                                                Y02668
+         XC    RPLRLEN(2),RPLRLEN  ZERO FIRST 2 BYTES AND        Y02668
+         MVC   RPLRLEN+2(2),0(R6)  MOVE LENGTH IN LAST 2 BYTES   Y02668
+         MVI   RPLREQ,RPLPUT       OPERATION TO BE A PUT         Y02668
+         LR    R1,R2               POINT TO RPL                  Y02668
+         DROP  R6                                                Y02668
+         ST    RD,IWASACHN         SAVE SAVE AREA POINTER        Y02668
+         LA    RD,IWAIOSA          SAVE AREA FOR ACCESS METHOD   Y02668
+         PUT   RPL=(1)
+         XC    RPLOPT2,RPLOPT2     CLEAR FOR FUTURE USE          Y02668
+         DROP  R2                                                Y02668
+         L     RD,IWASACHN         RESTORE SAVE AREA POINTER     Y02668
+         LTR   RF,RF               TEST RETURN CODE              Y02668
+         BCR   8,R7                NO ERROR RETURN TO CALLER     Y02668
+         B     AOIOERRT            ERROR.                        Y02668
+         EJECT
+*********************************************************************
+*     PUT INTERNAL TEXT ROUTINE                                  Y02668
+*********************************************************************
+AOIORTN  DS    0H                                                Y02668
+         TM    AOSW1,AOTXTWRT      IS THERE TEXT TO BE WRITTEN   Y02668
+         BCR   8,R7                BRANCH NO                     Y02668
+*   TEXT EXISTS FOR PRIOR STATEMENT. WRITE STRING TO TEXT DS     Y02668
+         L     R6,TEXTBUFP         GET BASE FOR TEXT PREFIX      Y02668
+         USING TEXT,R6             SET ADDRESSABILITY            Y02668
+         TM    STRINDCS,EXECSTR    IS THIS AN EXEC STRING        Y02668
+         BZ    AOIODD              NO GO TO CHECK FOR A DD       Y02668
+         TM    STREINDC,ETXCPFLG   C/R FLAG SET IN PREFIX      @ZA09485
+         BO    AOPSEUDO            DONT SET JOB HAS STEP BIT   @ZA09485
+         OI    SWA,JHS             SET STEP DOES EXIST           Y02668
+AOPSEUDO CLI   VERB(RA),2          YES IS THE NEXT AN EXEC ALSO@ZA09485
+         BE    AOIOEXDD            YES GO TO SET NO DD BIT       Y02668
+         CLI   VERB(RA),0          IS THE NEXT STMT A NULL?      Y02668
+         BNE   AOIOPUT             NO GO TO PUT TEXT             Y02668
+AOIOEXDD DS    0H                                                Y02668
+         OI    STREINDC,ETXNODD    YES SET NO DD IN STEP         Y02668
+         B     AOIOPUT             GO TO PUT TEXT                Y02668
+AOIODD   DS    0H
+         TM    STRINDCS,DDSTR      IS THIS DD TEXT TO BE WRITTEN Y02668
+         BZ    AOIOPUT             NO GO TO PUT TEXT             Y02668
+         CLI   VERB(RA),4          IS THE NEXT STMT A DD?        Y02668
+         BE    AOIOPUT             YES GO TO PUT TEXT            Y02668
+         OI    STRINDCS,LASTSTMT   YES  SET LAST STMT BIT IN PFX Y02668
+         DROP  R6                                                Y02668
+AOIOPUT  DS    0H                                                Y02668
+         NI    AOSW1,255-AOTXTWRT  CLEAR TEXT WRITE SWITCH       Y02668
+         L     R6,WANELPTR         GET BASE ADDRESS OF NEL       Y02668
+         USING NEL,R6              SET BASE                      Y02668
+         LA    R2,RPLADDR          GET BASE ADDRESS OF RPL       Y02668
+         USING IFGRPL,R2           SET BASE                      Y02668
+         MVI   RPLREQ,RPLPUT       OPERATION TO BE A PUT         Y02668
+         MVC   RPLDACB,NELTXTCB    MOVE IN ACB POINTER           Y02668
+         MVC   RPLAREA,TEXTBUFP    POINTER TO RECORD             Y02668
+         XC    RPLARG(4),RPLARG    ZERO FIELD                    Y02668
+         MVI   RPLOPT1,RPLSEQ      SET TO SEQUENTIAL             Y02668
+         L     R1,TEXTBUFP         GET TEXT ADDRESS              Y02668
+         XC    RPLRLEN(4),RPLRLEN  ZERO FIELD                    Y02668
+         MVC   RPLRLEN+2(2),0(R1)  GET LENGTH OF RECORD          Y02668
+         XC    RPLBUFL(4),RPLBUFL  ZERO FIELD                    Y02668
+         XC    RPLDDDD(4),RPLDDDD  ZERO FIELD                    Y02668
+         ST    RD,IWASACHN         SAVE SAVE AREA POINTER        Y02668
+         LA    RD,IWAIOSA          SAVE AREA FOR ACCESS METHOD   Y02668
+         LR    R1,R2               POINT TO RPL                  Y02668
+         DROP  R6                                                Y02668
+         DROP  R2                  FREE REGISTER 2               Y02668
+         PUT   RPL=(1)
+         L     RD,IWASACHN         RESTORE SAVE AREA POINTER     Y02668
+         LTR   RF,RF               ACCESS MTHOD ERROR?           Y02668
+         BNZ   AOIOERRT            YES, BR TO ERROR RTNE.        Y02668
+         LA    R2,RPLADDR          GET ADDRESS OF RPL            Y02668
+         USING IFGRPL,R2           SET ADDRESSABILITY            Y02668
+         L     R6,TEXTBUFP         GET BASE FOR TEXT PREFIX      Y02668
+         USING TEXT,R6             SET ADDRESSABILITY            Y02668
+         TM    STRINDCS,JOBSTR     IS THIS JOB TEXT?             Y02668
+         BZ    AOIOEXEC            NO GO CHECK FOR EXEC TEXT     Y02668
+         MVC   WAJOBRBA(8),RPLRBAR YES SAVE JOB TEXT SVA AND     Y02668
+         OC    WAJOBPFX(STRJPFXL),TEXT   JOB PREFIX             YM00387
+         B     AOIOEXIT            GO TO PUT SUBROUTINE EXIT     Y02668
+AOIOEXEC DS    0H                                                Y02668
+         TM    STRINDCS,EXECSTR    IS THIS EXEC TEXT?            Y02668
+         BZ    AOIOEXIT            NO GO TO PUT SUBROUTINE EXIT  Y02668
+         MVC   WAEXCRBA(8),RPLRBAR YES SAVE EXEC TEXT SVA AND    Y02668
+         MVC   WAEXCPFX(STREPFXL),TEXT      EXEC PREFIX          Y02668
+         DROP  R2                  FREE REGISTER 2               Y02668
+         DROP  R6                                                Y02668
+AOIOEXIT DS    0H                                                Y02668
+         BR    R7                  RETURN TO CALLER              Y02668
+* I/O ERROR.                                                     Y02668
+AOIOERRT DS    0H                                                Y02668
+         MVC   IWARET(2),PGMERROR  SET RETURN CODE               Y02668
+         OI    AOSW4,CWATERM       INDICATE TERMINATION          Y02668
+         LA    R5,4                I/O ERROR MSG CODE            Y02668
+         L     RF,IEFVHRV          GET ADDRESS OF IEFVHR         Y02668
+         BALR  RE,RF               GO TO IEFVHR                  Y02668
+         LA    R2,20               I/O ERROR MSG CODE            Y02668
+         L     RF,IEFVGMV          GET ADDRESS OF IEFVGM         Y02668
+         BALR  RE,RF               GO TO IEFVHR                  Y02668
+         L     RF,TERMRTN          GET TERMINATION ADDRESS       Y02668
+         BR    RF                  GO TO TERMINATION             Y02668
+B635     MVC   20(1,RD),0(R5)      STEPNAME                      Y02668
+         EJECT
+IEFVHRV  DC    V(IEFVHR)           WTO MODULE.                   Y02668
+IEFVGMV  DC    V(IEFVGM)                MSG
+IEFVHAV  DC    V(IEFVHA)                GET STMT
+IEFVHFV  DC    V(IEFVHF)           CONTROL ROUTINE.              Y02668
+IEFVHLV  DC    V(IEFVHL)                NULL
+IEFVHMV  DC    V(IEFVHM)                SCAN COMMAND
+IEFVHEB  DC    V(IEFVHEB)            **PRE-SCAN PREP RTN.
+IEFVINAV DC    V(IEFVINA)          INSTREAM PROC MODULE.         Y02668
+BLANKS   DC    C'        '          TO BLANK DDNAME            @ZA01932
+DD       DC    C'DD '
+JOB      DC    C'JOB '
+EXEC     DC    C'EXEC '
+PROCA    DC    C'PROC '              **PROC VERB
+SYSCHK   DC    C'SYSCHK '          CKPT/RESTART DD NAME CONSTANT   AACA
+ASTERISK DC    C'* '               CKPT/REST IMMEDIATE             AACA
+PGMERROR DC    X'0024'             PGM ERROR CODE (36)           Y02668
+TXTBUFLT DC    H'8184'             MAX TEXT RECLTH, BUF LTH-HDR. Y02668
+MSG60    EQU   60                  CHECKID = 0 AND SYSCHK DD       AACA
+*                                  APPEARED BEFORE AN EXEC STMT    AACA
+CPSTMTP  EQU   IWAJOBS5            SYSCHK DD STMT SAVE AREA PTR    AACA
+MSG1     EQU   1                        INVALID STMT IN PROC
+MSG5     EQU   5                        NO VERB
+MSG7   EQU     7             JOB HAS NO STEPS MSG KEY           YM00387
+MSG13    EQU   58
+MSG17    EQU   17                  CODE FOR IEF617I MSG        @ZA14932
+MSG42    EQU   42                      CODE FOR IEF642I MSG      A40034
+DDVERB   EQU   4                       DD STMT CODE IN PARM LIST A40034
+NOT      EQU   255                                               A27782
+MVTHREE  EQU   3                       LENGTH OF MOVE             O106
+DISPL0   EQU   0                       DISPLACEMENT               O106
+DISPL1   EQU   1                       DISPLACEMENT               O106
+MINCT    EQU   X'01'                   COUNT VALUE WHEN NO IN-LINEO106
+*                                      PROCEDURES EXIST           O106
+MAXLIN   EQU   255                     INITIALIZE FIRST BYTES OF  O106
+*                                      WORK AREA                  O106
+WORKLN   EQU   352                     LENGTH OF WORK AREA        O106
+QMPALN   EQU   48                      LEN OF EXTERNAL PARM LIST
+*                                      PARM LIST                  O106
+PEND     DC    C'PEND '                PEND VERB STATEMENT         4387
+ONE      EQU   1                                                 A26382
+PENDERR  EQU   X'44'                   IEF668I PEND VERB STMT OUT OF
+*                                      SEQUENCE                    4397
+INSTPR   EQU   X'80'                   IN-STREAM PROC BEING PROC   4398
+PATCH    DC    25F'0'              **********PATCH SPACE*********Y02668
+         END

@@ -1,0 +1,691 @@
+./ ADD NAME=SPELL                                  15SEP93 19.29 --
+/*REXX******************************************************************
+*                                                                      *
+* Spelling verification ISPF edit macro.                               *
+*                                                                      *
+* Syntax: SPELL <Save | Dictionary | ? | Help>                         *
+*         (default):  checks spelling in the document being edited.    *
+*         Save:       saves the document if it has been changed,       *
+*                     then checks spelling.                            *
+*         Dictionary: prompts for the data set name of a user spelling *
+*                     dictionary.                                      *
+*         ? or Help:  displays the tutorial.                           *
+*                                                                      *
+* The document is first saved if it has been changed.  Then SCRIPT/VS  *
+* is used to verify spelling in the document.  Member SPELLCHK is used *
+* as a SCRIPT/VS profile.  SPELLCHK reads the user dictionary, if any. *
+* SPELLCHK then writes "misspelled" words into file DSMUTWTF.          *
+*                                                                      *
+* SPELL reads DSMUTWTF and builds a string consisting of all the       *
+* "misspelled" words, in order of occurrence. SPELL also builds a      *
+* string consisting of just the first occurrence of each uniquely      *
+* "misspelled" word (this is case sensitive).                          *
+*                                                                      *
+* SPELL then creates an ISPF table with one row per uniquely           *
+* "misspelled" word. The table display supports a SORT primary command *
+* and Add, Change, Modify, and eXclude line commands.                  *
+*    A: adds the "misspelled" word to the user dictionary and deletes  *
+*       it from the table and from the above strings.                  *
+*    C: changes all occurrences of a misspelled word to a specified    *
+*       new spelling. Successful changes are deleted from the above    *
+*       string. If all changes are successful, the word is deleted     *
+*       from the unique string and from the table.                     *
+*    M: is similar to the C command. However the C command will not be *
+*       successful if it encounters a new spelling which is too long.  *
+*       The M command rearranges text so that the longer spelling will *
+*       fit.                                                           *
+*    X: deletes the "misspelled" word from the above strings and from  *
+*       the table.                                                     *
+*                                                                      *
+* Finally, SPELL inserts the remaining misspelled words as INFO lines  *
+* directly above the corresponding data lines in the document.  All    *
+* lines are excluded except those containing errors. The list of       *
+* uniquely misspelled words is inserted at the top of the document as  *
+* NOTE lines.                                                          *
+*                                                                      *
+* Original CLIST:     5/06/87 by Douglas H. Adams                      *
+* Converted to REXX:  2/13/90 by John F. Pearce II                     *
+* Revised:           12/08/92 by Douglas H. Adams                      *
+*                                                                      *
+* Douglas H. Adams                                                     *
+* Mail Code 110-SE28                                                   *
+* Rockwell International Corporation                                   *
+* 2201 Seal Beach Boulevard                                            *
+* P. O. Box 2515                                                       *
+* Seal Beach, California 90740-1515                                    *
+*                                                                      *
+* (310) 797-2618                                                       *
+*                                                                      *
+* December 8, 1992                                                     *
+*                                                                      *
+***********************************************************************/
+
+Profile = "'ATSO.ROCK.SKELS(SPELLCHK)'"
+Vio = "SYSVIO"
+
+/***********************************************************************
+* Main program                                                         *
+***********************************************************************/
+Signal on novalue
+Address ISREDIT
+Call initialize
+Call parameters
+Call script
+Call errors?
+Call process_words
+"RESET"
+Call table
+Call messages
+Call exit 1
+
+/***********************************************************************
+* Exit                                                                 *
+***********************************************************************/
+Exit:
+
+If changed = "YES"
+Then do
+   Zedsmsg = "Data saved"
+   Zedlmsg = "Data saved in" dataset
+   Address ISPEXEC "SETMSG MSG(ISRZ000) COND"
+   End
+Exit arg(1)
+
+/***********************************************************************
+* Initialization                                                       *
+***********************************************************************/
+Initialize:
+
+Address ISPEXEC "CONTROL ERRORS RETURN"
+
+"MACRO (PARM)"
+If rc ^== 0
+Then do
+   Say "SPELL must be invoked under the ISPF editor."
+   Call exit 20
+   End
+
+"SCAN OFF"
+"(CHANGED) = DATA_CHANGED"
+"(DATASET) = DATASET"
+"(MEMBER) = MEMBER"
+If member ^== ""
+Then dataset = dataset"("member")"
+
+Dictionary_read? = 0
+
+Return
+
+/***********************************************************************
+* Process parameters                                                   *
+***********************************************************************/
+Parameters:
+
+Parm = translate(parm)
+Select
+   When abbrev("SAVE",parm,1)
+   Then call save
+   When parm == "" & changed = "YES"
+   Then call prompt_save
+   When parm == "" & changed = "NO"
+   Then nop
+   When abbrev("DICTIONARY",parm,1)
+   Then do
+      Call dictionary
+      Exit 1
+      End
+   When parm == "?"
+   Then call ?
+   When abbrev("HELP",parm,1)
+   Then call help
+   Otherwise
+      Zerrsm = parm "invalid"
+      Zerrlm = "Valid parameters:  ? | Help | Save | Dictionary"
+      Zerralrm = "YES"
+      Zerrhm = "#SPELL"
+      Address ISPEXEC "SETMSG MSG(ISRZ002)"
+      Exit 20
+   End
+Return
+
+/***********************************************************************
+* Process parm = save (required if data was changed).                  *
+***********************************************************************/
+Save:
+
+If changed = "YES"
+Then do
+   "SAVE"
+   If rc >= 12
+   Then do
+      Address ISPEXEC "SETMSG MSG("zerrmsg")"
+      Call exit 20
+      End
+   End
+Return
+
+/***********************************************************************
+* Data changed but not saved. Prompt user to save.                     *
+***********************************************************************/
+Prompt_save:
+
+Address ISPEXEC "DISPLAY PANEL(SPELLSAV)"
+If rc == 0
+Then call save
+Else do
+   Zedsmsg = "No spell check"
+   Zedlmsg = "Data not be saved--spell check not done"
+   Address ISPEXEC "SETMSG MSG(ISRZ001)"
+   Call exit 20
+   End
+Return
+
+/***********************************************************************
+* Process parm = dictionary.                                           *
+***********************************************************************/
+Dictionary:
+
+Address ISPEXEC "DISPLAY PANEL(SPELLDU)"
+If rc == 0
+Then do
+   Zedlmsg = sysdsn(spelldsn)
+   If zedlmsg == "OK" | zedlmsg == "MEMBER NOT FOUND" | spelldsn == ""
+   Then address ISPEXEC "VPUT SPELLDSN PROFILE"
+   Else do
+      Zedsmsg = "Data set error"
+      Address ISPEXEC "SETMSG MSG(ISRZ001)"
+      End
+   End
+Return
+
+/***********************************************************************
+* Process parm = ?|Help.                                               *
+***********************************************************************/
+?:
+Help:
+
+Address ISPEXEC "SELECT PGM(ISPTUTOR) PARM(#SPELL)"
+Exit 1
+
+/***********************************************************************
+* Invoke SCRIPT/VS, then read list of "misspelled" words.              *
+***********************************************************************/
+Script:
+
+Files = "DSMUTWTF SCRPTFIL"
+"(DATAID) = DATAID"
+Address ISPEXEC "LMQUERY DATAID("dataid") DDNAME(INPUT) VOLUME(VOLUME)"
+Address TSO
+Select
+   When input ^== ""
+   Then sorcdd = "SORCDD"
+   When volume ^== ""
+   Then do
+      Input = "SORCDD"
+      Sorcdd = "SORCDD"
+      "ALLOCATE FILE(SORCDD) DATASET('"dataset"') VOLUME("volume")",
+               "SHR REUSE"
+      Files = files "SORCDD"
+      End
+   Otherwise
+      Input = "'"dataset"'"
+      Sorcdd = ""
+   End
+"ALLOCATE FILE(DSMUTWTF) DSORG(PS) RECFM(V B) UNIT("vio")",
+         "LRECL(259) BLKSIZE(0) REUSE"
+"ALLOCATE FILE(SCRPTFIL) DSORG(PS) RECFM(V B) DUMMY",
+         "LRECL(259) BLKSIZE(0) REUSE"
+Address ISPEXEC "VGET SPELLDSN PROFILE"
+Sysvar = ""
+If sysdsn(spelldsn) == "OK"
+Then do
+   "ALLOCATE FILE(ADDENDA) DATASET("spelldsn") SHR REUSE"
+   Files = files "ADDENDA"
+   Sysvar = "SYSVAR(1 ADDENDA)"
+   End
+If trace() == "N" | trace() == "O"
+Then delay = "DELAY"
+Else delay = ""
+"SCRIPT" input "CONTINUE DEVICE(TERM) MESSAGE(ID" delay")",
+        "NOSEGLIB NOSPIE PROFILE("profile") QUIET SPELLCHK" sorcdd,
+         sysvar "UNFORMAT"
+If rc < 12
+Then "EXECIO * DISKR DSMUTWTF (STEM DSMUTWTF. FINIS)"
+Else do
+   Address ISREDIT
+   "LINE_AFTER 0 = MSGLINE 'SCRIPT/VS failed with return code" rc"'"
+   "LOCATE 0"
+   Address TSO "FREE FILE("files")"
+   Call exit 20
+   End
+If trace() ^== "N" & trace() ^== "O"
+Then do
+   Address ISPEXEC "LMINIT DATAID(DSMUTWTF) DDNAME(DSMUTWTF)"
+   Address ISPEXEC "BROWSE DATAID("dsmutwtf")"
+   Address ISPEXEC "LMFREE DATAID("dsmutwtf")"
+   End
+"FREE FILE("files")"
+Return
+
+/***********************************************************************
+* Determine if there were any spelling errors.                         *
+***********************************************************************/
+Errors?:
+
+If dsmutwtf.0 == 0
+Then do
+   "LINE_AFTER 0 = MSGLINE 'No spelling errors found.'"
+   "LOCATE 0"
+   Call exit 1
+   End
+Return
+
+/***********************************************************************
+* Copy "misspelled" words from DSMUTWTF to a single list.              *
+* Count the number of occurrences of each unique "misspelled" word.    *
+* Build a list of unique occurrences of each "misspelled" word.        *
+***********************************************************************/
+Process_words:
+
+Parse value 0,
+      with  word_count. word_list unique_list
+Do record# = 1 to dsmutwtf.0
+   Word_list = word_list dsmutwtf.record#
+   Do while dsmutwtf.record# ^== ""
+      Parse var dsmutwtf.record# misspelled_word dsmutwtf.record#
+      Word_count.misspelled_word = word_count.misspelled_word+1
+      If word_count.misspelled_word == 1
+      Then unique_list = unique_list misspelled_word
+      End
+   End
+Drop dsmutwtf.
+Word_count = words(word_list)
+Unique_count = words(unique_list)
+Return
+
+/***********************************************************************
+* Build/display table of "misspelled" words.                           *
+***********************************************************************/
+Table:
+
+Address ISPEXEC
+"TBCREATE SPELLCHK NAMES(ROW UPPER NUMBER BADWORD ERRORS CHGWORD)",
+         "NOWRITE REPLACE"
+"TBVCLEAR SPELLCHK"
+Do word# = 1 to unique_count
+   Badword = word(unique_list,word#)
+   Upper = translate(badword)
+   Number = word_count.badword
+   Row = right(word#,6,0)
+   "TBADD SPELLCHK MULT("unique_count")"
+   End
+"TBTOP SPELLCHK"
+
+"TBDISPL SPELLCHK PANEL(SPELLWD) POSITION(CRP)"
+Do while rc < 8
+   Call line_commands
+   If ztdsels > 1
+   Then "TBDISPL SPELLCHK"
+   Else do
+      Call primary_commands
+      "TBDISPL SPELLCHK PANEL(SPELLWD) POSITION(CRP)",
+                   "CSRROW("crp") AUTOSEL(NO)"
+      End
+   End
+Do while ztdsels >= 1
+   Call line_commands
+   "TBDISPL SPELLCHK"
+   End
+"TBEND SPELLCHK"
+If dictionary_read?
+Then call dictionary_write
+Return
+
+/***********************************************************************
+* Write dictionary with ISPF statistics                                *
+***********************************************************************/
+Dictionary_write:
+
+Address TSO
+"EXECIO * DISKW ADDENDA (STEM DICTIONARY. FINIS)"
+Address ISPEXEC
+If member ^== ""
+Then do
+   If zlmod ^== ""
+   Then zlmod = min(zlmod+1,99)
+   If zlcnorc ^== ""
+   Then zlcnorc = min(zlcnorc+dictionary_added,65535)
+   If zlmnorc ^== ""
+   Then zlmnorc = min(zlmnorc+dictionary_added,65535)
+   "LMMSTATS DATAID("addenda") MEMBER("member") VERSION("zlvers")",
+            "MODLEVEL("zlmod") CREATED("zlcdate")",
+            "CURSIZE("zlcnorc") INITSIZE("zlinorc")",
+            "MODRECS("zlmnorc")"
+   "LMFREE DATAID("addenda")"
+   End
+Address TSO "FREE FILE(ADDENDA)"
+Return
+
+/***********************************************************************
+* Process table display line commands                                  *
+***********************************************************************/
+Line_commands:
+
+Select
+   When select == "A"
+   Then call add
+   When select == "C" | select == "M"
+   Then call change_modify select
+   When select == "X"
+   Then call exclude
+   Otherwise nop
+   End
+Return
+/***********************************************************************
+* Add command (add "misspelled" word to user addenda dictionary)       *
+***********************************************************************/
+Add:
+
+Dictionary_word = badword
+Hyphen_position = pos("-",dictionary_word)
+Do while hyphen_position ^== 0
+   Dictionary_word = insert("-",dictionary_word,hyphen_position)
+   Hyphen_position = pos("-",dictionary_word,hyphen_position+2)
+   End
+If ^ dictionary_read?
+Then call read_dictionary
+If dictionary_read?
+Then do
+   If length(dictionary.record#)+length(dictionary_word),
+      < dictionary_max & record# ^== 0
+   Then dictionary.record# = dictionary.record# dictionary_word
+   Else do
+      Record# = record#+1
+      Dictionary.record# = dictionary_word
+      Dictionary_added = dictionary_added+1
+      End
+   End
+   Call exclude
+Return
+
+/***********************************************************************
+* Allocate and read the user addenda dictionary                        *
+***********************************************************************/
+Read_dictionary:
+
+"VGET SPELLDSN PROFILE"
+If spelldsn == ""
+Then do
+   Call dictionary
+   If spelldsn == ""
+   Then do
+      Zedsmsg = "Add request failed"
+      Zedlmsg = "No user spelling dictionary was specified"
+      "SETMSG MSG(ISRZ001)"
+      Return
+      End
+   End
+Address TSO
+"ALLOCATE FILE(ADDENDA) DATASET("spelldsn") OLD REUSE"
+If rc ^== 0
+Then return
+Call listdsi "ADDENDA FILE"
+If left(sysrecfm,1) == "V"
+Then dictionary_max = min(syslrecl-4,247)
+Else dictionary_max = min(syslrecl,247)
+Dictionary. = ""
+If sysdsn(spelldsn) ^== "MEMBER NOT FOUND"
+Then "EXECIO * DISKR ADDENDA (STEM DICTIONARY. FINIS)"
+Else dictionary.0 = 0
+Parse var spelldsn "(" member ")" .
+If member ^== ""
+Then do
+   Address ISPEXEC
+   "LMINIT DATAID(ADDENDA) DATASET('"sysdsname"')"
+   "LMOPEN DATAID("addenda") OPTION(INPUT)"
+   "LMMFIND DATAID("addenda") MEMBER("member") STATS(YES)"
+   "LMCLOSE DATAID("addenda")"
+   End
+Record# = dictionary.0
+Dictionary.record# = space(dictionary.record#)
+Dictionary_added = 0
+Dictionary_read? = 1
+Return
+
+/***********************************************************************
+* Change/Modify command (correct misspelled words)                     *
+***********************************************************************/
+Change_modify:
+
+Address ISREDIT
+Parse value 0      1,
+      with  errors word_position
+Rc = find(badword,"FIRST")
+Do found = 1 to word_count.badword while rc == 0
+   "CHANGE * C'"chgword"' .ZCSR .ZCSR ALL" column
+   If rc == 0
+   Then do
+      Word_position = wordpos(badword,word_list,word_position)
+      Word_list = delword(word_list,word_position,1)
+      Word_count = word_count-1
+      End
+   Else if arg(1) == "C"
+      Then do
+         Word_position = word_position+1
+         Errors = errors+1
+         End
+      Else call split_change_flow
+   Rc = find(badword)
+   End
+Errors = errors+word_count.badword-found+1
+Address ISPEXEC
+If errors == 0
+Then do
+   Unique_list = delword(unique_list,wordpos(badword,unique_list),1)
+   Unique_count = unique_count-1
+   "TBDELETE SPELLCHK"
+   End
+Else "TBPUT SPELLCHK"
+Return
+
+
+/***********************************************************************
+* Split misspelled word onto a separate line, change it, then flow     *
+* the text into a paragraph.                                           *
+***********************************************************************/
+Split_change_flow:
+
+"TSPLIT"
+Rc = find(badword)
+"TSPLIT .ZCSR" column+length(badword)
+"CHANGE * C'"chgword"' .ZCSR .ZCSR ALL" column
+If rc == 0
+Then do
+   "CURSOR = (LINE)"
+   "TFLOW .ZCSR"
+   Rc = find(chgword)
+   "CHANGE * C'"chgword"' .ZCSR .ZCSR ALL" column
+   Word_position = wordpos(badword,word_list,word_position)
+   Word_list = delword(word_list,word_position,1)
+   Word_count = word_count-1
+   End
+Else do
+   Word_position = word_position+1
+   Errors = errors+1
+   End
+Return
+
+/***********************************************************************
+* Exclude command (disregard "misspelled" words)                       *
+***********************************************************************/
+Exclude:
+
+Word_position = 1
+Do word_count.badword
+   Word_position = wordpos(badword,word_list,word_position)
+   Word_list = delword(word_list,word_position,1)
+   Word_count = word_count-1
+   End
+Unique_list = delword(unique_list,wordpos(badword,unique_list),1)
+Unique_count = unique_count-1
+"TBDELETE SPELLCHK"
+Return
+
+/***********************************************************************
+* Process table display primary commands                               *
+***********************************************************************/
+Primary_commands:
+
+If verb == "SORT"
+Then do
+   Crp = 0
+   Select
+      When spellsrt == "BADWORD"
+      Then "TBSORT SPELLCHK FIELDS(UPPER C A BADWORD)"
+      When spellsrt == "NUMBER"
+      Then "TBSORT SPELLCHK FIELDS(NUMBER N A ROW)"
+      When spellsrt == "ROW"
+      Then "TBSORT SPELLCHK FIELDS(ROW)"
+      End
+   End
+Else do
+   "TBTOP SPELLCHK"
+   "TBSKIP SPELLCHK NUMBER("ztdtop") NOREAD"
+   "VGET (ZVERB ZSCROLLN)"
+   Select
+      When zverb = "UP"
+      Then "TBSKIP SPELLCHK NUMBER(-"zscrolln") NOREAD"
+      When zverb = "DOWN"
+      Then "TBSKIP SPELLCHK NUMBER("zscrolln") NOREAD"
+      Otherwise nop
+      End
+   End
+Return
+
+/***********************************************************************
+* Insert editor message/note/info lines.                               *
+***********************************************************************/
+Messages:
+
+If word_count == 0
+Then do
+   "LINE_AFTER 0 = MSGLINE 'All spelling errors eliminated.'"
+   "LOCATE 0"
+   Return
+   End
+
+"(LEFT,RIGHT) = BOUNDS"
+"BOUNDS"
+"EXCLUDE ALL"
+Call msg_unique
+Call list_misspelled
+Call hint
+Call context_words
+Call statistics
+"BOUNDS = (LEFT,RIGHT)"
+"LOCATE 0"
+Return
+
+/***********************************************************************
+* Insert MSG line with number of unique words.                         *
+***********************************************************************/
+Msg_unique:
+
+If unique_count == 1
+Then "LINE_BEFORE 1 = MSGLINE 'The following word is misspelled:'"
+Else "LINE_BEFORE 1 = MSGLINE 'The following" unique_count,
+                              "unique words are misspelled:'"
+Return
+
+/***********************************************************************
+* Insert list of misspelled words as NOTE lines, as many as possible   *
+* per line.                                                            *
+***********************************************************************/
+List_misspelled:
+
+Noteline = ""
+Do while unique_list ^== ""
+   Parse var unique_list misspelled_word unique_list
+   If length(noteline)+length(misspelled_word) < 72
+   Then noteline = strip(noteline misspelled_word,"Leading")
+   Else do
+      "LINE_BEFORE 1 = NOTELINE (NOTELINE)"
+      Noteline = misspelled_word
+      End
+   End
+If noteline ^== ""
+Then "LINE_BEFORE 1 = NOTELINE (NOTELINE)"
+Return
+
+/***********************************************************************
+* Insert helpful hint.                                                 *
+***********************************************************************/
+Hint:
+
+"LINE_BEFORE 1 = MSGLINE 'To view errors in context, enter RESet X,",
+                         "then Locate SPEcial.'"
+"LINE_BEFORE 1 = MSGLINE ''"
+Return
+
+/***********************************************************************
+* Find/unexclude those lines which contain misspelled words, and       *
+* insert INFO lines with the misspelled words immediately above their  *
+* counterpart in the text.                                             *
+***********************************************************************/
+Context_words:
+
+Parse var word_list misspelled_word word_list
+Rc = find(misspelled_word,"FIRST")
+Parse value line     1,
+      with  previous line_count infoline
+Infoline = overlay(misspelled_word,infoline,column)
+Do word_count-1
+   Parse var word_list misspelled_word word_list
+   Rc = find(misspelled_word)
+   If line ^== previous
+   Then do
+      "LINE_BEFORE (PREVIOUS) = INFOLINE (INFOLINE)"
+      Parse value line     line_count+1,
+            with  previous line_count   infoline
+      End
+   Infoline = overlay(misspelled_word,infoline,column)
+   End
+If infoline ^== ""
+Then "LINE_BEFORE (PREVIOUS) = INFOLINE (INFOLINE)"
+Return
+
+/***********************************************************************
+* Insert statistics message at top of text.                            *
+***********************************************************************/
+Statistics:
+
+Select
+   When word_count == 1
+   Then "LINE_AFTER 0 = MSGLINE '1 word on 1 line is misspelled.'"
+   When line_count == 1
+   Then "LINE_AFTER 0 = MSGLINE '"word_count,
+                                "words on 1 line are misspelled.'"
+   Otherwise "LINE_AFTER 0 = MSGLINE '"word_count "words on" line_count,
+                                      "lines are misspelled.'"
+   End
+Return
+
+/***********************************************************************
+* Find a word. Syntax: FIND(word<,options>)                            *
+* A word is defined as being surrounded by nonalphanumeric characters. *
+***********************************************************************/
+Find:
+
+Parse arg find_word,find_options
+Signal on error name find_error
+Do until ^ datatype(substr(" "text,column,1),"A") &,
+         ^ datatype(substr(text,column+length(find_word),1),"A")
+   "FIND C'"find_word"'" find_options
+   Find_options = ""
+   "(LINE,COLUMN) = CURSOR"
+   "(TEXT) = LINE .ZCSR"
+   End
+Return 0
+
+Find_error:
+Return rc

@@ -1,0 +1,659 @@
+ /* COPYRIGHT 1983 BY THOMAS GLEN SMITH */
+ /**********************************************************************
+ *                                                                     *
+ * ABEC IS CALLED FROM ABEA TO OBTAIN INPUT FROM THE INPUT SOURCE,     *
+ * WHICH IS USUALLY A 3270-TYPE TERMINAL, BUT MAY ALSO BE SOME OTHER   *
+ * TYPE TERMINAL, OR THE TSO COMMAND STACK (I.E. A CLIST).             *
+ *                                                                     *
+ **********************************************************************/
+   %INCLUDE ABESUB;
+ ABESUB(ABEC) PARMS(RHHDRPT) CHECK(YES);
+   %INCLUDE ABESUBA;
+   %INCLUDE ABERHPNL;
+   %INCLUDE ABEREC;
+   %INCLUDE ABEPNL;
+   % INCLUDE @HEXCHAR;
+   /*
+   FOLLOWING ARE ALL THE ENTRY DECLARATIONS
+   */
+   DCL ABEDBDO ENTRY(PTR,PTR,PTR,FIXED BIN(15,0),FIXED BIN(15,0))
+     RETURNS(CHAR(256) VAR);
+   DCL (ABECD,ABEHX,ABECIN) ENTRY;
+   DCL (ABEAPLA,ABEUD) ENTRY(PTR,PTR,FIXED BIN(15,0))
+     RETURNS(CHAR(256) VAR);
+   DCL ABEUDB ENTRY(PTR,PTR,FIXED BIN(15,0),CHAR(*) VAR);
+   DCL SUFFIX ENTRY(CHAR(*),CHAR(*))
+     RETURNS(FIXED BIN(15,0));
+   DCL STFSMOD ENTRY(CHAR(*),CHAR(*),FIXED BIN(15,0))
+     RETURNS(FIXED BIN(15,0));
+   DCL ABECPR ENTRY(PTR,PTR,CHAR(*) VAR);
+   DCL ABEDSN ENTRY;
+   DCL ABEDT ENTRY;
+   DCL ABECS ENTRY RETURNS(BIT(1));
+   DCL ABEPFK ENTRY;
+   DCL ABECP ENTRY(CHAR(*) VAR);
+   DCL SETCAPS ENTRY;
+   /*
+   END OF ENTRY DECLARATIONS
+   */
+   DCL MIN BUILTIN;
+   DCL PFK24 BIT(1);
+   DCL SAVPTR PTR;
+   DCL SEQBL CHAR(8),
+       SEQPIC PIC'(8)9' DEF SEQBL;
+       /* MAXIMUM SEQUENCE FIELD LENGTH IS 8 BYTES */
+   DCL 1 SKEL BASED(SKELPTR),
+     2 SKNXT PTR,
+     2 STC FIXED BIN(15,0),
+     2 ENC FIXED BIN(15,0);
+   DCL CAPSW BIT(1);
+   DCL FSW BIT(1);
+   DCL SCANPTR PTR;
+   DCL (TRIN,TROUT) ENTRY;
+   DCL BIGALTSW BIT(1);
+   DCL (STACK_HDR,QUEUE_HDR) PTR;
+
+   STACK_HDR,QUEUE_HDR=NULL;
+   DO WHILE(NXTRHEL^=NULL);
+     IF RH_STACK^=NULL
+       THEN RETURN; /* NOT REALLY NECESSARY, BUT OK */
+     IF HARDCOPY
+       THEN IF IN_HARDCOPY
+         THEN RETURN;
+     IF IN_FAM
+       THEN RETURN;
+     IF ^HARDCOPY
+       THEN DO;
+         DO UNTIL(IN_SCREEN);
+           END;
+         RETURN; /* GO PROCESS SUBCOMMANDS */
+         END;
+     END;
+   RETURN; /* GO BACK AND QUIT OR PROCESS SUBCOMMANDS */
+
+ IN_FAM: PROC RETURNS(BIT(1));
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO CHECK FOR INPUT FOR DATA SETS PROCESSED VIA A FAM MODULE. *
+ * THE FAM MODULE WILL BE CALLED, AND #PUSHLILO WILL BE CALLED TO  *
+ * PROCESS ANY COMMANDS STORED BY THE FAM MODULE IN CMDDATA.           *
+ * IF ANY SUBCOMMANDS ARE STACKED AS A RESULT, IN_FAM WILL RETURN      *
+ * '1'B.  OTHERWISE IN_FAM WILL RETURN '0'B.                           *
+ *                                                                     *
+ **********************************************************************/
+   DCL (T,DUMPTR) PTR;
+
+   DO T=NXTRHEL REPEAT T->RHNXT WHILE(T^=NULL);
+     IF T->RHFAMDS
+       THEN DO;
+         DUMPTR=T->RHFAMEP(RHHDRPT,T,DUMPTR,5);
+         CALL #PUSHLILO(T,RH_STACK,RH_QUEUE,T->CMDDATA);
+         IF RH_STACK^=NULL
+           THEN RETURN('1'B); /* ONE OR MORE SUBCOMMANDS RECEIVED */
+         END;
+     END;
+   RETURN('0'B); /* NO COMMANDS TO PROCESS */
+   END IN_FAM;
+
+ IN_HARDCOPY: PROC RETURNS(BIT(1));
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO OBTAIN INPUT WHEN THE TERMINAL IS A HARDCOPY DEVICE, OR   *
+ * INPUT IF FROM A CLIST.  RETURNS '1'B IF SUBCOMMANDS WERE RECEIVED,  *
+ * AND '0'B IF NOT.                                                    *
+ *                                                                     *
+ **********************************************************************/
+   DCL T PTR;
+   T=NXTRHEL;
+   IF T->MSGDATA^=''
+     THEN DO;
+       CALL #TERM(T->MSGDATA); /* CALL TERMWRT */
+       T->MSGDATA='';
+       END;
+   CALL ABECPR(T,RHHDRPT,'+');
+   IF RH_STACK^=NULL
+     THEN RETURN('1'B); /* ONE OR MORE SUBCOMMANDS RECEIVED */
+     ELSE RETURN('0'B);
+   END IN_HARDCOPY;
+
+ IN_SCREEN: PROC RETURNS(BIT(1));
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN INPUT IS NEEDED FROM A 3270-TYPE TERMINAL.  WILL RETURN *
+ * '1'B IF ANY SUBCOMMANDS HAVE BEEN ENTERED, AND '0'B OTHERWISE.      *
+ *                                                                     *
+ **********************************************************************/
+   DCL (I,J,K) FIXED BIN;
+   DCL STR CHAR(256) VAR;
+
+   INSERT_COUNT=0;
+   CALL IN_SCREEN_WRITE; /* GO WRITE THE SCREEN */
+   IF SUBSTR(@CALLFLGS,1,1)
+     THEN RETURN('0'B); /* WRITE-ONLY - NO READ */
+   /* NOW PROCESS WHAT WAS JUST READ FROM TERMINAL */
+   CURLINE=@CURLOC/LINESIZE;
+     /* CURLINE=RELATIVE SCREEN LINE # CONTAINING CURSOR */
+   CURSBASE=CMDSPTR->FLDSBAB+1; /* SET DEFAULT */
+   IF CURSMODE
+     THEN IF @CURLOC>CMDSPTR->FLDSBAB &
+       @CURLOC<=CMDSPTR->FLDSBAB+CMDOPTR->FIELD.LEN
+       THEN CURSBASE=CMDSPTR->FLDSBAB+1;
+       ELSE CURSBASE = @CURLOC;
+   CURPNL = @CURPNL;
+   NXTPNL = @NXTPNL;
+   DFLDPTR=CMDPTR;
+   IF DATA^=''
+     THEN CALL IN_SCREEN_CMDLINE; /* GO PROCESS COMMAND DATA */
+   IF @AID='01001100'B
+     THEN PFK24='1'B; /* PFK24 = ALTCASE SUBCOMMAND */
+     ELSE DO;
+       PFK24='0'B;
+       IF @AID^='01111101'B /* 7D=ENTER KEY */
+         THEN DO;
+           CALL ABEPFK(RHPTR,RHHDRPT,@AID,DATA);
+           IF DATA^=''
+             THEN IF SUBSTR(DATA,1,1)=' '
+               THEN DATA=''; /* CMDDATA CONTAINED PFK PARMS */
+           END;
+       END;
+   IF DATA^=''
+     THEN CALL ABECPR(RHPTR,RHHDRPT,DATA);
+       /* GO PROCESS COMMAND LINE */
+   CURSOR_SEQ=0;
+   CMDOPTR->DATA='';
+   SFLDPTR = INPTR;
+   DFLDPTR=DYNPTR;
+   DFLDADJ=DFLDADJ+DINOF+INOFF;
+   SAVPTR = NULL;
+   INSERT_COUNT=0; /* USED TO CONTROL BLANK LINES APPENDED AT END */
+   BIGALTSW = '0'B;
+   FSW = '1'B;
+   DATACNT=0; /* 0=CMD/DBD LINE                  */
+              /* 1=DEC DATA LINE                 */
+              /* 2=HEX DATA LINE                 */
+              /* 3=LINES SUPPRESSED MESSAGE LINE */
+   IFLDNUM=FLDNUM;
+   DO IL=1 REPEAT IL+1 UNTIL(IFLDNUM>FLDCNT);
+     BUF='';
+     IF IL>RHCEN
+       THEN CALL IN_SCREEN_NEXTDS; /* GET NEXT DS TO PROCESS */
+     DO WHILE(SUBSTR(FLAGS,3,1))  /* DO WHILE(PROTECTED */
+        UNTIL(IFLDNUM>FLDCNT); /* UNTIL NO MORE FIELDS ON DISPLAY */
+        CALL NXTFLD('IN'); /* LOCATE NEXT FIELD ON DISPLAY */
+        END;
+     IF IFLDNUM>FLDCNT
+       THEN LEAVE;
+     SELECT;
+       WHEN(IL^=1 & IL=RHCST) DO; /* IT IS COMMAND LINE */
+         DATACNT=0; /* INDICATE CMD/DBD LINE */
+         IF SCANFLAG
+           THEN CALL NXTFLD('IN'); /* IGNORE SEQUENCE FIELDS */
+         IF DATA^=''
+           THEN DO;
+             CALL IN_SCREEN_CMDLINE;
+             CALL ABECPR(RHPTR,RHHDRPT,DATA); /* DO COMMAND LINE */
+             END;
+         IF @CURLOC>FLDSBAB & @CURLOC<=FLDSBAB+LEN
+           THEN CURSBASE=FLDSBAB+1;
+         END;
+       WHEN((RHUSEHD^=NULL × RH_DISPLAY_HDR^=NULL) &
+         ((RHCST=1 & IL=1) × (RHCST^=1 & IL=RHCST+1))) DO;
+         DATACNT=0; /* INDICATE CMD/DBD LINE */
+         IF SCANFLAG
+           THEN CALL NXTFLD('IN'); /* IGNORE SEQUENCE FIELDS */
+         IF DATA^=''
+           THEN IF ^(RH_DISPLAY_HDR^=NULL & RH_APL^=NULL)
+             THEN CALL ABEUDB(RHPTR,RHHDRPT,COLUMN,DATA);
+         END;
+       OTHERWISE IF SCANFLAG
+         THEN DO;
+           CALL IN_SCREEN_SYNCH; /* GO SYNCHRONIZE RECORDS */
+           SAVLINE=FLDSBAB/LINESIZE; /* SAVELINE = RELATIVE
+             SCREEN LINE # CONTAINING THIS LINE OF DATA */
+           IF CURLINE=SAVLINE
+             THEN CURSOR_SEQ=SAVPTR->RECSEQ; /* CURSOR ON DATA LINE */
+           CAPSW=BOOL(LOFLAG,PFK24,'0110'B);
+           IF DATA^=''
+             THEN IF DATACNT=1 × DATACNT=2 × DATACNT=3
+               THEN BIGALTSW=ABECS(RHPTR,RHHDRPT,SAVPTR,DATA,FSW,CAPSW,
+                 STACK_HDR,QUEUE_HDR);
+           CALL NXTFLD('IN');
+           IF DATACNT=1 × DATACNT=2
+             THEN IF DATA^=''
+               THEN DO;
+                 BIGALTSW='1'B; /* PREVENT DEFAULT PF/PB */
+                 CALL IN_SCREEN_PROC_DATA; /* GO DO TABBING, ETC. */
+                 CALL IN_SCREEN_SCAN_DATA; /* GO PROCESS DATA FIELD */
+                 END;
+           END;
+         ELSE IF DATA^=''
+           THEN DO;
+           CALL IN_SCREEN_PROC_DATA; /* GO DO TABBING, ETC. */
+           CALL IN_SCREEN_INPUT;
+           END;
+       END;
+     CALL NXTFLD('IN'); /* GET NEXT DISPLAY FIELD */
+     END;
+   DO WHILE(STACK_HDR^=NULL);
+     CALL #POP(RHPTR,STACK_HDR,QUEUE_HDR,STR);
+     CALL #PUSHLILO(RHPTR,RH_STACK,RH_QUEUE,STR);
+     END;
+   IF RH_STACK^=NULL
+     THEN RETURN('1'B);
+   RHPTR = NXTRHEL;
+   IF SCANFLAG & ^BIGALTSW & ^CMODEFLAG
+     THEN I=#CMD(PFPB,RHPTR,RHHDRPT);
+     ELSE IF CMODEFLAG
+       THEN RHTYNSW='1'B;
+   IF RECPTR=HDPTR & NXTHDR^=HDPTR
+     THEN CALL #NC(RHPTR,NXTHDR);
+   RETURN('0'B);
+   END IN_SCREEN;
+
+ IN_SCREEN_CMDLINE: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN GLOBAL VARIABLE DFLDPTR IS SET TO POINT TO A DATA       *
+ * STRING CONTAINING COMMAND DATA.  DELIMITING QUOTES WILL BE CHECKED  *
+ * FOR IN CASE THE APL NOR OPERATOR (|) IS USED. THIS SYMBOL IS ALSO   *
+ * USED TO DELIMIT INFORMATION ON THE RIGHT END OF EACH COMMAND LINE,  *
+ * I.E. SYMBOLIC NAME, DSNAME, AND APL DIMENSIONS/ELEMENT LENGTH.      *
+ *                                                                     *
+ **********************************************************************/
+   DCL J FIXED BIN;
+
+   IF SUBSTR(DATA,1,1)='"'
+     THEN DO;
+       J=LENGTH(DATA);
+       DO I=J TO 1 BY -1;
+         IF SUBSTR(DATA,I,1)='"'
+           THEN LEAVE;
+         END;
+       IF I^=1
+         THEN DATA=SUBSTR(DATA,2,I-2);
+         ELSE DATA=SUBSTR(DATA,2);
+       END;
+     ELSE DO;
+       K=INDEX(DATA,@HEXCHAR(6A));
+       IF K^=0
+         THEN DATA=SUBSTR(DATA,1,K-1);
+       END;
+   END IN_SCREEN_CMDLINE;
+
+ IN_SCREEN_INPUT: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO READ INPUT FROM THE CRT WHEN IN INPUT MODE. CURRENT FIELD *
+ * IS A DATA FIELD (AS OPPOSED TO A LINE NUMBER FIELD).                *
+ *                                                                     *
+ **********************************************************************/
+   BUF='';
+   CALL ABECIN(BUFPTR,DATA,RHPTR,RHHDRPT,DATACNT);
+   SAVEFLAG='1'B; /*INDICATE SAVE NEEDS TO BE DONE*/
+   SEQ = -1;
+   IF SAVPTR=NULL
+     THEN SAVPTR=RECPTR;
+   CALL #ADD(RHPTR,RHHDRPT,SAVPTR,SAVPTR,SEQ,BUF,0);
+   END IN_SCREEN_INPUT;
+
+ IN_SCREEN_NEXTDS: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN ALL LINES ON THE DISPLAY FOR THE CURRENT DATA SET HAVE  *
+ * BEEN PROCESSED.  WILL UPDATE RHPTR TO POINT TO THE NEXT DATA SET    *
+ * ON THE DISPLAY TO BE PROCESSED.                                     *
+ *                                                                     *
+ *                                                                     *
+ **********************************************************************/
+   DO RHPTR=RHNXT REPEAT RHNXT WHILE(IL>RHCEN);
+     END;
+   CURSOR_SEQ=0;
+   SAVPTR=NULL;
+   INSERT_COUNT=0; /* USED TO CONTROL BLANK LINES APPENDED AT END */
+   DELIND,SUPIND=0;
+   DATACNT=0;
+   FSW = '1'B;
+   END IN_SCREEN_NEXTDS;
+
+ IN_SCREEN_PROC_DATA: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED FOR EACH INPUT DATA FIELD TO DO LOGICAL TABBING, TRANSLATE   *
+ * TO UPPER CASE, ETC.                                                 *
+ *                                                                     *
+ **********************************************************************/
+   IF ^CAPSW
+     THEN CALL SETCAPS(DATA);
+   IF TABK^=''
+     THEN CALL ABEDT(RHPPTR,DATA); /* DO LOGICAL TABBING */
+   END IN_SCREEN_PROC_DATA;
+
+ IN_SCREEN_SCAN_DATA: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED IN SCAN MODE FOR EACH NONBLANK INPUT DATA FIELD.             *
+ *                                                                     *
+ **********************************************************************/
+   BUF='';
+   TLEN = SCANLEN;
+   IF HEXMODE & RH_DISPLAY_HDR=NULL
+     THEN CALL IN_SCREEN_SCAN_HEX;
+   IF SAVPTR=HDPTR
+     THEN DO; /* THERE IS NO MATCHING RECORD - TREAT AS INSERT */
+       SAVPTR=LSTHDR;
+       DO WHILE(INSERT_COUNT>1);
+         INSERT_COUNT=INSERT_COUNT-1;
+         SEQ=-1;
+         CALL #ADD(RHPTR,RHHDRPT,SAVPTR,SAVPTR,SEQ,BUF,0);
+         END;
+       INSERT_COUNT=0;
+       CALL IN_SCREEN_INPUT;
+       RETURN;
+       END;
+   SAVEFLAG='1'B; /*INDICATE SAVE NEEDS TO BE DONE*/
+   CALL ABECIN(ADDR(SAVPTR->RECLEN),DATA,RHPTR,RHHDRPT,DATACNT);
+   END IN_SCREEN_SCAN_DATA;
+
+ IN_SCREEN_SCAN_HEX: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED IN SCAN/HEX MODE FOR EACH NONBLANK INPUT DATA FIELD.         *
+ *                                                                     *
+ **********************************************************************/
+   DCL (I,J,K,M) FIXED BIN;
+
+   M=MOD(LENGTH(DATA),2);
+   J=(LENGTH(DATA)+M)/2;
+   IF M>0
+     THEN DATA=DATA××' ';
+   IF DATACNT=2
+     THEN DO;  /* HEX LINE */
+       BUF=REPEAT(' ',J-1);
+       CALL TRIN(DATA,BUF);
+       END;
+     ELSE DO; /* DEC LINE */
+       BUF='';
+       DO I=1 TO J;
+         BUF=BUF××SUBSTR(DATA,(I-1)*2+1,1);
+         END;
+       END;
+   DATA=SUBSTR(BUF,1,J);
+   END IN_SCREEN_SCAN_HEX;
+
+ IN_SCREEN_SYNCH: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * IN_SCREEN_SYNCH IS CALLED FOR EACH DATA LINE ON THE DISPLAY. IT     *
+ * WILL ENSURE THAT SAVPTR POINTS TO THE RECORD ASSOCIATED WITH THE    *
+ * CURRENT DATA LINE.                                                  *
+ *                                                                     *
+ **********************************************************************/
+   DCL WRK PTR;
+
+   IF DATACNT=1 & HEXMODE & RH_DISPLAY_HDR=NULL
+     /* CURRENT LINE THE DECIMAL IN HEX MODE? */
+     THEN DATACNT=2; /* INDICATE HEX LINE */
+     ELSE DO;
+       DATACNT=1; /* INDICATE DEC LINE */
+       IF SAVPTR=NULL
+         THEN SAVPTR=RECPTR;
+         ELSE IF SAVPTR^=HDPTR
+           THEN SAVPTR=#SUCC(RHHDRPT,RHPTR,SAVPTR);
+       IF SAVPTR=HDPTR
+         THEN INSERT_COUNT=INSERT_COUNT+1;
+         ELSE IF SUBSTR(SAVPTR->RECFLGS,2,1) /* IS LINE SUPPRESSED */
+           THEN DO;
+             DATACNT=3; /* INDICATE SUPPRESSED LINE */
+             SUPCNT=1; /* KEEP TRACK OF NUMBER OF SUPPRESSED LINES */
+             DO WHILE('1'B);
+               WRK=#SUCC(RHHDRPT,RHPTR,SAVPTR);
+               IF WRK=HDPTR
+                 THEN LEAVE;
+               IF ^SUBSTR(WRK->RECFLGS,2,1)
+                 THEN LEAVE;
+               SUPCNT=SUPCNT+1;
+               SAVPTR=WRK;
+               END;
+             /* SAVPTR POINTS AT LAST SUPPRESSED LINE IN GROUP */
+             END;
+       END;
+   END IN_SCREEN_SYNCH;
+
+ IN_SCREEN_WRITE: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN IT IS TIME TO WRITE OUT TO THE SCREEN.                  *
+ *                                                                     *
+ **********************************************************************/
+   RHPTR=NXTRHEL;
+   IF ^STFSMODE
+     THEN DO;
+       J=STFSMOD('ON','INITIAL=YES',0);
+       STFSMODE='1'B;
+       CURPNL=0;
+       END;
+   RHPHEX=NXTRHEL->HEXMODE & NXTRHEL->RH_DISPLAY_HDR=NULL;
+   CALL #COLTR(RHHDRPT);
+   @CURPNL=CURPNL;
+   CURPNL,@NXTPNL = NXTPNL;
+   @CHGCURS = CURSBASE;
+   PNLPTR = RHPSTAPT;
+   DYNPTR = RHPDYNPT;
+   OUTFLAG(TABNUM)='1'B;
+   SUBSTR(CMDSPTR->FLAGS,9,1)='0'B; /* WAS =^LOFLAG */
+        /* INDICATE WHETHER COMMAND FIELD S/B
+           TRANSLATED TO UPPER CASE. */
+   IF MSGDATA ^= ''
+     THEN DO;
+       MSGPTR->DATA=MSGDATA;
+       MSGDATA='';
+       END;
+     ELSE IF TERMFLAG
+       THEN IF CMODEFLAG
+         THEN MSGPTR->DATA='CMODE';
+         ELSE MSGPTR->DATA='EMODE';
+       ELSE MSGPTR->DATA='';
+   IF RHTRANSW
+     THEN MSGPTR->DATA=MSGPTR->DATA××' TRANSLATED';
+   IF SCANFLAG
+     THEN IF RECPTR^=HDPTR
+       THEN IF RECPTR->LSTPTR = HDPTR
+         THEN PFPB='PF';
+   IF CMDDISPLAY ^= ''
+       THEN DO;
+         CMDOPTR->DATA = CMDDISPLAY;
+         CMDDISPLAY='';
+         END;
+       ELSE IF SCANFLAG
+         THEN CMDOPTR->DATA=PFPB;
+         ELSE CMDOPTR->DATA='';
+   OUTFLAG(MSGNUM)='1'B;
+   CALL ABEDSN(RHPTR,RHHDRPT,CMDOPTR->DATA,CMDOPTR->LEN);
+   CALL IN_SCREEN_WRITE_BODY; /* GO WRITE MAIN BODY OF SCREEN */
+   RHPTR = NXTRHEL;
+   SUBSTR(@CALLFLGS,8,1)=RHPPRINT;
+   IF RHVVTSW
+     THEN CALL #SCRWR(@PNLCALL,RHHDRPT);/*ABESCI*/
+     ELSE CALL ABECD(RHPPTR);
+   END IN_SCREEN_WRITE;
+
+ IN_SCREEN_WRITE_BODY: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN IT IS TIME TO WRITE THE DISPLAY, AFTER THE INITIAL      *
+ * HEADING LINES (COLUMN MEASURE, FIRST MESSAGE AND COMMAND LINES,     *
+ * AND TAB LINE) HAVE BEEN FORMATTED.  THIS SUBROUTINE WILL BE         *
+ * RESPONSIBLE FOR FORMATTING THE MAIN BODY OF THE DISPLAY.            *
+ *                                                                     *
+ **********************************************************************/
+   DATACNT=0; /* LAST LINE WAS A COMMAND LINE */
+   IF ^SCANFLAG
+     THEN IF RECPTR=HDPTR
+       THEN ISEQ=1;
+       ELSE ISEQ=RECPTR->RECSEQ+1;
+   SAVPTR=NULL;
+   SFLDPTR = INPTR; /* SFLDPTR POINTS AT 1ST  SEQ DISPLAY FLD */
+   DFLDPTR=DYNPTR;
+   DFLDADJ=DFLDADJ+DOUTOF+OUTOFF;
+   IFLDNUM=FLDNUM; /* SET INTERNAL FIELD NUMBER */
+   DO IL=1 REPEAT IL+1 UNTIL(IFLDNUM>FLDCNT);
+     IF ^SCANFLAG
+       THEN SUBSTR(FLAGS,3,2)='11'B; /* PROTECT FIELD */
+       ELSE SUBSTR(FLAGS,3,2)='00'B; /* UNPROTECT FIELD */
+     OUTFLAG(FLDNUM)='1'B; /* FORCE WRITE */
+     SELECT;
+       WHEN(IL>RHCEN) CALL IN_SCREEN_WRITE_CMDLINE;
+       WHEN(DATACNT=0 & (RHUSEHD^=NULL × RH_DISPLAY_HDR^=NULL))
+         CALL IN_SCREEN_WRITE_DBDLINE;
+       OTHERWISE CALL IN_SCREEN_WRITE_TXTLINE; /* IT M/B DATA LINE */
+       END; /* SELECT */
+     CALL NXTFLD('OUT'); /* GET NEXT DISPLAY LINE */
+     END;
+   END IN_SCREEN_WRITE_BODY;
+
+ IN_SCREEN_WRITE_CMDLINE: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN IT IS TIME TO PROCESS A COMMAND LINE IN THE MAIN BODY   *
+ * OF THE DISPLAY.                                                     *
+ *                                                                     *
+ **********************************************************************/
+   DATACNT=0; /* INDICATE IT IS COMMAND LINE */
+   CALL IN_SCREEN_NEXTDS; /* GET NEXT DS TO PROCESS */
+   DATA=SUBSTR('=======>',9-RHPMAXLN);
+   CALL NXTFLD('OUT'); /* GET NEXT FLD=COMMAND FIELD */
+   DATA=MSGDATA;
+   MSGDATA='';
+   IF CMDDISPLAY^=''
+     THEN DO;
+       DATA=CMDDISPLAY;
+       CMDDISPLAY='';
+       END;
+   CALL ABEDSN(RHPTR,RHHDRPT,DATA,LEN);
+   END IN_SCREEN_WRITE_CMDLINE;
+
+ IN_SCREEN_WRITE_DBDLINE: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN IT IS TIME TO PROCESS A DBD LINE IN THE MAIN BODY OF    *
+ * THE DISPLAY.                                                        *
+ *                                                                     *
+ **********************************************************************/
+   DATACNT=4; /* INDICATE IT IS DBD LINE */
+   DATA=SUBSTR('     DBD',9-RHPMAXLN);
+   CALL NXTFLD('OUT'); /* GET NEXT FLD=DBD USE FIELD */
+   IF RH_APL^=NULL & RH_DISPLAY_HDR^=NULL & RHUSEHD=NULL
+     THEN DATA=ABEAPLA(RHPTR,RHHDRPT,COLUMN);
+     ELSE DATA=ABEUD(RHPTR,RHHDRPT,COLUMN);
+   END IN_SCREEN_WRITE_DBDLINE;
+
+ IN_SCREEN_WRITE_TXTLINE: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN IT IS TIME TO FORMAT FOR DISPLAY A DATA LINE IN THE     *
+ * MAIN BODY OF THE DISPLAY.                                           *
+ *                                                                     *
+ **********************************************************************/
+   IF ^SCANFLAG
+     THEN DO; /* IT IS INSERT MODE */
+       SEQPIC=ISEQ;
+       ISEQ=ISEQ+1;
+       DATA=SUBSTR(SEQPIC,9-RHPMAXLN);
+       CALL NXTFLD('OUT'); /* GET NEXT FLD=DATA FIELD */
+       DATA='';
+       RETURN;
+       END;
+   IF SAVPTR^=HDPTR
+     THEN CALL IN_SCREEN_SYNCH; /* GET RECORD AND SET DATACNT */
+   IF SAVPTR=HDPTR
+     THEN DO; /* NO MORE LINES TO PROCESS FOR THIS DATA SET */
+       DATACNT=1; /* INDICATE PSEUDO DATA LINE */
+       DATA='';
+       CALL NXTFLD('OUT');
+       DATA='';
+       IF RHPTR=NXTRHEL
+         THEN DO;
+           PFPB='PB';
+           IF INDEX(CMDOPTR->DATA,'PF')+INDEX(CMDOPTR->DATA,'PB')^=0
+             THEN SUBSTR(CMDOPTR->DATA,1,2)=PFPB;
+           END;
+       RETURN;
+       END;
+   /* WE HAVE A DATA RECORD TO DISPLAY */
+   SEQPIC = SAVPTR->RECSEQ;
+   DATA = SUBSTR(SEQBL,9-RHPMAXLN);
+   CALL NXTFLD('OUT');
+   SELECT;
+     WHEN(DATACNT=3) /* IS IT GROUP OF SUPPRESSED LINES */
+       PUT STRING(DATA) EDIT(
+       '------LINES SUPPRESSED = ',SUPCNT)(A,P'ZZ9');
+     WHEN(HEXMODE & RH_DISPLAY_HDR=NULL)
+       IF DATACNT=2
+         THEN DO; /* HEX LINE */
+           CALL ABEHX('HEX',SAVPTR,DATA,RHPTR,
+             RHHDRPT);
+           END;
+         ELSE DO; /* DEC LINE */
+           CALL ABEHX('DEC',SAVPTR,DATA,RHPTR,
+             RHHDRPT);
+           CALL #ABETR(DATA);
+             /* CALL ABETR */
+           END;
+     OTHERWISE DO; /* IT MUST BE NORMAL DATA LINE IN ^HEXMODE */
+       L=LENGTH(SAVPTR->RECSTR);
+       DATA='';
+       IF RHPSKHD=NULL
+         THEN IF RH_DISPLAY_HDR=NULL
+           THEN IF COLUMN<=L
+             THEN DATA=SUBSTR(SAVPTR->RECSTR,COLUMN,MIN(L-COLUMN,
+               TRUNCATE-COLUMN)+1);
+             ELSE;
+           ELSE DATA=ABEDBDO(RHHDRPT,RHPTR,SAVPTR,COLUMN,TRUNCATE);
+         ELSE DO SKELPTR=RHPSKHD REPEAT SKNXT
+           WHILE(SKELPTR^=NULL) UNTIL(ENC>=L);
+           IF RH_DISPLAY_HDR=NULL
+             THEN IF STC<=L
+               THEN DATA=DATA××SUBSTR(SAVPTR->RECSTR,
+                 STC,MIN(L-STC,ENC-STC)+1);
+               ELSE;
+             ELSE DATA=DATA××ABEDBDO(RHHDRPT,RHPTR,SAVPTR,STC,ENC);
+           END;
+       IF LENGTH(DATA)>0
+         THEN DATA=SUBSTR(DATA,1,SUFFIX(DATA,' '));
+       IF LENGTH(DATA)<RHPFILL
+         THEN DATA=DATA××REPEAT(' ',RHPFILL-LENGTH(DATA)-1);
+       IF SUBSTR(SAVPTR->RECFLGS,3,1)
+         THEN DO;
+           SUBSTR(SAVPTR->RECFLGS,3,1)='0'B;
+           N=SAVPTR->RECRES;
+           SAVPTR->RECRES='0'B;
+           N=MIN(N,LINESIZE-RHPMAXLN-2);
+           IF LENGTH(DATA)<N
+             THEN DATA=DATA××REPEAT(' ',N);
+           @CHGCURS=FLDSBAB+1+N;
+           END;
+       END; /* OTHERWISE */
+     END; /* SELECT */
+   END IN_SCREEN_WRITE_TXTLINE;
+
+ NXTFLD: PROC(IO);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO LOCATE THE NEXT FIELD ON THE DISPLAY.                     *
+ *                                                                     *
+ **********************************************************************/
+   DCL IO CHAR(*);
+   IF IFLDNUM = FLDCNT
+     THEN IFLDNUM=FLDCNT+1; /* NO MORE FIELDS */
+     ELSE DO;
+       SFLDADJ=SFLDADJ+FLDLEN;
+       IFLDNUM=FLDNUM;
+       DFLDPTR = DYNPTR;
+       IF IO='IN'
+         THEN DFLDADJ = DFLDADJ + DINOF + INOFF;
+         ELSE DFLDADJ = DFLDADJ + DOUTOF + OUTOFF;
+         /* DLFDPTR NOW POINTS AT I/O DATA FOR CURRENT DISPLAY FLD */
+       END;
+   END NXTFLD;
+
+   END ABEC;

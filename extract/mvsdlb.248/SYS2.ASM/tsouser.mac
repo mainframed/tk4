@@ -1,0 +1,482 @@
+*  FROM CBT 249 FILE 136
+*          DATA SET CBT1374    AT LEVEL 001 AS OF 09/13/84
+*          DATA SET CBT1374    AT LEVEL 001 AS OF 01/02/83
+CBT1374  CSECT ,
+******************************************************************
+*  TSOUSER (TSOU) IS A COMMAND PROCESSOR TO DISPLAY 'ALL' THE
+*    TSO USERS CURRENTLY LOGGED ON. IT ALSO INCLUDES THEIR ASID
+*    LOGON PROC NAME, UCB ADDRESS (FOR LOCALS) OR 3705 RESOURCE
+*    ID (FOR SNA REMOTES),TERMINAL TYPE (BLANK FOR 327X CRT),
+*    AND TCAM TERMINAL MACRO NAMED FOR THE TERMINAL.
+*  BY UTILIZING THE KEYWORD 'USER'OR 'U' YOU MAY REQUEST THIS INFO
+*    ON A SPECIFIC TSO ID OR A GROUP OF IDS BEGINNING WITH ONE OR
+*    TWO SPECIFIC CHARS:
+*       TSOUSER USER(TS#)
+*       TSOU U(T#)
+*  BY UTILIZING THE KEYWORK 'PRT' OR 'P' THE OUTPUT WILL BE PLACED
+*    IN THE DATASET "YOU" HAVE PREALLOCATED TO THE DDNAME OF TSOUSER
+*
+*  AUTHOR: LAUREEN BEAUCHAINE - CONNECTICUT BANK + TRUST
+*
+******************************************************************
+******************************************************************
+* 04/06/83 - IF LOGON PROC DOES NOT START WITH 'TS' MOVE 'STARTING'
+*            IN AS USER ID NAME
+*          - IF THE TERMINAL IS NOT A TTY TYPE DEVICE AND THE 5TH
+*            POSITION OF THE TERMINAL NAME IS 0 OR 5, THEN THE TERMINAL
+*            IS A LOCAL DEVICE, OTHERWISE IT IS A REMOTE 327X TYPE
+*            DEVICE AND WILL BE LABELED AS  'R-327X'
+* 08/31/84 - UPDATED FOR X-A (CLC INCORRECT)                        LMB
+* 04/25/12 - adapted terminal naming convention to the          JW12116
+*            MVS 3.8j TK4- system                               JW12116
+* 10/26/13 - adapted terminal naming convention to the updated  JW13299
+*            MVS 3.8j TK4- system                               JW13299
+******************************************************************
+******************************************************************
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2        WORK REG (PPL,PDL,CPPL,AND UCB ADDR)
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7                  CPPL
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11                 SEQ NUMBERS FOR IDS
+R12      EQU   12                 BASE
+R13      EQU   13                 GETMAIN'D AREA
+R14      EQU   14                 BRANCHING TO ROUTINES
+R15      EQU   15
+CVT      EQU   76                 PTR TO CVT
+ASVTASID EQU   524                ASID BIT-ASCB ADDR
+TCBJSCBH EQU   180                PTR TO JSCB
+JSCBPSCB EQU   264                PTR TO PSCB
+ASXBLWA  EQU   20                 PTR TO LWA
+LWAPSCB  EQU   24                 PTR TO PSCB
+         USING *,R15
+         BC    15,PROLOG
+         DC    CL8'TEC1281'       MODULE NAME
+         DC    CL8'&SYSDATE'      DATE MODULE COMPILED
+         DC    CL8'SYSTIME'       TIME MODULE COMPILED
+         DROP  15
+PROLOG   STM   14,12,12(13)
+         LR    R12,R15            SET UP BASE REG
+         USING CBT1374,R12
+         LR    R7,R1              SAVE THE CPPLADDR ADDRESS
+         LA    0,L'WORKSIZE
+         GETMAIN R,LV=(0)
+         LR    R2,R1
+         LA    R3,L'WORKSIZE
+         LA    R4,FBLANK
+         LA    R5,L'FBLANK
+         ICM   R5,R8,=C' '
+         MVCL  2,4
+         ST    R1,8(R13)
+         ST    R13,4(R1)
+         LR    R13,R1
+         USING WORKAREA,R13
+         ST    R7,CPPLADDR        STORE THE CPPL ADDRESS
+         EJECT
+**********************************************
+*  GET COMMAND BUFFER & SET UP PARSE PARM LIST
+**********************************************
+         USING CPPL,R7
+         LA    R2,PARSLIST        ADDR OF PARSE PLIST
+         USING PPL,R2
+         MVC   PPLUPT,CPPLUPT     MOVE ADDR INTO PARSE PARM LIST
+         MVC   PPLECT,CPPLECT     MOVE ADDR INTO PARSE PARM LIST
+         MVC   PPLCBUF,CPPLCBUF   MOVE ADDR INT PARSE PARM LIST
+         XC    PECB,PECB          CLEAR ECB TO ZEROS
+         LA    R0,PECB            ADDR OF PARSE ECB
+         ST    R0,PPLECB          STORE INTO PPL
+         L     R0,=A(PCLIST)      ADDR OF CPL
+         ST    R0,PPLPCL          ADDR OF PCL
+         LA    R0,ANSWER          PPL REPLY
+         ST    R0,PPLANS          STORE INTO PPL
+         XC    PPLUWA,PPLUWA      CLEAR TO ZEROS
+         LA    R1,PPL             CPPL DSECT NO LONGER NEEDED
+         CALLTSSR EP=IKJPARS,MF=(E,(1))     CALL PARSE
+         CLC   ANSWER,=X'FF000000' IF NOT EQUAL
+         BC    7,CHECKPDE         NE - PARSE WAS SUCCESSFUL
+         MVC   MSGOUT,MSG00       MOVE MSG TO BUFFER
+         BAL   R14,PUTLINE        WRITE MSG
+         BC    15,RETURN          TERMINATE CP
+         EJECT
+***************************************
+*  CHECK THE PDE'S FOR RETURN SWITCHES
+**************************************
+CHECKPDE EQU   *
+         DROP  2                  PPL
+         DROP  7                  CPPL
+         L     R2,ANSWER
+         USING PDLDSECT,R2
+         MVI   USERSW,X'00'       INITIALIZE SWITCHES
+         MVI   ENDSW,X'00'
+         MVI   PRTSW,X'00'
+         MVI   SUPVSW,X'00'
+         LA    R1,USERPDE2        ADDR OF VOLSER PDE
+         TM    6(R1),X'80'        VERIFY KEYWORD WAS SPECIFIED
+         BC    8,CKPRT            BYPASS USER LOGIC
+*        CLC   4(2,R1),=X'0003'   not necessary, commented out  JW12116
+*        BC    12,GDUSER          not necessary, commented out  JW12116
+         CLC   4(2,R1),=X'0007'   if <= 7 it is a valid userid  JW12116
+         BC    12,GDUSER          it is valid, continue         JW12116
+INVALID  MVC   MSGOUT,MSG02       INVALID USERID
+         BAL   R14,PUTLINE
+         BC    15,RETURN
+GDUSER   LH    R7,4(,R1)          get length                    JW12116
+         SH    R7,=H'1'           subtract one for execute      JW12116
+         MVC   MATCHID(7),=CL7' ' blank userid                  JW12116
+         L     R1,0(R1)           ADDR OF USER ID
+         EX    R7,MATCHMOV        move in userid                JW12116
+         OI    USERSW,X'01'       TURN ON SWITCH
+CKPRT    CLC   PCEPRT,=H'1'       INDICATE TO WRITE TO DISK
+         BC    6,STARTHDG         GO CONTINUE
+         OI    PRTSW,X'01'        TURN ON SWITCH
+************************************
+*    PRINT HEADING
+***********************************
+STARTHDG TM    PRTSW,X'01'        IS PRT REQUESTED?
+         BC    8,PRTHDG           NO, CONTINUE
+         MVC   WRITEDCB,WRITEOUT  MOVE IN MODEL DCB
+         XC    OPENCLOS,OPENCLOS  INSURE LIST EQUALS ZEROS
+         LA    R1,OPENCLOS        ADDR OF LIST FORM
+         MVI   OPENCLOS,X'80'     INDICATE ONLY 1 DCB IN LIST
+         OPEN  (WRITEDCB,(OUTPUT)),MF=(E,(1))    OPEN FOR OUPUT
+         TM    WRITEDCB+48,X'10'  TEST IF SUCCESSFUL OPEN
+         BC    1,PRTHDG           YES,SUCCESSFUL
+         MVC   MSGOUT,MSG04       MOVE MSG TO BUFFER
+         BAL   R14,PUTLINE        WRITE MSG TO TERMINAL
+         BC    15,RETURN          TERMINATE CP
+PRTHDG   SR    R11,R11
+         MVC   MSGOUT,MSG01       MOVE IN OUTPUT MSG
+         BAL   R14,OUTPUTIT
+*        SR    R1,R1              SOMITCW commented out
+*        SVC   254                SOMITCW commented out
+*        BSPAUTH ON              SOMITCW added/JW commented out JW12116
+         MODESET MODE=SUP
+         OI    SUPVSW,X'01'       TURN SWITCH ON TO REMEMBER STATE
+**********************************
+*  SEARCH FOR TSO USER
+**********************************
+         L     R6,CVT             LOAD CVT ADDRESS
+         USING CVTMAP,R6
+         L     R5,CVTASVT
+         LA    R5,ASVTASID(R5)    LOAD ASID AND ASCB
+LOOPIT   MVC   OUTPUT+13(19),=19C' '   CLEAR OUT 'STARTING'
+         MVC   OUTPUT+34(6),=6C' '     CLEAR OUT TERMINAL TYPE
+         MVC   OUTPUT+48(8),=8C' '     CLEAR OUT TERMINAL NAME
+         CLC   0(4,R5),LASTASID   END OF ASCB ADDR
+         BC    8,RETURN           BR IF EQUAL
+         CLI   0(R5),X'80'        IS ASCB ASSIGNED?
+         BNE   SRCH               BR IF ASSIGNED
+         LA    R5,4(R5)           INCREMENT TO NEXT ASID-ASCB
+         BC    15,LOOPIT
+***********************************
+*  AN ASSIGNED ASCB FOUND
+***********************************
+SRCH     L     R6,0(R5)           LOAD ASCB ADDR IN R6
+         USING ASCB,R6            IF ZERO NOT TSO ID
+         L     R8,ASCBTSB         LOAD TSB ADDRESS
+         LTR   R8,R8
+         BC    6,GETDATA          IT IS TSO,SEARCH FOR DATA
+         LA    R5,4(R5)           INCREMENT TO NEXT ASID-ASCB
+         BC    15,LOOPIT
+GETDATA  EQU   *
+         MVC   BITHOLD,ASCBDSP1
+         MVC   OUTPUT+13(16),=CL16' ' CLEAR OUTPUT AREA
+***********************************
+*  A TSO ADDRESS SPACE FOUND
+*  R6 POINTS TO ASCB, R8 POINTS TO TSB,R7 WILL POINT TO PSCB
+***********************************
+*
+***********************************
+*  GO TO ASCB TO RETRIEVE THE FOLLOWING:
+*  JOBNAME AND LOGON PROC AND ASID
+***********************************
+         MVC   ASIDHOLD,ASCBASID
+A3       L     R6,ASCBJBNS        LOAD JOBNAME ADDRESS
+         CLC   0(4,R6),=C'INIT'   IS NAME INIT?
+         BC    6,GETTSOID         NO DEFINITELY TSO CONTROL BLK
+         LA    R5,4(R5)           INCREMENT TO NEXT ASID-ASCB
+         BC    15,LOOPIT          THIS IS'T TSO, CONT SEARCHING
+GETTSOID TM    BITHOLD,X'40'      IS IT AN ASID FAILURE?
+         BC    8,TESTSTRT         NO, SO CONTINUE
+         MVC   OUTPUT+13(19),FAILMSG  MOVE OUT FAILURE MESSAGE
+         BC    15,CONTASCB        GO CONTINUE PROCESSING
+TESTSTRT MVC   OUTPUT+24(8),8(R6) MOVE LOGON PROC TO OUTPUT
+         CLC   0(7,R6),STARTID    CK JOBNAME-IS IT A STARTING ID?
+         BC    7,CKPCNAME         NO, CHECK PROC NAME
+         MVC   OUTPUT+13(19),STARTING MOVE OUT STARTING MSG
+         BC    15,CONTASCB        GO CONTINUE ASCB PROCESSING
+CKPCNAME CLC   OUTPUT+24(2),=C'TS' IS IT A TSXXXX LOGON PROC?
+         BC    8,JOBNAME          YES, MOVE IN VALID JOBNAME
+         CLC   OUTPUT+24(2),=C'IK' is it the default procedure? JW12116
+         BC    8,JOBNAME          yes, move in valid jobname    JW12116
+         MVC   OUTPUT+13(19),STARTING  NO, IT'S JUST LOGGING ON
+         BC    15,CONTASCB        GO CONTINUE ASCB PROCESSING
+JOBNAME  MVC   OUTPUT+13(7),0(R6) MOVE JOBNAME TO OUTPUT
+CONTASCB LA    R2,ASIDHOLD
+         LH    R3,0(R2)
+         CVD   R3,PACKED
+         MVC   HLDASID,PATASID
+         ED    HLDASID,PACKED+6
+         MVC   OUTPUT+6(4),HLDASID    MOVE OUT ASID
+         EJECT
+*********************************************************************
+* THE FOLLOWING CODE HAS BEEN COMMENTED OUT BECAUSE IT IS JUST
+* RETRIEVING DATA FROM THE PSCB OF THE JOB EXECUTING THIS MODULE.
+* A MODIFICATION MUST BE ADDED TO SCHEDULE AN SRB TO GATHER INFO
+* FROM THE INDIVIDUAL PSCB'S OF THE OTHER TSO ASID'S.  THIS CONTROL
+* BLOCK RESIDES IN THE USERS PRIVATE AREA AND NOT IN COMMON STORAGE,
+* THUS CAUSING THIS PROBLEM.
+*********************************************************************
+*        USING ASCB,R6
+*        L     R7,ASCBASXB        LOAD ASXB ADDR
+*        L     R7,ASXBLWA(R7)     LOAD LWA ADDRESS
+*        L     R7,LWAPSCB(R7)     LOAD PSCB ADDRESS
+FOUNDIT  EQU   *
+************************************
+*  GO TO PSCB TO RETRIEVE THE FOLLOWING INFO
+*     REGION SIZE, DESTINATION, LOGON TIME
+************************************
+*        USING PSCB,R7
+*        L     R9,PSCBRSZ
+*        CVD   R9,DOUBLE
+*        MVC   OUTPUT+48(4),EDITRG
+*        ED    OUTPUT+48(4),DOUBLE+6
+*        OI    OUTPUT+51,X'F0'
+*        MVC   OUTPUT+56(8),PSCBDEST   MOVE OUT SYSOUT DEST
+**********************************************************************
+*
+*  THE END OF COMMENTED OUT AREA
+*
+**********************************************************************
+         EJECT
+         MVC   OUTPUT+35(5),=C' 327X'  default is local 327X    JW12116
+******************************************************************
+*  GO TO ASB TO RETRIEVE THE FOLLOWING: TERMINAL TYPE + OS ADDRESS
+******************************************************************
+         L     R9,CVT             ADDR OF CVT
+         L     R9,0(R9)           ADDR OF TCB WORK=DS
+         L     R9,4(R9)           ADDR OF CURRENT TCB
+         USING TCB,R9
+         USING TSB,R8
+A2       MODESET EXTKEY=ZERO      SET PROTECT KEY ZERO
+         LH    R2,TSBLINE
+         SLL   R2,4               TO GET 1 POSITION FOR SIGN
+         STH   R2,HALFTEMP
+         UNPK  ANS(4),HALFTEMP(2)
+         OI    ANS+3,C'0'
+         TR    ANS(4),TRTABLE
+         MVC   OUTPUT+42(3),ANS+1
+         MVC   OUTPUT+48(8),TSBTRMID
+TESTTWX  TM    TSBTERM2,X'20'     is it TWX?                    JW13299
+         BNO   TEST2741           no TWX, is it 2741?           JW13299
+         MVC   OUTPUT+35(5),=C' TWX '
+         B     DONEIT             skip 2741                     JW13299
+TEST2741 TM    TSBTERM1,X'08'     is it 2741?                   JW13299
+         BNO   DONEIT             no, out of luck, check names  JW13299
+         MVC   OUTPUT+35(5),=C' 2741' yes, say so               JW13299
+DONEIT   MODESET EXTKEY=TCB,WORKREG=4
+*        LA    R1,4               SOMITCW commented out
+*        SVC   254                SOMITCW commented out
+*        BSPAUTH OFF             SOMITCW added/JW commented out JW12116
+**************************************************************
+* TEST IF A REMOTE 327X TYPE TERMINAL
+**************************************************************
+         CLC   OUTPUT+49(4),=C'3767'   is it TTY faking a 3767? JW13299
+         BNE   ISITTTY                 no, check for TTY        JW12116
+         MVC   OUTPUT+35(5),=C' 3767'  yes, change message      JW13299
+         B     FINISH                  and go continue          JW13299
+ISITTTY  CLC   OUTPUT+35(4),=C' TWX'   IS IT A TTY TYPE?
+         BC    8,FINISH                YES, GO CONTINUE
+         CLC   OUTPUT+35(4),=C' 274'   is it a 2741 type?       JW13299
+         BC    8,FINISH                yes, go continue         JW13299
+         CLC   OUTPUT+51(3),=C'78S'    is it a remote terminal? JW13299
+         BE    REMOTE                  yes, change message      JW12116
+         CLC   OUTPUT+51(3),=C'L31'    is it a remote terminal? JW12116
+         BNE   FINISH                  no, go continue          JW12116
+REMOTE   MVC   OUTPUT+34(6),=C'R-327X' it's a 327X remote       JW12116
+**************************************************************
+*  INCREMENT FOR NEXT ASCB, PRINT OUTPUT, AND BRANCH TO LOOPIT
+**************************************************************
+FINISH   LA    R5,4(R5)           INCR TO NEXT ASID-ASCB
+         MVC   MSGOUT,OUTPUT      MOVE DATA TO OUTPUT AREA
+         LA    R14,LOOPIT         SEARCH FOR MORE IDS
+************************************************
+* LOOK FOR 1 SPECIFIC USER ID REQUESETED IN PARM
+************************************************
+          TM    USERSW,X'01'       IS 1 ID REQUESTED?
+          BC    8,OUTPUTIT         NO-GO PRINT ALL
+          CLI   MATCHID+1,C'#'     IS IT A GLOBAL SEARCH OF 1 POSITION
+          BC    8,ONECHAR          YES GO SEE IF IT MATCHES
+          CLI   MATCHID+2,C'#'     IS IT A GLOBAL SEARCH OF 2 POSITIONS
+          BC    8,TWOCHAR          YES GO SEE IF IT MATCHES
+          BC    15,WHOLEID         GO COMPARE WHOLE ID
+ONECHAR   CLC   OUTPUT+13(1),MATCHID  DOES FIRST CHAR MATCH?
+          BC    6,LOOPIT           NO, GO LOOK FOR NEXT ID
+          BC    8,GOTMATCH         GOT A MATCH - GO PROCESS IT
+TWOCHAR   CLC   OUTPUT+13(2),MATCHID  DOES FIRST TWO CHARS MATCH?
+          BC    6,LOOPIT           NO, GO LOOK FOR NEXT ID
+          BC    8,GOTMATCH         GOT A MATCH - GO PROCESS IT
+WHOLEID   CLC   OUTPUT+13(7),MATCHID    YES-DOES IT MATCH?
+          BC    6,LOOPIT           NO,  GO LOOK FOR NEXT ID
+GOTMATCH  OI    ENDSW,X'01'        GOT A MATCH
+****************************************************************
+*  OUTPUT  PROCESSING
+****************************************************************
+* ROUTINE TO SEQUENCE NUMBER IDS LOGGED ON
+OUTPUTIT A     R11,ONE
+         CVD   R11,DOUBLE
+         MVC   OUTPUT+1(4),EDITNUM
+         ED    OUTPUT+1(4),DOUBLE+6
+         LR    R3,R14             SAVE THE RETURN REGISTER
+         TM    PRTSW,X'01'        IS PRT REQUESTED?
+         BC    8,PUTLINE          NO, CONTINUE
+         PUT   WRITEDCB,MSGOUT    PUT MSG TO DISK
+         LR    R14,R3             RESTORE THE BRANCH TO REGISTER
+         BR    R14                RETURN TO PROCESSING
+PUTLINE  MVC   MSGCNTL,PUTCNTL    MOVE IN PUTLINE CONTROL CHARS
+         STM   R0,R15,SAVEREGS    SAVE CLLER'S REGS
+         LA    R5,MSGWORK         ADDR OF MSG BUFFER
+         L     R2,CPPLADDR        ADDR OF CPPL
+         USING CPPL,R2
+         LA    R1,PUTLPARM        ADDR OF PLIST
+         USING IOPL,R1
+         MVC   IOPLECT,CPPLECT    MOVE ADDR OF ECT TO PLIST
+         MVC   IOPLUPT,CPPLUPT    MOVE ADDR OF UPT TO PLIST
+         LA    R0,ECB             ADDR OF ECB
+         ST    R0,IOPLECB         STORE INTO PLIST
+         XC    ECB,ECB            CLEAR ECB TO ZEROS
+         XC    PTPB(16),PTPB      CLEAR PLIST TO ZEROS
+         PUTLINE PARM=PTPB,ECB=ECB,                                    X
+               TERMPUT=(EDIT,WAIT,NOHOLD,NOBREAK),                     X
+               OUTPUT=((R5),TERM,SINGLE,DATA),                         X
+               MF=(E,(1))
+         MVI   MSGWORK,X'40'      CLEAR BUFFER TO SPACES
+         MVC   MSGWORK+1(120),MSGWORK
+         LM    R0,R15,SAVEREGS    RESTORE CALLER'S REGS
+         BR    R14                RETURN TO CALLER
+         EJECT
+***********************************
+*  NO MORE ADDRESS SPACES TO SEARCH
+***********************************
+RETURN   TM    USERSW,X'01'       WAS 1 ID REQUESTED?
+         BC    8,ENDIT            NO, GO CLEAN-UP
+         TM    ENDSW,X'01'        WAS THE ID FOUND?
+         BC    1,ENDIT            YES, GO CLEAN-UP
+         MVC   MSGOUT,MSG03       ID NOT FOUND MSG
+         LA    R14,ENDIT
+         BC    15,OUTPUTIT
+ENDIT    TM    PRTSW,X'01'        WAS PRT REQUESTED?
+         BC    8,FINITO           END THE JOB
+         TM    WRITEDCB+48,X'10'  IF NOT OPENED BYPASS
+         BC    8,FINITO           NOT OPENED
+         XC    OPENCLOS,OPENCLOS  INSURE LIST EQUAL ZEROS
+         MVI   OPENCLOS,X'80'     INDICATE ONLY 1 DCB
+         LA    R1,OPENCLOS        LIST FORM ADDR
+         CLOSE (WRITEDCB),MF=(E,(1))   CLOSE DCB
+         FREEPOOL WRITEDCB
+****** TEST TO SEE IF WE ARE IN PROB OR SUPV STATE
+FINITO   TM    SUPVSW,X'01'       ARE WE IN SUPV STATE?
+         BC    8,FINITO2          NO, BYPASS THE MODESET
+         MODESET MODE=PROB
+FINITO2  LA    R0,L'WORKSIZE
+         LR    R1,R13
+         L     R13,4(R1)
+         FREEMAIN R,LV=(0),A=(1)
+         LM    14,12,12(13)
+         BR    14
+         EJECT
+CBT1374  CSECT
+         LTORG
+         DS    0H
+*************THE FOLLOWING IS A PUTLINE MSG:
+MSG00    DC    CL120'UNABLE TO PARSE INPUT BUFFER. CP TERMINATED'
+MSG01    DC    CL120'   NO  ASID  USER-ID   LOGON PROC  TERM  ADDR  TERX
+               M-NAME         '
+MSG02    DC    CL120'INVALID USER ID ENTERED'
+MSG03    DC    CL120'        ****TSO USER NOT CURRENTLY LOGGED ON*****'
+MSG04    DC    CL120'OPEN PROCESSING FOR DDNAME=TSOUSER NOT SUCCESSFUL'
+*******************************************************
+FAILMSG  DC    C'***ASID  FAILURE***'
+STARTING DC    C'*****STARTING******'
+MATCHMOV MVC   MATCHID(1),0(R1)  move in userid, to be EXecuted JW12116
+**** THE FOLLOWING HEADING ADDED WHEN PSCB UPDATE IS MADE:
+*HEADING2 DC   C'REGION DESTINATION'
+STARTID  DC    X'040C000000016A'  ASCB STARTING JOBNAME (FROM DUMP)
+LASTASID DC    X'80000000'        TEST FOR LAST ASID-ASCB IN CHAIN
+FBLANK   DC    X'40'
+ONE      DC    F'+1'
+EDITNUM  DC    X'40202120'
+EDITRG   DC    X'40202021'
+PATASID  DC    X'40202020'        FOR ASID
+PUTCNTL  DC    H'121'             PUTLINE CONTROL CHARACTER
+WRITEOUT DCB   DDNAME=TSOUSER,DSORG=PS,MACRF=(PM),                     X
+               BLKSIZE=120,LRECL=120,RECFM=FB
+OPENLIST OPEN  (0),MF=L           LIST FORM OF OPEN + CLOSE
+TRTABLE  DS    0D                 TO DEFINE WHOLE FF BYTES OF A TABLE
+         DS    CL240
+         DC    C'0123456789ABCDEF'     TO DEFINE A THROUGH F BYTES
+*******************
+* PARSE DEFINITIONS
+*******************
+         PRINT NOGEN
+PCLIST   IKJPARM DSECT=PDLDSECT
+PCEUSER  IKJKEYWD
+         IKJNAME 'USER',ALIAS=('U'),SUBFLD=USERPDE
+PCEPRT   IKJKEYWD
+         IKJNAME 'PRINT',ALIAS=('PRT','P')
+USERPDE  IKJSUBF
+USERPDE2 IKJIDENT 'USER ID',MAXLNTH=7,FIRST=ALPHA,OTHER=ALPHANUM
+         IKJENDP
+********************************************************
+* WORKAREA FOR GETMAIN'D AREA FOR LITERALS BEING CHANGED
+********************************************************
+WORKAREA DSECT ,
+SAVE     DS    18F
+SAVEREGS DS    16F
+DOUBLE   DS    D
+OUTPUT   DC    CL120' '
+HALFTEMP DS    H
+USERSW   DS    X        IF USER KEYWD USED(01), IF ID FOUND (11)
+ENDSW    DS    X        WHEN USER KEYWORD USED, STOP CHECKING BIT ON
+PRTSW    DS    X        IF OUTPUT TO A DDNAME AND NOT CRT IS REQUESTED
+SUPVSW   DS    X        TELLS IF IN SUPV OR PROBLEM STATE
+BITHOLD  DS    X        ASCBDSP1 - NON-DISPATCHABILITY FLAGS
+MATCHID  DS    CL7
+ANS      DS    CL4
+CPPLADDR DS    F                  CPPL ADDR FOR DSECT
+         DS    0F
+OPENCLOS DS    CL4                EXEC COPY OF OPEN + CLOSE
+         DS    0D
+WRITEDCB DS    CL96               EXEC VERSION OF DCB
+*******THE FOLLOWING ARE FOR PARSE:
+PARSLIST DS    7A                 FOR PPL DSECT
+PECB     DS    F                  ECB FOR PPL
+ANSWER   DS    F                  REPLY FROM PARSE IN PPL
+*******THE FOLLOWING ARE FOR PUTLINE:
+MSGWORK  DS    0CL121
+MSGCNTL  DS    F                  PUTLINE CONTROL CHARS
+MSGOUT   DS    CL120              OUTPUT DATA
+PUTLPARM DS    10A
+ECB      DS    F
+PTPB     DS    4F
+ASIDHOLD DS    H
+PACKED   DS    D
+HLDASID  DS    CL4
+WORKEND  DS    0H
+WORKSIZE DS    0XL(WORKEND-WORKAREA)
+         EJECT
+         IKJCPPL
+         CVT
+         IKJPPL
+         IKJIOPL
+         IKJTCB
+         IHAASCB
+         IKJPSCB
+         IKJTSB LIST=NO
+         END   CBT1374

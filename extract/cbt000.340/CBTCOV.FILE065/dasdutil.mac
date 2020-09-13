@@ -1,0 +1,768 @@
+DASDUTIL TITLE 'FLUOR IRVINE DASD UTILITY PROGRAM'
+***********************************************************************
+*                                                                     *
+*  THIS PROGRAM READS A VTOC OF A VOLUME, SORTS THE DSNAMES, THEN IT  *
+*  WILL COMPRESS, RELEASE UNUSED SPACE, OR BYPASS IT DEPENDING ON     *
+*  THE CONTROL CARDS. OTHER OPTIONS ARE PASSED VIA PARM= STATEMENT    *
+*  FOR COMPRESSING PDS DATASETS WITHOUT RELEASING FREE SPACE AND      *
+*  BYPASSING SEQUENTIAL DATA SET PROCESSING OR DELETING LOAD MODULES  *
+*  THAT ARE OLDER THAN A SPECIFIED DATE PRIOR TO NORMAL PROCESSING.   *
+*                                                                     *
+*                                                                     *
+*  REQUIRED DDNAMES:                                                  *
+*           SYSVOL   - POINTING TO TARGET VOLUME                      *
+*           SYSIN    - POINTING TO A CONTROL CARD DATA SET            *
+*           SYSPRINT - FOR OUTPUT (SYSOUT=A)                          *
+*           SYSUT3   - WORK FILE FOR IEBCOPY                          *
+*                                                                     *
+*  OPTIONAL DDNAMES:                                                  *
+*           CMPRLIST - SYSOUT FILE FOR IEBCOPY                        *
+*           CLEANLST - SYSOUT FILE FOR CLEANLD                        *
+*           SYSOUT   - SYSOUT FOR SORT/MERGE                          *
+*                                                                     *
+*  CONTROL CARD FORMAT:                                               *
+*           *           - COLUMN ONE FOR COMMENTS                     *
+*           +BYPASS-    - BYPASS A DATA SET                           *
+*           +CMPRS-     - ONLY COMPRESS A DATASET                     *
+*           +RLSE-      - ONLY RELEASE UNUSED SPACE                   *
+*           +ENDCNTL-   - END OF CONTROL STATEMENTS                   *
+*           +NOCNTL-    - NO CONTROL CARDS SPECIFIED                  *
+*                                                                     *
+*  NOTE: DATA SET NAME MUST FOLLOW CONTROL CARD                       *
+*  EXAMPLE-  +BYPASS-SYS1.LINKLIB                                     *
+*                                                                     *
+*  LINKED/ATTACHED PROGRAMS:  SORT,IEBCOPY,CLEANLD,RELEASER           *
+*                                                                     *
+***********************************************************************
+DASDUTIL ENTER REGEQUS=YES,PARMREG=2,     REGISTER EQUATES             +
+               BASEREG=(3,11),            SET 2 BASE REGS              +
+               GETMAIN=(WORKSIZE,SUBPOOL), AND GET SOME CORE
+         LR    R12,R13                    GET ADDRESS OF GETMAIN AREA
+         USING WORKAREA,R12               TELL THE ASSEMBLER
+         BAL   R14,INIT                   INITIALIZATION ROUTINE
+         BAL   R14,DRIVER                 MAIN ROUTINE
+         BAL   R14,CLEANUP                GET READY TO GO
+         LEAVE GETMAIN=(WORKSIZE,SUBPOOL) BYE-BYE
+*
+         TITLE 'DASD UTILITY INITIALIZATION ROUTINE'
+*
+*   INITIALIZATION ROUTINE THAT READS THE CONTROL FILE, FINDS THE VTOC,
+*   AND ALLOCATES DUMMY FILES.
+*
+INIT     BEGIN
+         L     R2,0(R2)                   GET PARM ADDRESS
+         LH    R1,0(R2)                   LOAD THE LENGTH
+         LTR   R1,R1                      WAS A PARM SPECIFIED?
+         BZ    INIT1                      NOPE, -->
+         LA    R2,2(R2)                   LOOK PAST THE LENGTH
+         CLC   CMPALL,0(R2)               WAS COMPRESS SPECIFIED?
+         BNE   INIT0                      NOPE, -->
+         MVC   HMSG,MSG0                  MOVE IN EXTRA HEADING MSG
+         MVC   HMSG(L'CMPALL),CMPALL      TELL HIM COMPRESS SPECIFIED
+         MVI   PARMFLG,C'C'               SET PARM FLAG TO COMPRESS
+INIT0    DS    0H
+         CLC   CLEANLD,0(R2)              WAS CLEANLD SPECIFIED?
+         BNE   INIT1                      NOPE, -->
+         MVC   HMSG,MSG0                  MOVE IN HEADING MSG
+         MVC   HMSG(L'CLEANLD+4),0(R2)    TELL HIM CLEANLD AND DAYS
+         MVC   DAYS,L'CLEANLD(R2)         SAVE TARGET DAYS
+         MVI   PARMFLG,C'D'               SET PARM FLAG TO DELETE
+*
+INIT1    DS    0H
+         OPEN  (SYSPRINT,(OUTPUT))        OPEN REPORT FILE
+         LA    R4,SPECTBL                 GET ADDRESS OF EXEMPT DSN'S
+         LA    R6,TBLSIZE                 GET TABLE SIZE
+         OPEN  (SYSIN,(INPUT))            OPEN INPUT FILE
+INIT1A   DS    0H
+         GET   SYSIN                      READ A CONTOL CARD
+         CLI   0(R1),C'*'                 IS IT A COMMENT CARD
+         BE    INIT1A                     YEP, --> SKIP IT
+         CLC   ENDCNTL,0(R1)              END OF CNTL CARDS
+         BE    INIT2                      YEP, -->
+         CLC   NOCNTL,0(R1)               NO CONTROL CARDS
+         BNE   INIT1B                     NOPE, -->
+         MVC   HMSG,MSG0                  MOVE IN NO CONTROL MSG
+         B     INIT2                      -->
+INIT1B   DS    0H
+         CLC   CMPRS,0(R1)                COMPRESS SPECIFIED
+         BNE   INIT1C                     NOPE, -->
+         MVI   0(R4),C'C'                 SET COMPRESS ONLY FLAG
+         LA    R5,L'CMPRS(R1)             POINT PAST CONTROL WORD
+         B     INIT1E                     --> MOVE IN DSN
+INIT1C   DS    0H
+         CLC   RLSE,0(R1)                 RELEASE SPECIFIED
+         BNE   INIT1D                     NOPE, -->
+         MVI   0(R4),C'R'                 MOVE IN RELEASE ONLY FLAG
+         LA    R5,L'RLSE(R1)              POINT PAST CONTROL WORD
+         B     INIT1E                     --> MOVE IN DSN
+INIT1D   DS    0H
+         CLC   BYPASS,0(R1)               WAS BYPASS SPECIFIED?
+         BNE   ERROR1                     NOPE, --> ERROR
+         MVI   0(R4),C'B'                 SET BYPASS FLAG
+         LA    R5,L'BYPASS(R1)            POINT PAST CONTROL WORD
+INIT1E   DS    0H
+         MVC   1(44,R4),0(R5)             MOVE IN DSN
+         LA    R4,45(R4)                  BUMP TABLE INDEX
+         BCT   R6,INIT1A                  CHECK FOR MAX ENTRIES
+         B     ERROR2                     IF MAX, --> ERROR
+*
+INIT2    DS    0H
+         MVI   0(R4),X'FF'                SET END OF TABLE FLAG
+         CLOSE SYSIN                      CLOSE INPUT FILE
+         LA    R7,VTOC                    GET ADDRESS OF VTOC DCB
+         USING IHADCB,R7                  TELL THE ASSEMBLER
+         LA    R8,JFCBPARM                GET ADDRESS OF JFCB DATA
+         USING JFCBMAP,R8                 TELL THE ASSEMBLER
+         RDJFCB VTOC                      READ JFCB
+         MVC   VOLSER,JFCBVOLS            SAVE VOLSER FOR HEADING
+         MVC   S99VOL,JFCBVOLS            AND SVC 99
+         MVI   JFCBPARM,X'04'             GET READY TO MOVE IN DSN
+         MVC   JFCBPARM+1(43),JFCBPARM    MOVE IN VTOC DSN
+         OPEN  (VTOC,(INPUT)),TYPE=J      OPEN FOR INPUT, TYPE J
+         TM    DCBOFLGS,DCBOFOPN          WAS IT A GOOD OPEN?
+         BZ    ERROR3                     NOPE --> ERROR
+         L     R5,DCBDEBAD                GET ADDRESS OF DEB
+         ST    R5,DEBADDR                 SAVE IT
+INIT3    DS    0H
+         XC    BUFLIST1(BUFFLEN),BUFLIST1 CLEAR BUFFER LIST
+         XC    DSCB#140,DSCB#140          CLEAR DSCB
+         USING BUFFMAP,R4                 TELL THE ASSEMBLER
+         LA    R4,BUFLIST1                GET BUFFER LIST ADDRESS
+         OI    BFLHFL,BFLHDSCB            SET DSCB FLAG
+         MVI   BFLHNOE,1                  ONLY ONE DSCB
+         LA    R1,DSCB#140                GET ADDRESS OF DSCB FORMAT
+         ST    R1,BFLEBUF                 SAVE IT IN THE BUFFER LIST
+         MVI   BFLELTH,140                SET LENGTH OF THE DSCB#140
+         DROP  R4                         ALL DONE W/R4
+INIT4    DS    0H
+         BAL   R14,ALLOC                  ALLOC DUMMY SORT SYSOUT
+         MVC   S99DDNSZ,=H'8'             SET SIZE FOR OTHER DDNAMES
+         MVC   S99DDN,CMPRESIN            MOVE IN DMY DDN FOR COPY
+         BAL   R14,ALLOC                  ALLOC DUMMY SYSIN IEBCOPY
+         MVC   S99DDN,CMPRLIST            MOVE IN DMY DDN FOR COPY
+         BAL   R14,ALLOC                  ALLOC DUMMY SYSOUT IEBCOPY
+         MVC   S99DDN,CLEANLST            MOVE IN DMY DDN FOR CLEANLST
+         BAL   R14,ALLOC                  ALLOC SYSOUT FOR CLEANLD
+         MVC   S99DDN,CLEANLIB            MOVE IN DASDUTILS DDNAME
+         MVC   S99PRM2(4),S99PRM2@        MOVE IN REGULAR PARM
+         MVI   S99PTR2,X'00'              CLEAR LIST END FLAG
+         MVC   LINE,BLANKS                CLEAR THE PRINT LINE
+         MVI   CC,X'FF'                   SET HEADING FLAG
+         BAL   R14,REPORT                 AND WRITE IT
+INITX    GOBACK                           GO BACK TO CALLER
+         DROP  R7
+         DROP  R8
+*
+         TITLE 'DASD UTILITY LINK TO SORT/MERGE'
+*
+*   LINK TO SORT/MERGE
+*
+DRIVER   BEGIN
+         ST    R3,SAVE3                   SAVE BASE REGISTER
+         ST    R11,SAVE11                 SAVE BASE REGISTER
+         ST    R12,SAVE12                 SAVE GETMAIN ADDRESS
+         LA    R1,@SORTPRM                GET SORT PARM ADDRESS
+         LINK  EP=SORT                    LINK TO SORT PROGRAM
+DRIVERX  GOBACK
+*
+         TITLE 'DASD UTILITY E15 EXIT AND READ THE VTOC'
+*
+*   E15 EXIT THAT READS THE VTOC AND INPUTS IT TO SORT/MERGE
+*
+DRIVER1  DS    0H
+         ENTRY DRIVER1                    ENTRY FOR E15 EXIT
+         STM   R14,R12,12(R13)            SAVE HIS REGISTERS
+         USING DRIVER1,R15                SET UP BASE REGISTER
+         L     R12,SAVE12                 GET ADDRESS OF GETMAIN AREA
+         USING WORKAREA,R12               TELL THE ASSEMBLER
+         LA    R1,SAVEAREA                GET NEW SAVE AREA ADDRESS
+         ST    R13,4(R1)                  SAVE HIS REG 13
+         ST    R1,8(R13)                  AND REG 1
+         LR    R13,R1                     SAVE REG 1
+         L     R3,SAVE3                   GET BASE REGISTER
+         L     R11,SAVE11                 GET BASE REGISTER
+         DROP  R15                        FORGET REG 15
+*
+DRIVER1A DS    0H
+         L     R4,DEBADDR                 GET DEB ADDRESS
+         LA    R5,BUFLIST1                GET BUFFER LIST FOR CVAF
+         LA    R6,DSCB#140
+         USING IECSDSL1,R6
+         CVAFSEQ ACCESS=GT,               READ VTOC SEQUENTIALLY       +
+               BUFLIST=(R5),                                           +
+               DEB=(R4)
+         C     R15,=F'4'                  CHECK RETURN CODE
+         BE    DRIVER1X                   IF 4, --> ALL DONE
+         BH    ERROR4                     GT 4, --> ERROR
+         CLI   DS1FMTID,C'1'              IS IT  A FORMAT 1 DSCB
+         BNE   DRIVER1A                   NOPE, -->
+         MVC   SORTDATA,DS1DSNAM          SAVE DSN FOR SORT
+         MVC   SORTDATA+44(2),DS1BLKL     AND BLOCK SIZE
+         MVC   SORTDATA+46(2),DS1DSORG    AND DSORG
+         MVC   SORTDATA+48(3),DS1EXPDT    AND EXPDT
+         MVC   SORTDATA+51(1),DS1RECFM    AND RECFM
+         LA    R1,SORTDATA                GET THE DATA ADDRESS
+         L     R13,4(R13)                 GET SAVE AREA ADDRESS
+         L     R14,12(R13)                AND SORTS ADDRESS
+         RETURN (2,12),RC=12              RC=12 IS FOR RECORD INSERT
+DRIVER1X DS    0H
+         L     R13,4(R13)                 GET SAVE AREA ADDRESS
+         RETURN (14,12),RC=8              RC=8 IS FOR NO RETURN
+         DROP  R6
+*
+*
+         TITLE 'DASD UTILITY E35 EXIT'
+*
+*   E35 EXIT THAT READS THE THE SORT DSNAMES AND PASSES THEM TO CHKTYPE
+*
+DRIVER2  DS    0H
+         ENTRY DRIVER2                    ENTRY POINT FOR E35 EXIT
+         STM   R14,R12,12(R13)            SAVE HIS REGISTERS
+         LR    R2,R1                      SAVE THE PARM REGISTER
+         USING DRIVER2,R15                TELL THE ASSEMBLER
+         L     R12,SAVE12                 GET ADDRESS OF WORKAREA
+         USING WORKAREA,R12               TELL THE ASSEMBLER
+         LA    R1,SAVEAREA                GET ADDRESS OF NEW SAVEAREA
+         ST    R13,4(R1)                  SAVE HIS REG 13
+         ST    R1,8(R13)                  AND MY REG1
+         LR    R13,R1                     SAVE REG1 IN REG13
+         L     R3,SAVE3                   GET BASE REGISTER
+         L     R11,SAVE11                 GET BASE REGISTER
+         DROP  R15                        FORGET REG15
+*
+         L     R5,0(R2)                   POINT TO DATA ADRESS
+         USING DATAMAP,R5                 USE DATAMAP DSECT
+         LTR   R5,R5                      IS THERE AN ENTRY?
+         BZ    DRIVER2X                   NOPE, -->
+         MVC   DETAIL,BLANKS              CLEAR DETAIL LINE
+         MVC   DSNAME,DSXDSNAM            MOVE IN DSNAME
+         BAL   R14,CHKTYPE                --> DO THE REAL WORK
+         L     R13,4(R13)                 GET HIS SAVEAREA
+         RETURN (14,12),RC=4              RC=4 IS TO DELETE THE RECORD
+DRIVER2X DS    0H
+         L     R13,4(R13)                 GET HIS SAVE AREA
+         RETURN (14,12),RC=8              RC=8 IS NO RETURN
+*
+         TITLE 'DASD UTILITY ROUTINE TO DETERMINE WHAT ACTION TO TAKE'
+*
+*   CHECK DSORG AND COMPARE TO CONTROL CARDS
+*
+CHKTYPE  BEGIN
+         LA    R6,SPECTBL                 GET ADDRESS OF TABLE
+         CLC   VTOCIX,DSNAME              IS IT A VTOC INDEX DATA SET?
+         BNE   CHKTYPEA                   NOPE, -->
+         MVC   MSG,MSG10                  MOVE IN BYPASS MSG
+         MVC   DSORG,=C'PS'               AND DSORG TYPE
+         B     CHKTYPED                   -->
+CHKTYPEA DS    0H
+         CLI   0(R6),X'FF'                END OF TABLE?
+         BE    CHKTYPEB                   YEP, -->
+         CLC   DSNAME,1(R6)               IS DSNAME IN TABLE?
+         BE    CHKTYPEB                   YEP, -->
+         LA    R6,45(R6)                  BUMP INDEX TO NEXT ENTRY
+         B     CHKTYPEA                   --> CHECK AGAIN
+CHKTYPEB DS    0H
+         TM    DSXDSORG,DS1DSGPO          IS IT A PDS?
+         BO    POFILE                     YEP, -->
+         TM    DSXDSORG,DS1DSGPS          IS IT SEQUENTIAL?
+         BO    PSFILE                     YEP, -->
+         TM    DSXDSORG,DS1DSGDA          HOW 'BOUT DIRECT ACCESS?
+         BZ    CHKTYPE0                   NOPE, -->
+         MVC   DSORG,=C'DA'               MOVE IN DSORG TYPE
+CHKTYPE0 DS    0H
+         TM    DSXDSORG,DS1DSGIS          HOW 'BOUT INDEXED SEQUENTIAL
+         BZ    CHKTYPE1                   NAW, -->
+         MVC   DSORG,=C'IS'               MOVE IN DSORG TYPE
+CHKTYPE1 DS    0H
+         TM    DSXDSORG+1,DS1ACBM         TRY VSAM
+         BZ    CHKTYPE2                   NOPE, -->
+         MVC   DSORG,=C'VS'               MOVE IN DSORG TYPE
+CHKTYPE2 DS    0H
+         MVC   MSG,MSG5                   MOVE IN CAN'T DO MSG
+         B     CHKTYPED                   -->
+*
+POFILE   DS    0H
+         MVC   DSORG,=C'PO'               MOVE IN DSORG TYPE
+         CLI   0(R6),C'B'                 WAS BYPASS SPECIFED?
+         BNE   POFILE0                    NOPE, -->
+         MVC   MSG,MSG4                   MOVE IN BYPASS MSG
+         B     CHKTYPED                   -->
+POFILE0  DS    0H
+         CLI   0(R6),C'R'                 RELEASE ONLY?
+         BE    PSFILE2                    YEP, -->
+         CLI   PARMFLG,C'C'               COMPRESS ALL?
+         BE    POFILE1                    YEP, -->
+         CLI   0(R6),C'C'                 COMPRESS SPECIFIC DATA SET?
+         BNE   POFILE2                    NOPE, -->
+POFILE1  DS    0H
+         MVI   RLSEFLG,C'N'               SET NO RELEASE FLAG
+         MVC   MSG,MSG2                   MOVE IN COMPRESS ONLY FLAG
+         B     POFILE3                    -->
+POFILE2  DS    0H
+         MVC   MSG,MSG1                   MOVE IN CMPRS/RLSE MSG
+POFILE3  DS    0H
+         BAL   R14,COMPRES                --> COMPRESS ROUTINE
+         MVI   RLSEFLG,C' '               RESET NO RELEASE FLAG
+         B     CHKTYPED                   -->
+*
+PSFILE   DS    0H
+         MVC   DSORG,=C'PS'               MOVE IN DSORG TYPE
+         CLI   0(R6),C'B'                 HOW 'BOUT BYPASS?
+         BE    PSFILE1                    NOPE, -->
+         CLI   0(R6),C'C'                 WAS COMPRESS SPECIFIED?
+         BNE   PSFILE0                    NOPE, -->
+         MVC   MSG,MSG7                   MOVE IN ERROR MSG
+         B     CHKTYPED                   -->
+PSFILE0  DS    0H
+         CLI   PARMFLG,C'C'               COMPRESS ALL PO FILES?
+         BNE   PSFILE2                    YEP, --> NO RELEASE WORK
+PSFILE1  DS    0H
+         MVC   MSG,MSG4                   MOVE IN BYPASS MSG
+         B     CHKTYPED                   -->
+PSFILE2  DS    0H
+         MVC   MSG,MSG3                   MOVE IN RELEASE MSG
+         BAL   R14,ALLOC                  --> ALLOC ROUTINE
+         LTR   R15,R15                    GOOD RETURN CODE?
+         BNZ   CHKTYPED                   NOPE, -->
+         BAL   R14,OPNCLS                 --> RELEASE ROUTINE
+         LTR   R15,R15                    GOOD RETURN CODE?
+         BNZ   CHKTYPED                   NOPE, -->
+         BAL   R14,FREE                   --> FREE ALLOC ROUTINE
+CHKTYPED DS    0H
+         MVC   LINE,DETAIL                GET READY TO PRINT DETAIL
+         BAL   R14,REPORT                 PRINT IT
+CHKTYPEX GOBACK
+*
+         TITLE 'DASD UTILITY ROUTINE TO COMPRESS A PDS'
+*
+*   COMPRESS USING IEBCOPY
+*
+COMPRES  BEGIN
+         MVI   S99DISP,OLD                SET DISP=OLD
+         BAL   R14,ALLOC                  --> ALLOCATE FILE
+         LTR   R15,R15                    TEST RC
+         BNZ   COMPRESX                   NO GOOD, -->
+         CLI   PARMFLG,C'D'               DELETE OLD LOAD MODS?
+         BNE   COMPRES0                   NOPE, -->
+         CLI   DSXRECFM,DCBRECU           IS IT RECFM=U?
+         BNE   COMPRES0                   NOPE, -->
+         XC    TASKECB,TASKECB            CLEAR ECB AREA
+         LA    R1,@CLNPRM                 GET PARMLIST
+         ATTACH EP=CLEANLD,ECB=TASKECB,   DELETE OLD MODS IN SUBTASK   X
+               SZERO=NO
+         ST    R1,TASKTCB                 SAVE ADDRESS OF SUBTASK'S TCB
+         WAIT  ECB=TASKECB                WAIT FOR SUBTASK TO FINISH
+         DETACH TASKTCB                   DETACH THE SUBTASK
+*        LTR   R15,R15                    TEST RETURN CODE
+*        BNZ   ERROR5                     BAD, --> ERROR
+COMPRES0 DS    0H
+         LA    R1,@COPYPRM                LOAD ADDR OF PARMLIST
+         LINK  EP=IEBCOPY                 COMPRESS FILE
+*        LTR   R15,R15                    TEST RETURN CODE
+*        BNZ   ERROR6                     BAD, --> ERROR
+COMPRES1 DS    0H
+         BAL   R14,FREE                   FREE UP FILE
+COMPRESX GOBACK
+*
+         TITLE 'DASD UTILITY ROUTINE TO ALLOCATE A FILE'
+*
+*   DYNAMIC ALLOCATION ROUTINE
+*
+ALLOC    BEGIN
+         MVI   S99RBVRB,1                 SET VERB TO ALLOCATE
+         CLC   S99PRM2(4),S99DUMMY        ALLOCATE A DUMMY FILE?
+         BE    ALLOC4                     YEP, -->
+         CLC   DSXEXPDT,HEXZEROS          IS THERE AN EXPDT?
+         BE    ALLOCA                     NOPE, -->
+         MVC   MSG,MSG11                  MOVE IN MESSAGE
+         LA    R15,4                      SET RETURN CODE
+         B     ALLOCX                     -->
+ALLOCA   DS    0H
+         CLC   DSXBLKL,HEXZEROS           IS BLOCK SIZE 0
+         BH    ALLOC0                     NOPE, -->
+         MVC   MSG,MSG8                   MOVE IN MESSAGE
+         LA    R15,4                      SET RETURN CODE
+         B     ALLOCX                     -->
+ALLOC0   DS    0H
+         LA    R7,DSNAME                  GET ADDRESS OF DSN
+         LA    R8,0                       SET COUNTER TO ZERO
+ALLOC1   DS    0H
+         CLI   0(R7),C' '                 IS THIS END OF DSN FIELD
+         BE    ALLOC2                     YEP, -->
+         LA    R7,1(R7)                   BUMP DSN POINTER
+         LA    R8,1(R8)                   BUMP COUNTER
+         C     R8,=F'44'                  IS IT PAST DSN?
+         BNH   ALLOC1                     NOPE, -->
+ALLOC2   DS    0H
+         STH   R8,S99DSNLN                SAVE DSN LENGTH
+         MVC   S99DSN,DSNAME              MOVE IN DSN FO ALLOCATION
+         CLI   RLSEFLG,C' '               IS NO RELEASE FLAG ON
+         BE    ALLOC4                     NOPE, -->
+ALLOC3   DS    0H
+         OI    S99PTR7,X'80'              TELL SVC 99 END OF LIST
+ALLOC4   DS    0H
+         LA    R1,S99RBPTR                GET ADDRESS OF REQEST BLKPTR
+         DYNALLOC                         AND ALLOCATE
+         LTR   R15,R15                    WAS RETURN CODE OK?
+         BZ    ALLOC5                     YEP, -->
+         MVC   MSG,MSG6                   MOVE NEW MESSAGE
+ALLOC5   DS    0H
+         MVI   S99PTR7,X'00'              RESET END OF LIST
+         MVI   S99DISP,MOD                RESET DISP=MOD
+ALLOCX   GOBACK
+*
+         TITLE 'DASD UTILITY ROUTINE TO UNALLOCATE A FILE'
+*
+*   DYNAMIC UN-ALLOCATION ROUTINE
+*
+FREE     BEGIN
+         MVI   S99RBVRB,2                 SET VERB TO UNALLOCATE
+         OI    S99PTR2,X'80'              SET END OF LIST
+         LA    R1,S99RBPTR                GET ADDR OF REQUEST BLKPTR
+         DYNALLOC                         SVC 99
+         MVI   S99PTR2,X'00'              RESET END OF LIST
+FREEX    GOBACK
+*
+         TITLE 'DASD UTILITY ROUTINE TO OPEN AND CLOSE A FILE'
+*
+*   OPEN AND CLOSE THE FILE TO RELEASE FREE SPACE
+*
+OPNCLS   BEGIN
+         XC    TASKECB,TASKECB            CLEAR ECB AREA
+         MVC   DASDDCB,MODELDCB           MOVE IN A DCB
+         LA    R1,DASDDCB                 GET DCB ADDRESS
+         ATTACH EP=RELEASER,ECB=TASKECB,  COMPRESS FILE IN SUBTASK     X
+               SZERO=NO
+         ST    R1,TASKTCB                 SAVE ADDRESS OF SUBTASK'S TCB
+         WAIT  ECB=TASKECB                WAIT FOR SUBTASK TO FINISH
+         DETACH TASKTCB                   DETACH THE SUBTASK
+OPNCLSX  GOBACK
+         TITLE 'DASD UTILITY CLEANUP ROUTINE'
+*
+*   PRINT LAST LINE AND CLOSE OPEN FILES
+*
+CLEANUP  BEGIN
+         MVI   CC,C'0'                    SET CARRIAGE CONTROL
+         MVC   LINE(L'LASTLINE),LASTLINE  MOVE FINAL PRINT LINE
+         BAL   R14,REPORT                 PRINT IT
+         CLOSE SYSPRINT                   CLOSE PRINT FILE
+         CLOSE VTOC                       CLOSE VTOC
+CLEANUPX GOBACK
+*
+         TITLE 'DASD UTILITY REPORT ROUTINE'
+*
+*   PRINT ROUTINE
+*
+REPORT   BEGIN
+         CLI   CC,X'FF'                   FIRST HEADING REQUESTED?
+         BE    REPORT0                    YEP, -->
+         MVC   LINE(1),CC                 MOVE IN CARRIAGE CONTROL
+         PUT   SYSPRINT,LINE              PRINT LINE
+         MVC   LINE,BLANKS                CLEAR PRINT LINE
+         MVI   CC,C' '                    RESET CARRIAGE CONTROL
+         L     R15,LINECNT                GET LINE COUNT
+         LA    R15,1(R15)                 BUMP LINE COUNT
+         C     R15,MAXLINES               MAX LINES YET?
+         BL    REPORT1                    NOPE, -->
+REPORT0  DS    0H
+         MVC   LINE(LHEADING),HEADING     MOVE IN HEADING
+         PUT   SYSPRINT,LINE              PRINT LINE
+         MVC   LINE,BLANKS                CLEAR PRINT LINE
+         MVC   LINE(LHEADIN2),HEADING2    MOVE IN HEADING2
+         PUT   SYSPRINT,LINE              PRINT LINE
+         MVC   LINE,BLANKS                CLEAR PRINT LINE
+         MVI   CC,C'0'                    RESET CARRIAGE CONTROL
+         LA    R15,4                      RESET LINE COUNT
+REPORT1  DS    0H
+         ST    R15,LINECNT                SAVE LINE COUNT
+REPORTX  GOBACK
+*
+         TITLE 'ERROR CLEAN-UP ROUTINES'
+*
+*   ERROR HANDLING ROUTINES
+*
+ERROR1   DS    0H
+         MVC   LINE(L'ERR1),ERR1          MSG FOR BAD CONTROL CARD
+         MVC   LINE+L'ERR1(80),0(R1)      MOVE IN BAD RECORD
+         BAL   R14,REPORT                 PRINT IT
+         LA    R2,1                       GET ABEND CODE
+         B     ERRORX                     --> ERROR ROUTINE
+ERROR2   DS    0H
+         MVC   LINE(L'ERR2),ERR2          MSG FOR TO MANY ENTRIES
+         BAL   R14,REPORT                 PRINT IT
+         LA    R2,2                       GET ABEND CODE
+         B     ERRORX                     --> ERROR ROUTINE
+ERROR3   DS    0H
+         MVC   LINE(L'ERR3),ERR3          MSG FOR BAD OPEN OF VTOC
+         BAL   R14,REPORT                 PRINT IT
+         LA    R2,3                       GET ABEND CODE
+         B     ERRORX                     --> ERROR ROUTINE
+ERROR4   DS    0H
+         MVC   LINE(L'ERR4),ERR4          MSG FOR BAD VTOC READ
+         BAL   R14,REPORT                 PRINT IT
+         LA    R2,4                       GET ABEND CODE
+         B     ERRORX                     --> ERROR ROUTINE
+ERROR5   DS    0H
+         MVC   LINE(L'ERR5),ERR5          MSG FOR BAD CLEANLD LINK
+         BAL   R14,REPORT                 PRINT IT
+         LA    R2,5                       GET ABEND CODE
+         B     ERRORX                     --> ERROR ROUTINE
+ERROR6   DS    0H
+         MVC   LINE(L'ERR6),ERR6          MSG FOR BAD COMPRESS
+         MVC   LINE+L'ERR6(44),DSNAME     MOVE IN VICTIM DSN
+         BAL   R14,REPORT                 PRINT IT
+         LA    R2,6                       GET ABEND CODE
+ERRORX   DS    0H
+         BAL   R14,FREE                   FREE UP ANY ALLOCATIONS
+         CLOSE SYSIN                      CLOSE INPUT FILE
+         CLOSE SYSPRINT                   CLOSE PRINT FILE
+         CLOSE VTOC                       CLOSE VTOC
+         LA    R1,WORKAREA                GET ADDRESS OF CORE
+         FREEMAIN R,A=(1),LV=WORKSIZE,    GIVE IT BACK                 +
+               SP=SUBPOOL
+         ABEND (R2),DUMP                  STOP
+         DS    0F
+         TITLE 'DASD UTILITY DATA AREAS'
+         DS    0F
+SAVE3    DC    F'0'
+SAVE11   DC    F'0'
+SAVE12   DC    F'0'
+DEBADDR  DC    F'0'
+HEXZEROS DC    F'0'
+NOCNTL   DC    C'+NOCNTL-'
+ENDCNTL  DC    C'+ENDCNTL-'
+CMPRS    DC    C'+CMPRS-'
+RLSE     DC    C'+RLSE-'
+BYPASS   DC    C'+BYPASS-'
+VTOCIX   DC    C'SYS1.VTOCIX'
+CMPALL   DC    C'COMPRESS'
+CLEANLD  DC    C'CLEANLD('
+RLSEFLG  DC    C' '
+PARMFLG  DC    C' '
+*
+LINECNT  DC    F'1'
+TASKTCB  DC    F'0'
+TASKECB  DC    F'0'
+MAXLINES DC    F'55'
+CC       DC    C'1'
+BLANKS   DC    CL133' '
+*
+HEADING  DC    C'1         FLUOR IRVINE DASD UTILITY PROGRAM REL 1.1'
+         DC    C' FOR VOLUME '
+VOLSER   DC    CL6' '
+         DC    C'  '
+HMSG     DC    CL25' '
+LHEADING EQU   *-HEADING
+HEADING2 DC    C'0 DATA SET NAME '
+         DC    CL30' '
+         DC    C' DSORG  PROCESS PERFORMED'
+LHEADIN2 EQU   *-HEADING2
+*
+*
+ERR1     DC    C'  001 DASDUTIL- CONTROL CARD ERROR- '
+ERR2     DC    C'  002 DASDUTIL- MAX CONTROL CARD COUNT EXCEEDED '
+ERR3     DC    C'  003 DASDUTIL- CRITICAL ERROR DURING VTOC OPEN ++'
+ERR4     DC    C'  004 DASDUTIL- CRITICAL ERROR DURING VTOC READ ++'
+ERR5     DC    C'  005 DASDUTIL- CRITICAL ERROR IN CLEANLD DELETE ++'
+ERR6     DC    C'  006 DASDUTIL- CRITICAL ERROR COMPRESS FAILED FOR-'
+*
+MSG0     DC    C'+NOCNTL- WAS SPECIFIED   '
+MSG1     DC    C'COMPRESSED/RELEASED      '
+MSG2     DC    C'COMPRESSED               '
+MSG3     DC    C'RELEASED                 '
+MSG4     DC    C'BYPASSED                 '
+MSG5     DC    C'FILE IS NOT A PO/PS      '
+MSG6     DC    C'ALLOCATION FAILED        '
+MSG7     DC    C'FILE NOT COMRESSED-NOT PO'
+MSG8     DC    C'BLKSIZE=0, NO DCB        '
+MSG9     DC    C'RELEASE FAILED           '
+MSG10    DC    C'VTOC INDEX BYPASSED      '
+MSG11    DC    C'EXPDT GT ZERO SPECIFIED  '
+*
+LASTLINE DC    C' ++FLUOR IRVINE DASD UTILITY COMPLETED++ '
+*
+         TITLE 'DASD UTILITY SVC 99 REQUEST BLOCKS AND DATA AREAS'
+         CNOP  0,4
+S99RBPTR DC    X'80',AL3(S99RB)
+S99RB    DS    0F
+S99RBLEN DC    AL1(20)
+S99RBVRB DC    AL1(0)
+S99FLG1  DC    AL2(0)
+S99ERROR DC    F'0'
+S99PTR0  DC    A(S99PTRL)
+         DC    F'0'
+S99FLG2  DC    F'0'
+*
+S99PTRL  DS    0F
+S99PTR1  DC    A(S99PRM1)
+S99PTR2  DC    X'80',AL3(S99PRM2)
+S99PTR3  DC    A(S99PRM3)
+S99PTR4  DC    A(S99PRM4)
+S99PTR5  DC    A(S99PRM5)
+S99PTR6  DC    A(S99PRM6)
+S99PTR7  DC    A(S99PRM7)
+S99PTR8  DC    X'80',AL3(S99PRM8)
+S99TXUNT DS    0F
+S99PRM1  DC    H'1'
+         DC    H'1'
+S99DDNSZ DC    H'6'
+S99DDN   DC    C'SYSOUT  '
+         DS    0F
+S99PRM2  DC    H'36'
+         DC    H'0'
+S99DSNLN DC    H'0'
+S99DSN   DC    CL44' '
+S99PRM3  DC    H'4'
+         DC    H'1'
+         DC    H'1'
+S99DISP  DC    X'02'
+         DS    0F
+S99PRM4  DC    H'5'
+         DC    H'1'
+         DC    H'1'
+         DC    X'08'
+         DS    0F
+S99PRM5  DC    H'6'
+         DC    H'1'
+         DC    H'1'
+         DC    X'08'
+         DS    0F
+S99PRM6  DC    X'0010'
+         DC    H'1'
+         DC    H'6'
+S99VOL   DC    CL6' '
+         DS    0F
+S99PRM7  DC    X'0015'
+         DC    H'1'
+         DC    H'8'
+         DC    C'SYSALLDA'
+         DS    0F
+S99PRM8  DC    X'000D'
+         DC    H'0'
+*
+S99PRM2@ DC    H'2',H'1'
+S99DUMMY DC    H'36',H'0'
+CLEANLIB DC    C'CLEANLIB'
+CLEANLST DC    C'CLEANLST'
+CMPRLIST DC    C'CMPRLIST'
+CMPRESIN DC    C'CMPRESIN'
+OLD      EQU   X'01'
+MOD      EQU   X'02'
+*
+         TITLE 'DASD UTILITY SORT/MERGE PARM LIST'
+         CNOP  0,4
+@SORTPRM DC    X'80',AL3(SORTPARM)
+         CNOP  2,4
+SORTPARM DC    AL2(SORTEND-SORTLIST)
+SORTLIST DC    A(SORTPRM1)
+         DC    A(SORTPRM2)
+         DC    A(SORTPRM3)
+         DC    A(SORTPRM4)
+         DC    A(DRIVER1)
+         DC    A(DRIVER2)
+         DC    X'FF'
+         DC    C'(I)'
+SORTEND  EQU   *
+SORTPRM1 DC    C' SORT FIELDS=(1,44,CH,A),FILSZ=E10000'
+SORTPRM2 DC    C' '
+SORTPRM3 DC    C' RECORD LENGTH=52,TYPE=F'
+SORTPRM4 DC    C' '
+*
+*
+         TITLE 'DASD UTILITY IEBCOPY PARM LIST'
+         CNOP  0,4
+@COPYPRM DC    X'00',AL3(COPYPARM)
+         DC    X'80',AL3(DDNMLIST)
+         CNOP  6,8
+COPYPARM DC    H'8'                       PARM
+         DC    C'COMPRESS'
+         CNOP  6,8
+DDNMLIST DC    H'88'                      DDNAME LIST
+         DC    4XL8'00'
+DDSYSIN  DC    CL8'CMPRESIN'              DDNAME FOR SYSIN
+DDSYSPR  DC    CL8'CMPRLIST'              DDNAME FOR SYSPRINT
+         DC    XL8'00'
+DDSYSUT1 DC    CL8'CLEANLIB'              DDNAME FOR SYSUT1
+DDSYSUT2 DC    CL8'CLEANLIB'              DDNAME FOR SYSUT2
+         DC    2XL8'00'
+*
+         TITLE 'CLEANLD PARM LIST'
+         CNOP  0,4
+@CLNPRM  DC    X'80',AL3(CLNPARM)
+         CNOP  6,8
+CLNPARM  DC    AL2(CLNPRMLN)              PARM
+         DC    C'('
+DAYS     DC    CL3' '
+         DC    C'),DELETE'
+CLNPRMLN EQU   *-CLNPARM
+*
+         TITLE 'DASD UTILITY JFCB PARM LIST'
+JFCBAD   DS    0H
+         DC    X'87'
+         DC    AL3(JFCBPARM)
+JFCBPARM DC    44F'0'
+         TITLE 'DASD UTILITY PROGRAM DCBS'
+SYSIN    DCB   DDNAME=SYSIN,DSORG=PS,                                  +
+               MACRF=GL,EODAD=ERROR1
+         EJECT
+MODELDCB DCB   DDNAME=CLEANLIB,DSORG=PS,                               +
+               MACRF=PL
+DCBLEN   EQU   *-MODELDCB
+         EJECT
+SYSPRINT DCB   DDNAME=SYSPRINT,DSORG=PS,                               +
+               MACRF=PM,BLKSIZE=2660,                                  +
+               LRECL=133,RECFM=FBA
+         EJECT
+VTOC     DCB   DDNAME=SYSVOL,DSORG=PS,MACRF=RP,RECFM=F,                +
+               KEYLEN=44,LRECL=96,BLKSIZE=96,EXLST=JFCBAD
+         TITLE 'DASD UTILITY PROGRAM ADDRESS SAVE AREAS AND DSECTS'
+         LTORG
+TBLSIZE  EQU   1000
+SUBPOOL  EQU   0
+*
+         PRINT NOGEN
+BUFLIST  DSECT
+BUFFMAP ICVAFBFL DSECT=NO
+BUFFLEN  EQU   *-BUFLIST
+*
+DATAMAP  DSECT
+DSXDSNAM DS    CL44
+DSXBLKL  DS    H
+DSXDSORG DS    H
+DSXEXPDT DS    CL3
+DSXRECFM DS    X
+DATALEN  EQU   *-DATAMAP
+*
+DSCB     DSECT
+         IECSDSL1 (1)
+*
+         DCBD  DSORG=DA
+*
+JFCBMAP  DSECT
+         IEFJFCBN LIST=YES
+*
+         IEZDEB
+*
+WORKAREA DSECT
+         DS    18F
+SAVEAREA DS    18F
+*
+LINE     DS    CL133
+DETAIL   DS    0CL133
+         DS    CL1
+DSNAME   DS    CL44
+         DS    CL3
+DSORG    DS    CL2
+         DS    CL4
+MSG      DS    CL25
+DETSIZE  EQU   *-DETAIL
+         DS    CL(133-DETSIZE)
+*
+*
+BUFLIST1 DS    CL(BUFFLEN)
+SORTDATA DS    CL(DATALEN)
+DSCB#140 DS    CL140
+DASDDCB  DS    CL(DCBLEN)
+SPECTBL  DS    45CL(TBLSIZE+1)
+WORKSIZE EQU   *-WORKAREA
+         END

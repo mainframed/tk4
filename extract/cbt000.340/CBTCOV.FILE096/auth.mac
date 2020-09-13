@@ -1,0 +1,551 @@
+AUTH     TITLE 'AUTHORIZATION MODULE FOR THE SP-AS COMMAND'
+******************************************************************
+*
+* MODULE NAME = AUTH
+*
+* DESCRIPTIVE NAME = AUTHORIZATION MODULE FOR THE SP-AS COMMAND
+*
+* FUNCTION = TO PROVIDE A SECURITY FUNCTION WHICH CONTROLS THE
+*    USE THE TSO SP-AS COMMAND, ITS SUB-COMMANDS, AND THE JOBS
+*    OR DATASETS A USER MAY ACCESS, CHANGE, OR DELETE.  THE AUTH
+*    CSECT IS INVOKED AT VARIOUS POINTS DURING SP-AS COMMAND
+*    PROCESSING VIA A AUTHCK MACRO.
+*
+* DEFAULT OPERATION = THE DEFAULT AUTHORITY CHECKING FOR THE
+*    SP-AS COMMAND IS AS FOLLOWS:
+*
+*    (1) THE START-UP ENTRY FROM THE INIT CSECT GIVES JES2
+*        SYSTEM PROGRAMMER AUTHORITY TO ANYONE HAS OPERATOR
+*        AUTHORITY.  SINCE JES2 SYSTEM PROGRAMMER AUTHORITY HAS
+*        GREAT POWER, MANY USERS WILL PROBABLY WANT TO CHANGE
+*        THIS TO SUIT THE REQUIREMENTS OF THEIR INSTALLATION.
+*        THE SAME CONSIDERATIONS APPLY TO EXEC AUTHORITY (THE
+*        ABILITY TO ISSUE TSO COMMANDS WHILE IN SP-AS) BECAUSE
+*        THE SP-ASCMN AREA COULD BE ALTERED BY USER PROGRAMS
+*        EXECUTING IN THAT ENVIRONMENT.
+*
+*    (2) THE START-UP ENTRY FROM THE INIT CSECT ALSO ISSUES A
+*        TESTAUTH MACRO.  IF THE SP-AS COMMAND IS NOT APF
+*        AUTHORIZED, THEN THE AUTHORITY FOR USING THE SUB-SYSTEM
+*        INTERFACE COMMANDS IS TURNED OFF.
+*
+*    (3) THE START-UP ENTRY FROM THE INIT CSECT ALSO SETS THE
+*        HELP CONTROL FLAGS FROM THE AUTHORIZATION FLAGS.  SEE
+*        THE HELP CSECT FOR MORE INFORMATION ON THE HELP CONTROL
+*        FLAGS.
+*
+*    (4) THE ENTRY FROM THE PARSE ROUTINE IS USED TO DETERMINE
+*        WHO MAY USE A GIVEN SP-AS SUB-COMMAND.  A SUB-COMMAND
+*        IS ALLOWED TO PROCEED IF ALL SUB-COMMAND TYPE
+*        RESTRICTIONS ('TYPE=' CODED IN THE SPSCE MACRO) HAVE
+*        CORRESPONDING AUTHORIZATION BITS SET ON IN THE
+*        AUTHORIZATION FLAGS (QAFLAGS).
+*
+*    (5) THE ENTRY FROM THE SPFJOB  ROUTINE IS ENTERED FOR ANY
+*        JOB WHOSE INPUT/OUTPUT IS TO BE ACCESSED BY A SP-AS
+*        COMMAND FUNCTION.  THE FUNCTION IS ALLOWED TO PROCEED
+*        IF THE JOBNAME BEGINS WITH THE USER'S USERID OR IF THE
+*        USER HAS OPERATOR OR JES2 SYSTEM PROGRAMMER AUTHORITY.
+*        ALTHOUGH THE ENTRY FROM THE SPFJOB  ROUTINE MAY ALLOW
+*        THE FUNCTION TO PROCEED, OTHER ENTRIES MAY FUTHER
+*        RESTRICT THE ACCESS GRANTED BY THIS ENTRY.
+*
+*    (6) THE LIST COMMAND MAY NOT LIST DATASET ID'S LESS THAN
+*        101 UNLESS THE USER HAS JES2 SYSTEM PROGRAMMER
+*        AUTHORITY.
+*
+*    (7) THE DEL, REQ, AND CAN COMMANDS MAY NOT ACCESS A JOB
+*        WHOSE JOBNAME DOES NOT BEGIN WITH THE USER'S USERID
+*        UNLESS THEY HAVE JES2 SYSTEM PROGRAMMER AUTHORITY.
+*
+******************************************************************
+         EJECT ,
+******************************************************************
+*
+*  DO ENTRY POINT HOUSEKEEPING FOR THE AUTH CSECT
+*
+******************************************************************
+         SPACE 1
+AUTH     QSTART ,                  START AUTH CSECT ASSEMBLY
+         SPACE 2
+*
+*  SETUP ADDRESSABILITY FOR COMMON SUB-AREAS AND SAVE/WORK AREA
+*
+         SPACE 1
+         USING WORK,R13            NOTE SAVE/WORK ADDRESSABILITY
+         SPACE 1
+         L     R10,QVDAIR          ADDR OF DAIR WORK AREA
+         USING QDAIR,R10           NOTE DAIR WORK ADDRESSABILITY
+         SPACE 1
+         L     R9,QVCKPT           ADDR OF CKPT WORK AREA
+         USING QCKPT,R9            NOTE CKPT WORK ADDRESSABILITY
+         EJECT ,
+******************************************************************
+*
+*  VALIDATE AUTHORIZATION REQUEST CODE AND ENTER PROCESSING RTN
+*
+******************************************************************
+         SPACE 1
+         CLI   QACODE,MAXCODE      IS REQUEST CODE WITHIN RANGE ?
+         BH    BOMB                ERROR IF NO
+         SPACE 1
+         SLR   R15,R15             ENTER
+         IC    R15,QACODE           PROCESSING ROUTINE
+         SLL   R15,2                 PER
+         B     VECTOR(R15)            AUTHORIZATION REQUEST CODE
+         SPACE 1
+VECTOR   DS    0H                  AUTH REQUEST CODE VECTOR
+         B     Q#NULL           0  NULL REQUEST
+         B     Q#START          1  SP-AS COMMAND START-UP
+         B     Q#END            2  SP-AS COMMAND TERMINATION
+         B     Q#ALLOC          3  DATASET ALLOCATION/UNALLOCATION
+         B     Q#BEFOPN         4  BEFORE CKPT/SPOOL OPEN
+         B     Q#AFTOPN         5  AFTER CKPT/SPOOL OPEN
+         B     Q#SPOOL          6  SPREADSP RTN (AFTER SPOOL I/O)
+         B     Q#PARSE          7  SP-AS SUBCOMMAND AUTHORIZATION
+         B     Q#FINDJ          8  SPFJOB  RTN FOR JOB
+         B     Q#JCL            9  JCL CMD FOR JOB
+         B     Q#JLOG          10  JLOG CMD FOR JOB
+         B     Q#JMSG          11  JMSG CMD FOR JOB
+         B     Q#LIST          12  LIST CMD FOR JOB/DSID
+         B     Q#JHIST         13  JHIST CMD FOR JOB
+         B     Q#DD            14  DD CMD FOR JOB
+         B     Q#PDDB          15  PDDB CMD FOR JOB
+         B     Q#SYSOUT        16  DEL/REQ/CAN CMDS FOR JOB
+         B     Q#SYSLOG        17  AUTHORIZATION TO LOOK AT SYSLOG
+         B     Q#KEY0          18  ENTER KEY=0 SUPERVISOR STATE
+         B     Q#KEYP          19  EXIT TO KEY=8 PROBLEM STATE
+         SPACE 1
+MAXCODE  EQU   (*-4-VECTOR)/4      MAX SUPPORTED REQUEST CODE
+         SPACE 1
+BOMB     DS    0H                  INVALID AUTH REQUEST CODE
+         WTO   'SP-AS COMMAND INTERNAL LOGIC ERROR IN AUTH RTN',       +
+               ROUTCDE=11
+         SPACE 1
+         ABEND 913                 ABEND U0913
+         SPACE 2
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = NULL REQUEST
+*
+******************************************************************
+         SPACE 1
+Q#NULL   DS    0H                  NULL REQUEST
+         B     AUTHOK              ALLOW FUNCTION TO PROCEED
+         EJECT ,
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = SP-AS COMMAND START-UP
+*
+******************************************************************
+         SPACE 1
+Q#START  DS    0H                  SP-AS COMMAND START-UP
+         SPACE 1
+*
+*  USERS ARE DIVIDED INTO THREE GROUPS:
+*
+*    (1) ORDINARY USERS
+*    (2) USERS WITH THE TSO OPERATOR PRIVILEGE
+*    (3) JES2 SYSTEM PROGRAMMERS
+*
+*  THESE GROUPS ARE GIVEN THE FOLLOWING SP-AS AUTHORIZATIONS:
+*
+*    AUTHORIZATION    ----GROUP----    DESCRIPTION
+*    -------------    (1)  (2)  (3)    -------------------------
+*      QAFXACTV             X    X     DISPLAY ACTIVE LISTS
+*      QAFXBLOG             X    X     DISPLAY BACKLOG LISTS
+*      QAFXSSSM        X    X    X     MAY USE CAN/DEL/REQ
+*      QAFXSLOG             X    X     MAY LOOK AT SYSLOG
+*      QAFXEXEC                  X     MAY ISSUE TSO CMDS IN QUE
+*      QAFXOPER             X    X     OPERATOR AUTHORITY
+*      QAFXSYSP                  X     JES2 SYSTEM PROGRAMMER
+*
+*  A USER IS GRANTED JES2 SYSTEM PROGRAMMER AUTHORITY ONLY
+*  IF THEY HAVE OPERATOR AUTHORITY AND THEIR USERID IS ALSO
+*  CONTAINED IN A TABLE BELOW (SEE SYMBOL SYSPTABL).
+*
+         SPACE 1
+         NI    QAFLAGS,QAFXOPER    CLEAR ALL BUT OPER AUTHORITY
+         OI    QAFLAGS,QAFXSSSM    ASSUME GROUP 1 AUTHORITY
+         SPACE 1
+         ACFGACVT R4,NONE=QSNOSYSP      GET THE ACCVT
+         USING ACCVT,R4                 ADDRESS ACF2 CVT
+         ACFGUCB R5,NONE=QSNOSYSP,INLINE=NO
+         USING ACUCB,R5                 ADDRESS THE ACUCB
+         LR    R6,R15                   ADDRESS OF ACF2 ASVT
+         USING ACFASVT,R6               ADDRESS IT
+         L     R8,ACUUIDP               GET UID ADDR
+         CLC   =C'01CSDDCUSRDBDA',0(R8) IS IT DBA
+         BE    SETSLOG
+         B     CHKOPER
+SETSLOG  OI    QAFLAGS,QAFXSLOG
+CHKOPER  TM    QAFLAGS,QAFXOPER    DOES USER HAVE OPER AUTHORITY?
+         BZ    QSNOOPER            SKIP IF NO
+         SPACE 1
+         OI    QAFLAGS,QAFXACTV+QAFXBLOG+QAFXSLOG ADD GROUP 2 AUTH
+*****************************************************************
+***      SEE IF USER IS AUTHORIZED TO USE THIS COMMAND
+         ACFGACVT R4,NONE=QSNOSYSP      GET THE ACCVT
+         USING ACCVT,R4                 ADDRESS ACF2 CVT
+         ACFGUCB R5,NONE=QSNOSYSP,INLINE=NO
+         USING ACUCB,R5                 ADDRESS THE ACUCB
+         LR    R6,R15                   ADDRESS OF ACF2 ASVT
+         USING ACFASVT,R6               ADDRESS IT
+         L     R8,ACUUIDP               GET UID ADDR
+         CLC   =C'01150001000700',0(R8) IS IT SYSPGM
+         BE    QSSPHIT
+         B     QSNOSYSP
+         SPACE 1
+QSSPHIT  DS    0H                  USER ID FOUND IN SYS PGMR TABLE
+         OI    QAFLAGS,QAFXSYSP+QAFXEXEC  SET JES2 SYS-PGMR & EXEC
+QSNOSYSP DS    0H                  CONT HERE IF NOT JES2 SYS PGMR
+QSNOOPER DS    0H                  CONT HERE IF NO OPER AUTHORITY
+         SPACE 1
+*
+*  THE DEFAULT CODE FOR THIS ENTRY TURNS OF AUTHORITY FOR THE
+*  SUB-SYSTEM INTERFACE COMMANDS IF THE SP-AS COMMAND IS NOT
+*  APF AUTHORIZED.
+*
+         SPACE 1
+         TESTAUTH FCTN=1           TEST FOR APF AUTHORIZATION
+         SPACE 1
+         LTR   R15,R15             ARE WE APF AUTHORIZED?
+         BZ    QSNOTAPF            SKIP IF YES
+         NI    QAFLAGS,255-QAFXSSSM  ELSE, TURN OFF SSSM AUTHORITY
+QSNOTAPF DS    0H
+         SPACE 2
+*
+*  THE DEFAULT CODE FOR THIS ENTRY SETS THE HELP CONTROL FLAGS
+*  FROM THE AUTHORITY FLAGS.
+*
+         SPACE 1
+         MVC   QAHELP,QAFLAGS      SET HELP FLAGS PER AUTHORITY
+         SPACE 1
+         B     AUTHOK              ALLOW FUNCTION TO PROCEED
+         SPACE 2
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = SP-AS COMMAND TERMINATION
+*
+******************************************************************
+         SPACE 1
+Q#END    DS    0H                  SP-AS COMMAND TERMINATION
+         B     AUTHOK              ALLOW FUNCTION TO PROCEED
+         SPACE 2
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = DATASET ALLOCATION/UNALLOCATION
+*
+******************************************************************
+         SPACE 1
+Q#ALLOC  DS    0H                  DATASET ALLOCATION/UNALLOCATION
+         B     AUTHOK              ALLOW FUNCTION TO PROCEED
+         SPACE 2
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = PRE-OPEN FOR CHECKPOINT/SPOOL DATASETS
+*
+******************************************************************
+         SPACE 1
+Q#BEFOPN DS    0H                  BEFORE CKPT/SPOOL OPEN
+         SPACE 1
+         B     AUTHOK              ALLOW FUNCTION TO PROCEED
+         SPACE 2
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = POST-OPEN FOR CHECKPOINT/SPOOL DATASETS
+*
+******************************************************************
+         SPACE 1
+Q#AFTOPN DS    0H                  AFTER CKPT/SPOOL OPEN
+         B     AUTHOK              ALLOW FUNCTION TO PROCEED
+         SPACE 2
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = SPREADSP ROUTINE (AFTER SPOOL I/O)
+*
+******************************************************************
+         SPACE 1
+Q#SPOOL  DS    0H                  SPREADSP RTN (AFTER SPOOL I/O)
+         SPACE 1
+         B     AUTHOK              ALLOW FUNCTION TO PROCEED
+         EJECT ,
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = SP-AS SUBCOMMAND AUTHORIZATION
+*
+*   THIS ENTRY IS USED TO CONTROL WHO CAN USE WHICH SP-AS
+*   SUB-COMMAND.  OTHER ENTRIES MAY FUTHER RESTRICT THE FUNCTION
+*   OF SOME SUB-COMMANDS.  INSTALLATIONS MAY TAYLOR THE FUNCTION
+*   OF THIS ENTRY BY ASSIGNING USER FLAGS IN THE PARSE TABLE
+*   (SPSCE MACROS) AND BY INSERTING THEIR OWN CODE BELOW.
+*
+*   A SUB-COMMAND IS ALLOWED TO PROCEED IF ALL SUB-COMMAND TYPE
+*   RESTRICTIONS ('TYPE=' CODED IN THE SPSCE MACRO) HAVE
+*   CORRESPONDING AUTHORIZATION BITS SET ON IN THE AUTHORIZATION
+*   FLAGS (QAFLAGS).
+*
+*   THE USER WILL GET THE HELP SCREEN IF THEY ENTER A COMMAND
+*   WHICH IS NOT ALLOWED.
+*
+******************************************************************
+         SPACE 1
+Q#PARSE  DS    0H                  SP-AS SUBCOMMAND AUTHORIZATION
+         SPACE 1
+*  INSERT CODE HERE TO SUPERCEDE STANDARD CHECKING
+         SPACE 1
+         ICM   R2,1,QASCFLGS       PICKUP SUB-COMMAND AUTH FLAGS
+         BZ    QPOK                SKIP IF NO RESTRICTIONS
+         EX    R2,QPTM             DOES USER HAVE THE AUTHORITY?
+         BO    QPOK                SKIP IF COMMAND IS ALLOWED
+         SPACE 1
+*  INSERT CODE HERE TO ALLOW RESTRICTED SUB-COMMANDS TO PROCEED
+         SPACE 1
+QPNOK    DS    0H                  COMMAND IS NOT ALLOWED
+         XC    QCODEH,QCODEH       CLEAR FUNCTION CODE
+         MVC   QSUBCMD,=V(SEARCH)  REDIRECT TO THE HELP ROUTINE
+         B     AUTHOK              PROCEED AS IF HELP WERE ENTERED
+         SPACE 2
+QPOK     DS    0H                  COMMAND IS ALLOWED
+         SPACE 1
+*  INSERT CODE HERE TO IMPOSE ADDTIONAL RESTRICTIONS
+         B     AUTHOK              ALLOW FUNCTION TO PROCEED
+         SPACE 2
+QPTM     TM    QAFLAGS,*-*         (EXECUTED) MATCH AUTH FLAGS
+         EJECT ,
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = SPFJOB  ROUTINE FOR JOB AUTHORIZATION
+*
+*   THIS ENTRY IS THE FIRST LINE OF DEFENSE AT THE JOB LEVEL.  IT
+*   IS ENTERED BEFORE A USER CAN LOOK AT A JOB'S INPUT/OUTPUT OR
+*   DO ANYTHING WITH A JOB.  OTHER ENTRIES IN THIS AUTHORIZATION
+*   MODULE MAY FUTHER REFINE A JOB LEVEL AUTHORITY GRANTED BY
+*   THIS ENTRY.
+*
+******************************************************************
+         SPACE 1
+Q#FINDJ  DS    0H                  SPFJOB  RTN FOR JOB
+         SPACE 1
+*
+*  THIS EGG CODE WILL INTEROGATE TO INSURE THAT THE JOB STARTS
+*  WITH THE USERS ID, IF NOT IT WILL CHECK TO SEE OF THE JCT
+*  OF THE JOB (JCTUSER0 THROUGH JCTUSER5) HAS A LIST OF USERS
+*  THAT CAN ACCESS THE DATA.  THE FIRST THREE BYTES OF JCTUSER0
+*  MAY CONTAIN '###' INDICATING NOONE BUT THE USER CAN USE DD
+*  OR A '***' INDICATING ANYBODY CAND USE DD.  THE DATA IS PLACED
+*  IN THE JCT BY JES EXIT4 AFTER FINDING //*UQ CARDS PRESENT IN
+*  THE JCL.
+*
+         SPACE 1
+         L     R8,QCJCTA           ADDR OF JCT
+         USING JCT,R8              NOTE JCT ADDRESSABILITY
+         SPACE 1
+         ICM   R1,15,QLOGONLN      GET LENGTH OF USERID
+         BNP   FINDJNOK            ERROR IF NO LENGTH
+         BCTR  R1,0                LESS ONE FOR EXECUTE
+         EX    R1,FINDJCLC         JOBNAME BEGINS WITH USERID ?
+         BE    AUTHOK              DONE IF YES, ALLOW ACCESS
+         CLC   =C'SLOG',QSUBNAME   IS THIS SYSLOG?
+         BE    AUTHOK              YES DO NOT ALLOW ACCESS
+         CLC   JCTUSER0(3),=C'###' UQ DISALLOW PRESENT?
+         BE    FINDJNOK            YES DO NOT ALLOW ACCESS
+         TM    QAFLAGS,QAFXOPSP    USER HAS OPER OR SYS PGMR AUTH?
+         BNZ   AUTHOK              DONE IF YES, ALLOW ACCESS
+         CLI   JCTUSER0,X'40'      UQ CARD PROCESSED?
+         BE    FINDJNOK            NO - DISALLOW ACCESS
+         CLC   JCTUSER0(3),=C'***' UQ ALLOW PRESENT
+         BE    AUTHOK              YES ALLOW ACCESS
+         ICM   R1,15,QLOGONLN      GET LENGTH OF USERID
+         C     R1,=F'3'            IS LOGON ID 3 CHARACTERS?
+         BNE   FINDJNOK            NO? DONE'T USE UQ CARD
+         LA    R2,JCTUSER0         LOAD ADDRESS OF
+LOOPIT   DS    0H                  LOAD ADDRESS OF
+         CLI   0(R2),X'40'         END OF ALLOWABLE USERIDS?
+         BE    FINDJNOK            YES - NO ALLOWABLE USER
+         CLC   QLOGON(3),0(R2)     IS USERID MATCHED IN UQ
+         BE    AUTHOK              YES ALLOW ACCESS
+         LA    R2,3(R2)            GO TO NEXT ENTRY
+         B     LOOPIT              GO SEARCH THE USER TABLE AGAIN
+FINDJCLC CLC   JCTJNAME(*-*),QLOGON  EXECUTED - MATCH JOBNAME
+         SPACE 1
+FINDJNOK DS    0H                  JOBNAME DOESN'T MATCH USERID
+         SPACE 1
+         QTILT  'QAUTH - Jobname must begin with your USERID'
+         SPACE 1
+         DROP  R8                  KILL JCT ADDRESSABILITY
+         SPACE 1
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = JCL COMMAND FOR JOB AUTHORIZATION
+*
+******************************************************************
+         SPACE 1
+Q#JCL    DS    0H                  JCL COMMAND FOR JOB
+         B     AUTHOK              ALLOW FUNCTION TO PROCEED
+         SPACE 2
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = JLOG COMMAND FOR JOB AUTHORIZATION
+*
+******************************************************************
+         SPACE 1
+Q#JLOG   DS    0H                  JLOG COMMAND FOR JOB
+         B     AUTHOK              ALLOW FUNCTION TO PROCEED
+         SPACE 2
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = JMSG COMMAND FOR JOB AUTHORIZATION
+*
+******************************************************************
+         SPACE 1
+Q#JMSG   DS    0H                  JMSG COMMAND FOR JOB
+         B     AUTHOK              ALLOW FUNCTION TO PROCEED
+         EJECT ,
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = LIST COMMAND FOR JOB/DSID AUTHORIZATION
+*
+******************************************************************
+         SPACE 1
+Q#LIST   DS    0H                  LIST CMD FOR JOB AND DSID
+         SPACE 1
+DSIDOK   DS    0H                  THE DSID IS OK
+         B     AUTHOK              ALLOW FUNCTION TO PROCEED
+         SPACE 1
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = JHIST COMMAND FOR JOB AUTHORIZATION
+*
+******************************************************************
+         SPACE 1
+Q#JHIST  DS    0H                  JHIST COMMAND FOR JOB
+         B     AUTHOK              ALLOW FUNCTION TO PROCEED
+         SPACE 2
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = DD COMMAND FOR JOB AUTHORIZATION
+*
+******************************************************************
+         SPACE 1
+Q#DD     DS    0H                  DD COMMAND FOR JOB
+         B     AUTHOK              ALLOW FUNCTION TO PROCEED
+         SPACE 2
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = PDDB COMMAND FOR JOB AUTHORIZATION
+*
+******************************************************************
+         SPACE 1
+Q#PDDB   DS    0H                  PDDB COMMAND FOR JOB
+         B     AUTHOK              ALLOW FUNCTION TO PROCEED
+         SPACE 2
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = DEL, REQ, AND CAN COMMANDS FOR JOB AUTH
+*
+******************************************************************
+         SPACE 1
+Q#SYSOUT DS    0H                  DEL/REQ/CAN CMDS FOR JOB
+         SPACE 1
+*
+*  THE DEFAULT CODE FOR THIS ENTRY IS TO ALLOW THE DEL, REQ, AND
+*  CAN COMMANDS TO BE USED ONLY ON JOBS WHOSE JOBNAME BEGINS WITH
+*  THE USER'S USERID.  USERS WHO HAVE JES2 SYSTEM PROGRAMMER
+*  AUTHORITY MAY USE ANY JOBNAME.
+*
+         SPACE 1
+         TM    QAFLAGS,QAFXSYSP    USER HAS JES2 SYSTEM PGMR AUTH?
+         BO    AUTHOK              DONE IF YES, ALLOW ACCESS
+         SPACE 1
+         L     R8,QCJCTA           ADDR OF JCT
+         USING JCT,R8              NOTE JCT ADDRESSABILITY
+         SPACE 1
+         ICM   R1,15,QLOGONLN      GET LENGTH OF USERID
+         BNP   SYSONOK             ERROR IF NO LENGTH
+         BCTR  R1,0                LESS ONE FOR EXECUTE
+         EX    R1,SYSOCLC          JOBNAME BEGINS WITH USERID ?
+         BE    AUTHOK              DONE IF YES, ALLOW ACCESS
+         B     SYSONOK             ELSE, GO TELL USER
+         SPACE 1
+SYSOCLC  CLC   JCTJNAME(*-*),QLOGON  EXECUTED - MATCH JOBNAME
+         SPACE 1
+SYSONOK  DS    0H                  JOBNAME DOESN'T MATCH USERID
+         QTILT 'QAUTH - Johname must begin with your USERID'
+         SPACE 1
+         DROP  R8                  KILL JCT ADDRESSABILITY
+         SPACE 1
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = AUTHORIZATION TO LOOK AT SYSLOG
+*
+******************************************************************
+         SPACE 1
+Q#SYSLOG DS    0H                  AUTHORIZATION TO LOOK AT SYSLOG
+         B     AUTHOK              ALLOW FUNCTION TO PROCEED
+         SPACE 2
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = ENTER KEY ZERO IF AUTHORIZED
+*
+******************************************************************
+         SPACE 1
+Q#KEY0   DS    0H                  ENTER KEY=0 SUPERVISOR STATE
+         SPACE 1
+         MODESET KEY=ZERO,MODE=SUP
+         B     AUTHOK              ALLOW FUNCTION TO PROCEED
+         SPACE 2
+******************************************************************
+*
+*  PROCESS REQUEST TYPE = EXIT FROM KEY ZERO
+*
+******************************************************************
+         SPACE 1
+Q#KEYP   DS    0H                  RETURN TO KEY=8 PROBLEM STATE
+         SPACE 1
+         MODESET KEY=NZERO,MODE=PROB
+         B     AUTHOK              ALLOW FUNCTION TO PROCEED
+         SPACE 2
+******************************************************************
+*
+*  RETURN TO CALLER, REQUESTED FUNCTION MAY PROCEED
+*
+******************************************************************
+         SPACE 1
+AUTHOK   DS    0H                  REQUESTED FUNCTION MAY PROCEED
+         QSTOP  ,                  RETURN TO CALLER
+         SPACE 3
+         LTORG ,                   DEFINE LITERAL ORIGIN
+         SPACE 2
+******************************************************************
+*
+*  GENERATE CONTROL BLOCK DSECTS
+*
+******************************************************************
+         SPACE 1
+SYMDEL   DSECT ,                   KILL SYM CARD GENERATION
+AUTH     CSECT ,                   RESUME CSECT
+         QPRBGEN  BEGIN            SET PRINT FOR CNTL BLOCK GEN
+         SPACE 1
+         $HASPEQU
+         IFGRPL
+         $BUFFER ,
+         $JQE  ,
+         $JCT  ,
+         $PDDB ,
+         $TAB  ,
+         $IOT  ,
+         SPACE 1
+         ACCVT
+         ACUCB
+         ACFASVT
+WORK     DSECT ,                   SAVE AREA WORK DSECT
+         DS    18F                 OS SAVE AREA
+WORKAREA DS    0D                  START OF DATA
+         SPACE 1
+         IHAPSA ,
+         QCOMMON ,                 GENERATE SPCOMMON DSECT
+         SPACE 1
+         QPRBGEN  DONE             RESTORE NORMAL PRINT STATUS
+SYMNODEL DSECT ,                   RESTORE SYM CARD GENERATION
+         END   ,

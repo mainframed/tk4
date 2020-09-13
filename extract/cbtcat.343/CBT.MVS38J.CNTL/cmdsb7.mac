@@ -1,0 +1,111 @@
+//HERC01  JOB  (MVS),
+//             'INSTALL # SUBSYS',
+//             CLASS=A,
+//             MSGCLASS=X,
+//             MSGLEVEL=(1,1),
+//             NOTIFY=HERC01
+//********************************************************************
+//*                                                                  *
+//* NAME: SYS1.SETUP.CNTL(CMDSB6)                                    *
+//*                                                                  *
+//* TYPE: JCL TO INSTALL THE # COMMAND SUBSYSTEM                     *
+//*                                                                  *
+//* DESC: THIS JOB COPIES THE REQUIRED MODULES INTO THE TARGET LIBS  *
+//*                                                                  *
+//********************************************************************
+//DMCOPY  PROC LINKLIB='CBT.CMDSBSYS.LINKLIB',
+//             TARGLIB=
+//DMCOPY  EXEC PGM=IEBCOPY
+//SYSPRINT DD  SYSOUT=*
+//SYSUT1   DD  DISP=SHR,DSN=&LINKLIB.
+//SYSUT2   DD  DISP=SHR,DSN=&TARGLIB.
+//SYSUT3   DD  UNIT=VIO,SPACE=(TRK,(50,20))
+//SYSUT4   DD  UNIT=VIO,SPACE=(TRK,(50,20))
+//DMCOMP  EXEC PGM=IEBCOPY
+//SYSPRINT DD  SYSOUT=*
+//SYSUT1   DD  DISP=SHR,DSN=&TARGLIB.
+//SYSUT2   DD  DISP=SHR,DSN=&TARGLIB.
+//SYSUT3   DD  UNIT=VIO,SPACE=(TRK,(50,20))
+//SYSUT4   DD  UNIT=VIO,SPACE=(TRK,(50,20))
+//SYSIN    DD  DUMMY
+//        PEND
+//COPY1   EXEC DMCOPY,TARGLIB='SYS2.LINKLIB'
+//SYSIN  DD  *
+ C I=SYSUT1,O=SYSUT2
+ S M=((CMDPRINT,,R))
+ S M=((CMDSBCSC,,R))
+ S M=((CMDSBINT,,R))
+ S M=((CMDSBSYS,,R))
+ S M=((CMDSBMON,,R))
+ S M=((CSCSA03D,,R))
+ S M=((CSCSC03D,,R))
+ S M=((CSCSD03D,,R))
+ S M=((CSCSE03D,,R))
+ S M=((CSCSF03D,,R))
+ S M=((CSCSG03D,,R))
+ S M=((CSCSH03D,,R))
+ S M=((CSCSI03D,,R))
+ S M=((CSCSJ03D,,R))
+ S M=((CSCSK03D,,R))
+ S M=((CSCSL03D,,R))
+ S M=((CSCSM03D,,R))
+ S M=((CSCSN03D,,R))
+ S M=((CSCSO03D,,R))
+ S M=((CSCSP03D,,R))
+ S M=((CSCSQ03D,,R))
+ S M=((CSCSR03D,,R))
+ S M=((CSCSS03D,,R))
+ S M=((CSCSZ03D,,R))
+ S M=((CSCZA03D,,R))
+ S M=((CSCZB03D,,R))
+ S M=((CSCZC03D,,R))
+ S M=((CSCZJ03D,,R))
+ S M=((CSCZP03D,,R))
+ S M=((CSCZS03D,,R))
+/*
+//COPY2 EXEC DMCOPY,TARGLIB='SYS1.LPALIB'
+//SYSIN  DD  *
+ C I=SYSUT1,O=SYSUT2
+ S M=((CMDDUMMY,,R))
+ S M=((CSCSA03D,IEESA03D,R))
+ S M=((CSCSC03D,IEESC03D,R))
+ S M=((CSCSD03D,IEESD03D,R))
+ S M=((CSCSE03D,IEESE03D,R))
+ S M=((CSCSF03D,IEESF03D,R))
+ S M=((CSCSG03D,IEESG03D,R))
+ S M=((CSCSH03D,IEESH03D,R))
+ S M=((CSCSI03D,IEESI03D,R))
+ S M=((CSCSJ03D,IEESJ03D,R))
+ S M=((CSCSK03D,IEESK03D,R))
+ S M=((CSCSL03D,IEESL03D,R))
+ S M=((CSCSM03D,IEESM03D,R))
+ S M=((CSCSN03D,IEESN03D,R))
+ S M=((CSCSO03D,IEESO03D,R))
+ S M=((CSCSP03D,IEESP03D,R))
+ S M=((CSCSQ03D,IEESQ03D,R))
+ S M=((CSCSR03D,IEESR03D,R))
+ S M=((CSCSS03D,IEESS03D,R))
+ S M=((CSCSZ03D,IEESZ03D,R))
+ S M=((CSCZA03D,IEEZA03D,R))
+ S M=((CSCZB03D,IEEZB03D,R))
+ S M=((CSCZC03D,IEEZC03D,R))
+ S M=((CSCZJ03D,IEEZJ03D,R))
+ S M=((CSCZP03D,IEEZP03D,R))
+ S M=((CSCZS03D,IEEZS03D,R))
+/*
+//COPY3 EXEC DMCOPY,TARGLIB='SYS2.CMDLIB' FULL SCREEN FOR TSO AND OPER
+//SYSIN  DD  *
+ C I=SYSUT1,O=SYSUT2
+ S M=((CMDTSO,,R))
+ S M=((CMDSBTSO,,R))
+ S M=((CSCGA03D,,R))        ACTIVITY MONITOR
+ S M=((CSCGE03D,,R))        EXCEPTION MONITOR
+ S M=((CSCGF03D,,R))        JOB FRAME MONITOR
+ S M=((CSCGH03D,,R))        HELP FOR GRAPH MONITORS
+ S M=((CSCGI03D,,R))        JES2 INIT DISPLAY
+ S M=((CSCGJ03D,,R))        JOB CPU MONITOR
+ S M=((CSCGO03D,,R))        I/O ACTIVITY MONITOR
+ S M=((CSCGQ03D,,R))        QUE COMMAND
+ S M=((CSCGS03D,,R))        SYSTEM IND. GRAPH
+ S M=((CSCGU03D,,R))        DASD FREE SPACE
+/*

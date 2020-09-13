@@ -1,0 +1,463 @@
+ PLIFIX:  PROC OPTIONS(MAIN);       /* REBUILD A BUST PDS      MH*/
+  /* *************************************************************** */
+  /*                                                                 */
+  /* THIS PROGRAM IS USED TO RECOVER AS MUCH MEMBER DATA AS POSSIBLE */
+  /* FROM A PDS WHOSE DIRECTORY HAS BEEN DAMAGED OR OVERLAYED.       */
+  /* IT IS USED UNDER ISPF.                                          */
+  /*                                                                 */
+  /* IT WORKS AS FOLLOWS :  A) DISPLAY A PANEL AND OBTAIN THE        */
+  /*                           RELEVANT DATA FROM THE USER.          */
+  /*                                                                 */
+  /*                        B) PARSE THE USERDATA AND DISPLAY ANY    */
+  /*                           ERROR CONDITIONS.                     */
+  /*                                                                 */
+  /*                        C) DYNAMICALLY ALLOCATE THE BROKEN PDS   */
+  /*                           AND THE OUTPUT SEQUENTIAL DATASET     */
+  /*                           CALLED USERID.GARBAGE.SEQ             */
+  /*                                                                 */
+  /*                        E) INVOKE ASSEMBLER PGM SALVAGE TO       */
+  /*                           BUILD UP THE SEQUENTIAL DATA SET      */
+  /*                                                                 */
+  /*                        F) DYNAMICALLY ALLOCATE THE OUTPUT PDS   */
+  /*                           WITH THE NAME USERID.GARBAGE.PDS      */
+  /*                                                                 */
+  /*                        G) READ THE SEQUENTIAL DATASET AND       */
+  /*                           RE-BUILD THE PDS.                     */
+  /*                                                                 */
+  /*  YOU MAY GET AN ABEND SB37 IF THE ALLOCATION SIZES ARE TOO SMALL*/
+  /*  IN THIS CASE RUN A BATCH JOB.                                  */
+  /*                                                                 */
+  /*  I TRY TO DO MOST THINGS INTERACTIVELY BECAUSE I AM BASICALLY   */
+  /*  A VM BIGOT AND I WANT TO DO STUFF LIKE I CAN DO IT ON A PC.    */
+  /*  WHY SHOULD IT BE SO MUCH TROUBLE TO GET ANYTHING DONE          */
+  /*  UNDER MVS. (YESTERDAY'S COMPUTING TOMMORROW FOLKS!!!).         */
+  /*  BESIDES I HATE JCL BECAUSE I CAN NEVER REMEMBER IT.            */
+  /*                                                                 */
+  /* UNFORTUNATELY PL/I DOES NOT YET HAVE BPAM SUPPORT (SHARE        */
+  /* REQUIREMENT) SO I HAVE CHEATED BY DYNAMICALLY ALLOCATING        */
+  /* THE OUTPUT DATASET AS A SEQUENTIAL DATASET WITH A MEMBER        */
+  /* THEN USING QSAM TO ADD THE MEMBER DATA. AT CHANGE OF MEMBER TO  */
+  /* CLOSE THE DATASET UNALLOCATE IT AND THEN RE-ALLOCATE IT WITH    */
+  /* A DIFFERENT MEMBER NAME. THIS ADDS OVERHEAD BUT THIS PROGRAM    */
+  /* IS ONLY USED IN AN EMERGENCY RECOVERY SITUATION AND IT'S MUCH   */
+  /* EASIER MEDDLING AROUND WITH PL/I THAN USING ASSEMBLER.          */
+  /* (BPAM NEEDS YOU TO LOOK AFTER THE BLOCKING AND DEBLOCKING OF    */
+  /* YOUR PDS--GOOD OLD QSAM HANDLES BLOCKING AND DEBLOCKING).       */
+  /*                                                                 */
+  /* I.E DYNAMIC ALLOCATION ALLOCATES OUR PDS EACH TIME AS           */
+  /* USERID.GARBAGE.PDS(MEM#NNNN) DISP=SHR                           */
+  /*                                                                 */
+  /* ************************************************************** */
+  /*                                                                */
+  /* DEFINE EXTERNAL REFERENCES : DYNAMIC ALLOCATION INTERFACE      */
+  /*                            : CATALOG MANAGEMENT                */
+  /*                            : ISPF SERVICES                     */
+  /*                            : BROKEN PDS RECOVERY MODULE        */
+  /*                                                                */
+  /* ************************************************************** */
+ DCL ISPLINK          ENTRY EXTERNAL OPTIONS(ASM,INTER,RETCODE);
+ DCL (CATMAN, DYNAM)  ENTRY EXTERNAL OPTIONS(ASM,INTER,RETCODE);
+ DCL SALVAGE          ENTRY EXTERNAL OPTIONS(ASM,INTER,RETCODE);
+  /*                                                                */
+  /* ************************************************************** */
+  /*                                                                */
+  /* DEFINE PLI BUILTIN FUNCTIONS/SERVICES.                         */
+  /*                                                                */
+  /* ************************************************************** */
+ DCL (PLIRETV, LENGTH, SUBSTR, INDEX, ADDRESS, ADDR) BUILTIN;
+  /* ************************************************************** */
+  /*                                                                */
+  /* DEFINE NON ISPF VARIABLES .                                    */
+  /*                                                                */
+  /* ************************************************************** */
+ DCL REKORD           CHAR(4000) INIT(' ');      /* MAX LRECL 4000  */
+ DCL CONS             CHAR(80) INIT(' '),
+     SW               CHAR(1) INIT('N'),
+     TEXTL            CHAR(80),
+     PDS              FILE STREAM OUTPUT ENV(FB),
+     MSGFILE          FILE STREAM OUTPUT ENV(FB),
+     MEM              FIXED BIN(15) INIT(0),
+     MEMB             CHAR(12) INIT(0),
+     Q                PTR,
+     R                PTR,
+     I                FIXED BIN(15) INIT(0),
+     J                FIXED BIN(15) INIT(0),
+     K                FIXED BIN(15) INIT(0),
+     ERR_FLAG         CHAR(1) INIT('N'),
+     MSGID            CHAR(8) INIT(' '),
+     BLANK            CHAR(8) INIT(' '),
+     LEN_USERID       FIXED BIN(15) INIT(0),
+     LEN_ERR          FIXED BIN(15) INIT(0),
+     SAVERC           FIXED BIN(15) INIT(0),
+     L_BUST           FIXED BIN(15) INIT(0),
+     L_BLK            FIXED BIN(15) INIT(0),
+     L_LRECL          FIXED BIN(15) INIT(0),
+     WORK             FIXED BIN(31) INIT(0),
+     PARMPTR          FIXED BIN(31) INIT(0) BASED(R),
+     TESTDSN          CHAR(44) INIT(' '),
+     BROWSE_DSN       CHAR(44) INIT(' '),
+     FLAG             CHAR(1) INIT(' '),
+     FILE_IND         CHAR(1) INIT('N'),
+     QUOTE            CHAR(1) INIT(''''), /* THIS IS A SINGLE QUOTE !*/
+  /* ************************************************************** */
+  /*                                                                */
+  /* SET UP OPTIONS LIST FOR PASSING THE BLOCKSIZE TO SALVAGE PGM   */
+  /*                                                                */
+  /* ************************************************************** */
+  1 FORPDS            UNALIGNED,
+    3  OPTLEN         FIXED BIN(15) INIT(0),
+    3  OPTDATA        CHAR(100),
+  /* ************************************************************** */
+  /*                                                                */
+  /* SET UP PARAMETER LIST FOR CATALOG MANAGEMENT INTERFACE         */
+  /*                                                                */
+  /* ************************************************************** */
+  PARMS1              CHAR(169) BASED(Q),
+  1  WORK1            UNALIGNED,
+    3 FUNC            CHAR(1) INIT('P'),
+    3 DSNAME          CHAR(44) INIT(' '),
+    3 VOLCOUNT        FIXED BIN(31) INIT(0),
+    3 VOLLIST(20)     CHAR(6),
+  /* ************************************************************** */
+  /*                                                                */
+  /* DEFINE ISPF VARIABLES WE ARE GOING TO USE IN THE PROGRAM.      */
+  /*                                                                */
+  /* ************************************************************** */
+     BLK              CHAR(5) INIT(' '),
+     BUST             CHAR(44)  INIT(' '),
+     LRECL            CHAR(5) INIT(' '),
+     ZUSER            CHAR(7)  INIT('ZUSER'),
+     USERID           CHAR(8)  INIT(' '),
+     LBLK             FIXED BIN(31) INIT(LENGTH(BLK)),
+     LBUST            FIXED BIN(31) INIT(LENGTH(BUST)),
+     LLRECL           FIXED BIN(31) INIT(LENGTH(LRECL)),
+     LZUSER           FIXED BIN(31) INIT(LENGTH(ZUSER));
+  /* ************************************************************** */
+  /*                                                                */
+  /* SET UP THE INITIAL PROGRAM ENVIRONMENT :                       */
+  /*                                                                */
+  /*        A) SET UP ADDRESSABILITY OF BASED VARIABLES             */
+  /*        B) INITIALIZE THE DYNAMIC ALLOCATION INTERFACE          */
+  /*        C) ALLOCATE TERMINAL FILE AND ISSUE A MESSAGE           */
+  /*                                                                */
+  /* ************************************************************** */
+ Q = ADDR(WORK1);
+ R = ADDR(OPTDATA);
+ FETCH DYNAM;
+ FETCH CATMAN;
+ CALL DYNAM(WORK, 'INIT ');
+ CALL DYNAM(WORK,'ALLOC ','DD=MSGFILE;','TE;');
+ OPEN FILE(MSGFILE) LINESIZE(80);
+  /* ************************************************************** */
+  /*                                                                */
+  /* SET UP THE ISPF ENVIRONMENT:                                   */
+  /*                                                                */
+  /*        A) DEFINE OUR PROGRAMS VARIABLES TO ISPF SO WE          */
+  /*           CAN GET DATA FROM A PANEL.                           */
+  /*        B) GET THE TSO USER-ID FROM ISPF. THIS IS THE SYSTEM    */
+  /*           VARIABLE ZUSER FROM ISPF OBTAINED VIA VCOPY FUNCTION */
+  /*        C) SHOW THE USER THE PANEL                              */
+  /*        D) GET DATA BACK FROM THE PANEL                         */
+  /* WE SAVE THE PANEL SO  ON PARSE ERROR WE CAN ISSUE A MESSAGE    */
+  /* AND RE-DISPLAY THE PANEL. THE USER CAN THEN CORRECT HIS        */
+  /* ERROR(S)                                                       */
+  /*                                                                */
+  /*       (IF PLIRETV = 8 THEN PFK3 OR END KEY HAS BEEN PRESSED)   */
+  /*        IF THIS HAS HAPPENED WE EXIT WITHOUT MORE ADO.          */
+  /*                                                                */
+  /* ************************************************************** */
+ CALL ISPLINK('VDEFINE', '(BUST)', BUST, 'CHAR', LBUST);
+ CALL ISPLINK('VDEFINE', '(BLK)', BLK, 'CHAR', LBLK);
+ CALL ISPLINK('VDEFINE', '(LRECL)', LRECL, 'CHAR', LLRECL);
+ CALL ISPLINK('VCOPY', ZUSER, LZUSER, USERID, 'MOVE');
+ CALL ISPLINK('DISPLAY', 'BUSTPDS ', 'INV030  ');
+ LEN_USERID = INDEX(USERID,' ');
+ IF LEN_USERID ^= 0
+ THEN LEN_USERID = LEN_USERID - 1;
+ REDOO: IF PLIRETV = 8    /* COME BACK TO HERE ON ANY ERROR*/
+ THEN GO TO EXIT1;        /* EXIT WITHOUT DOING ANY PROCESSING*/
+ TSOLEN = 1;
+  /* ************************************************************** */
+  /*                                                                */
+  /*   PARSE THE DATA FROM THE USER.                                */
+  /*                                                                */
+  /*        A) GET THE BROKEN DATASET AND CHECK FOR VALIDITY.       */
+  /*           IF THE DATASET IS UNQUOTED APPEND THE TSO USER-ID.   */
+  /*           IF MISSING QUOTE THEN ISSUE ERROR MESSAGE .          */
+  /*           IF UNCATALOGUED THEN ISSUE A MESSAGE.                */
+  /*                                                                */
+  /*        B) CHECK THAT LRECL AND BLKSIZE HAVE BEEN ENTERED.      */
+  /*                                                                */
+  /*        C) IF ALL THE ABOVE TESTS PASS SET UP OPTIONS FOR       */
+  /*           PASSING TO THE SALVAGE PROGRAM WHICH CREATES         */
+  /*           OUR SEQUENTIAL DATASET.                              */
+  /*           WE THEN RE-BUILD THE PDS.                            */
+  /*           OTHERWISE RE-DISPLAY PANEL AND RE-DO.                */
+  /*                                                                */
+  /*       SEE ISPF DIALOG MANAGEMENT SERVICES                      */
+  /*       (SC34-2088) FOR MESSAGE FORMATS AND USING ISPF SERVICES  */
+  /*       FROM A PROBLEM PROGRAM.                                  */
+  /*                                                                */
+  /*      HINT : TO RE-DISPLAY A PANEL AFTER AN ERROR               */
+  /*             CALL ISPLINK OMITTING THE PANEL NAME BUT INCLUDE   */
+  /*             A MESSAGE NUMBER AND THE FIELD WHERE YOU WANT      */
+  /*             THE CURSOR TO GO.                                  */
+  /*             TO OMIT A PARAMETER IN THIS WAY TO ISPLINK         */
+  /*             I USE A PANEL NAME OF ALL BLANKS. THIS ACHIEVES    */
+  /*             THE SAME OBJECT AS OMITTING A PARAMETER WHICH      */
+  /*             IS NOT THE LAST ONE IN THE LIST.                   */
+  /*                                                                */
+  /* ************************************************************** */
+  DSNAME = ' ';
+ IF SUBSTR(BUST,1,1) = ' '            /* MISSING SOURCE DATASET     */
+ THEN DO;
+         CALL ISPLINK('DISPLAY', BLANK, 'INV001  ', 'BUST ');
+         GO TO REDOO;
+      END;
+ TESTDSN = BUST;
+ CALL PARSE;
+ IF ERR_FLAG = 'Y'    /* PARSE SETS MESSAGE ID  */
+ THEN DO;
+         ERR_FLAG = 'N';
+         CALL ISPLINK('DISPLAY', BLANK,  MSGID, 'BUST ');
+         GO TO REDOO;
+      END;
+ IF BLK = ' '
+ THEN DO;
+         MSGID = 'INV031';
+         CALL ISPLINK('DISPLAY', BLANK,  MSGID, 'BLK  ');
+         GO TO REDOO;
+      END;
+ IF LRECL = ' '
+ THEN DO;
+         MSGID = 'INV032';
+         CALL ISPLINK('DISPLAY', BLANK,  MSGID, 'LRECL ');
+         GO TO REDOO;
+      END;
+ CONS= 'SUPER PDS RE-BUILDER V2.1  MIKE HAWTHORNE OCT 1985';
+ CALL WRITEIT;
+ BUST = DSNAME;          /* PARSE HAS APPENDED USER-ID IF NECESSARY*/
+ FUNC = 'P';                    /* SET FOR PURGE OF DATASETS */
+ DSNAME=SUBSTR(USERID,1,LEN_USERID) ×× '.GARBAGE.SEQ';
+ CALL CATMAN(PARMS1);           /* IGNORE RET CODE IF NOT 0  */
+ FUNC = 'P';                    /* SET FOR PURGE OF DATASETS */
+ DSNAME=SUBSTR(USERID,1,LEN_USERID) ×× '.GARBAGE.PDS';
+ CALL CATMAN(PARMS1);           /* IGNORE RET CODE IF NOT 0  */
+ K = INDEX(BUST,' ');
+ K = K - 1;           /* PARSE HAS ALREADY REMOVED ANY QUOTES */
+ CALL DYNAM(WORK, 'ALLOC ',
+ 'DSN=' ×× SUBSTR(BUST,1,K) ×× ' SHR;',
+          'DD=EXCPDD;');
+ J = INDEX(BLK,' ');
+ IF J = 0
+ THEN J = 5;
+ ELSE J = J - 1;                  /* FOR BLKSIZE IN ALLOCATE */
+ I = INDEX(LRECL,' ');
+ IF I = 0
+ THEN I = 5;                      /* FOR LRECL IN ALLOCATE   */
+ ELSE I = I - 1;
+ PARMPTR = SUBSTR(LRECL,1,I);    /* GET LRECL FOR SALVAGE PGM */
+ OPTLEN = 4;
+ CONS = 'NOW RECOVERING DATA : PLEASE WAIT THIS CAN TAKE A LONG TIME';
+ CALL WRITEIT;
+ CONS = 'FOR LARGE DATASETS PLEASE TAKE A COFFEE (TEA) BREAK NOW';
+ CALL WRITEIT;
+ CALL DYNAM(WORK, 'ALLOC ', 'DSN=' ×× SUBSTR(USERID,1,LEN_USERID)
+      ×× '.GARBAGE.SEQ NEW CATLG;',
+      'LR=' ×× SUBSTR(LRECL,1,I)
+      ×× ' BLK=' ×× SUBSTR(BLK,1,J) ×× ';', ' FB;',
+      'UNIT=SYSDA;',  'DD=QSAMDCB;',
+       'CYL PRIMARY=30 SECONDARY=10 RLSE;');
+  FETCH SALVAGE;
+  CALL SALVAGE(FORPDS);
+  SAVERC = PLIRETV;
+  RELEASE SALVAGE;
+  CONS= 'SEQ DATASET BUILT : ABOUT TO RECONSTRUCT PDS';
+  CALL WRITEIT;
+  /* ************************************************************** */
+  /*                                                                */
+  /*   DE-ALLOCATE DDNAMES USED IN FIRST STEP                       */
+  /*                                                                */
+  /* ************************************************************** */
+ CALL DYNAM(WORK, 'UNALLOC ', 'DD=QSAMDCB;');
+ CALL DYNAM(WORK, 'UNALLOC ', 'DD=EXCPDD;');
+ CALL DYNAM(WORK, 'UNALLOC ', 'DD=SYSIN;');
+  /* ************************************************************** */
+  /*                                                                */
+  /*   ALLOCATE INPUT DATASET AND NEW OUTPUT DATASET                */
+  /*                                                                */
+  /* ************************************************************** */
+ K = INDEX(BLK,' ');
+ IF K = 0
+ THEN K = 5;
+ ELSE K = K - 1;                  /* FOR BLKSIZE IN ALLOCATE */
+ I = INDEX(LRECL,' ');
+ IF I = 0
+ THEN I = 5;                      /* FOR LRECL IN ALLOCATE   */
+ ELSE I = I - 1;
+ CALL DYNAM(WORK, 'ALLOC ', 'DSN=' ×× SUBSTR(USERID,1,LEN_USERID)
+      ×× '.GARBAGE.SEQ SHR;', 'FB;','DD=SYSIN;');
+ CALL DYNAM(WORK, 'ALLOC ', 'DSN=' ×× SUBSTR(USERID,1,LEN_USERID)
+      ×× '.GARBAGE.PDS NEW CATLG;',
+      'LRECL=' ×× SUBSTR(LRECL,1,I) ×× ';',
+      'BLKSIZE=' ×× SUBSTR(BLK,1,K) ×× ';',
+      'UNIT=SYSDA;', 'DD=PDS;', 'DIR=150;',
+       'CYL PRIMARY=30 SECONDARY=10;');
+  CALL DYNAM(WORK, 'UNALLOC ', 'DD=PDS;');
+  CONS= 'THIS CAN TAKE A LOT OF TIME FOR LARGE DATASET : PLEASE WAIT';
+  CALL WRITEIT;
+  ON ENDFILE(SYSIN) FILE_IND = 'Y';
+  OPEN FILE(SYSIN);
+  GET FILE(SYSIN) EDIT(REKORD)(A(SUBSTR(LRECL,1,I)));
+  DO WHILE (FILE_IND = 'N');
+     IF SUBSTR(REKORD,1,2) = './'
+     THEN DO;
+             SW = 'Y';
+             IF MEM ^= 0
+             THEN DO;
+                     CLOSE FILE(PDS);
+                     CALL DYNAM(WORK, 'UNALLOC ', 'DD=PDS;');
+                  END;
+             MEMB = 'ME=' ×× SUBSTR(REKORD,26,8) ×× ';';
+ CALL DYNAM(WORK, 'ALLOC ', 'DSN=' ×× SUBSTR(USERID,1,LEN_USERID)
+      ×× '.GARBAGE.PDS SHR;',
+             MEMB, 'DD=PDS;');
+             OPEN FILE(PDS) OUTPUT;
+             MEM = MEM + 1;
+          END;
+     ELSE DO;
+             IF SW = 'Y'
+             THEN DO;
+                PUT FILE(PDS) EDIT(REKORD)(A(SUBSTR(LRECL,1,I)));
+                  END;
+          END;
+     GET FILE(SYSIN) EDIT(REKORD)(A(SUBSTR(LRECL,1,I)));
+  END;
+  CLOSE FILE(SYSIN);
+  CLOSE FILE(PDS);
+  GO TO EXIT;  /* REDUNDANT STATEMENT BUT MAKES CODE EASIER TO READ */
+  /* ************************************************************** */
+  /*                                                                */
+  /*  THIS SUBROUTINE DOES THE FOLLOWING :                          */
+  /*                                                                */
+  /*                  A) TOO MANY QUOTES ON DATASET NAME.           */
+  /*                  B) IF WE HAVE ( OR ) IN THE DATASET           */
+  /*                     THEN INVALID : CANNOT BE A MEMBER          */
+  /*                  C) CHECKS FOR QUOTED DATASET. IF QUOTED       */
+  /*                     CHECKS FOR MATCHING END OF QUOTE.          */
+  /*                  D) IF NOT QUOTED APPENDS THE USERS TSO ID     */
+  /*                     IN FRONT OF THE DSN.                       */
+  /*                  E) CHECKS WHETHER THE DATASET CATALOGUED.     */
+  /*                                                                */
+  /*                                                                */
+  /* ERRORS WILL CAUSE A RE-DISPLAY OF THE PANEL WITH A MESSAGE.    */
+  /* PF2 WILL PRESENT THE ALTERNATE LONG MESSAGE.                   */
+  /*                                                                */
+  /*                                                                */
+  /* ************************************************************** */
+ PARSE: PROC;
+ MEML = 0;
+ DSNAME = ' ';
+ K = INDEX (TESTDSN,QUOTE ×× QUOTE); /* CHECK FOR DOUBLE QUOTES */
+ IF K ^= 0
+ THEN DO;
+         ERR_FLAG = 'Y';
+         MSGID = 'INV009  '; /* TOO MANY QUOTES          */
+         GO TO ENDPARS;
+      END;
+ IF SUBSTR(TESTDSN,1,1) = QUOTE   /* EXTRACT QUOTES IF ANY   */
+  THEN DO;                        /* IF THERE APPEND USER ID */
+          K = INDEX (TESTDSN,' ');     /* GET LENGTH OF SOURCE DSN  */
+          K = K - 1;                   /* GET THE REAL LENGTH       */
+          IF SUBSTR(TESTDSN,K,1) ^= QUOTE
+          THEN DO;
+                  ERR_FLAG = 'Y';
+                  MSGID = 'INV004  ';
+                  GO TO ENDPARS;
+               END;
+          ELSE DO;
+                  DSNAME=SUBSTR(TESTDSN,2,K-2); /* EXTRACT QUOTES */
+               END;
+       END;
+  ELSE DO;
+          K = INDEX (TESTDSN,QUOTE);   /* CHECK FOR A SINGLE QUOTE */
+          IF K = 0                             /* NOT FOUND   OKAY */
+          THEN DO;
+                  K = INDEX (TESTDSN,' ');
+                  K = K - 1;
+                  DSNAME=SUBSTR(USERID,1,LEN_USERID) ×× '.'
+                  ×× SUBSTR(TESTDSN,1,K);
+                END;
+          ELSE DO;
+                  ERR_FLAG = 'Y';
+                  MSGID = 'INV004  ';
+                  GO TO ENDPARS;
+               END;
+       END;
+ K = INDEX (DSNAME,'(');  /* NOTE WE HAVE NOW EXTRACTED QUOTE */
+ IF K = 0                 /* AND IF NECESSARY APPENDED TSO USER ID */
+ THEN DO;
+         K = INDEX (DSNAME,')');
+         IF K ^=0
+         THEN DO;
+                 ERR_FLAG = 'Y';
+                 MSGID = 'INV004  '; /* SET INVALID DATASET NAME */
+                 GO TO ENDPARS;
+             END;
+      END;        /* THAT TAKES CARE OF UNBALANCED PARENTHESES */
+ ELSE DO;         /* WE HAVE ALREADY FOUND A  '('                */
+         MSGID = 'INV004  '; /* CANNOT BE A MEMBER OF A PDS*/
+         ERR_FLAG = 'Y';
+         GO TO ENDPARS;
+      END;
+  IF ERR_FLAG = 'N'          /* ON ERROR SKIP REST OF PROCESSING    */
+  THEN DO;
+          FUNC = 'I';        /* CHECK IF CATALOGED                  */
+          CALL CATMAN(PARMS1);
+          IF PLIRETV ^=0
+          THEN DO;
+                  MSGID = 'INV002  ';
+                  ERR_FLAG = 'Y';
+                  GO TO ENDPARS;
+               END;
+       END;
+  ENDPARS: END PARSE;
+- /* ************************************************************** */
+  /*                                                                */
+  /*  THIS SUBROUTINE ISSUES ANY NON ISPF TERMINAL MESSAGES         */
+  /*                                                                */
+  /*  (NOTE MSGFILE IS AN ORDINARY PL/I STREAM DIRECTED I/O         */
+  /*   DATASET : THE DYNAMIC ALLOCATION INTERFACE ALLOCATES IT      */
+  /*   AS A TERMINAL FILE SO YOU DO NOT NEED SUBROUTINES            */
+  /*   FOR TPUT/TGET)                                               */
+  /*                                                                */
+  /* ************************************************************** */
+ WRITEIT: PROC;
+          PUT FILE(MSGFILE) EDIT (CONS)(A(80));
+ END WRITEIT;
+- /* ************************************************************** */
+  /*                                                                */
+  /*            CLEAN UP AND TERMINATION SECTION.                   */
+  /*                                                                */
+  /* ************************************************************** */
+ EXIT: CALL DYNAM(WORK,'UNALLOC ','DD=SYSIN;');
+ CALL DYNAM(WORK,'UNALLOC ','DD=PDS;');
+ FUNC = 'P';                    /* SET FOR PURGE OF DATASETS */
+ DSNAME=SUBSTR(USERID,1,LEN_USERID) ×× '.GARBAGE.SEQ';
+ CALL CATMAN(PARMS1);           /* IGNORE RET CODE IF NOT 0  */
+ CONS = 'PDS NOW RE-CONSTRUCTED - ENTERING ISPF BROWSE';
+ CALL WRITEIT;
+ CONS = 'HIT ENTER TO CONTINUE AND PFK3/15 TO EXIT BROWSE';
+ CALL WRITEIT;
+ BROWSE_DSN = 'GARBAGE.PDS';
+ CALL ISPLINK('BROWSE', BROWSE_DSN);
+ CONS = 'PDS REBUILDER NOW FINISHED';
+ CALL WRITEIT;
+ EXIT1: RELEASE CATMAN;
+ CLOSE FILE(MSGFILE);
+ CALL DYNAM(WORK,'UNALLOC ','DD=MSGFILE;');
+ RELEASE DYNAM;
+ CALL ISPLINK('VDELETE', '(BUST)');
+ CALL ISPLINK('VDELETE', '(BLK)');
+ CALL ISPLINK('VDELETE', '(LRECL)');
+  END PLIFIX;

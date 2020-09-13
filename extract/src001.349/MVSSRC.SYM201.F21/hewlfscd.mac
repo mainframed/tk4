@@ -1,0 +1,1677 @@
+ TITLE 'HEWLFSCD - SECOND PASS CONTROL AND I/O'
+***********************************************************************
+*STATUS:  CHANGE LEVEL 0                                              *
+*FUNCTION/OPERATION:                                                  *
+*        1) READS TEXT AND RLD RECORDS FROM THE INTERMEDIATE FILE IF  *
+*              RECORDS ARE NOT ALREADY IN CORE                        *
+*        2) RELOCATES ALL ADDRESS CONSTANTS IN THE TEXT RECORDS       *
+*        3) CREATES AND WRITES RLD/CONTROL AND TEXT RECORDS IN A      *
+*              FORMAT ACCEPTABLE TO PROGRAM FETCH                     *
+*        4) CREATES ENTAB AND TTR LIST,WHEN OVERLAY IS SPECIFIED      *
+*        THE SECOND PASS PROCESSOR(HEWLFSCD AND HEWLFREL) OPERATES IN *
+*AN OVERLAP ENVIRONMENT.   READS, WHEN NEEDED FROM SYSUT1, ARE OVER-  *
+*LAPPED WITH WRITES ON SYSLMOD.  I/O OPERATIONS ARE ALSO OVERLAPPED   *
+*WITH PROCESSING OF RLDS.                                             *
+*        IN ORDER TO HAVE AN EFFECTIVE AND EFFICIENT OVERLAP SYSTEM,  *
+*INFORMATION ABOUT EACH UNIT OF TEXT MUST BE RETAINED UNTIL THAT TEXT *
+*IS PROCESSED AND WRITTEN OUT.  THIS INFORMATION IS MAINTAINED IN     *
+*CONTROL BLOCKS.  BY RETAINING THIS INFORMATION IN CONTROL BLOCKS,    *
+*NEEDLESS SEARCHING OF TABLES IS AVOIDED AND UNCHECKED READ AND WRITES*
+*CAN BE CONTROLLED.                                                   *
+*        TWO TEXT CONTROL BLOCKS ARE MAINTAINED --- ONE FOR THE       *
+*CURRENT TEXT BEING PROCESSED AND ONE FOR THE NEXT TEXT TO BE         *
+*PROCESSED.  THIS SECOND CONTROL BLOCK IS ALSO USED TO RETAIN INFOR-  *
+*MATION ABOUT AN UNCHECKED WRITE OF TEXT UNTIL ANOTHER WRITE IS ISSUED*
+*OR THE TEXT CONTROL BLOCK IS NEEDED FOR A LOOK-AHEAD READ.           *
+*        CONTROL BLOCKS EXIST ALSO FOR EACH RLD BUFFER.  THE RLD INPUT*
+*BUFFERS ARE MAINTAINED AS TWO DISTINCT BUFFERS CONTROLLED BY TWO     *
+*CONTROL BLOCKS.  BY MAINTAINING THE RLD NOTELIST ENTRY ADDRESSES,    *
+*EACH RLD SET CAN BE ADDRESSED DIRECTLY WHEN NEEDED,THUS ELIMINATING  *
+*NEEDLESS SCANNING OF ALL RLDS IN THE BUFFER.  THIS ALSO ELIMINATES   *
+*REDUNDANT SCANS OF THE RLD NOTELIST.  CONTROL BLOCKS ARE ASSOCIATED  *
+*WITH EACH OF THE RLD OUTPUT BUFFERS, WHICH ALLOWS CONTROL OF ALL     *
+*THREE BUFFERS AT ONE TIME.  THE RLD BUFFERS, IN TURN, ARE ASSOCIATED *
+*WITH THE CURRENT TEXT CONTROL BLOCK AS THEY ARE USED BY THE CURRENT  *
+*TEXT.                                                                *
+*                                                                     *
+*        THE SECOND PASS BEGINS BY MAKING SURE THAT THERE IS TEXT     *
+*READY TO PROCESS AND THAT THE NEXT TEXT TO BE PROCESSED IS IDENTIFIED*
+*AND READ IF NECESSARY.  AN ID-LENGTH LIST ENTRY IS THEN MADE IN THE  *
+*PREVIOUS CONTROL RECORD AND THE RECORD WRITTEN OUT IF THE CURRENT    *
+*TEXT IS LAST IN THE GROUP AND THERE ARE RLDS FOR THE TEXT IN THE     *
+*CURRENT GROUPING.  THIS ALLOWS OVERLAPPING OF THE CONTROL RECORD     *
+*WRITE AND THE ACTUAL PROCESSING OF THE TEXT.  NEXT, ALL RLDS FOR THE *
+*CURRENT TEXT ARE READ INTO CORE AND ASSOCIATED WITH THE TEXT THROUGH *
+*THE TEXT CONTROL BLOCK. THE TEXT IS RELOCATED AND THE PROCESSED RLDS *
+*MOVED TO THE OUTPUT BUFFERS.  IF THE PREVIOUS CONTROL RECORD HAS NOT *
+*BEEN WRITTEN,  IT IS WRITTEN AT THIS TIME.  THE TEXT IS WRITTEN AND  *
+*ALL RLD RECORDS EXCEPT ONE ARE WRITTEN.  IF THE MODULE IS IN OVERLAY,*
+*AN ENTAB IS CREATED AFTER EVERY SEGMENT REQUIRING ONE.  THE TEXT     *
+*CONTROL BLOCKS ARE SWITCHED AND PROCESSING RESUMES ON THE NEXT TEXT. *
+*WHEN THE LAST FOR THE LOAD MODULE HAS BEEN PROCESSED, CONTROL IS     *
+*TRANSFERRED TO THE FINAL PROCESSOR.                                  *
+*                                                                     *
+*                                                                     *
+*ENTRY POINTS:                                                        *
+*       -HEWLFSCD FROM HEWLFOUT                                       *
+*       -WRTTXT FROM HEWLFREL TO WRITE A TEXT RECORD                  *
+*       -WRTCRRLD FROM HEWLFREL TO WRITE A CR/RLD RECORD              *
+*       -CHECKRD FROM HEWLFREL TO CHECK A READ                        *
+*       -CHECKWRT FROM HEWLFREL TO CHECK A WRITE                      *
+*       -GETIDMUL FROM HEWLFREL TO GET NEXT TEXT TO PROCESS           *
+*                                                                     *
+*INPUT: 1) TEXT AND RLDS RECORDS (SEE HEWLFRAT)                       *
+*       2) TEXT I/O TABLE AND TEXT NOTELIST (SEE HEWLFRAT)            *
+*       3) RLD NOTELIST (SEE HEWLFRAT)                                *
+*       4) HESD TABLE (SEE HEWLFOUT)                                  *
+*       5) DELINK TABLE (SEE HEWLFRAT)                                *
+*       6) RELOCATION CONSTANT TABLE (SEE HEWLFADA)                   *
+*       7) SEGTAB1 TABLE (SEE HEWLFADA)                               *
+*       8) REGISTER 1 -ADDRESS OF 1ST HESD ENTAB ENTRY                *
+*OUTPUT: RLD/CONTROL AND TEXT RECORDS IN LOAD MODULE FORMAT ACCEPTABLE*
+*              TO PROGRAM FETCH. THE CONTROL INFORMATION INCLUDES     *
+*              THE FOLLOWING:                                         *
+*        BYTE 0 CONTAINS CONTROL INDICATORS                           *
+*              X'01' A TEXT RECORD FOLLOWS THIS CONTROL RECORD        *
+*              X'02' THIS CONTROL RECORD CONTAINS RLDS ONLY           *
+*              X'03' THIS CONTROL RECORD CONTAINS RLDS AND A TEXT     *
+*                   RECORD FOLLOWS                                    *
+*              X'05' THIS IS THE LAST CONTROL RECORD FOR THIS SEGMENT,*
+*                   NO RLDS ARE PRESENT AND A TEXT RECORD FOLLOWS     *
+*              X'06' THIS IS THE LAST CONTROL RECORD FOR THE SEGMENT, *
+*                   NO TEXT FOLLOWS AND RLDS ARE PRESENT IN THE RECORD*
+*              X'07' THIS IS THE LAST CONTROL RECORD FOR THE SEGMENT, *
+*                   RLDS ARE PRESENT ANT TEXT FOLLOWS                 *
+*              X'0D' THIS IS THE LAST CONTROL RECORD FOR THIS SEGMENT *
+*                   AND LOAD MODULE, NO RLDS ARE PRESENT AND A TEXT   *
+*                   RECORD FOLLOWS                                    *
+*              X'0E' THIS IS THE LAST CONTROL RECORD FOR THIS SEGMENT *
+*                   AND LOAD MODULE, RLDS ARE PRESENT BUT NO TEXT     *
+*                   RECORD FOLLOWS                                    *
+*              X'0F' THIS IS THE LAST CONTROL RECORD FOR THIS SEGMENT *
+*                   AND LOAD MODULE, RLDS ARE PRESENT AND TEXT FOLLOWS*
+*        BYTES 1 THRU 3 CONTAIN ZEROS                                 *
+*        BYTES 4 AND 5 CONTAIN THE NUMBER OF BYTES OF ID-LENGTH IN    *
+*              THIS CONTROL RECORD.  FOR CONTROL INDICATORS 02,06,AND *
+*              0E THIS WILL BE ZERO                                   *
+*        BYTES 6 AND 7 CONTAIN THE NUMBER OF BYTES OF RLD INFORMATION *
+*              IN THE CONTROL RECORD                                  *
+*        BYTES 8 THRU 11 CONTAIN THE READ BITS AND THE LINKAGE EDITOR *
+*              ASSIGNED ADDRESS OF THE TEXT WHICH FOLLOWS             *
+*        BYTES 12 THRU 15  CONTAIN THE FLAGS AND THE LENGTH OF THE    *
+*              TEXT RECORD THAT FOLLOWS                               *
+*        FOR CONTROL INDICATORS  02,06 AND 0E, BYTES 8 THRU 15 WILL BE*
+*              ZERO. THE TEXT RECORDS WILL CONTAIN THE NUMBER OF BYTES*
+*              OF TEXT INDICATED IN THE CONTROL RECORD WHICH PRECEDES *
+*              IT.                                                    *
+*                                                                     *
+*EXTERNAL ROUTINES:                                                   *
+*        HEWLFREL- AT HEWLFREL FOR INITIALIZATION                     *
+*                - AT RELOCATE FOR RELOCATION                         *
+*                - AT SCDENTAB TO CREATE AN ENTAB AND ITS RLDS        *
+*        HEWLCR03- ERROR ROUTINE FOR SYNCHRONOUS ERRORS ON XDAP WRITE *
+*                                                                     *
+*EXITS: NORMAL- TO HEWLFFNL       L  15,ADFINAL                       *
+*                                 BR 15                               *
+*       ERROR-  NONE                                                  *
+*                                                                     *
+*TABLES/WORK AREAS: - REFER TO LINKAGE EDITOR PLM FOR DETAILED        *
+*        DESCRIPTIONS                                                 *
+*        1) ALL PURPOSE TABLE                                         *
+*        2) HESD                                                      *
+*        3) DELINK TABLE                                              *
+*        4) TEXT I/O TABLE                                            *
+*        5) TEXT NOTELIST                                             *
+*        6) RLD NOTELIST                                              *
+*        7) TTR LIST                                                  *
+*        8) TEXT CONTROL BLOCKS(SEE HEWLFREL FOR BLOCK DESCRIPTIONS)  *
+*        9) RLD CONTROL BLOCKS(SEE HEWLFREL)                          *
+*                                                                     *
+*ATTRIBUTES: REUSABLE                                                 *
+*                                                                     *
+*NOTES: THE SECOND PASS IN DETERMINING THE NUMBER OF BYTES READ, USES *
+*        THE RESIDUAL BYTE COUNT IN THE CCW OF THE IOB USED BY BSAM TO*
+*        PERFORM THE READ. TO ACCESS THIS COUNT REQUIRES KNOWLEDGE OF *
+*        THE IOB ADDRESS IN THE DECB USED IN ISSUING THE READ AND     *
+*        THE FORMAT OF THE IOB. IF EITHER OF THESE FORMATS ( IOB  OR  *
+*        DECB ) CHANGE THIS PART OF THE CODE IN THE READ TEXT ROUTINE *
+*        MUST BE CHECKED FOR ACCURACY. ANY CHANGE IN CCW FORMAT WILL  *
+*        ALL AFFECT FORMATTING OF CONTROL RECORDS.                    *
+***********************************************************************
+HEWLFSCD CSECT
+**********************************************************************
+*071200-071800,212200-216400,218800-223600,551200-560800         S01904
+*I084400,I396400                                        OX03510,OY03043
+*I212200,D213400-214000,I572200                           OX4565,OY3055
+*C654400,I671800,I678400                                        XA05128
+* SEE FIX FOR XA05128                                           YA03165
+*I678920                                                        XM09099
+*A678992                                                        XM19517
+*C670000                                                        ZA01410
+*A05200,A679319-679395,A887100                                  ZA02253
+* SEE FIX FOR ZA02253
+*A566700,A5686120-686190                                        OZ04724
+*SEE FIX FOR OY09071
+*A686100-A686800,A614200 (SEE FIX FOR OZ06707)                  OZ06707
+*C685700,685840,686100-REMOVE PTFUZ11354              @XA16348,@ZA17503
+**********************************************************************
+*
+****  OUTPUT RLD CONTROL BLOCK INDICATORS
+LASTUSED EQU   X'20'                   LAST RLD BUFFER FILLED
+LASTOFF  EQU   X'DF'
+***        TEXT CONTROL BLOCK                                       ***
+*                         BYTE 1                                      *
+USED     EQU   X'E0'                    TXT CTRL. BLOCK IN USE
+INUSE    EQU   X'80'                    CONTROL BLOCK IN USE
+NOTINUSE EQU   X'7F'
+BEINGWT  EQU   X'40'                    TEXT BEING WRITTEN
+WRTCKD   EQU   X'3F'                    WRITE CHECKED - CB NOT IN USE
+BEINGRD  EQU   X'20'                    TEXT BEING READ
+RDCHKD   EQU   X'DF'                    READ CHECKED
+RLDS     EQU   X'10'
+FIRSTXT  EQU   X'08'                    TEXT FIRST IN GROUP
+ENDINDIC EQU   X'06'                   END OF GROUP AND SEG
+LASTXT   EQU   X'04'                    TEXT LAST IN GROUP
+SEGMTEND EQU   X'02'                    TEXT IS LAST IN SEGMENT
+MODULEND EQU   X'01'                    TEXT IS LAST IN MODULE
+*                     BYTE 2                                          *
+XDAP     EQU   X'80'                    XDAP WRITE NEEDED
+PREV     EQU   X'07'                    TEST IF PREV CR/RLD WRITTEN
+BUF1PREV EQU   X'24'                    BFR.1 HAS ID-LENGTH LIST
+BUF2PREV EQU   X'12'                    BFR.2 HAS ID-LENGTH LIST
+BUF3PREV EQU   X'09'                    BFR.3 HAS ID-LENGTH LIST
+OUTBUF1  EQU   X'20'                    OUTPUT BFR.1 IS BEING USED
+BUF1OFF  EQU   X'DF'
+OUTBUF2  EQU   X'10'
+BUF2OFF  EQU   X'EF'
+OUTBUF3  EQU   X'08'
+BUF3OFF  EQU   X'F7'
+*                           BYTE  3                                   *
+MORETXT  EQU   X'08'                   MORE TEXT TO PROCESS IN SEGMENT
+TEXTOFF  EQU   X'F7'
+***         TEXT  I/O TABLE  INDICATORS                             ***
+INCORE   EQU   X'80'                    TEXT IN CORE
+TTRENTRY EQU   X'40'                    ENTRY CONTAINS TTR
+OUTORDER EQU   X'20'                    TEXT IS OUT-OF-ORDER
+TEXTDONE EQU   X'10'                    TEXT IS PROCESSED
+*                                             INCORRECT LENGTH
+DCLGTH   EQU   X'04'                   LENGTH TEST FOR DC       ZA02253
+***      RLD  NOTELIST INDICATORS                                   ***
+*INCORE  EQU   X'80'                    RLDS IN CORE
+*TTRENTRY EQU  X'40'                   TTR ENTRY
+BUF2     EQU   X'10'                    RLDS IN BFR2
+*              CONTROL RECORD INDICATORS                              *
+MODEND   EQU   X'08'                    LAST TXT FOR LOAD MODULE
+SEGEND   EQU   X'04'                    LAST TXT FOR SEGMENT
+RLD      EQU   X'02'                    RLDS PRESENT IN RECORD
+RLDOFF   EQU   X'FD'
+TXT      EQU   X'01'                    TEXT FOLLOWS
+*                                                                     *
+*                   NEWSW2 INDICATORS IN APT                          *
+MORERLDS EQU   X'80'                    MORE RLDS STILL TO BE READ
+MOREOFF  EQU   X'7F'
+SPLTMOVD EQU   X'40'                    SPLIT RLD MOVED TO OUTPUT BFR.
+MOVDOFF    EQU   X'BF'
+SPLITRLD EQU   X'08'                    SPLIT RLD SAVED IN HESD
+SPLITOFF EQU   X'F7'
+NOCTLREC EQU   X'04'                   NO RLDS FOR PRECEDING TEXT
+NOCROFF  EQU   X'FB'
+GROUPOFF EQU   X'FD'                   RLDS ARE NOT TO BE GROUPED
+*        APT3  SWITCH INDICATORS                                      *
+*FIRSTXT EQU   X'08'                    FIRST TEXT OF LOAD MODULE
+SEGSTART EQU   X'04'                    TEXT  IS FIRST IN SEGMENT
+SEGOFF   EQU   X'FB'
+RLDSINGP EQU   X'02'                   RLDS IN GROUP
+RLDSOFF  EQU   X'FD'
+SCTR     EQU   X'04'                    SCATTER OPTION ON
+DC       EQU   X'80'                    DC OPTION ON
+OVLY     EQU   X'20'                    OVERLAY OPTION
+LKAZERO  EQU   X'BF'                    LKA IS NOT ZERO
+SIX10    EQU   16                                                S01904
+TWTY     EQU   20                                                S01904
+*                                                                     *
+*                        REGISTER USAGE                               *
+*                                                                     *
+SAVEAREA EQU   13                  SAVE AREA
+RETURN   EQU   14                  NSI REGISTER FOR BALR
+BRANCH   EQU   15                  FIRST LEVEL BRANCH REGISTER
+WORK0    EQU   0                   GENERAL WORK REGISTER
+PARM     EQU   1                   PARM.REG. AND WORK REG.
+APT      EQU   2                   BASE REGISTER FOR APT
+CURTXTCB EQU   3                   ADDRESS OF CURRENT TXT CONTROL BLOCK
+NXTTXTCB EQU   4                   ADDRESS OF NEXT TEXT CONTROL BLOCK
+WORK1    EQU   5                   WORK REGISTER
+WORK2    EQU   6                   WORK REGISTER
+WORK3    EQU   7                   WORK REGISTER
+PREVCREC EQU   8                   ADDRESS OF RLD CONTROL BLOCK FOR
+*                                         PREVIOUS  CR/RLD RECORD
+WORK8    EQU   8                       GENERAL WORK REGISTER-GETIDMUL
+WORK9    EQU   9                       GENERAL WORK REGISTER
+BASE2    EQU   10
+BRANCHX  EQU   11                  SECOND LEVEL BRANCH REGISTER
+BASE     EQU   12                  BASE REGISTER FOR SCD
+REG0     EQU   0                       ERR MSG PARM REG OX03510,OY03043
+REG14    EQU   14                      LINKAGE REG      OX03510,OY03043
+REG15    EQU   15                      LINKAGE REG      OX03510,OY03043
+         ENTRY GETIDMUL                 LOOKAHEAD/READAHEAD ROUTINE
+         EXTRN HEWLCMDB                SYSLMOD DCB ADDRESS
+         EXTRN HEWLCUDB                SYSUT1 DCB ADDRESS
+         BALR  BASE,0
+         USING *,BASE                   BASE REGISTER FOR HEWLMSCD
+         L     BASE2,ADSIO             PICK UP ADDR OF IEWLMSIO
+         ST    BASE2,BASEREG           SAVE SIO BASE REG
+         USING HEWLFSIO,BASE2           ESTABLISH ADDRILITY FOR SIO
+         B     MODID+10
+MODID    DC    C'27MSCD'
+BASEREG  DS    1F                      STORAGE FOR SIO BASE REG
+         USING APTDSECT,APT             BASE REGISTER FOR APT
+*                 INITIALIZATION MOVED TO HEWLFREL FOR SPACE          *
+         L     BRANCH,ADREL
+         BALR  RETURN,BRANCH           BRANCH TO MREL FOR INIT.
+*                                                                     *
+         L     BASE2,BASEREG           RESTORE SIO BASE REG
+         MVC   FREEADDR(4),TXTBFBEG    INIT FIRST FREE ADDR IN BFR.
+         MVC   CURSEG(2),ONE
+         MVC   SRCHSEG(2),ONE          INITIALIZE SEG. NO. AND MULT.
+         MVC   SRCHMULT(2),ZERO
+*                                                                     *
+*    THIS ROUTINE MAKES SURE THAT AN ID-MULT ARE READY TO PROCESS AND *
+*        A LOOKAHEAD IS DONE FOR THE NEXT ID-MULT TO PROCESS          *
+*                                                                     *
+GETID    TM    0(CURTXTCB),USED         TEXT CTRL. BLK. IN USE
+         BZ    GETID1                   NO
+         TM    0(CURTXTCB),BEINGWT      TEXT BEING WRITTEN
+         BO    GETID2                   YES
+         TM    0(CURTXTCB),BEINGRD      TEXT BEING READ
+         BZ    GETID3                  ID-MULT IS READY TO PROCESS
+         BAL   BRANCHX,CHECKRD          CHECK READ
+         NI    0(CURTXTCB),RDCHKD       MARK READ CHECKED
+         B     GETID3
+GETID1   LR    PARM,CURTXTCB
+         NI    0(CURTXTCB),X'00'       CLEAR FLAG BITS
+         NI    2(CURTXTCB),X'00'
+         SR    WORK0,WORK0             INDIC PRIME READ
+         BAL   RETURN,GETIDMUL          BRANCH TO READY ID-MULT
+         B     GETID
+GETID2   BAL   BRANCHX,CHECKWRT         CHECK WRITE
+         NI    0(CURTXTCB),WRTCKD       MARK WRITE CHECKED-CB FREE
+         B     GETID
+GETID3   L     WORK1,12(CURTXTCB)
+         MVC   CURID(2),0(WORK1)       GET CURR. ID
+         MVC   CURMULT(2),2(WORK1)     GET CURR MULT
+         NI    CURMULT,X'03'           CLEAR HIGH ORDER BITS
+         TM    0(CURTXTCB),FIRSTXT     IS TEXT FIRST OF GROUP
+         BZ    LOOKAHED                NO, BRANCH OUT
+         TM    APT3,SEGSTART           WORKING IN NEW SEGMENT
+         BO    GETID3A                 YES, GO TO UPDATE SEG NO.
+         CLC   CURSEG+1(1),SRCHSEG+1   CURR SAME AS SRCH?
+         BE    LOOKAHED                YES, BRANCH OUT
+GETID3A  LH    WORK1,CURID             NO, UPDATE CURR. SEG.
+         SLL   WORK1,3
+         A     WORK1,HESD
+GETID3B  EQU   *
+         ST    WORK1,SAVESTOR          SAVE REG
+         LH    WORK1,CURSEG            PICK UP LAST SEG #
+         LA    WORK1,ON1(WORK1)        ADD ONE TO SEG #
+         STH   WORK1,CURSEG            REPLACE OLD SEG #
+         L     WORK1,SAVESTOR          RESTORE REG
+         CLC   CURSEG+ON1(ON1),FOR(WORK1)  COMPARE UPDATED SEG #
+*                                      WITH NEXT SEG # FROM TIOT
+         BE    SCDANDY                 BRANCH IF EQUAL
+         OI    SSWITCH+ON1,SEGNO       NOT EQUAL,ON SWITCH
+SCDANDY  EQU   *                       CONTINUE
+*                                                                     *
+********    UPDATE ENTRY LIST TO HAVE ONLY ONE PATH    ***************
+*                                                                     *
+         LH    WORK1,CURSEG
+         L     WORK3,SELST             GET BEGINNING OF ENTRY LIST
+         A     WORK1,SGT1              GET CURR. SEG ENTRY IN SEGTA1
+ENTLST1  C     WORK3,CURENTRY          LOOKING AT THE CURRENT ENTRY
+         BE    LOOKAHED                YES
+         CLC   2(1,WORK3),0(WORK1)     NO, ARE SEGMENTS IN SAVE PATH
+         BH    ENTLST3                 NO
+*   SEE IF REGION OF SEGMENT IN ENTRY LIST IS SAME AS CURRENT REGION
+*
+         LA    WORK2,LSTS         LOAD ADD. OF REGION LIST
+TEMP1    CLC   0(1,WORK2),CURSEG+1  IS CUR. SEG. IN THIS REG.
+         BC    10,STORE           YES - STORE THIS REG.
+         LA    WORK2,1(WORK2)     INCREMENT LIST ADD.
+         B     TEMP1
+STORE    MVC   CURRGN(1),0(WORK2)  STORE CURR. REGION
+         LA    WORK2,LSTS         LOAD ADD. OF REGION LIST
+TEMP2    CLC   0(1,WORK2),2(WORK3)  IS ENTRY LIST SEGMENT IN
+*                                            THIS REGION
+         BC    10,COMP            YES - BRANCH
+         LA    WORK2,1(WORK2)     INCREMENT LIST ADDRESS
+         B     TEMP2
+COMP     CLC   0(1,WORK2),CURRGN  IS ENTRY LIST SEGMENT IN SAME
+*                                 REGION AS CURRENT SEGMENT
+         BC    7,ENTLST3          NO - DIFFERENT REGIONS
+ENTLST2  LA    WORK3,6(WORK3)          YES, UPDATE TO NEXT ENTRY
+         B     ENTLST1
+ENTLST3  CLI   2(WORK3),X'01'          KEEP ENTRY FOR ROOOT SEGMENT
+         BE    ENTLST2
+         ST    WORK3,CURENTRY          1ST FREE ADDR IN ENTRY LIST
+         S     WORK3,SELST             BYTES IN ENTRY LIST
+         SR    WORK2,WORK2
+         D     WORK2,SIX
+         STH   WORK3,ENELTC            CUR NO OF ENTRIES IN ENTRY LIST
+LOOKAHED TM    SSWITCH+ON1,SEGNO       IS NOT EQUAL SWITCH ON
+         BZ    LOOKAHD2                NO SO BRANCH
+         NI    SSWITCH+ON1,SEGNOOFF    TURN SWITCH OFF
+         L     WORK1,SAVESTOR          RESTORE REG
+         B     GETID3B                 GET NEXT SEGNO
+LOOKAHD2 TM    ZRO(NXTTXTCB),USED      HAS NEXT ID-MULT BEEN READ
+         BZ    LKAHED1                  NO
+         TM    0(NXTTXTCB),BEINGWT
+         BZ    SPECTEST                YES
+         BAL   BRANCHX,CHECKWRT         CHECK WRITE
+         NI    0(NXTTXTCB),WRTCKD       MARK WRITE CHECKED
+         B     LOOKAHED
+LKAHED1  LR    PARM,NXTTXTCB
+         NI    0(NXTTXTCB),X'00'       CLEAR FLAG BITS
+         NI    2(NXTTXTCB),X'00'
+         LA    WORK0,1                 INDIC LOOKAHEAD READ
+         BAL   RETURN,GETIDMUL          BRANCH TO READY NEXT ID-MULT
+*                                                                     *
+*   SET END INDICATORS WHEN LAST MULTIPLICITY OF LAST CSECT OF SEGMENT*
+*         OR MODULE IS A DS AREA                                      *
+*                                                                    *
+SPECTEST TM    0(NXTTXTCB),INUSE       IS CURR TEXT LAST OF SEGMENT
+         BO    CONTREC                 NO
+         TM    2(CURTXTCB),MORETXT     IS THERE MORE TEXT IN SEG
+         BZ    SPECT1                  NO
+         NI    2(CURTXTCB),TEXTOFF     TURN INDIC OFF
+         B     CONTREC
+SPECT1   LH    WORK1,CURID
+         SLL   WORK1,3
+         A     WORK1,HESD
+         TM    0(WORK1),X'40'          IS CURR CSECT MARKED LAST IN SEG
+         BZ    CONTREC                 NO
+         OI    0(CURTXTCB),ENDINDIC    SET END INDICATORS
+         XC    GROUPLNG(2),GROUPLNG    INIT GROUP CT. FOR NEXT SEG.
+         CLC   CURSEG(2),ENSPC         IS CURR TEXT LAST OF MODULE
+         BNE   CONTREC                 NO
+         OI    0(CURTXTCB),MODULEND    YES, SET END OF MODULE INDIC
+*                                                                     *
+*        MAKE ID-LENGTH LIST ENTRY IN PREVIOUS CONTROL RECORD         *
+*                                                                     *
+CONTREC  LA    BRANCHX,CCWADD           READY BRANCH REGISTER
+         L     WORK3,8(PREVCREC)
+         CLC   4(4,PREVCREC),12(PREVCREC) IS THIS LAST ENTRY
+         BL    CONT30                  NO
+         TM    0(WORK3),RLD             MORE THAN 60 CSECTS GROUPED
+         BO    CONT40                   NO
+         OI    0(CURTXTCB),LASTXT       YES,SET LAST TEXT OF GROUP
+         TM    0(NXTTXTCB),USED         NEXT ID-MULT READ OR BEING WRT.
+         BZ    CONT10                   NO
+         TM    0(NXTTXTCB),BEINGWT      MAYBE
+         BZ    CONT20                   YES
+CONT10   XC    GROUPLNG(2),GROUPLNG     ZERO GROUP LENGTH
+         B     CONT30
+CONT20   MVC   26(2,NXTTXTCB),24(NXTTXTCB) CORRECT GROUP LENGTH
+         OI    0(NXTTXTCB),FIRSTXT      SET 1ST TXT IN GROUP INDICATOR
+         L     WORK2,8(NXTTXTCB)
+         SH    WORK2,24(NXTTXTCB)
+         ST    WORK2,4(NXTTXTCB)       UPDATE BE OF TEXT
+         MVC   GROUPLNG(2),24(NXTTXTCB) UPDATE LNG FOR GROUPING
+         ST    WORK2,PREVBEG           RESET TEXT BEG. ADDR
+         MVC   29(3,NXTTXTCB),CCWDISP+1  RESET CCW ADDR
+CONT30   L     WORK2,4(PREVCREC)
+         MVC   16(2,WORK2),CURID       MAKE ID-LENGTH LIST ENTRY
+         MVC   18(2,WORK2),24(CURTXTCB)
+         LA    WORK2,4(WORK2)
+         ST    WORK2,4(PREVCREC)        UPDATE 1ST FREE ADDR FIELD
+         LH    WORK2,2(PREVCREC)       UPDATE ID-LENGTH FIELD
+         LA    WORK2,4(WORK2)
+         STH   WORK2,2(PREVCREC)       UPDATE ID-LENGTH FIELD
+         BR    BRANCHX
+CONT40   BAL   BRANCHX,CONT30           BRANCH-MAKE ID-LENGTH LST ENTRY
+         MVC   CONTSAVE(16),0(WORK3)    SAVE CONTROL INFORMATION
+         XC    0(16,WORK3),0(WORK3)     ZERO CONTROL INFORMATION
+         OI    0(WORK3),RLD             SET RLD'S PRESENT
+         MVC   6(2,WORK3),CONTSAVE+6    RESTORE RLD BYTE COUNT
+         LR    PARM,PREVCREC
+         BAL   RETURN,WRTCRRLD          WRITE AN RLD RECORD
+         BAL   BRANCHX,CHECKWRT        CHECK WRITE
+         NI    0(PREVCREC),WRTCKD      MARK CHECKED
+         OI    0(PREVCREC),INUSE
+         L     WORK3,8(PREVCREC)       BFR. BEG. ADDR.
+         MVC   0(16,WORK3),CONTSAVE
+         NI    0(WORK3),RLDOFF          SET RLD PRESENT BIT OFF
+         LH    WORK2,6(WORK3)           BYTES OF RLD INFORMATION
+         XC    6(2,WORK3),6(WORK3)      ZERO RLD BYTE FIELD
+         LA    WORK2,16(WORK3,WORK2)    BEGINNING OF ID-LENGTH LIST
+         LH    WORK1,2(PREVCREC)        BYTES OF ID
+         BCTR  WORK1,0
+         EX    WORK1,MOVE              MOVE ID-LENGTH LIST
+         LA    WORK1,1(WORK3,WORK1)
+         ST    WORK1,4(PREVCREC)        UPDATE 1ST FREE ADDRESS
+*                                                                     *
+*     MOVE CCW DISPLACEMENT INFORMATION TO THE CONTROL RECORD         *
+*                                                                     *
+CCWADD   TM    0(CURTXTCB),FIRSTXT      TEXT 1ST IN GROUP
+         BZ    RLDSCAN                  NO
+         MVC   8(4,WORK3),28(CURTXTCB) YES, PUT CCW DISP IN CR
+         OI    0(WORK3),TXT             SET TXT PRESENT INDICATOR
+         NI    APT3,RLDSOFF            SET RLDS FOR GROUP INDIC OFF
+         TM    PDSE7,OVLY              IS PROGRAM IN OVLY
+         BO    CCW0                    YES, ORIGIN OF SEGTAB =0
+         TM    APT3,FIRSTXT            FIRST TXT OF LOAD MODULE
+         BZ    CCW0                    NO
+         NC    29(3,CURTXTCB),29(CURTXTCB)  IS LKA OF 1ST TEXT =0
+         BZ    CCW0                    YES
+*   *   *   *   *   *   *   *   *   *   *   *   *   *   *   *   *   *
+*   SET UP AND WRITE OUT CONTROL RECORD FOR THE ONE BYTE OF TEXT    *
+*   TO BE PLACED AT ADDR ZERO                                       *
+*   *   *   *   *   *   *   *   *   *   *   *   *   *   *   *   *   *
+         STM   R14,WORK3,SAV10         SAVE REGISTERS            S01904
+*    FIND FIRST NON-ZERO LENGTH SD, PC, OR CM WITH        OX4565,OY3055
+*    ADDRESS ZERO AND ASSIGN ITS CESDID TO ONE-BYTE       OX4565,OY3055
+*    TEXT RECORD                                          OX4565,OY3055
+         L     WORK3,HESD              PT TO HESD-8       OX4565,OY3055
+         SR    WORK2,WORK2             ZERO REG           OX4565,OY3055
+NEXTID   LA    WORK2,1(,WORK2)         INCR ESDID CNTR    OX4565,OY3055
+         LA    WORK3,8(,WORK3)         PT TO NEXT HESD    OX4565,OY3055
+         TM    0(WORK3),X'0F'          CHK FOR SD ITEM    OX4565,OY3055
+         BZ    TESTMOR2                BRANCH IF SD       OX4565,OY3055
+         TM    0(WORK3),X'04'          CHK FOR CM/PC ITEM OX4565,OY3055
+         BO    TESTMOR1                IF FOUND, BRANCH   OX4565,OY3055
+         B     NEXTID                  TRY NXT HESD ENTRY OX4565,OY3055
+TESTMOR1 TM    0(WORK3),X'02'          CHK FOR PR ITEM    OX4565,OY3055
+         BO    NEXTID                  BRANCH IF FOUND    OX4565,OY3055
+TESTMOR2 CLC   1(3,WORK3),ZEROS3       CHK ADDRESS ZERO   OX4565,OY3055
+         BNE   NEXTID                  BRANCH IF NOT      OX4565,OY3055
+         CLC   5(3,WORK3),ZEROS3       CHK LENGTH ZERO    OX4565,OY3055
+         BE    NEXTID                  BRANCH IF SO       OX4565,OY3055
+         LA    WORK3,BYTCTRRD          PICK UP CNTRL RCD ADDR    S01904
+         STH   WORK2,SIX10(WORK3)      PUT CESD ID IN CTRL RCD   S01904
+         LA    WORK2,TWTY              PUT LENGTH OF RCD IN REG  S01904
+         BAL   BRANCHX,SCDWRITE        WRITE CTRL RCD            S01904
+         BAL   BRANCHX,CHECKWRT        CHECK WRITE               S01904
+*   *   *   *   *   *   *   *   *   *   *   *   *   *   *   *   *   *
+*    SET UP AND WRITE OUT THE 1 BYTE OF TEXT                        *
+*   *   *   *   *   *   *   *   *   *   *   *   *   *   *   *   *   *
+         LA    WORK2,ON1               LENGTH OF TEXT RCD IN REG S01904
+         LA    WORK3,TXTBYT            PICK UP ADDR OF TEXT      S01904
+         BAL   BRANCHX,SCDWRITE        WRITE THE RECORD          S01904
+         BAL   BRANCHX,CHECKWRT        CHECK THE WRITE           S01904
+         BAL   BRANCHX,NOTEMCRO        GET TTR OF TEXT ON SYSLM  S01904
+         ST    PARM,PDSE4              PUT TTR OF 1ST TXT INPDSD S01904
+         MVI   PDSE10+ON1,ON1          PUT LENGTH IN PDS DICT    S01904
+         NI    APT3,FIRSTOFF           TURN OFF 1ST TXT BIT      S01904
+         LM    R14,WORK3,SAV10         RESTORE REGS              S01904
+*                                                                     *
+*   CHECK FOR SAVED SPLIT RLD - MOVE SPLIT RLD TO OUTPUT BUFFER       *
+*                                                                     *
+CCW0     TM    NEWSW2,SPLITRLD         HAS SPLIT RLD BEEN SAVED
+         BZ    RLDSCAN                  NO
+         TM    1(CURTXTCB),BUF1PREV  DOES BUFFER1 HAVE CNTRLRCD
+         BO    CCW4            YES,GO TO CHECK BUFFER2
+         L     WORK1,OUTCB1    NO,PICK UP BUFFER1 CB AND CHECK IT
+         TM    0(WORK1),X'40'          IS IT WRITTEN YET
+         BZ    CCW1                    YES, USE IT
+         BAL   BRANCHX,CHECKWRT        NO, GO TO CHECK WRITE
+         B     CCW1                    GO TO USE BUFFER1
+CCW4     L     WORK1,OUTCB2            USE BUFFER 2
+         TM    0(WORK1),X'40'          IS IT WRITTEN YET
+         BZ    CCW5                    YES, GO TO USE IT
+         BAL   BRANCHX,CHECKWRT        NO, GO TO CHECK WRITE
+CCW5     OI    1(CURTXTCB),OUTBUF2   INDICATE BUFFER2 BEING USED
+         B     CCW2
+CCW1     OI    1(CURTXTCB),OUTBUF1      INDICATE BFR1 BEING USED
+CCW2     OI    0(WORK1),INUSE           MARK CTRL BLK USED
+         L     WORK2,8(WORK1)           GET BUFFER BEG.
+         XC    0(16,WORK2),0(WORK2)     CLEAR THE CONTROL RECORD
+         OI    0(WORK2),RLD             SET RLD INDIC ON
+         MVI   7(WORK2),X'08'           PUT IN RLD BYTE CT
+         L     WORK3,HESD
+         MVC   16(8,WORK2),0(WORK3)    MOVE SAVED RLD TO OUTPUT BUFFER
+         TM    0(WORK3),X'80'          IS R MARKED DELINK
+         BZ    CCW3                    NO
+         NI    0(WORK3),X'7F'          TURN OFF DELINK BIT
+         LH    WORK3,0(WORK3)
+         MH    WORK3,FIVE
+         A     WORK3,DLKT              DELINK TABLE ENTRY FOR R PTR
+         MVC   16(2,WORK2),0(WORK3)    CHANGE TO DELINKED R PTR
+CCW3     LA    WORK2,8(WORK2)
+         ST    WORK2,4(WORK1)           SAVE 1ST FREE ADDR.
+         NI    NEWSW2,SPLITOFF          SET SPLIT RLD SAVED INDIC OFF
+         OI    NEWSW2,SPLTMOVD          SPLIT RLD HAS BEEN MOVED
+         ST    WORK1,CBTOUSE            SAVE CTRL. BLK. ADDR
+           OI  APT3,RLDSINGP
+           ST  WORK1,LASTBUF
+*                                                                     *
+*                                                                     *
+*      PRELIMINARY SCAN OF RLD NOTELIST TO SEE IF TEXT HAS RLD'S.  IF *
+*      THE TEXT HAS RLD'S AND IT IS THE LAST TEXT FOR THE GROUP, THE  *
+*      CONTROL RECORD WRITE CAN BE OVERLAPPED WITH RLD READ'S AND     *
+*      THE PROCESSING OF TEXT.                                        *
+*                                                                     *
+*                                                                     *
+RLDSCAN  L     WORK1,RNLS2              START OR RLD NOTELIST
+         LH    WORK2,ENR2C              NO. OF RLD NOTELIST ENTRIES
+         LTR   WORK2,WORK2             IS NOTELIST EMPTY
+         BZ    LASTTEXT                YES
+COMPID   CLC   CURID(2),0(WORK1)        CUR. ID = NOTELIST ENTRY ID
+         BNE   NEXTENT
+         MVC   TEMP(2),2(WORK1)
+         NI    TEMP,X'03'               CLEAR INDICATORS
+         CLC   CURMULT(2),TEMP          CUR. MULT  = ENTRY MULT
+         ST    WORK1,RLDION             SAVE ADDR OF NOTELIST ENTRY
+         BE    CRREADY                  YES
+NEXTENT  LA    WORK1,9(WORK1)           UPDATE TO NEXT NOTELIST ENTRY
+         BCT   WORK2,COMPID
+         B     LASTTEXT                 NO RLD'S FOR TEXT
+*                                                                     *
+*        WRITE PREVIOUS CONTROL RECORD IF READY TO BE WRITTEN
+*                                                                     *
+CRREADY  OI    0(CURTXTCB),RLDS         SET RLD'S FOR TXT IN CTRL BLK
+         OI    APT3,RLDSINGP           SET RLDS IN GROUP INDIC
+         TM    0(CURTXTCB),LASTXT       IS TXT LAST IN GROUP
+         BZ    READYRLD                 NO
+         LR    PARM,PREVCREC
+         BAL   RETURN,WRTCRRLD          GO TO WRITE PREVIOUS CTRL. REC.
+         NC    1(1,CURTXTCB),1(PREVCREC) MARK PREV.CTRL.REC.WRITTEN
+*                                                                     *
+*     GET ALL NEEDED RLDS AND PASS CONTROL TO HEWLFREL TO RELOCATE    *
+*                                                                     *
+READYRLD L     PARM,RLDION              GET 1ST NOTELIST ENTRY FOR
+*                                              NEEDED RLD'S
+         BAL   RETURN,RDRLD             GO TO GET ALL NEEDED RLD'S
+         L     BRANCHX,RELOC
+         BALR  RETURN,BRANCHX          GO TO RELOCATE RLDS
+         L     BASE2,BASEREG           RESTORE SIO BASE REG
+         TM    NEWSW2,MORERLDS          MORE RLDS STILL TO READ
+         BO    READYRLD                 YES, GO TO READ
+*                                                                     *
+** SPECIAL TESTING TO FIND LEAST FILLED BUFFER TO USE FOR ID-LENGTH***
+*                                                                     *
+         ST    PARM,LASTBUF            SAVE CB ADDR OF LAST BFR FILLED
+LASTTEXT TM    0(CURTXTCB),LASTXT      IS CURRENT TEXT LAST OF GROUP
+         BZ    LASTTXT                 NO
+         TM    APT3,RLDSINGP           WERE THERE ANY RLDS FOR GROUP
+         BZ    LASTTXT                 NO
+          NI    NEWSW2,MOVDOFF
+         L     PARM,LASTBUF            YES, THEN SET INDIC IN CB OF
+         TM    0(PARM),INUSE           EMPTY BUFFER--SPLIT ADCON ONLY
+         BZ    LASTTXT                 YES
+         OI    0(PARM),LASTUSED              LAST BUFFER FILLED
+*                                                                     *
+* CHECK IS MORE TEXT IN CURRENT GROUP. IF MORE TEXT, GO TO PROCESS    *
+*     IT.  IF ALL TEXT PROCESSED FOR GROUP PREPARE TO WRITE THE TEXT  *
+*                                                                     *
+LASTTXT  TM    0(CURTXTCB),LASTXT       CURR. TXT LAST IN GROUP
+         BO    LASTTXT0                YES
+         MVI   0(CURTXTCB),X'00'       CLEAR INDICATORS
+         B     SGEND0                  GO TO PROCESS NEXT TEXT OF GROUP
+LASTTXT0 NI    NEWSW2,GROUPOFF         RLDS ARE NOT TO BE GROUPED
+         TM    1(CURTXTCB),PREV         PREVIOUS CR/RLD WRITTEN YET
+         BZ    TEXTWRIT                 YES
+         TM    APT3,RLDSINGP           ANY RLDS FOR FOLLOWING TXT
+         BO    LASTTXT2
+         TM    0(CURTXTCB),SEGMTEND    IS TEXT LAST IN SEGMENT
+         BZ    LASTTXT2                NO
+         TM    PDSE7,OVLY              IS OVERLAY SPECIFIED
+         BZ    LASTTXT1                NO
+         CLC   CURSEG+1(1),ENTABSEG    IS AN ENTAB NEEDED
+         BE    LASTTXT2                YES
+*                                                                     *
+*      SET-UP AND WRITE PREVIOUS CONTROL RECORD IF NOT ALREADY WRITTEN*
+*                                                                     *
+LASTTXT1 L     WORK2,8(PREVCREC)       BEG. OF BUFFER
+         OI    0(WORK2),SEGEND         SET END OF SEG IN CR
+         CLC   CURSEG(2),ENSPC         LAST SEG OF MODULE
+         BNE   LASTTXT2
+         OI    0(WORK2),MODEND         SET END OF MOD. IN CR
+LASTTXT2 LR    PARM,PREVCREC
+         BAL   RETURN,WRTCRRLD         BRANCH TO WRITE PREV CTRL REC
+         NC    1(1,CURTXTCB),1(PREVCREC) MARK PREV.CTRL.REC.WRITTEN
+*                                                                     *
+*          WRITE A TEXT RECORD                                        *
+*                                                                     *
+TEXTWRIT TM    0(CURTXTCB),INUSE       HAS TEXT BEEN WRITTEN
+         BO    WRIT00                  NO
+         TM    1(CURTXTCB),XDAP        IS XDAP WRITE NEEDED
+         BZ    WRIT0                   NO
+WRIT00   BAL   RETURN,WRTTXT            BRANCH TO WRITE TEXT
+*                                                                     *
+*    WRITE ALL RLD RECORDS EXCEPT ONE                                 *
+*                                                                     *
+WRIT0    TM    1(CURTXTCB),OUTBUF1     IS BUFFER 1 BEING USED
+         BZ    WRIT10                  NO
+         L     PARM,OUTCB1
+         TM    0(PARM),LASTUSED        IS IT THE LAST BUFFER FILLED
+         BZ    WRIT1                   NO
+            LR PREVCREC,PARM
+         OI    1(CURTXTCB),BUF1PREV    YES,USE FOR ID-LENGTH
+         B     WRIT10
+WRIT1    BAL   RETURN,WRTCRRLD         WRITE BUF 1
+         NI    1(CURTXTCB),BUF1OFF     TURN OFF BUF 1 BEING USED
+WRIT10   TM    1(CURTXTCB),OUTBUF2     IS BUF 2 BEING USED
+         BZ    WRIT20                  NO
+         L     PARM,OUTCB2
+         TM    0(PARM),LASTUSED        IS IT THE LAST BUFFER FILLED
+         BZ    WRIT2                   NO
+         OI    1(CURTXTCB),BUF2PREV    YES,USE FOR ID-LENGTH
+            LR PREVCREC,PARM
+         B     WRIT20
+WRIT2    BAL   RETURN,WRTCRRLD         WRITE BUF 2
+         NI    1(CURTXTCB),BUF2OFF     TURN OFF BUF 2 BEING USED
+WRIT20   TM    1(CURTXTCB),OUTBUF3     IS BUF 3 BEING USED
+         BZ    WRIT4                   NO
+         L     PARM,OUTCB3
+         TM    0(PARM),LASTUSED        IS IT THE LAST BUFFER FILLED
+         BZ    WRIT3                   NO
+         OI    1(CURTXTCB),BUF3PREV    YES,USE FOR ID-LENGTH
+            LR PREVCREC,PARM
+         B     TSTSGEND
+WRIT3    BAL   RETURN,WRTCRRLD         WRITE BUF 3
+         NI    1(CURTXTCB),BUF3OFF     TURN OFF BUF 3 BEING USED
+         B     TSTSGEND
+WRIT4    TM    0(PREVCREC),LASTUSED    HAS PREV CTRL REC BEEN IDENT
+         BO    TSTSGEND                YES
+         OI    NEWSW2,NOCTLREC          NO,SET NO CTRL.RECS. IN USE
+WRIT5    L     PREVCREC,OUTCB1         USE BFR1. AS PREV. CR
+         TM    0(PREVCREC),BEINGWT     IS IT BEING WRITTEN
+         BO    WRIT6                   YES
+         OI    1(CURTXTCB),BUF1PREV
+         B     TSTSGEND
+WRIT6    L     PREVCREC,OUTCB2         YES, THEN USE BFR2 AS PREV CR
+         OI    1(CURTXTCB),BUF2PREV
+*                                                                     *
+*  TEST FOR END OF SEGMENT--IF NOT SWITCH TEXT CONTROL BLOCKS AND     *
+*             RETURN TO PROCESS NEXT TEXT                             *
+*                                                                     *
+TSTSGEND XC    2(2,PREVCREC),2(PREVCREC) ZERO ID-LENGTH FIELD
+         TM    0(CURTXTCB),SEGMTEND     IS TEXT LAST IN SEGMENT
+         BO    SGEND1                   YES
+         NI    NEWSW2,NOCROFF          INIT NO CTRL REC INDIC
+         TM    0(PREVCREC),INUSE       DOES CONT. REC CONTAIN RLDS
+         BO    SGEND0                  YES
+SGEND    MVC   4(4,PREVCREC),8(PREVCREC) 1ST FREE ADDR = BFR BEG
+         XC    2(2,PREVCREC),2(PREVCREC) ZERO ID-LENGTH FIELD
+         OI    0(PREVCREC),INUSE       MARK CB IN USE
+         L     WORK1,8(PREVCREC)
+         XC    0(16,WORK1),0(WORK1)    ZERO CONTROL RECORD
+SGEND0   XR    CURTXTCB,NXTTXTCB        SWITCH TEXT CONTROL BLOCKS
+         XR    NXTTXTCB,CURTXTCB
+         XR    CURTXTCB,NXTTXTCB
+         MVC   1(1,CURTXTCB),1(NXTTXTCB) TRANSFER INDICATORS
+         MVC   1(2,NXTTXTCB),ZERO      ZERO WHEN NOT LAST TEXT OF GROUP
+         NI    0(PREVCREC),LASTOFF
+         B     GETID
+*                                                                     *
+*               END OF SEGMENT LOGIC                                  *
+*                                                                     *
+SGEND1   NI    0(PREVCREC),LASTOFF     CLEAR LAST BUFFER USED INDIC
+         TM    PDSE7,OVLY              IS OVERLAY SPECIFIED
+         BZ    SGEND1A                 NO
+         CLC   CURSEG+1(1),ENTABSEG    IS AN ENTAB NEEDED
+         BNE   SGEND1A
+         LA    RETURN,SGEND3           GET RETURN ADDRESS
+         L     BRANCHX,ADENTAB
+         BR    BRANCHX                 GO TO CREATE ENTAB
+SGEND1A  OI    APT3,SEGSTART           YES,SET SEG BEG FOR NEXT SEG
+         TM    NEWSW2,NOCTLREC          ANY RLDS STILL IN BUFFERS
+         BO    SGEND3                   NO
+         CLC   CURSEG(2),ENSPC          IS THIS THE LAST SEGMENT
+         BL    SGEND2                   NO
+         L     WORK1,8(PREVCREC)        YES
+         OI    0(WORK1),MODEND          SET END OF MODULE INDICATOR
+SGEND2   L     WORK1,8(PREVCREC)
+         OI    0(WORK1),SEGEND          SET END OF SEGMENT INDIC.
+         LR    PARM,PREVCREC
+         BAL   RETURN,WRTCRRLD          GO TO WRITE CONTROL RECORD
+         NC    1(1,CURTXTCB),1(PREVCREC)
+         NI    0(CURTXTCB),X'FD'       CLEAR END OF SET INDIC
+SGEND3   NI    NEWSW2,NOCROFF          INIT. NO CTRL REC INDIC
+         NI    0(CURTXTCB),X'F0'       TURN OFF SEGMENT END INDIC--
+*                                           TO REUSE TSTSGEND CODING
+         L     BASE2,BASEREG           RESTORE SIO BASE REG
+         CLC   CURSEG(2),ENSPC          ANY MORE SEGMENTS TO PROCESS
+         BL    WRIT5                   YES
+*                                                                     *
+*     PROCESSING COMPLETE - GO TO FINAL PROCESSOR                     *
+*                                                                     *
+         TM    0(PREVCREC),BEINGWT      CHECK FOR UNCHECKED CR WRITE
+         BO    ENDCHECK
+         TM    0(CURTXTCB),BEINGWT      CHECK FOR UNCHECKED TEXT WRITE
+         BZ    FINISH
+ENDCHECK BAL   BRANCHX,CHECKWRT         GO TO CHECK LAST WRITE
+FINISH   L     BRANCH,ADFINAL
+         BR    BRANCH                   GO TO FINAL PROCESSOR
+*                                                                     *
+*                                                                     *
+*                                                                     *
+*            LOOK-AHEAD / READ-AHEAD ROUTINE                          *
+*                                                                     *
+*                                                                     *
+*                                                                     *
+GETIDMUL EQU   *
+         STM   WORK1,BRANCHX,SAVEREG1  SAVE REGISTER USED
+         L     BASE2,BASEREG      RESTORE SECOND BASE REG.
+         ST    RETURN,RETURNRG          SAVE RETURN REGISTER
+         L     WORK1,SRCHBEG
+         CLC   SRCHMULT(2),ZERO         WORKING WITH NEW CSECT
+         BNE   IDMUL50                  NO
+*                                                                     *
+*  SEARCH FOR TEXT I/O TABLE ENTRY FOR CURRENT ID AND MULTIPLICITY    *
+*                                                                     *
+IDMUL10  CL    WORK1,TXTIOEND           AT END OF TEXT I/O TABLE
+         BH    IDMUL90                  YES
+         TM    2(WORK1),TEXTDONE        IS TEXT ALREADY PROCESSED
+         BZ    IDMUL30
+IDMUL20  LA    WORK1,4(WORK1)           UPDATE TO NEXT ENTRY
+         B     IDMUL10
+IDMUL30  TM    2(WORK1),OUTORDER        IS TEXT OUT-OF-ORDER TEXT
+         BO    IDMUL20
+         LH    WORK2,0(WORK1)           GET ID
+         SLL   WORK2,3                  MULT. BY SIZE OF ENTRY
+         A     WORK2,HESD               HESD ENTRY FOR ID
+         CLC   SRCHSEG+1(1),4(WORK2)   IS ID IN CURRENT SEGMENT
+         BNE   IDMUL20                  NO
+         MVC   SRCHID(2),0(WORK1)       SET SEARCH ID = ENTRY ID
+         ST    WORK1,IDBEG
+         L     WORK3,4(WORK2)
+         LA    WORK3,0(WORK3)           LENGTH OF CSECT
+         LH    WORK2,LSTMULSZ          PICK UP LAST MULT SIZE
+         LA    WORK2,7(WORK2)          ROUND TO
+         N     WORK2,DBLWRDDD          DOUBLE WORD BOUNDARY
+         STH   WORK2,LSTMULSS          SAVE IT
+         SR    WORK2,WORK2             ZERO OUT WORK2 REG
+         D     WORK2,MULTSIZE
+         STH   WORK2,LSTMULSZ          SAVE LAST MULT. SIZE
+         LTR   WORK2,WORK2              IS THE REMAINDER ZERO
+         BC    7,IDMUL40                NO
+         MVC   LSTMULSZ(2),MULTSIZE+2  SAVE LAST MULT SIZE
+         BCTR  WORK3,0                  DECR. HIGH MULT. BY 1
+IDMUL40  STH   WORK3,HIGHMULT           SAVE HIGHEST MULT. FOR ID
+IDMUL50  MVC   TEMP(2),2(WORK1)        GET ENTRY MULT
+         NI    TEMP,X'03'               CLEAR OUT FLAG BITS
+         CLC   TEMP(2),HIGHMULT        COMP TO HI MULT  OX03510,OY03043
+         BNH   IDMUL51                 BR IF VALID      OX03510,OY03043
+         LA    REG0,X'0438'            LOG MSG IEW0564  OX03510,OY03043
+         L     REG15,ERDIG             GET LINK TO ERR  OX03510,OY03043
+         BALR  REG14,REG15             GO LOG MSG, QUIT OX03510,OY03043
+IDMUL51  EQU   *                       ERR MSG BYPASS   OX03510,OY03043
+         CLC   TEMP(2),SRCHMULT        ENTRY MULT = SEARCH MULT
+         BE    IDMUL150
+IDMUL60  LA    WORK1,4(WORK1)           INDEX TO NEXT TXTIOT ENTRY
+         ST    WORK1,SRCHBEG
+         CL    WORK1,TXTIOEND           AT END OF TEXT I/O TABLE
+         BH    IDMUL70                 YES
+         CLC   0(2,WORK1),SRCHID        ENTRY ID = SEARCH ID
+         BE    IDMUL50                  YES, CHECK MULT.
+         B     IDMUL60                  NO, UPDATE TO NEXT ENTRY
+*                                                                     *
+*   MULTIPLICITY WITH NO TEXT ----COMPENSATE FOR IT                   *
+*                                                                     *
+IDMUL70  CLC   SRCHMULT(2),ZERO        IS FIRST MULT MISSING
+         BNE   IDMUL75                 NO
+         LH    WORK2,SRCHID            GET TEXT ID
+         SLL   WORK2,3
+         A     WORK2,HESD
+         MVC   CCWDISP+1(3),1(WORK2)   INIT CCWDISP =LKA
+         B     IDMUL77
+IDMUL75  L     WORK3,CCWDISP
+         A     WORK3,MULTSIZE
+         ST    WORK3,CCWDISP            UPDATE CCW DISP. BY MULT. SIZE
+IDMUL77  LH    WORK2,SRCHMULT
+         LA    WORK2,1(WORK2)
+         STH   WORK2,SRCHMULT           UPDATE SEARCH MULT.
+         CH    WORK2,HIGHMULT           IS IT A VALID MULT FOR THIS ID
+         BH    IDMUL80                  NO
+         MVC   SRCHBEG(4),IDBEG
+         L     WORK1,IDBEG
+         B     IDMUL50
+IDMUL80  XC    SRCHMULT(2),SRCHMULT     SET SEARCH MULT = 0
+         L     WORK1,IDBEG
+         LA    WORK1,4(WORK1)
+         ST    WORK1,SRCHBEG
+         B     IDMUL10
+*                                                                     *
+*        ALL  TEXT FOR A SEGMENT HAS BEEN  PROCESSED                  *
+*                                                                     *
+IDMUL90  LH    WORK2,SRCHSEG
+         LA    WORK2,1(WORK2)
+         STH   WORK2,SRCHSEG            UPDATE TO NEXT SEGMENT
+         MVC   SRCHBEG(4),TXTIO         INIT SEARCH POINTER
+IDMUL130 TM    0(PARM),FIRSTXT         IS TEXT FIRST OF GROUP
+         BZ    IDMUL140
+         MVC   29(3,PARM),CCWDISP+1    PUT CCW DISP IN TXT CTRL BLK.
+IDMUL140 L     RETURN,RETURNRG          RESTORE REGISTERS
+         LM    WORK1,BRANCHX,SAVEREG1  RESTORE REGISTERS USED
+         BR    RETURN                   RETURN
+*                                                                     *
+*             GET CCW DISPLACEMENT INFORMATION                        *
+*                                                                     *
+IDMUL150 ST    WORK1,12(PARM)           STORE TXTIOT ENTRY ADDR.IN CB
+         CLC   SRCHMULT(2),ZERO         WORKING WITH NEW CSECT
+         BNE   IDMUL170                 NO
+         LH    WORK2,0(WORK1)           GET ID
+         SLL   WORK2,3
+         A     WORK2,HESD
+         L     WORK3,CCWDISP           PICK UP CCW DISP
+         LA    WORK3,0(WORK3)          CLEAR HIGH ORDER BYTE
+         AH    WORK3,LSTMULSS          ADD TO LAST MULT SIZE
+         ST    WORK3,CCWDISP           SAVE IT TEMPORARILY
+         CLC   CCWDISP+1(3),1(WORK2)   IS THE NEXT CSECT ADJA.
+         MVC   CCWDISP+1(3),1(WORK2)   REPLACE IT ANY WAY
+         BE    IDMUL180                YES,GROUPING POSSIBLE
+         OI    SSWITCH,X'01'           NO,DO NOT ALLOW GROUPING
+         B     IDMUL180
+IDMUL170 L     WORK2,CCWDISP
+         A     WORK2,MULTSIZE
+         ST    WORK2,CCWDISP            UPDATE CCW DISP. FOR CUR. MULT.
+*                                                                     *
+*      GET FIRST AND LAST TXTIOT ENTRIES FOR GROUP                    *
+*                                                                     *
+IDMUL180 CL    WORK1,TXTIO              CURRENT ENTRY FIRST IN TABLE
+         BE    IDMUL182                 YES
+         SH    WORK1,FOUR               DECR. TO PRECEDING ENTRY
+         TM    2(WORK1),TTRENTRY        IS THIS A TTR ENTRY
+         BZ    IDMUL180                 NO
+         LA    WORK1,4(WORK1)           YES,UPDATE TO FIRST GROUP ENTRY
+IDMUL182 ST    WORK1,16(PARM)           SAVE AS BEG. ENTRY
+IDMUL184 TM    2(WORK1),TTRENTRY        IS THIS A TTR ENTRY
+         BO    IDMUL185                 YES
+         CL    WORK1,TXTIOEND           IS THIS THE LAST ENTRY
+         BE    IDMUL185                 YES
+         LA    WORK1,4(WORK1)           NO, INCR. TO THE NEXT ENTRY
+         B     IDMUL184
+IDMUL185 ST    WORK1,20(PARM)           SAVE AS END ENTRY
+         L     WORK1,12(PARM)
+         TM    2(WORK1),INCORE          IS THE TEXT IN CORE
+         BO    IDMUL300                 YES
+*                                                                     *
+*    CHECK IF RECORD CAN BE READ IN BOTTOM OF BUFFER                  *
+*                                                                     *
+         SR    WORK2,WORK2              CLEAR FOR ACCUM. RECORD LENGTH
+         L     WORK3,TXTIO
+         L     WORK1,16(PARM)           GET  BEG. GROUP ENTRY
+         LNR   WORK3,WORK3
+         AR    WORK3,WORK1
+         SRL   WORK3,2                  GET ENTRY NUMBER
+         MH    WORK3,SEVEN
+         A     WORK3,TNLS2              GET ADDR.OF CORRES.NOTELIST
+IDMUL190 MVC   TEMP(2),5(WORK3)              ENTRY - GET LENGTH
+         AH    WORK2,TEMP               ADD LENGTH TO ACCUM RECORD CT.
+         CL    WORK1,20(PARM)           IS THIS LAST ENTRY FOR GROUP
+         BE    IDMUL210                 YES
+         LA    WORK1,4(WORK1)           NO, UPDATE TO NEXT TXTIOT ENTRY
+         LA    WORK3,7(WORK3)           UPDATE TO NEXT NOTELIST ENTRY
+         B     IDMUL190
+IDMUL210 LR    WORK1,WORK2
+         MVC   TTRPOINT(3),2(WORK3)    GET TTR FOR POINT
+         A     WORK1,FREEADDR
+         CL    WORK1,TXTBFEND           WILL REC. FIT IN BOTTOM OF BFR.
+         BH    IDMUL220                 NO, CHECK IF FITS AT TOP
+         BAL   RETURN,RDTXT             YES, BRANCH TO READ NEEDED TXT
+         B     IDMUL301
+*                                                                     *
+*   CHECK TO SEE IF RECORD CAN BE READ AT TOP OF BFR.-CHECK FOR A     *
+*                   POSSIBLE SPLIT  ADDRESS CONSTANT                  *
+IDMUL220 LTR   WORK0,WORK0              WORKING WITH CUR. OR NEXT TXTCB
+         BZ    IDMUL230                CURR TXTCB
+         TM    0(CURTXTCB),INUSE        IS OTHER TXTCB IN USE
+         BZ    IDMUL240                 NO,TEXT WILL FIT AT TOP OF BFR.
+         L     WORK3,4(CURTXTCB)        GET BEG. ADDR. OF TEXT
+         OI    0(CURTXTCB),LASTXT       SET LAST TXT IN GROUP INDIC.
+         XC    GROUPLNG(2),GROUPLNG    INIT GROUPLNG
+         B     IDMUL235
+IDMUL230 TM    0(NXTTXTCB),INUSE        IS OTHER TXTCB IN USE
+         BZ    IDMUL240                 NO, TEXT WILL FIT AT TOP OF BFR
+         L     WORK3,4(NXTTXTCB)
+IDMUL235 A     WORK2,TXTBFBEG
+         CLR   WORK2,WORK3              WILL TEXT FIT AT TOP OF BFR.
+         BNH   IDMUL240
+         OI    2(CURTXTCB),MORETXT     SET MORE TEXT TO PROCESS
+         L     WORK3,CCWDISP
+         S     WORK3,MULTSIZE
+         ST    WORK3,CCWDISP           RESET CCW DISP
+         MVC   SRCHBEG(4),IDBEG
+         LTR   WORK0,WORK0             IS THIS A PRIME READ
+         BNZ   IDMUL130                NO
+         BAL   BRANCHX,CHECKWRT        CHECK WRITE
+         NI    0(NXTTXTCB),WRTCKD      MARK WRITE CHECKED
+         B     IDMUL130
+IDMUL240 MVC   FREEADDR(4),TXTBFBEG    SET FIRST FREE ADDR TO BFR BEG
+         CLC   SRCHMULT(2),ZERO         WORKING WITH NEW CSECT
+         BE    IDMUL250                 YES
+         CLC   SRCHID(2),CURID          WORKING WITH NEW CSECT
+         BNE   IDMUL250                 YES
+         LH    WORK3,CURMULT
+         LA    WORK3,1(WORK3)
+         CH    WORK3,SRCHMULT           NO,CHECK FOR CONTIGUOUS MULT.
+         BNE   IDMUL250                NOT CONTIGUOUS--READ
+         OI    2(CURTXTCB),MORETXT     SET MORE TEXT TO PROCESS
+         L     WORK3,CCWDISP
+         S     WORK3,MULTSIZE
+         ST    WORK3,CCWDISP           RESET CCW DISPLACEMENT
+         B     IDMUL130
+IDMUL250 BAL   RETURN,RDTXT             BRANCH TO READ TEXT AT BFR.TOP
+         B     IDMUL301
+*                                                                     *
+*     THE NEEDED TEXT IS IN CORE - DETERMINE TEXT GROUPING            *
+*                                                                     *
+IDMUL300 BAL   RETURN,RDTXT             GO TO READ IN OUT-OF-ORDER TXT
+IDMUL301 TM    PDSE8,DC                 IS DC SPECIFIED
+         BZ    IDMUL305                YES
+         TM    PDSE7,SCTR               IS SCATTER SPECIFIED
+         BZ    IDMUL310                 NO
+IDMUL305 OI    0(PARM),LASTXT           SET LAST TEXT IN GROUP INDIC.
+         XC    GROUPLNG(2),GROUPLNG     ZERO GROUPLNG
+IDMUL310 L     WORK1,12(PARM)          CURRENT TXTIOT ENTRY
+         LR    WORK3,WORK1
+         S     WORK3,TXTIO
+         SRL   WORK3,2
+         MH    WORK3,SEVEN
+         A     WORK3,TNLS2
+         MVC   24(2,PARM),5(WORK3)      SAVE TEXT LENGTH IN TXTCB
+         LH    WORK3,0(WORK1)
+         SLL   WORK3,3
+         A     WORK3,HESD
+         LR    WORK8,WORK3             SAVE HESD ENTRY ADDR
+         L     WORK3,4(WORK3)           GET CSECT LENGTH FROM HESD
+         LA    WORK3,0(WORK3)
+         AH    WORK3,GROUPLNG
+         CL    WORK3,MULTSIZE          IS GROUP LNG+CSECT LNG GT.MULT
+         BNH   IDMUL330                NO
+IDMUL324 LH    WORK3,GROUPLNG     LOAD GROUP LENGTH
+         LTR   WORK3,WORK3              IS GROUP LENGTH = 0
+         BZ    IDMUL325                 YES
+         OI    0(CURTXTCB),LASTXT       SET LAST TEXT FOR GROUP
+         XC    GROUPLNG(2),GROUPLNG     SET GROUP LENGTH = 0
+IDMUL325 OI    0(PARM),FIRSTXT          SET FIRST TEXT OF GROUP
+         B     IDMUL340
+IDMUL330 TM    SSWITCH,1               IS GROUPING ALLOWED
+         MVI   SSWITCH,0               RESET SWITCH ANYWAY
+         BO    IDMUL324                NO GROUPING
+         LH    WORK3,GROUPLNG          SWITCH OFF,ALLOW GROUPING
+         LTR   WORK3,WORK3              IS GROUP LENGTH = 0
+         BZ    IDMUL325                 YES
+IDMUL340 OI    2(WORK1),TEXTDONE        MARK TEXT PROCESSED
+         OI    0(PARM),INUSE            MARK TXTCB  IN USE
+*                                                                     *
+*     CALC. BEGINNING AND END TEXT ADDRESS FOR TEXT CTRL. BLK         *
+*                                                                     *
+         TM    0(PARM),FIRSTXT         IS CURR TEXT 1ST OF GROUP
+         BZ    IDMUL345                NO
+         LA    BRANCHX,IDMUL344
+         L     WORK2,12(PARM)          CUR TXTIOT ENTRY OF GROUP
+IDMUL343 S     WORK2,TXTIO
+         SRL   WORK2,2                 GET ENTRY NO.
+         MH    WORK2,SEVEN
+         A     WORK2,TNLS2             CORRES. NOTELIST ENTRY
+         BR    BRANCHX
+IDMUL344 MVC   PREVBEG+1(3),2(WORK2)
+IDMUL345 MVC   5(3,PARM),PREVBEG+1     GET BEG. TEXT ADDR
+         LA    BRANCHX,IDMUL347
+         L     WORK2,12(PARM)
+         B     IDMUL343
+IDMUL347 MVC   9(3,PARM),2(WORK2)      TEXT ADDR OF CURR OF GROUP
+         MVC   TEMP(2),5(WORK2)        CALC END ADDR
+         LH    WORK2,TEMP
+         A     WORK2,8(PARM)
+         ST    WORK2,8(PARM)           SAVE AS TEXT END ADDR
+*                                                                     *
+*                    SET-UP FOR NEXT LOOK-AHEAD                       *
+*                                                                     *
+         CLC   SRCHMULT(2),HIGHMULT     IS MULT = HIGHEST MULT.
+         BNE   IDMUL350                 NO
+         XC    SRCHMULT(2),SRCHMULT    ZERO SEARCH MULT
+         LH    WORK3,24(PARM)
+         AH    WORK3,GROUPLNG
+         STH   WORK3,GROUPLNG           UPDATE  GROUP LENGTH
+         STH   WORK3,26(PARM)           PUT ACCUM. GROUP LENGTH IN CB
+         L     WORK3,IDBEG
+         LA    WORK3,4(WORK3)
+         ST    WORK3,SRCHBEG            SET SRCHBEG TO NEXT ENTRY
+         TM    0(WORK8),X'40'          IS ID LAST ID WITH TEXT IN SEG
+         BZ    IDMUL348                NO
+         OI    0(PARM),ENDINDIC        SET END INDIC IN TXTCB
+         XC    GROUPLNG(2),GROUPLNG    INIT GROUP CT. FOR NEXT SEG.
+         CLC   SRCHSEG(2),ENSPC        IS SEGMENT LAST SEGMENT
+         BNE   IDMUL348                NO
+         OI    0(PARM),MODULEND        SET LAST TEXT OF MODULE
+IDMUL348 CLC   HIGHMULT(2),ZERO        CAN CURR. TXT BE GROUPED WITH
+*                                        NEXT TEXT
+         BZ    IDMUL130                YES
+         OI    0(PARM),LASTXT          NO
+         XC    GROUPLNG(2),GROUPLNG    ZERO GROUP LENGTH
+         B     IDMUL130                 GO TO RETURN
+IDMUL350 LH    WORK3,SRCHMULT
+         LA    WORK3,1(WORK3)
+         STH   WORK3,SRCHMULT           UPDATE SEARCH MULT
+         MVC   26(2,PARM),24(PARM)     SET GROUP LENGTH = MULT.SIZE
+         OI    0(PARM),LASTXT           SET LAST TEXT FOR GROUP INDIC.
+         XC    GROUPLNG(2),GROUPLNG     ZERO GROUP LENGTH
+         MVC   SRCHBEG(4),IDBEG
+         B     IDMUL130                 GO TO RETURN
+*                                                                     *
+*                   CONSTANTS                                         *
+SAVEREG1 DS    7F                 SAVE AREA
+SAV10    DS    10F                     SAVE REG AREA FOR 1 TXT   S01904
+BYTCTRRD EQU   *                       CONTROL RECORD FOR 1 BYT  S01904
+         DC    20X'00'                 ZERO OUT RECORD           S01904
+         ORG   BYTCTRRD                                          S01904
+         DC    X'01'                   SET TXT TO FOLLOW INDIC.  S01904
+         ORG   BYTCTRRD+5                                        S01904
+         DC    X'04'                   SET NO BYTES ESD ID       S01904
+         ORG   BYTCTRRD+8                                        S01904
+         DC    X'06'                   SET READ CCW FOR FETCH    S01904
+         ORG   BYTCTRRD+12                                       S01904
+         DC    X'40'                   SET FLAG FIELD FOR FETCH  S01904
+         ORG   BYTCTRRD+15                                       S01904
+         DC    X'01'                   PUT LENGTH IN CCW         S01904
+         ORG   BYTCTRRD+19                                       S01904
+         DC    X'01'                   LENGTH OF RECORD          S01904
+TXTBYT   EQU   *                       ONE BYTE OF TEXT          S01904
+         DC    X'00'                   INITIALIZE TO ZERO        S01904
+SAVESTOR DS    1F                      TO SAVE WORK1 IN SEGNO
+ZERO     DC    X'0000'
+ONE      DC    H'1'
+FOUR     DC    H'4'
+FIVE     DC    H'5'
+SIX      DC    F'6'
+SRCHSEG  DC    H'0'                     SEGMENT NO. BEING SEARCHED
+SRCHID   DC    H'0'                     ID BEING SEARCHED
+SRCHMULT DC    H'0'                     MULT. BEING SEARCHED
+PARMSA   DC    F'0'                     SAVE AREA FOR PARM      OZ04724
+OUTCB1   DC    V(OTRLDCB1)              RLD OUTPUT CONTROL BLOCKS
+OUTCB2   DC    V(OTRLDCB2)
+OUTCB3   DC    V(OTRLDCB3)
+INCB1    DC    V(INRLDCB1)              RLD INPUT CONTROL BLOCKS
+INCB2    DC    V(INRLDCB2)
+ADREL    DC    V(HEWLFREL)              RELOCATION ROUTINE
+RELOC    DC    V(RELOCATE)             ENTRY IN HEWLFREL FOR RELOC.
+ADENTAB  DC    V(SCDENTAB)
+ADFINAL  DC    V(HEWLFFNL)              FINAL PROCESSOR
+ADSIO    DC    A(HEWLFSIO)             ADDR OF IEWLMSIO
+ZEROS3   DC   F'0'                     ZERO TEST FLD      OX4565,OY3055
+MOVE     MVC   16(0,WORK3),0(WORK2)     MOVE ID-LENGTH LIST TO BEG. OF
+*                                            RLD OUTPUT BUFFER
+***                                                                 ***
+*                       SAVE AREAS                                    *
+***                                                                 ***
+LSTMULSS DC    H'0'
+SSWITCH  DC    H'0'
+*                                      BITS FOR SSWITCH+ON1
+SEGNO    EQU   X'80'                   SEG # NOT = 1+LAST SEG #
+SEGNOOFF EQU   X'7F'                   TURN SEGNO BIT OFF
+         DS    0F
+DBLWRDDD DC    X'FFFFFFF8'
+RLDION   DS    1F                       RLD NOTELIST ENTRY ADDR.
+LASTBUF  DS    1F                      CB ADDR OF LAST BUFFER FILLED
+TTRPOINT DC    F'0'                    SAVE AREA FOR TTR0 FOR POINT
+RETURNRG DS    1F                      SAVE AREA FOR RETURN REG
+TEMP     DS    1H                       TEMP STORAGE AREA
+HIGHMULT DS    1H                       HIGHEST MULT. FOR ID
+LSTMULSZ DC    H'0'                    SAVE AREA FOR LAST MULT SIZE
+CURRGN   DS    XL1                TEMP. STORAGE FOR REGION NO.
+*                                          ROUTINES
+PATCH    DS    25F     ********PATCH AREA   **************************
+         HEWAPT
+*                                                                     *
+*                   APT  REDEFINITIONS                                *
+*                                                                     *
+CURENTAB EQU   IOCT                     HESD ADDR.OF NEXT ENTAB ENTRY
+LKAENTAB EQU   IOCT+4                   ENTAB LKA
+ENTABSEG EQU   IOCT+8                   ENTAB SEGMENT NUMBER
+GROUPLNG EQU   IOCT+10                  ACCUMULATED GROUP LENGTH
+CCWDISP  EQU   IOCT+12                  CCW DISPLACEMENT
+CBTOUSE  EQU   IOCT+20                  CTRL.BLK.ADDR.FOR BFR.WITH
+*                                            SPLIT RLD
+CURSEG   EQU   EPSM                     CURRENT SEGMENT
+CURID    EQU   EPSM+4                   CURREND ID
+CURMULT  EQU   EPSM+6                   CURRENT MULTIPLICITY
+TEMPSTOR EQU   SPACES                   SAVE AREA FOR I/O SUBROUTINES
+CONTSAVE EQU   SPACES+28                TEMP SAVE AREA FOR CTRL. INFO.
+TXTIOEND EQU   SPACES+44                END ADDR.OF TXT I/O TABLE
+ENDRLDNT EQU   SPACES+48                END ADDR.OF RLD NOTELIST+1
+IDBEG    EQU   SPACES+52                WHERE TO RESUME SEARCH OF
+*                                            TXTIOT FOR NEW MULT.OF ID
+SRCHBEG  EQU   SPACES+56                WHERE TO RESUME SEARCH OF
+*                                            TXTIOT FOR NEW ID
+CURENTRY EQU   SPACES+60               FIRST FREE ADDR IN ENTRY LIST
+FREEADDR EQU   SPACES+64               FIRST FREE ADDR IN TEXT BUFFER
+PREVBEG  EQU   SPACES+68               ADDR OF 1ST TEXT OF GROUP
+ TITLE  'HEWLFSIO - SECOND PASS I/O'
+HEWLFSIO CSECT
+*   *   *  *   *   *   *  *   *   *   *   *   *   *   *   *   *   *   *
+*  THIS CSECT WAS CREATED FROM THE I/O ROUTINES THAT WERE FORMERLY IN *
+*  THE CSECT IEWLMSCD.  THE ROUTINES INCLUDED IN THIS CSECT ARE:      *
+*        WRTTXT: TO WRITE OUT THE TEXT USED BY IEWLMSCD AND           *
+*                IEWLMREL                                             *
+*        WRTCRRLD: TO WRITE OUT CONTROL RLD RECORDS, USED BY          *
+*                IEWLMSCD AND IEWLMREL                                *
+*        CHECKRD: TO CHECK READS, USED BY IEWLMSCD AND IEWLMREL       *
+*        CHECKWRT: TO CHECK THE WRITES, USED BY IEWLMSCD AND          *
+*                IEWLMREL                                             *
+*   *   *   *   *   *   *   *   *   *   *   *   *   *   *   *   *   * *
+FIRSTOFF EQU   X'F7'
+*                     BYTE 2                                          *
+NOTXDAP  EQU   X'7F'                    REGULAR WRITE NEEDED
+DUMMY    EQU   X'40'                    DUMMY WRITE
+DUMMYOFF EQU   X'BF'                    REGULAR WRITE
+*                           BYTE  3                                   *
+RLDIN1   EQU   X'80'                    INPUT BFR1 CONTAINS NEEDED RLDS
+RLDIN2   EQU   X'20'                    INPUT BFR2 CONTAINS NEEDED RLDS
+***         TEXT  I/O TABLE  INDICATORS                             ***
+BADLNG   EQU   X'08'                   CORRES. NOTELIST ENTRY HAS
+*                                             INCORRECT LENGTH
+HZERO    EQU   X'FF'                   TEST FOR ZERO            OZ06707
+***      RLD  NOTELIST INDICATORS                                   ***
+*INCORE  EQU   X'80'                    RLDS IN CORE
+OUTCORE  EQU   X'6F'
+*TTRENTRY EQU  X'40'                   TTR ENTRY
+*              CONTROL RECORD INDICATORS                              *
+*        APT3  SWITCH INDICATORS                                      *
+*FIRSTXT EQU   X'08'                    FIRST TEXT OF LOAD MODULE
+NRLD1TXT EQU   X'01'                    ONE TEXT REC - NO RLDS
+*                                                                     *
+*                        REGISTER USAGE                               *
+*                                                                     *
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+ZRO      EQU   0
+ON1      EQU   1
+FOR      EQU   4
+EIGHT    EQU   8
+TWELVE   EQU   12
+TWENTY4  EQU   24
+         ENTRY WRTTXT
+         ENTRY WRTCRRLD
+         ENTRY CHECKRD
+         ENTRY CHECKWRT
+SIO0010  EQU   *
+         SAVE  (14,12),T,*              SAVE REGS AND NAME CSECT
+***    *     *     *    *    *    *    *    *    *    *    *    *   ***
+*                                                                     *
+*             ROUTINE TO SET-UP AND READ TEXT
+*                                                                     *
+***    *     *     *    *    *    *    *    *    *    *    *    *   ***
+RDTXT    EQU   *
+         STM   R14,R12,TWELVE(R13)     SAVE REGS
+         BALR  R10,ZRO                  *  *  *  *  *  *  *  *  *  *  *
+         LA    R11,RDTXT-SIO0010+6      *  ESTABLISH ADDRESSIBILITY   *
+         SR    R10,R11                  *  *  *  *  *  *  *  *  *  *  *
+         ST    R13,SIOSAVE1+FOR         *                             *
+         LR    R15,R13                  *  ESTABLISH SAVE AREAS       *
+         LA    R13,SIOSAVE1             *                             *
+         ST    R13,EIGHT(R15)           *  *  *  *  *  *  *  *  *  *  *
+         L     WORK1,12(PARM)           CURRENT TXTIOT ENTRY
+         L     WORK2,TXTIO
+         LNR   WORK2,WORK2
+         AR    WORK2,WORK1
+         SRL   WORK2,2
+         MH    WORK2,SEVEN
+         A     WORK2,TNLS2              CORRES. NOTELIST ENTRY
+         MVC   CURTXTAD+1(3),2(WORK2)  BFR. ADDR. FOR OUT-OF ORDER READ
+         CLR   PARM,CURTXTCB            LOOKAHEAD OR PRIME READ
+         BE    RDTXT30                  PRIME READ
+*                                                                     *
+*              CHECK ANY UNCHECKED READS                              *
+*                                                                     *
+         TM    0(CURTXTCB),BEINGRD      LOOKAHEAD READ INITIATED
+         BZ    RDTXT50                  NO
+         NI    0(CURTXTCB),RDCHKD
+         B     RDTXT40
+RDTXT30  TM    0(NXTTXTCB),BEINGRD
+         BZ    RDTXT50                  NO
+         NI    0(NXTTXTCB),RDCHKD
+RDTXT40  BAL   BRANCHX,CHCKRD2          YES GO TO CHECK THE READ
+RDTXT50  TM    2(WORK1),INCORE          IS TEXT IN CORE
+         BO    RDTXT69                  YES,GO TO READ OUT-     XA05128
+*                                       OF-ORDER TEXT           XA05128
+         L     PARM,FREEADDR            1ST FREE ADDR. IN BUFFER
+         BAL   BRANCHX,SCDREAD          BRANCH TO READ TEXT
+         L     PARM,SIOSAVE1+FOR       PICK UP TXT CONTROL BLOCK
+         L     PARM,TWENTY4(PARM)      ADDRESS
+         OI    0(PARM),BEINGRD          SET BEING READ INDIC.
+         L     WORK1,16(PARM)           1ST TXTIOT ENTRY
+         L     WORK2,TXTIO
+         LNR   WORK2,WORK2
+         AR    WORK2,WORK1
+         SRL   WORK2,2
+         MH    WORK2,SEVEN
+         A     WORK2,TNLS2              CORRES. NOTELIST ENTRY
+         L     WORK3,FREEADDR           GET 1ST FREE ADDR.BEORE READ
+RDTXT60  OI    2(WORK1),INCORE          MARK TEXT IN CORE
+         MVC   2(3,WORK2),FREEADDR+1    STORAGE ADDR. OF TEXT
+         CL    WORK1,12(PARM)           LOOKING AT CURRENT ENTRY
+         BNE   RDTXT65                  NO
+         MVC   CURTXTAD+1(3),2(WORK2)  BFR.ADDR.FOR OUT-OR-ORDER READS
+         TM    2(WORK1),BADLNG         IS LENGTH INCORRECT
+         BZ    RDTXT65                 NO
+         MVC   5(2,WORK2),LSTMULSZ      CORRECT LENGTH IN NOTELIST
+RDTXT65  MVC   TEMP(2),5(WORK2)        MOVE TEXT LENGTH FOR ALIGN.
+         AH    WORK3,TEMP               UPDATE STORAGE ADDR.
+         ST    WORK3,FREEADDR           SAVE FOR MVC
+         CL    WORK1,20(PARM)          IS THIS LAST ENTRY IN GROUP
+         BE    RDTXT69                  YES                     ZA01410
+         LA    WORK1,4(WORK1)           UPDATE TO NEXT TXTIOT ENTRY
+         LA    WORK2,7(WORK2)          UPDATE TO NEXT NOTELIST ENTRY
+         B     RDTXT60
+RDTXT69  CL    WORK1,12(,PARM)         TEST IF CURRENT TXTIO    XA05128
+         BE    RDTXT70                 BRANCH IF SO             XA05128
+         TM    2(WORK1),BADLNG         TEST IF INCORRECT LENGTH XA05128
+         BZ    RDTXT70                 BRANCH IF NOT            XA05128
+         MVC   5(2,WORK2),LSTMULSZ     UPDATE MULT LENGTH       XA05128
+*              SEARCH  FOR OUT-OF-ORDER TEXT                          *
+RDTXT70  TM    2(WORK1),OUTORDER        IS ENTRY MARKED OUT-OF-ORDER
+         BZ    RDTXT90                  NO
+         TM    2(WORK1),INCORE         IS TXT IN CORE
+         BO    RDTXT90                YES
+         CLC   0(2,WORK1),SRCHID        IS ID = CURRENT ID
+         BNE   RDTXT90                 NO
+         MVC   TEMP(2),2(WORK1)
+         NI    TEMP,X'03'
+         CLC   TEMP(2),SRCHMULT         IS MULT = CURRENT MULT
+         BNE   RDTXT90
+         CLC   HIGHMULT(2),SRCHMULT    TEST IF LAST MULT        XA05128
+         BE    RDTXT75                 BRANCH IF IT IS          XA05128
+         L     PARM,SIOSAVE1+FOR       GET SAVE AREA POINTER    XM09099
+         L     PARM,TWENTY4(PARM)      RESTORE PARM VALUE       XM09099
+         L     BRANCHX,12(,PARM)       GET CURRENT TXTIO PTR    XA05128
+         S     BRANCHX,TXTIO           CALC TXTIO OFFSET        XA05128
+         SRL   BRANCHX,2               CALC CESD ID             XA05128
+         MH    BRANCHX,SEVEN           CALC TXT NOTE LST OFFSET XA05128
+         A     BRANCHX,TNLS2           CALC TXT NOTE LST PTR    XA05128
+         CLC   MULTSIZE+2(2),5(BRANCHX)  TEST IF MULT FULL SIZE XM19517
+         BE    RDTXT75                 BRANCH IF IT IS          XA05128
+         MVC   TEMP(2),5(BRANCHX)      GET LENGTH OF MULT       XA05128
+         LH    PARM,TEMP               ACCUMULATE IT            XA05128
+         MVC   TEMP(2),5(WORK2)        GET EXPAND TEXT LENGTH   XA05128
+         AH    PARM,TEMP               ACCUMULATE SUM           XA05128
+         STH   PARM,TEMP               SAVE SUM                 XA05128
+         TM    PDSE8,DC                IS DC SPECIFIED          ZA02253
+         BO    RDTXT74                 NO  BRANCH               ZA02253
+         TM    TEMP,DCLGTH             IS LENGTH X'400'         ZA02253
+         BZ    RDTXT74                 NO BRANCH                ZA02253
+         NC    TEMP(2),DCREST          ZERO LOW BYTE OF COUNT   ZA02253
+RDTXT74  MVC   5(2,BRANCHX),TEMP       PUT SUM IN TXT NOTE LST  XA05128
+RDTXT75  EQU   *                                                XA05128
+         MVC   TTRPOINT(3),2(WORK2)    TTR  FOR  POINT
+         MVC   TEMP(2),0(WORK2)        MOVE DISP. FOR ALIGNMENT
+         L     PARM,SIOSAVE1+FOR       PICK UP TXT CONTROL BLOCK
+         L     PARM,TWENTY4(PARM)      ADDRESS
+         TM    0(PARM),BEINGRD         ANY OUTSTANDING READ
+         BZ    RDTXT80                 NO, GO TO READ
+         BAL   BRANCHX,CHCKRD2         YES, CHECK IT
+         NI    0(PARM),RDCHKD          MARK READ CHECKED
+RDTXT80  L     PARM,CURTXTAD           ADDR OF TEXT
+         AH    PARM,TEMP                READ ADDR.
+         BAL   BRANCHX,SCDREAD          BRANCH TO READ OUT-OF-ORDER TXT
+         BAL   BRANCHX,CHCKRD2         CHECK READ
+         CL   WORK1,12(PARM)           LOOKING AT CURRENT ENTRY OZ06707
+         BE    RDTXT90                  YES                    @OZ06707
+         TM    14(PARM),BADLNG          LENGTH INCORRECT        OZ06707
+         BZ    RDTXT90                  NO. BRANCH             @OZ06707
+         TM    15(PARM),HZERO           MULTIPLE EQ ZERO        OZ06707
+         BM    RDTXT90                  NO. BRANCH              OZ06707
+         TM    3(WORK1),HZERO           MULTIPLE EQ ZERO        OZ06707
+         BZ    RDTXT90                  NO. BRANCH              OZ06707
+         CLC   12(4,PARM),16(PARM)      CURRENT TXTIO EQ FIRST  OZ06707
+         BNE   RDTXT90                  NO. BRANCH              OZ06707
+         CLC   12(4,PARM),20(PARM)      CURRENT TXTIO EQ LAST   OZ06707
+         BE    RDTXT90                  YES BRANCH              OZ06707
+         ST    PARM,PARMSA              SAVE PARM              @OZ06707
+         MVC   TEMP(2),5(WORK2)         GET EXPAND LENGTH       OZ04724
+         L     PARM,FREEADDR            GET FREEADDR            OZ04724
+         AH    PARM,TEMP                ADD EXPAND LENGTH       OZ04724
+         ST    PARM,FREEADDR            STORE UPDATED ADDRESS   OZ04724
+         L     PARM,PARMSA              RESTORE PARM            OZ04724
+RDTXT90  LA    WORK1,4(WORK1)           UPDATE TO NEXT TXTIOT ENTRY
+         LA    WORK2,7(WORK2)           UPDATE TO NEXT NOTELIST ENTRY
+         CL    WORK1,TXTIOEND           AT END OF TEXT I/O TABLE
+         BNH   RDTXT70                 NO
+         B     SIOEXIT1                 RETURN
+*                                                                     *
+*                                                                     *
+*              ROUTINE TO SET-UP AND READ RLD'S                       *
+*                                                                     *
+*                                                                     *
+RDRLD    EQU   *
+         STM   R14,R12,TWELVE(R13)     SAVE REGS
+         BALR  R10,ZRO                  *  *  *  *  *  *  *  *  *  *  *
+         LA    R11,RDRLD-SIO0010+6      *  ESTABLISH ADDRESSIBILITY   *
+         SR    R10,R11                  *  *  *  *  *  *  *  *  *  *  *
+         ST    R13,SIOSAVE1+FOR         *                             *
+         LR    R15,R13                  *  ESTABLISH SAVE AREAS       *
+         LA    R13,SIOSAVE1             *                             *
+         ST    R13,EIGHT(R15)           *  *  *  *  *  *  *  *  *  *  *
+         NI    NEWSW2,MOREOFF          SET MORE RLDS INDIC OFF
+         LR    WORK1,PARM               SAVE CURRENT NOTELIST ENTRY   *
+         TM    2(WORK1),INCORE          IS NEEDED RECORD IN CORE
+         BO    RDRLD30                 YES
+         L     WORK3,INCB1              RLD INPUT BUFFER 1 IN USE
+         TM    0(WORK3),INUSE
+         BZ    RDRLD60                  NO
+         L     WORK3,INCB2             RLD INPUT BFR. 2 IN USE
+         TM    0(WORK3),INUSE
+         BZ    RDRLD60                  NO
+         NI    0(WORK3),NOTINUSE        YES, FREE BUFFER 2
+         L     WORK2,8(WORK3)           ADDR OF 1ST NOTELIST ENTRY
+RDRLD20  NI    2(WORK2),OUTCORE         MARK ENTRY NOT IN CORE
+         CL    WORK2,16(WORK3)          ALL ENTRIES MARKED NOT IN CORE
+         BE    RDRLD60                  YES
+         LA    WORK2,9(WORK2)           INCR. TO NEXT NOTELIST ENTRY
+         B     RDRLD20
+*                                                                     *
+*        RLD ENTRY IN CORE - ADD PERTINENT DATA TO CONTROL BLOCKS     *
+RDRLD30  TM    2(WORK1),BUF2            RLD'S IN BUFFER 2
+         BZ    RDRLD40                  NO
+         OI    2(CURTXTCB),RLDIN2       BUFFER 2 USED IN TXT CTRL BLK
+         L     WORK3,INCB2              GET CTRL BLK ADDR FOR BFR2
+         B     RDRLD60
+RDRLD40  OI    2(CURTXTCB),RLDIN1       BUFFER 1 USED IN TXT CTRL BLK
+         L     WORK3,INCB1              GET CTRL BLK ADDR FOR BFR1
+RDRLD60  ST    WORK1,12(WORK3)          PUT CURR.NOTELIST ENTRY IN CB
+RDRLD70  CL    WORK1,RNLS2             IS IT THE 1ST NOTELIST ENTRY
+         BE    RDRLD80                 YES
+         SH    WORK1,NINE               NO
+         TM    2(WORK1),TTRENTRY        IS IT A TTR ENTRY
+         BZ    RDRLD70                 NO
+         LA    WORK1,9(WORK1)           YES
+RDRLD80  ST    WORK1,8(WORK3)          BEG. NOTELIST ENTRY FOR GROUP
+RDRLD90  CL    WORK1,ENDRLDNT          SINGLE NOTELIST ENTRY?    A32340
+         BC    10,RDRLD200             YES--RETURN               A32340
+         TM    2(WORK1),TTRENTRY       IS IT A TTR ENTRY         A32340
+         BO    RDRLD100                YES
+         LA    WORK1,9(WORK1)           NO, INCR. TO NEXT ENTRY
+         B     RDRLD90
+RDRLD100 ST    WORK1,16(WORK3)         END NOTELIST ENTRY FOR GROUP
+         MVC   TTRPOINT(3),6(WORK1)    SAVE TTR OR STORAGE ADDR
+         TM    2(WORK1),INCORE         ARE RLDS IN CORE
+         BO    RDRLD150                YES
+         TM    0(NXTTXTCB),BEINGRD      ANY UNCHECKED TEXT READS
+         BZ    RDRLD110                 NO
+         BAL   BRANCHX,CHCKRD2          YES, CHECK TEXT READ
+         NI    0(NXTTXTCB),RDCHKD      MARK READ CHECKED
+RDRLD110 L     PARM,4(WORK3)            BEGINNING OF BUFFER
+         BAL   BRANCHX,SCDREAD          READ RLD RECORD
+         BAL   BRANCHX,CHCKRD2          CHECK RLD RECORD READ
+         L     WORK2,8(WORK3)           START OF NOTELIST ENTRIES
+         OI    0(WORK3),INUSE           MARK CTRL.BLK. IN USE
+RDRLD120 OI    2(WORK2),INCORE          SET RLD'S IN CORE INDICATOR
+         TM    0(WORK3),BUF2            ARE RLD'S IN BUFFER 2
+         BZ    RDRLD130                 NO
+         OI    2(WORK2),BUF2            YES, SET BUFFER 2 INDICATOR
+         OI    2(CURTXTCB),RLDIN2       BFR2 CONTAINS RLD'S
+         B     RDRLD140
+RDRLD130 OI    2(CURTXTCB),RLDIN1       BFR1 CONTAINS RLD'S
+RDRLD140 CL    WORK2,16(WORK3)          LAST NOTELIST ENTRY FOR RECORD
+         BE    RDRLD150                 YES
+         LA    WORK2,9(WORK2)           NO, INCR. TO NEXT ENTRY
+         B     RDRLD120
+*                                                                     *
+*     UPDATE TO NEXT GROUP OR END OF RLD NOTELIST                     *
+*                                                                     *
+RDRLD150 L     WORK1,16(WORK3)          END OF CURRENT NOTELIST GROUP
+         LA    WORK1,9(WORK1)           UPDATE TO NEXT ENTRY
+RDRLD160 CL    WORK1,ENDRLDNT           END OF NOTELIST
+         BH    RDRLD200                YES, RETURN
+*        CHECK FOR MORE RLD RECORDS FOR CURRENT TEXT                  *
+         CLC   0(2,WORK1),CURID         DOES ENTRY ID = CURRENT ID
+         BNE   RDRLD180                 NO
+         MVC   TEMP(2),2(WORK1)         YES, DOES ENTRY MULT=CURR.MULT
+         NI    TEMP,X'03'
+         CLC   TEMP(2),CURMULT
+         BE    RDRLD190                 YES
+RDRLD180 LA    WORK1,9(WORK1)           NO, INCR TO NEXT NOTELIST ENTRY
+         B     RDRLD160
+*      CHECK IF ALL NEEDED RLDS CAN BE ACCOMMODATED IN INPUT BUFFERS  *
+RDRLD190 TM    2(WORK1),INCORE          IS RLD RECORD IN CORE
+         BO    RDRLD30                  YES
+         L     WORK3,INCB1
+         TM    0(WORK3),INUSE           IS BUFFER 1 IN USE
+         BZ    RDRLD60                  NO, GO TO READ IN RECORD
+         L     WORK3,INCB2              IS BUFFER 2 IN USE
+         TM    0(WORK3),INUSE
+         BZ    RDRLD60                  NO,GO TO READ IN RECORD
+         ST    WORK1,RLDION             SAVE ADDR FOR LATER READ
+         OI    NEWSW2,MORERLDS          SET MORE RLDS INDICATOR
+RDRLD200 EQU   *
+         B     SIOEXIT1                 RETURN
+***  *   *     *    *    *    *    *    *    *    *    *    *    *  ***
+*                                                                     *
+*              SET-UP ROUTINE FOR THE WRITING OF TEXT                 *
+*                                                                     *
+***  *   *     *    *    *    *    *    *    *    *    *    *    *  ***
+WRTTXT   EQU   *
+         STM   R14,R12,TWELVE(R13)     SAVE REGS
+         BALR  R10,ZRO                  *  *  *  *  *  *  *  *  *  *  *
+         LA    R11,WRTTXT-SIO0010+6     *  ESTABLISH ADDRESSIBILITY   *
+         SR    R10,R11                  *  *  *  *  *  *  *  *  *  *  *
+         ST    R13,SIOSAVE1+FOR         *                             *
+         LR    R15,R13                  *  ESTABLISH SAVE AREAS       *
+         LA    R13,SIOSAVE1             *                             *
+         ST    R13,EIGHT(R15)           *  *  *  *  *  *  *  *  *  *  *
+         L     WORK9,SYSLMDCB           ADDR. OF SYSLMOD DCB
+         LH    WORK2,26(CURTXTCB)      RECORD LENGTH
+         L     WORK3,4(CURTXTCB)        TEXT BEGINNING
+*        CHECK  FOR ANY  UNCHECKED WRITES                             *
+         L     WORK1,OUTCB1             CHECK IF ANY RLD OUTPUT BFRS.
+         TM    0(WORK1),BEINGWT              ARE  BEING WRITTEN
+         BO    WRTTXT10
+         L     WORK1,OUTCB2
+         TM    0(WORK1),BEINGWT
+         BO    WRTTXT10
+         L     WORK1,OUTCB3
+         TM    0(WORK1),BEINGWT
+         BZ    WRTTXT20
+WRTTXT10 BAL   BRANCHX,CHCKWT2          CHECK UNCHECKED WRITE
+         NI    0(WORK1),WRTCKD          TURN OFF BEING WRT. AND IN USE
+WRTTXT20 TM    1(CURTXTCB),XDAP         IS XDAP WRITE NEEDED
+         BO    WRTTXT99                 YES, GO TO ISSUE XDAP
+         TM    PDSE7,OVLY              IS OVERLAY SPECIFIED
+         BZ    WRTTXT30                NO
+         TM    APT3,SEGSTART           YES, IS THIS 1ST TXT OF SEG
+         BZ    WRTTXT30                 NO
+         NI    APT3,SEGOFF              TURN OFF FIRST TEXT OF SEG.
+         BAL   BRANCHX,NOTEMCRO         BRANCH TO GET TTR
+         LH    WORK1,CURSEG
+         SLL   WORK1,2
+         A     WORK1,TTRLIST            ADDR. OF TTR LIST ENTRY FOR SEG
+         ST    PARM,0(WORK1)            MAKE ENTRY FOR CURR. SEG.
+WRTTXT30 BAL   BRANCHX,SCDWRITE         GO TO WRITE TEXT
+         OI    0(CURTXTCB),BEINGWT
+         TM    1(CURTXTCB),DUMMY        IS THIS A DUMMY WRITE
+         BZ    WRTTXT40                 NO
+         BAL   BRANCHX,CHCKWT2          CHECK WRITE OF TEXT
+         NI    0(CURTXTCB),WRTCKD
+         BAL   BRANCHX,NOTEMCRO         CONVERT DISK ADDR.TO TTR
+         AH    PARM,NEXTTTR
+         ST    PARM,TTRPOINT
+         MVC   CONTSAVE(16),4(WORK9)    SAVE DCB INFO. BEFORE POINT
+         STM   RETURN,PARM,TEMPSTOR    SAVE REG BEFORE POINT
+         L     PARM,SYSLMDCB
+         POINT (1),TTRPOINT
+         LM    RETURN,PARM,TEMPSTOR    SAVE REG BEFORE POINT
+         MVC   XDAPBLOK+36(8),5(WORK9)  DISK ADDR. TO XDAP ECB
+         MVC   4(16,WORK9),CONTSAVE     RESTORE BSAM INFO TO DCB
+         NI    1(CURTXTCB),DUMMYOFF     TURN DUMMY WRITE OFF
+WRTTXT40 TM    APT3,FIRSTXT             IS THIS FIRST TXT OF LOAD MOD.
+         BZ    WRTTXT90                 NO, BRANCH TO RETURN
+         NI    APT3,FIRSTOFF            TURN OFF 1ST TEXT INDIC.
+         TM    PDSE7,OVLY               IS OVERLAY OPTION SPECIFIED
+         BZ    WRTTXT50                NO
+         L     WORK1,TTRLIST
+         LA    WORK1,4(WORK1)
+         MVC   0(4,WORK1),PDSE4         MAKE ENTRY FOR SEG.1 IN TTRLIST
+         B     WRTTXT90                 BRANCH TO RETURN
+WRTTXT50 TM    0(CURTXTCB),BEINGWT      HAS TEXT WRITE BEEN CHECKED
+         BZ    WRTTXT60                 YES
+         BAL   BRANCHX,CHCKWT2          NO, BRANCH TO CHECK IT
+         NI    0(CURTXTCB),WRTCKD       MARK TXTCB NOT IS USE
+WRTTXT60 BAL   BRANCHX,NOTEMCRO         CONVERT DISK ADDR. TO TTR
+         ST    PARM,PDSE4               STORE TTR OF FIRST TXT IN PDS
+         MVC   PDSE10(2),26(CURTXTCB)   LENGTH OF FIRST TXT TO PDS
+WRTTXT70 TM    PDSE7,SCTR               IS SCATTER OPTION SPECIFIED
+         BZ    WRTTXT80                 NO
+         MVC   PDSE15(2),CURID          YES, ENTER CURR.ID INTO PDS
+WRTTXT80 TM    0(CURTXTCB),MODULEND     IS TEXT LAST IN MODULE
+         BZ    WRTTXT90                 NO, BRANCH TO RETURN
+         TM    APT3,RLDSINGP           ANY RLDS FOR TEXT
+         BO    WRTTXT90                 YES, BRANCH TO RETURN
+         OI    PDSE7,NRLD1TXT           SET NO RLDS -ONE TEXT REC INDIC
+WRTTXT90 EQU   *
+         B     SIOEXIT1                 RETURN
+WRTTXT99 NI    1(CURTXTCB),NOTXDAP      TURN OFF XDAP INDICATOR
+         STM   RETURN,PARM,TEMPSTOR    SAVE BEFORE XDAP
+         XDAP  XDAPBLOK,WI,(WORK9),(WORK3),(WORK2),,,MF=E
+         WAIT  1,ECB=XDAPBLOK           WIAT FOR COMPLETION OF XDAP
+         LM    RETURN,PARM,TEMPSTOR    RESTORE REG. AFTER XDAP
+         TM    XDAPBLOK,X'7F'           IS XDAP SUCCESSFUL
+         BO    WRTTXT90
+         L     BRANCH,ADSNX             ADDR. OF ERROR ROUTINE
+         LA    PARM,XDAPBLOK+4         ADDRESS OF IOB
+         BR    BRANCH                   BRANCH TO ERROR ROUTINE
+         XDAP  XDAPBLOK,WI,,,,,,MF=L    EXPAND XDAP ECB
+***    *     *     *    *    *    *    *    *    *    *    *    *     *
+*                                                                     *
+*        SET-UP ROUTINE TO WRITE THE CONTROL RECORD OR RLD RECORD     *
+*                                                                     *
+***    *     *     *    *    *    *    *    *    *    *    *    *   ***
+WRTCRRLD EQU   *
+         STM   R14,R12,TWELVE(R13)      SAVE REGS
+         BALR  R10,ZRO                  *  *  *  *  *  *  *  *  *  *  *
+         LA    R11,WRTCRRLD-SIO0010+6   *  ESTABLISH ADDRESSIBILITY   *
+         SR    R10,R11                  *  *  *  *  *  *  *  *  *  *  *
+         ST    R13,SIOSAVE1+FOR         *                             *
+         LR    R15,R13                  *  ESTABLISH SAVE AREAS       *
+         LA    R13,SIOSAVE1             *                             *
+         ST    R13,EIGHT(R15)           *  *  *  *  *  *  *  *  *  *  *
+         L     WORK3,8(PARM)            GET BEGINNING OF BUFFER
+         TM    0(WORK3),TXT             CR/RLD OR RLD RECORD
+         BZ    RLDWRT10                 GO TO WRITE RLD RECORD
+         MVC   14(2,WORK3),26(CURTXTCB) GROUP LENGTH TO CTRL.REC.
+         OI    8(WORK3),X'06'           SET READ BITS
+         OI    12(WORK3),X'40'          SET FLAGS
+         MVC   4(2,WORK3),2(PARM)       ID-LENGTH TO CTRL. REC
+RLDWRT10 LR    WORK2,CURTXTCB           CHECK ANY UNCHECKED WRITES
+         TM    0(WORK2),BEINGWT
+         BO    RLDWRT20
+         LR    WORK2,NXTTXTCB
+         TM    0(WORK2),BEINGWT
+         BO    RLDWRT20
+         L     WORK2,OUTCB1
+         TM    0(WORK2),BEINGWT
+         BO    RLDWRT20
+         L     WORK2,OUTCB2
+         TM    0(WORK2),BEINGWT
+         BO    RLDWRT20
+         L     WORK2,OUTCB3
+         TM    0(WORK2),BEINGWT
+         BZ    RLDWRT40                 GO TO WRITE RECORD
+RLDWRT20 BAL   BRANCHX,CHCKWT2          CHECK PREVIOUS WRITE
+         NI    0(WORK2),WRTCKD          FREE CTRL. BLOCK
+RLDWRT40 LH    WORK2,4(WORK3)           CALC. LENGTH OF RECORD
+         AH    WORK2,6(WORK3)
+         LA    WORK2,16(WORK2)
+         BAL   BRANCHX,SCDWRITE         BRANCH TO WRITE A RECORD
+         OI    0(PARM),BEINGWT          MARK CTRL.BLK BEING WRITTEN
+         B     SIOEXIT1                 RETURN
+*                                                                     *
+*                            CHECK  ROUTINE                           *
+*                                                                     *
+CHECKRD  EQU   *
+         STM   R14,R12,TWELVE(R13)      SAVE REGS
+         BALR  R10,ZRO                  *  *  *  *  *  *  *  *  *  *  *
+         LA    R11,CHECKRD-SIO0010+6    *  ESTABLISH ADDRESSIBILITY   *
+         SR    R10,R11                  *  *  *  *  *  *  *  *  *  *  *
+CHCKRD1  ST    R13,SIOSAVE2+FOR         *                             *
+         LR    R11,R13                  *  ESTABLISH SAVE AREAS       *
+         LA    R13,SIOSAVE2             *                             *
+         ST    R13,EIGHT(R11)           *  *  *  *  *  *  *  *  *  *  *
+         LA    PARM,RDDECB              READ DECB
+         B     CHECK
+CHCKRD2  SAVE  (14,12),T               SAVE REGS,ENTRY IF FROM IEWLMSIO
+         B     CHCKRD1                 CONTINUE
+CHECKWRT EQU   *
+         STM   R14,R12,TWELVE(R13)     SAVE REGS
+         BALR  R10,ZRO                  *  *  *  *  *  *  *  *  *  *  *
+         LA    R11,CHECKWRT-SIO0010+6   *  ESTABLISH ADDRESSIBILITY   *
+         SR    R10,R11                  *  *  *  *  *  *  *  *  *  *  *
+CHCKWT1  ST    R13,SIOSAVE2+FOR         *                             *
+         LR    R11,R13                  *  ESTABLISH SAVE AREAS       *
+         LA    R13,SIOSAVE2             *                             *
+         ST    R13,EIGHT(R11)           *  *  *  *  *  *  *  *  *  *  *
+         LA    PARM,WTDECB              WRITE DECB
+         B     CHECK                   GO TO CHECK
+CHCKWT2  SAVE  (14,12),T               SAVE REGS, ENTRY FROM WITHIN SIO
+         B     CHCKWT1                 CONTINUE
+CHECK    EQU   *
+         CHECK (1)                     CHECK
+         LM    BRANCHX,PARM,TEMPSTOR   RESTORE REGISTERS
+         B     SIOEXIT2                 RETURN
+*                                                                     *
+*                                                                     *
+*                        READ  ROUTINE                                *
+*                                                                     *
+*                                                                     *
+SCDREAD  STM   BRANCHX,PARM,TEMPSTOR    SAVE REGS. #11-#1
+         L     PARM,SYSUTDCB
+         POINT (1),TTRPOINT
+         L     BRANCHX,TEMPSTOR+24     RESTORE READ ADDR.-POINT CHANGED
+         LA    BRANCHX,0(BRANCHX)      ZERO OUT HIGH ORDER BYTE  A30173
+         L     BRANCH,TXTBFEND         PICK UP TXTBUF END ADDR   A30173
+         SR    BRANCH,BRANCHX          TAKE THE DIFFERENCE       A30173
+         C     BRANCH,UT1SIZE          GREATER THAN UT1SIZE?     A30173
+         BNH   SCDREADA                NO, GO TO READ THAT MUCH; A30173
+*   OUT OF ORDER TEXT MAY HAVE ITS RECORD SIZE > ITS ACTUAL SIZE A30173
+         L     BRANCH,UT1SIZE          YES-ONLY READ UP TO MAX.  A30173
+SCDREADA READ  RDDECB,SF,HEWLCUDB,(BRANCHX),(BRANCH)
+         LM    BRANCHX,PARM,TEMPSTOR    RESTORE REGISTERS
+         BR    BRANCHX
+***    *     *     *    *    *    *    *    *    *    *    *    *   ***
+*                                                                     *
+*                       WRITE   ROUTINE                               *
+*                                                                     *
+***    *     *     *    *    *    *    *    *    *    *    *    *   ***
+SCDWRITE STM   BRANCHX,PARM,TEMPSTOR   SAVE REGISTERS
+         WRITE WTDECB,SF,HEWLCMDB,(WORK3),(WORK2)
+         LM    BRANCHX,PARM,TEMPSTOR
+         BR    BRANCHX
+*                     ******************
+*                                                                     *
+NOTEMCRO STM   RETURN,PARM,TEMPSTOR    SAVE REGISTERS
+         L     PARM,SYSLMDCB
+         NOTE  (1)
+         LM    RETURN,WORK0,TEMPSTOR   RESTORE REGISTERS
+         BR    BRANCHX                  RETURN
+SIOEXIT1 EQU   *
+         L     R13,SIOSAVE1+FOR        RESTORE REG 13
+SIORETRN EQU   *
+         RETURN (14,12),T              RETURN
+SIOEXIT2 EQU   *
+         L     R13,SIOSAVE2+FOR        RESTORE REG 13
+         LM    R14,R12,TWELVE(R13)     RESTORE REGS
+         BR    R11                     RETURN
+***********************************************************************
+*     DECLARES                                                        *
+**********************************************************************
+SAVEREG2 DS    7F                 SAVE AREA
+PARMSAVE DS    2F                       SAVE AREA FOR REG 1
+SEVEN    DC    H'7'
+NINE     DC    H'9'                     RLD NOTELIST ENTRY SIZE
+NEXTTTR  DC    H'0256'                  TO INCREMENT TTR ADDR
+DCREST   DC    X'FFF8'                 RESET CONSTANT FOR DC    ZA02253
+ADSNX    DC    V(HEWLCRO3)             ERROR ROUTINE
+SYSLMDCB DC    A(HEWLCMDB)             ADDR OF SYSLMOD DCB
+SYSUTDCB DC    A(HEWLCUDB)             SYSUT1 DCB ADDRESS
+***                                                                 ***
+*                       SAVE AREAS                                    *
+***                                                                 ***
+SIOSAVE1 DS    18F                      REG SAVE AREA FOR EXTERNAL RTNS
+SIOSAVE2 DS    18F                     REG SAVE AREA, INTERNAL RTNS
+CURTXTAD DC    F'0'                    BFR.ADDR OF CURRENT TEXT
+PATCHSIO DS    25F     ********PATCH AREA   **************************
+         END
+***********************************************************************

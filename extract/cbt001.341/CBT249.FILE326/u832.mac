@@ -1,0 +1,285 @@
+         TITLE '* * *  IEFU83 - SVC 83 WRITE SMF RECORD EXIT  * * *'
+***********************************************************************
+*                                                                     *
+* MODULE NAME - IEFU83                                                *
+*                                                                     *
+* FUNCTION - TO PROVIDE A MEANS OF CAPTURING EXCP COUNTS FROM         *
+*    DYNAMICALLY ALLOCATED DD'S AND INCLUDING THEM IN THE ACCOUNTING  *
+*    SUMMARY PROVIDED BY IEFACTRT.                                    *
+*                                                                     *
+* OPERATION -                                                         *
+*       IMMEDIATELY UPON ENTRY, BIT 0 OF BYTE 0 OF THE JMRUSEID       *
+*    FIELD IS CHECKED FOR A COMPLETE STANDARDS BYPASS.  IF IT IS ON,  *
+*    IEFU83 RETURNS IMMEDIATELY.                                      *
+*                                                                     *
+*       THE RECORD TYPE IS CHECKED FOR TYPE 34 (TS STEP TERM) OR TYPE *
+*    40 (DYNAMIC DD).  IF EITHER IS FOUND, THEN THE EXCPS ARE ADDED   *
+*    INTO THE USER STEP TABLE ENTRY.  PROCESSING OF THE TYPE 34 IS    *
+*    NECESSARY BECAUSE PCF II WRITES A TYPE 34 RECORD FOR EACH        *
+*    COMMAND AND THEN ZEROS THE TCBTIOT EXCP COUNTS.                  *
+*                                                                     *
+*       SINCE PCF II GIVES BOGUS STEP NUMBERS, ALL TSO RECORDS ARE    *
+*    CONSIDERED TO COME FROM STEP 1.                                  *
+*                                                                     *
+*    NOTE:  IEFU83 INTERFACES WITH IEFACTRT.  IEFACTRT GATHERS        *
+*    ACCOUNTING INFORMATION FOR A JOB AT JOB AND STEP TERMINATION.    *
+*    EXCP COUNTS FOR DYNAMIC DD'S ARE NOT AVAILABLE TO IEFACTRT AND   *
+*    ARE COLLECTED IN IEFU83 AND ADDED TO THE PROPER STEP TABLE       *
+*    ENTRY.                                                           *
+*                                                                     *
+* ENTRY POINTS -                                                      *
+*    IEFU83                                                           *
+*    PATCH                                                            *
+*                                                                     *
+* EXTERNAL REFERENCES -                                               *
+*    NONE                                                             *
+*                                                                     *
+* INPUT -                                                             *
+*    REGISTER 1 POINTS TO THE 4 BYTE ADDRESS OF THE RDW OF THE SMF    *
+*       RECORD TO BE WRITTEN.                                         *
+*                                                                     *
+* OUTPUT -                                                            *
+*    REGISTER 15 WILL CONTAIN ZEROS TO INDICATE THAT ALL RECORDS WILL *
+*       BE WRITTEN.                                                   *
+*                                                                     *
+* WRITTEN - DOUG MOORE    FEBRUARY 1978                               *
+*                                                                     *
+* MODIFIED - BEN MOORE    APRIL 1978                                  *
+*    ADDED CODE FOR RECORD TYPE 34 (TS STEP TERM) AND CODE TO ASSUME  *
+*       ALL TSO RECORDS COME FROM STEP 1.                             *
+*    CHANGED SUBPOOL FROM 229 TO 230 BECAUSE 229 IS FETCH PROTECTED   *
+*       AND CHARGES COMMAND WAS S0C4ING.                              *
+*                                                                     *
+* MODIFIED - DOUG MOORE    JUNE 1978                                  *
+*    REMOVED GETMAIN FOR STWA TO IEFUJI.  IF IEFU83 OBTAINED THE STWA *
+*       IT WAS CHAINED TO THE USER'S TCB AND WAS FREED WHEN THE STEP  *
+*       ENDED CAUSING IEFACTRT TO HAVE S0C4.                          *
+*                                                                     *
+* MODIFIED - RICH OLCOTT   OCTOBER 1981                               *
+*    REMOVED JMRSTPSW TEST (SMF PULLED THE BYTE FROM THE JMR AT       *
+*       MVS/SP-3)                                                     *
+*                                                                     *
+***********************************************************************
+         EJECT
+IEFU83   START 0
+         SAVE  (14,12),,IEFU83-&SYSDATE-&SYSTIME   SAVE REGISTERS
+         LR    BASEREG,R15         LOAD BASE REGISTER
+         USING IEFU83,BASEREG
+         SPACE 2
+***********************************************************************
+* LOCATE JMR TO CHECK USER ID FIELD FOR COMPLETE STANDARDS BYPASS.    *
+* RETURN IMMEDIATELY IF BYPASS REQUESTED.                             *
+***********************************************************************
+         SPACE
+         L     R2,540(0,0)         POINT TO CURRENT TCB
+         USING TCB,R2
+         ICM   R2,B'0111',TCBTCT+1 POINT TO TCT
+*                                  Q. IS SMF DATA BEING COLLECTED
+         BZ    RETURN2             ...NO, GO AWAY (SHOULD NOT OCCUR)
+         USING SMFTCT,R2
+         L     JMRREG,TCTJMR       POINT TO JMR
+         USING JMR,JMRREG
+         TM    JMRUSEID,BIT0       Q. COMPLETE STANDARDS BYPASS REQUEST
+         BO    RETURN2             ...YES, GET OUT
+         DROP  R2
+         SPACE 2
+***********************************************************************
+* SELECT SMF RECORD TYPES TO PROCESS.  IF NONE SELECTED, RETURN.      *
+***********************************************************************
+         SPACE
+SELECT   DS    0H
+         L     SMFREG,0(0,R1)      POINT TO SMF RECORD
+         USING TDDSMF,SMFREG
+         CLI   TDDRCDTY,X'22'      Q. IS THIS TYPE 34 RECORD
+         BE    RCD34               ...YES, GO PROCESS IT
+         CLI   TDDRCDTY,X'28'      Q. IS THIS TYPE 40 RECORD
+         BE    RCD40               ...YES, GO PROCESS IT
+         B     RETURN2             ...NO, RETURN
+         SPACE
+RETURN   DS    0H
+         L     R13,4(0,R13)        GET ORIGINAL REG 13
+RETURN2  DS    0H
+         LM    R14,R12,12(R13)     RESTORE REGS
+         SLR   R15,R15             INDICATE TO WRITE THIS RECORD
+         BR    R14
+         SPACE
+RETURN3  DS    0H
+         LR    R13,R7              GET ORIGINAL REG 13
+         B     RETURN2
+         TITLE '******* RECORD TYPE 34 (X''22'') AND 40 (X''28'') HANDL*
+               LER *******'
+***********************************************************************
+* IF RECORD TYPES 4 AND 34 ARE NOT BEING RECORDED (OPT=1) THEN EXIT.  *
+* IF THEY ARE (OPT=2) PROCEED.                                        *
+*                                                                     *
+* POINT TO STEP TABLE WORK AREA OBTAINED BY IEFUJI FOR USE BY THE     *
+* SMF EXITS.  THE ADDRESS OF THE STWA IS STORED IN THE TCBUSER FIELD  *
+* OF THE REGION CONTROL TASK'S TCB.                                   *
+*    SELECT EXCP COUNTS AND STORE IN TABLE.  TABLE IS INDEXED BY THE  *
+* STEP NUMBER.  THE STEP NUMBER IS DECREMENTED BY ONE TO OBTAIN ZERO  *
+* INDEXING.  IF THE EXCP COUNT INVALID FLAG IS ON, IT IS IGNORED      *
+* BECAUSE THE VALUE SYSTEM IGNORES IT.                                *
+*    IF THE STEP NUMBER IN THE SMF RECORD IS ZERO, RETURN.  THE STEP  *
+* NUMBER SHOULD BE 1,2,3,ETC.  ALL TSO RECORDS ARE CONSIDERED TO COME *
+* FROM STEP 1.                                                        *
+*                                                                     *
+* ON ENTRY,                                                           *
+*    REG 13 IS PREVIOUS REGISTER SAVE AREA                            *
+*    SMFREG IS POINTER TO RDW FIELD OF TYPE 34 OR 40 SMF RECORD       *
+*    JMRREG IS POINTER TO SMF JOB MANAGEMENT RECORD                   *
+***********************************************************************
+         SPACE 5
+RCD34    DS    0H
+RCD40    DS    0H
+         SPACE 2
+***********************************************************************
+* CHECK JMR SMF OPTIONS FIELD TO INSURE THAT STEP INFORMATION IS      *
+* BEING GATHERED.  IF NOT, EXIT.                                      *
+***********************************************************************
+         SPACE
+*        TM    JMRINDC,JMRSTPSW    Q. IS STEP INFO BEING RECORDED   RJO
+*        BNO   RETURN2             ...NO, GO AWAY             RJO 10/81
+         SPACE  2
+***********************************************************************
+* POINT TO TCBUSER FIELD OF REGION CONTROL TASK'S TCB AND GET POINTER *
+* TO STWA.                                                            *
+***********************************************************************
+         SPACE
+         L     R2,548(0,0)         POINT TO CURRENT ASCB
+         USING ASCB,R2
+         L     R2,ASCBASXB         POINT TO ASXB
+         USING ASXB,R2
+         L     R2,ASXBFTCB         POINT TO RCT TCB
+         USING TCB,R2
+         LR    R7,R13              SAVE REG 13
+         L     STWAREG,TCBUSER     POINT TO STWA
+         LTR   STWAREG,STWAREG     Q. IS IT REALLY THERE
+         BZ    RETURN3             ...NO, FORGET IT AND GO AWAY
+         USING STWA,STWAREG
+         ST    R7,STWARSA+4        CHAIN SAVE AREAS
+         ST    R13,8(0,R7)
+         SPACE 2
+***********************************************************************
+* IF STEP NUMBER IS VALID, ADD EXCP COUNTS TO STEP TABLE ENTRY.       *
+***********************************************************************
+         SPACE
+         SLR   R2,R2               CLEAR REG FOR STEP NUMBER
+         TM    JMRINDC,JMRFIND     Q. IS THIS A TSO USER
+         BO    STEP1OK             ...YES, ALWAYS STEP 1
+         ICM   R2,B'0001',TDDINVSQ GET STEP NUMBER FROM SMF RECORD
+*                                  Q. IS IT GOOFY (ZERO)
+         BZ    RETURN              ...YES, IGNORE IT
+         BCTR  R2,0                MAKE IT RELATIVE TO ZERO
+STEP1OK  DS    0H
+         LA    R3,STELTH           LENGTH OF ONE ENTRY
+         MR    R2,R2               GET DISPLACEMENT OF ENTRY
+         LA    STEREG,STEPTBLE(R3) POINT TO THIS STEPS ENTRY
+         USING STEPTBLE,STEREG
+         SPACE 2
+***********************************************************************
+* COLLECT EXCP COUNTS, IF ANY, AND STORE IN STEP TABLE ENTRY.         *
+***********************************************************************
+         SPACE
+EXCPOK   DS    0H
+         CLI   TDDRCDTY,X'22'      Q. IS THIS TYPE 34 RECORD
+         BE    GOT34               ...YES, GO PROCESS IT
+         USING TDDSMF,SMFREG       GET ADDRESSABILITY TO RCD TYPE 40
+         LH    R15,TDDVAR          LENGTH OF DEVICE ENTRY SEGMENT + 2
+         SH    R15,=H'2'           SUBTRACT 2
+         SRL   R15,3               DIVIDE BY 8 (LENGTH OF 1 ENTRY)
+         LTR   R15,R15             Q. ANY DEVICE ENTRIES
+         BZ    DEVDONE             ...NO, ALL DONE
+         LA    R14,TDDDEVC         POINT TO 1ST DEVICE ENTRY
+         B     GOTDEVS             GO TO COMMON DEVICE ENTRY ROUTINE
+         SPACE
+GOT34    DS    0H                  RECORD TYPE 34 ROUTINE
+         USING TIVSMF,SMFREG       GET ADDRESSABILITY TO RCD TYPE 34
+         LH    R15,TIVVAR          LENGTH OF DEVICE ENTRY SEGMENT + 2
+         SH    R15,=H'2'           SUBTRACT 2
+         SRL   R15,3               DIVIDE BY 8 (LENGTH OF 1 ENTRY)
+         LTR   R15,R15             Q. ANY DEVICE ENTRIES
+         BZ    DEVDONE             ...NO, ALL DONE
+         LA    R14,TIVDEVC         POINT TO 1ST DEVICE ENTRY
+         SPACE
+GOTDEVS  DS    0H                  COMMON DEVICE ENTRY ROUTINE
+         USING TDDDEVC,R14         DEV ENTRIES ARE SAME FOR 34 AND 40S
+         SPACE 2
+* REGS FOR TOTALING EXCP COUNTS MUST BE LOADED FROM TABLE BECAUSE
+* IEFU83 COULD HAVE ALREADY PUT SOME COUNTS THERE.
+         SPACE
+         L     R3,STDISKEX         LOAD FOR TOTAL DISK EXCPS
+*                                     (INCLUDES VIO)
+         L     R4,STTAPEEX         LOAD FOR TOTAL TAPE EXCPS
+         L     R5,STOTHREX         LOAD FOR TOTAL OTHER EXCPS
+DEVLOOP  DS    0H
+         MVC   STWAFWK1,TDDNEXCP   ALIGN EXCP COUNT FOR NO ASM ERROR
+         CLI   TDDDEVC,X'20'       Q. DISK
+         BE    DISK                ...YES, GO TO DISK
+         CLI   TDDDEVC,X'80'       Q. TAPE
+         BE    TAPE                ...YES, GO TO TAPE
+         CLC   TDDCUAD,=X'0FFF'    Q. VIO
+         BE    DISK                ...YES, GO TO DISK
+OTHER    DS    0H
+         AL    R5,STWAFWK1         ADD TO OTHER
+         B     NEXTDEV             GO GET NEXT ENTRY
+DISK     DS    0H
+         AL    R3,STWAFWK1         ADD TO DISK
+         B     NEXTDEV             GO GET NEXT ENTRY
+TAPE     DS    0H
+         AL    R4,STWAFWK1         ADD TO TAPE
+NEXTDEV  DS    0H
+         LA    R14,8(0,R14)        POINT TO NEXT DEVICE ENTRY
+         BCT   R15,DEVLOOP         LOOP ON NUMBER OF ENTRIES
+         ST    R3,STDISKEX         STORE TOTAL DISK EXCPS IN TABLE
+         ST    R4,STTAPEEX         STORE TOTAL TAPE EXCPS IN TABLE
+         ST    R5,STOTHREX         STORE TOTAL OTHER EXCPS IN TABLE
+DEVDONE  DS    0H
+         DROP  R14
+         B     RETURN
+         DROP  STEREG
+         TITLE '******* EQUATES /  CONSTANTS *******'
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         SPACE
+STWAREG  EQU   R13                 STWA POINTER
+BASEREG  EQU   R12                 BASE REGISTER
+SMFREG   EQU   R11                 SMF RECORD POINTER
+JMRREG   EQU   R10                 JMR POINTER
+STEREG   EQU   R9                  STEP TABLE ENTRY POINTER
+         SPACE 5
+         ENTRY PATCH
+PATCH    DC    50S(*)              GENERATE SCONS FOR PATCH AREA
+         SPACE 5
+         LTORG
+         TITLE '******* DATA AREAS (DSECTS) *******'
+         STWA
+         SPACE 3
+         PRINT NOGEN
+         TITLE 'SMF RECORDS DSECTS'
+         IFASMFR (34,40)
+         TITLE 'ASCB DSECT'
+         IHAASCB
+         TITLE 'ASXB DSECT'
+         IHAASXB
+         TITLE 'TCB DSECT'
+         IKJTCB
+         TITLE 'TCT DSECT'
+         IEFTCT
+         TITLE 'JMR DSECT'
+         IEFJMR
+         SPACE 5
+         END   IEFU83

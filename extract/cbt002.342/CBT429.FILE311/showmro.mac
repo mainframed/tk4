@@ -1,0 +1,388 @@
+SHOWMRO TITLE  'Show the currently active MRO regions'
+*
+* Name: SHOWMRO
+*
+* Author: David Alcock
+*         dalcock@csw.com (work)
+*         davea@ticnet.com (home)
+*
+* Written: 11-NOV-1997
+*
+* Purpose: TSO command that shows all of the current CICS MRO regions.
+*
+* Reference:
+* - LY33-6082 CICS/ESA Diagnosis Reference Version 4 Release 1
+* - CICS.SDFHSRC(DFHIRPD) macro source. It is not used by this program
+*   for these reasons:
+*   - Assembly error for field MCNTL and I didn't look into why
+*   - Less things to be dependant on. Don't have to worry when IBM
+*     Changes the MACRO at release levels.
+*
+* Requirements:
+* - High Level Assembler
+* - MVS version 3 and higher (for entry and exit housekeeping)
+* - MVS version 4 and higher (for jobname information and STCKCON)
+* - Only tested on CICS 4.1.0 LNKLST/LPALST and it's subsystem format
+*
+         SPACE 2
+***********************************************************************
+***                                                                 ***
+**           M o d i f i c a t i o n   H i s t o r y                 **
+**                                                                   **
+** Person     Date        Description                                **
+** ---------- ----------- ------------------------------------------ **
+** DGAlcock   11-NOV-1997 Initial program written;                   **
+***                                                                 ***
+***********************************************************************
+         PRINT NOGEN
+*
+** IBM DSECTs
+*
+         CVT   DSECT=YES,LIST=NO          Communications Vector Table
+         IEFJESCT                         JES Communications Table
+         IEFJSCVT ,                       Subsystem Comm. Vector table
+         IEFJSSVT ,                       Subsystem Vector Table
+         IHAASVT ,                        Address Space Vector Table
+         IHAASCB ,                        Address Space Control Block
+         IHAASSB ,                        Address Space Sec. Block
+         IAZJSAB ,
+*
+** CICS: DFHSAB - CICS subsystem Anchor Block
+** (Based on CICS 4.1)
+*
+SAB      DSECT ,
+SABCDD   DS    F                          Addr of CEC 'inop' data
+SABSCTE  DS    F                          Addr of SCTE
+SAB_ID   DS    C'DFHSAB'                  Eyecatcher
+         ORG   SAB+X'18'
+SABMAPPT DS    F                          Addr of bit map: act CICS
+         ORG   ,
+SABL     EQU   32
+*
+** CICS: SCTE - Subsystem Control Table Extension
+** (Based on CICS 4.1)
+*
+SCTE     DSECT ,
+SCTELACB DS    F
+         DS    F
+         DS    F
+SCTESVC  DS    X'0A00'
+         DS    X'0000'
+SCTEL    EQU   *-SCTE
+*
+** CICS: LACB - Logon Control Block
+** (Based on CICS 4.1)
+*
+LCB      DSECT ,
+         ORG   LCB+X'7C'
+LCBAPPLD DS    CL8' '
+LCBLNGTH EQU   X'D8'
+*
+** CICS: LACB - Logon Address Space Control Block
+** (Based on CICS 4.1)
+*
+LACB     DSECT ,
+         ORG   LACB+X'0C'
+LACBSUDB DS    F
+LACBL    EQU   X'58'
+*
+LACBE    DSECT ,
+LACBENM  DS    CL8
+LACBELEN EQU   X'14'
+*
+** CICS: SUDB - SubSystem User Definition Control Block
+** (Based on CICS 4.1)
+*
+SUDB     DSECT ,
+SUDBCHN  DS    A
+SUDBLACB DS    A
+         ORG   SUDB+X'0E'
+SUDBASID DS    H
+         DS    F
+SUDBASCB DS    F
+SUDBJSB  DS    F
+SUDBAWS  DS    F
+SUDBLCB  DS    F
+         ORG   ,
+SUDBLEN  EQU   X'58'
+         PRINT GEN
+         YREGS ,
+         EJECT
+***********************************************************************
+***                                                                 ***
+**       Entry housekeeping                                          **
+***                                                                 ***
+***********************************************************************
+         SPACE 2
+SHOWMRO  CSECT ,
+SHOWMRO  AMODE 31
+SHOWMRO  RMODE ANY
+*
+** Standard ESA entry housekeeping
+*
+         BAKR  R14,0                    Save regs
+         LAE   R12,0(R15,0)             Get base register
+         USING SHOWMRO,R12              Get addressibility
+         SAC   0
+         SYSSTATE ASCENV=P
+*
+** Obtain Dynamic Save Area for Registers and work areas.
+*
+         STORAGE OBTAIN,LENGTH=DSAL,LOC=BELOW Obtain storage
+         LR    R13,R1                   Point to Save Area
+         MVC   4(4,R13),=C'F1SA'        Indicate stack SA
+         USING DSA,R13                  Get addressibility to area
+         EJECT
+***********************************************************************
+***                                                                 ***
+**   Locate to the first SUDB                                        **
+***                                                                 ***
+***********************************************************************
+         SPACE 2
+*
+** Find the CICS subsystem and get the SSCTSUSE (DFHSAB) in R4
+*
+         L     R4,CVTPTR                  -> CVT
+         L     R4,CVTJESCT-CVTMAP(R4)     -> JESCT
+         L     R4,JESSSCT-JESCT(R4)       -> SSCVT
+FSS$L    DS    0H
+         CLC   SSCTSNAM-SSCT(4,R4),=C'CICS'  SubSystem Match?
+         BE    FSS$LX                        Yes, leave loop
+         ICM   R4,B'1111',SSCTSCTA-SSCT(R4)  Check next one out
+         BNZ   FSS$L                         Got one, repeat performanc
+         B     E$NSS                         SubSystem not found...
+FSS$LX   DS    0H                            SubSystem found
+         ICM   R4,B'1111',SSCTSUSE-SSCT(R4)  -> DFHSAB
+*
+** Locate the SCTE and issue the starting message (w/SVC number)
+*
+         ICM   R5,B'1111',SABSCTE-SAB(R4) Locate SCTE
+         BZ    E$NSCTE
+         MVC   MSG(MSG1L),MSG1
+* Note: The SVC is in the machine code format "0Axx" or SVC xx
+         SLR   R1,R1
+         IC    R1,SCTESVC+1-SCTE(R5)      Get the SVC
+         CVD   R1,DOUBLE
+         UNPK  MSG+MSG1SVCD-1-MSG1(4),DOUBLE+6(2)
+         OI    MSG+MSG1SVCD+2-MSG1,C'0'
+         MVI   MSG+MSG1SVCD-1-MSG1,C'='
+*
+         UNPK  MSG+MSG1SVCH-MSG1(3),SCTESVC+1-SCTE(2,R5)
+         MVZ   MSG+MSG1SVCH-MSG1(2),=8X'00'
+         TR    MSG+MSG1SVCH-MSG1(2),=C'0123456789abcdef'
+         MVI   MSG+MSG1SVCF-MSG1,C')'
+*
+         L     R1,CVTPTR                  -> CVT
+         MVC   MSG+MSG1SYS-MSG1(L'CVTSNAME),CVTSNAME-CVTMAP(R1)
+         TPUT  MSG,MSG1L
+         MVI   MSG,C' '
+         TPUT  MSG,1
+*
+** Locate the LACB (Logon Address Space Control Block)
+*
+         ICM   R6,B'1111',SCTELACB-SCTE(R5)  Locate LACB
+         BZ    E$NLACB
+*
+** Locate the first SUDB
+*
+         ICM   R7,B'1111',LACBSUDB-LACB(R6) Locate SUDB
+         BZ    E$NSUDB
+* Note: After this point R4, R5, R6 are freed up. Only R7 matters.
+         EJECT
+***********************************************************************
+***                                                                 ***
+**       Process all of the SUDBs                                    **
+***                                                                 ***
+***********************************************************************
+         SPACE 2
+         XC    PS_MROC(4),PS_MROC           Ensure we start at zero
+PS$L     DS    0H
+         ICM   R1,B'1111',SUDBCHN-SUDB(R7)  On the last one?
+         BZ    PS$X                         Yes, Leave
+*
+         ICM   R8,B'1111',SUDBLCB-SUDB(R7)  LCB pointer
+         BZ    PS$LB                        None, skip this entry
+*
+         L     R1,PS_MROC                   Get MRO region count
+         LA    R1,1(R1)                     Bump by one
+         ST    R1,PS_MROC                   Save for later
+*
+         MVC   MSG(MSG2L),MSG2
+         ICM   R9,B'1111',SUDBASCB-SUDB(R7) ASCB pointer
+         L     R9,ASCBASSB-ASCB(,R9)        -> ASSB
+         L     R9,ASSBJSAB-ASSB(,R9)        -> JSAB
+         MVC   MSG+MSG2JOBI-MSG2(8),JSABJBID-JSAB(R9)
+         MVC   MSG+MSG2JOBN-MSG2(8),JSABJBNM-JSAB(R9)
+*
+         MVC   MSG+MSG2APPL-MSG2(8),LCBAPPLD-LCB(R8)
+*
+** Get the CICS region start time and date
+*
+         ICM   R9,B'1111',SUDBASCB-SUDB(R7) ASCB pointer
+         MVC   PS_TOD(8),ASCBINTS-ASCB(R9) Get start time
+         STCKCONV STCKVAL=PS_TOD,         Convert this TOD Stamp       @
+               CONVVAL=PS_SOUT,           ..Into these date/time areas @
+               TIMETYPE=DEC,              ..Output time format         @
+               DATETYPE=DDMMYYYY,         ..Output Date format         @
+               MF=(E,PARMLIST)
+         LTR   R15,R15                    STCKCONV worked?
+         BNZ   PS$SCE                     Failed: give up
+*
+         LA    R15,MSG+MSG2L              Locate output area
+*                               D  D  -  M  M  -  C  C  Y  Y
+         MVC   0(11,R15),=X'40,20,20,60,20,20,60,20,20,20,20'
+         ED    0(11,R15),PS_SOUT+8        Edit it to " dd-mm-ccyy"
+         MVC   0(3,R15),1(R15)            Move "dd-" over "dd-...-ccyy"
+         PACK  DOUBLE(8),4(2,R15)         Get month in decimal
+         CVB   R14,DOUBLE                 Convert to binary
+         BCTR  R14,0                      Make relative to zero
+         MH    R14,=H'3'                  Multiply for month offset
+         LA    R1,=C'JanFebMarAprMayJunJulAugSepOctNovDec'
+         AR    R1,R14                     Locate month entry
+         MVC   3(3,R15),0(R1)             Move "mmm" to "dd-mmm-ccyy"
+         OI    0(R15),X'F0'               Ensure leading zero
+* Bump past xx-mmm-ccyy
+         LA    R15,11(R15)                Bump past date
+         MVC   0(12,R15),=X'F021207A20207A20204B2020'
+         ED    0(12,R15),PS_SOUT
+         MVI   0(R15),C' '
+         B     PS$SCX
+PS$SCE   DS    0H
+         LA    R15,MSG+MSG2L              Locate output area
+         MVI   0(R15),C' '
+         MVC   1(21,R15),0(R15)
+PS$SCX   DS    0H
+*
+** Print message
+*
+         TPUT  MSG,MSG2L+11+12
+*
+** Bump to next SUDB
+*
+PS$LB    DS    0H
+         ICM   R7,B'1111',SUDBCHN-SUDB(R7)
+         BNZ   PS$L
+*
+** The end of the SUDB chain - print number of MRO regions found
+*
+PS$X     DS    0H
+         MVI   MSG,C' '
+         TPUT  MSG,1
+         MVC   MSG(MSG3L),MSG3
+         LA    R15,MSG+MSG3L-1
+         ICM   R1,B'1111',PS_MROC
+         CVD   R1,DOUBLE
+         UNPK  0(4,R15),DOUBLE+6(2)
+         OI    3(R15),C'0'
+         MVI   MSG+MSG3L-1,C'='
+         TPUT  MSG,MSG3L+4
+         EJECT
+***********************************************************************
+***                                                                 ***
+**       Exit Housekeeping                                           **
+**                                                                   **
+**       Release resources and return to caller                      **
+***                                                                 ***
+***********************************************************************
+         SPACE 2
+EXIT     DS    0H
+         LR    R2,R13                     Get storage address
+         STORAGE RELEASE,LENGTH=DSAL,ADDR=(R2) Release storage
+         SLR   R15,R15                    Set return code
+         PR                               Return to caller
+         EJECT ,
+***********************************************************************
+***                                                                 ***
+**       Error routines                                              **
+***                                                                 ***
+***********************************************************************
+         SPACE 2
+*
+** SUDB not found
+*
+E$NSUDB  DS    0H
+         MVC   MSG(MSG96L),MSG96
+         TPUT  MSG,MSG96L
+         B     EXIT
+*
+** LACB not found
+*
+E$NLACB  DS    0H
+         MVC   MSG(MSG97L),MSG97
+         TPUT  MSG,MSG97L
+         B     EXIT
+*
+** SCTE not found
+*
+E$NSCTE  DS    0H
+         MVC   MSG(MSG98L),MSG98
+         TPUT  MSG,MSG98L
+         B     EXIT
+*
+** Sub system for CICS not found
+*
+E$NSS    DS    0H
+         MVC   MSG(MSG99L),MSG99
+         TPUT  MSG,MSG99L
+         B     EXIT
+         EJECT
+***********************************************************************
+***                                                                 ***
+**       Constants                                                   **
+***                                                                 ***
+***********************************************************************
+         SPACE 2
+MSG1     DC    C'SHOWMRO-01I CICS SRB SVC '
+MSG1SVCD DC    C'xxx'
+         DC    C' ('
+MSG1SVCH DC    C'xx'
+MSG1SVCF DC    C')  - System=' '
+MSG1SYS  DS    CL(L'CVTSNAME)
+         DC    C' - active MRO regions:'
+MSG1L    EQU   *-MSG1
+*
+MSG2     DC    C'SHOWMRO-02I > '
+MSG2JOBI DC    CL8' '
+         DC    C' '
+MSG2JOBN DC    CL8' '
+         DC    C' - APPLID: '
+MSG2APPL DC    CL8' '
+         DC    C' - '
+MSG2L    EQU   *-MSG2
+*
+MSG3     DC    C'SHOWMRO-03I The number of MRO regions='
+MSG3L    EQU   *-MSG3
+*
+MSG96    DC    C'SHOWMRO-96E SUDB not found '
+MSG96L   EQU   *-MSG96
+*
+MSG97    DC    C'SHOWMRO-97E LACB not found '
+MSG97L   EQU   *-MSG97
+*
+MSG98    DC    C'SHOWMRO-98E SCTE not found '
+MSG98L   EQU   *-MSG98
+*
+MSG99    DC    C'SHOWMRO-99E CICS subsystem not found '
+MSG99L   EQU   *-MSG99
+         LTORG ,
+         EJECT
+***********************************************************************
+***                                                                 ***
+**       GETMAINed work area                                         **
+***                                                                 ***
+***********************************************************************
+         SPACE 2
+DSA      DSECT ,
+         DS    18F                      Register Save Area
+PARMLIST DS    XL64                     Work area for parm lists
+         DS    0D                       Process_SUDBs:
+PS_TOD   DS    D                        ..TOD (STCK) area
+PS_SOUT  DS    XL16                     ..STCKCON output area
+PS_MROC  DS    F                        ..Count of MRO regions
+         DS    0D
+DOUBLE   DS    D                        Work area
+*
+MSG      DS    79C' '                   Message area
+         DS    0D
+DSAL     EQU   *-DSA
+         END

@@ -1,0 +1,3214 @@
+         TITLE 'IGC0001F - PROLOG'
+***************************************************************
+*                                                             *
+* MODULE NAME = IGC0001F                                      *
+*                                                             *
+* DESCRIPTIVE NAME = I/O REQUEST PURGE ROUTINE                *
+*                                                             *
+* COPYRIGHT NAME = ''NONE''                                   *
+*                                                             *
+* STATUS = OS/VS2 RELEASE 2, CHANGE LEVEL 00                  *
+*                                                             *
+* FUNCTION =                                                  *
+* THIS ROUTINE WILL REMOVE I/O REQUESTS FROM THE              *
+* FOLLOWING QUEUES: THE RB QUEUE, THE IOS LOGICAL CHANNEL     *
+* QUEUES, DDRCOM, GLOBAL AND LOCAL SPL, AND SIRB.             *
+*                                                             *
+* NOTES = 1. WHEN HIO OPTION IS GIVEN, RESTORING THE I/O      *
+* REQUESTS CANNOT BE DONE.  IN HIO OPTION, REQUESTS ARE       *
+* DEQUED AND NOT CHAINED TO A LINKFIELD; THUS THEY CANNOT     *
+* BE RESTARTED.                                               *
+* 2. IN QUIESCE OPTION, THE PURGE CHAIN FIELD OF THE          *
+* PARAMETER LIST CANNOT POINT TO ITSELF.                      *
+* 3. IN QUIESCE OPTION, CHAIN FIELD IN THE INPUT PARAMETER    *
+* LIST WILL POINT TO THE PIRL.                                *
+* 4. IN QUIESCE OPTION, REQUEST ELEMENTS WHICH HAVE REACHED   *
+* THE CHANNEL SCHEDULER WILL BE ALLOWED TO COMPLETE.  THOSE   *
+* WHICH ARE ON THE QUEUES OF THE DRIVERS WILL BE CHAINED TO   *
+* THE LINK FIELD SPECIFIED IN THE INPUT PARAMETER LIST VIA    *
+* THE PIRL, AND IF POST OPTION WAS SPECIFIED THEIR ECB WILL   *
+* BE POSTED AS PURGED.                                        *
+* 5. RB PURGE IS INVALID FOR: MEMORY PURGE,                   *
+* TCB PURGE (QUIESCE OPTION) OF CURRENT TCB,                  *
+* AND RB PURGE ONLY SPECIFIED.                                *
+*                                                             *
+* THIS ROUTINE ALSO BRANCHES TO IECVPURG TO DECREMENT         *@YM3154P
+* THE IPIB QUIESCE COUNT.                                     *@YM3154P
+*                                                             *
+*    DEPENDENCIES = EBCDIC                                    *
+*                                                             *
+*    RESTRICTIONS = IRB ROUTINES ACTIVE WHEN PURGE            *
+*    WITH THE HIO OPTION IS ISSUED WILL NOT HAVE              *
+*    CONTROL RETURNED TO THEM.  THIS ROUTINE WILL             *
+*    SET THEIR RESUME PSW TO A PURGE CLEAN UP                 *
+*    ROUTINE AND THEN ISSUE SVC 3 WHEN IT IS FINISHED.        *
+*                                                             *
+*    REGISTER CONVENTIONS = SVC LINKAGE                       *
+*    SEE REGISTER EQUATES                                     *
+*                                                             *
+*    PATCH LABEL = PURGEZAP                                   *
+*                                                             *
+* MODULE TYPE = SVC                                           *
+*    PROCESSOR = ASSEMBLER                                    *
+*    MODULE SIZE = 116C HEX BYTES                             *
+*    ATTRIBUTES = REENTRANT, KEY 0, SUPERVISOR STATE          *
+*                                                             *
+* ENTRY POINT = IGC016                                        *
+*    PURPOSE = ALL FUNCTIONS                                  *
+*    LINKAGE = SVC                                            *
+*                                                             *
+* INPUT = REGISTER 1 CONTAINS ADDRESS OF PURGE PARAMETER LIST.*
+*       = REGISTER 1 CONTAINS IPIB ADDRESS IN COMPLIMENT FORM.*@YM3154P
+*                                                             *
+*    OUTPUT = REGISTER 15 CONTAINS A RETURN CODE IF CALLER    *
+*    REQUESTS RETURN CODE BY SETTING PPLEXR IN PURGE          *
+*    PARAMTER LIST                                            *
+*     RETURN CODE                COMPLETION CODE              *
+*   00 - SUCCESSFUL PURGE        PPLCC = 7F                   *
+*        (DEFAULT IF PPLEXR                                   *
+*        IS NOT SET)                                          *
+*   04 - TCB NOT PURGABLE        PPLCC = 40                   *
+*   08 - DSID NOT PURGABLE       PPLCC = 40                   *
+*   12 - I/O WAS HALTED          PPLCC = 40                   *
+*   16 - TP I/O WAS HALTED       PPLCC = 40                   *
+*   20 - ENQ WAS UNSUCCESSFUL    PPLCC = 40                   *
+*                                                             *
+*    EXITS-NORMAL = RETURN TO CALLER                          *
+*                                                             *
+*    EXITS-ERROR = FRR AND ESTAE                              *
+*                                                             *
+* EXTERNAL REFERENCES =                                       *
+*    ROUTINES =                                               *
+*       IECVSMGR                                              *
+*       IFGDEBVR                                              *
+*       IECIHIO                                               *
+*       DRIVERS OF IOS                                        *
+*    DATA AREAS =                                             *
+*       PPL - PURGE PARAMETER LIST                            *
+*       IPIB - IOS PURGE INTERFACE BLOCK                      *
+*       PIRL - I/O RESTORE LIST                               *
+*       PWA - PURGE WORK AREA                                 *
+*       PFRRPARM - FRR PARAMETERS                             *
+*       SDBF - 4K SDUMP BUFFER                                *
+*    CONTROL BLOCKS =                                         *
+*       IECDPPL      IECDIPIB     IECDPIRL                    *
+*       IHADDR       IEZDEB       IECDLCH                     *
+*       IHASRB       IKJTCB       IHAPSA                      *
+*       IHALCCA      IECDIRT      IEFUCBOB                    *
+*       IECDIOCM     IECDIOCX     IECDIOQ                     *
+*       IECDVOID     IECDERWA     IECDIOSB                    *
+*       IECDSIAB     CVT          IHAASCB                     *
+*       IHAASXB      IHAFRRS      IHASDWA                     *
+*       IHARB        IHAASVT                                  *
+* TABLES =                                                    *
+*    PURGE PARAMETER LIST                                     *
+*                                                             *
+* MACROS =                                                    *
+*    GETMAIN      FREEMAIN     ESTAE                          *
+*    PGFIX        PGFREE       WAIT                           *
+*    ENQ          DEQ          STATUS                         *
+*    SETLOCK      SETFRR       PURGEDQ                        *
+*    SCHEDULE     SDUMP        IOSGEN(RESTART)                *
+*                                                             *
+* LOCKS = LOCAL, UCB, LCH, CMS, IOSYNCH                       *
+*                                                             *
+* CHANGE ACTIVITY = NONE                                      *
+*                                                             *
+***************************************************************
+     TITLE     'IGC0001F-PURGE WORK AREA DSECT'
+PWA      DSECT
+         SPACE 1
+***************************************************************
+*                                                             *
+*        PURGE PARAMETER LIST                                 *
+*                                                             *
+***************************************************************
+         IECDPPL             DSECT=NO
+         EJECT
+***************************************************************
+*                                                             *
+*        IOS PURGE INTERFACE BLOCK                            *
+*                                                             *
+***************************************************************
+         IECDIPIB            DSECT=NO
+         EJECT
+***************************************************************
+*                                                             *
+*        PURGE WORK AREA                                      *
+*                                                             *
+***************************************************************
+         SPACE
+PWREGSAV DC    18F'0'              REG SAVE AREA
+     ORG  PWREGSAV
+PWREG0   DC    F'0'                TEMPORARY REG SAVE AREA
+PWREG1   DC    F'0'                *
+PWREG2   DC    F'0'                *
+PWREG3   DC    F'0'                *
+PWREG4   DC    F'0'                *
+PWREG5   DC    F'0'                *
+PWREG6   DC    F'0'                *
+PWREG7   DC    F'0'                *
+PWREG8   DC    F'0'                *
+PWREG9   DC    F'0'                *
+PWREGA   DC    F'0'                *
+PWREGB   DC    F'0'                *
+PWREGC   DC    F'0'                *
+PWREGD   DC    F'0'                *
+PWREGE   DC    F'0'                *
+PWREGF   DC    F'0'                *
+PWRTEMP1 DC    2F'0'                                           @Y30IPLG
+PQUEREG  DC    F'0'                TOTAL LCH COUNT
+PWAQCNT  DC    F'0'                PURGE QUIESCE COUNT
+PWPIRLNG DC    F'0'                PIRL LENGTH
+         EJECT
+*****************************************************************
+*                                                               *
+*  THESE FIVE LABELS MUST ALWAYS BE TOGETHER AS THEY FORM THE   *
+*   FIX LIST PURGE USES TO FIX THE PIRL AND ITS OWN MODULE      *
+*                                                               *
+*****************************************************************
+PWASAVP  DS    0F                  SAVE AREA POINTER
+PWAFIX   DC    F'0'                PAGE FIX - FIX LIST
+PWAFIX2  DC    F'0'                *
+PWAFIX3  DC    F'0'                *
+PWAFIX4  DC    F'0'                *
+         SPACE 3
+*****************************************************************
+*                                                               *
+*        PURGEDQ PARAMETERS                                     *
+*                                                               *
+*****************************************************************
+         SPACE
+         DS    0F                                              @YM01450
+PWPRGPRM DS    0CL12               PURGEDQ PARM LIST           @YM01450
+         ORG   PWPRGPRM                                        @YM01450
+         PURGEDQ MF=L                                          @YM01450
+PDQPARML DS    0D                  DWORD PARM FOR PURGEDQ      @YM01450
+         ORG   PDQPARML                                        @YM01450
+PDQPRSV1 DS    1H                  RESERVED                    @YM01450
+PDQPASID DS    1H                  ASID                        @YM01450
+PDQPRSV2 DS    XL1                 RESERVED                    @YM01450
+PDQPTCBP DS    AL3                 TCB ADDRESS                 @YM01450
+         EJECT
+PWAECB   DS    0F                  EVENT CONTROL BLOCK
+PWAUCBLK DC    F'0'                SAVE AREA FOR UCB LOCK ADDRESS
+PWALCHLK DC    F'0'                SAVE AREA FOR LCH LOCK ADDRESS
+PWAFRRPM DC    F'0'                PTR TO FRRPARM WA IF ONE    @Y30IPLG
+PWRET1   DC    F'0'                RETURN ADDRESS FOR SUBROUTINES
+PWRET2   DC    F'0'                *
+MASK1    DC    XL1'0'              MASK FLAG BYTE
+MSKDEQ   EQU   X'80'               DEQ
+MSKHIO   EQU   X'40'               HALT I/O
+MSKRDV   EQU   X'20'               REDRIVE IOS
+MSKUCB   EQU   X'10'               USED TO INDICATE RETRY HALT @OZ00762
+MSKDDRM  EQU   X'08'               DDR
+MSKNULL  EQU   X'04'               UNUSED
+MSKFREE  EQU   X'01'               PIRL MUST BE FREED
+MSKOFF   EQU   X'00'               ZERO THIS FLAG BYTE
+PURGRETC DC    XL1'0'              RETURN CODE FLAG BYTE
+PURTT    EQU   X'01'               CALLED BY TASK TERMINATION
+PURTCB   EQU   X'02'               TCB NOT PURGEABLE
+PURDSID  EQU   X'04'               DSID NOT PURGEABLE
+PURIO    EQU   X'08'               INDICATES I/O HALTED
+PURTP    EQU   X'10'               TP I/O HALTED
+PURNOENQ EQU   X'20'               ENQ UNSUCCESSFUL            @YM3104P
+PURNG    EQU   X'40'               BAD PURGE COMPLETION
+PURGOOD  EQU   X'7F'               GOOD PURGE COMPLETION
+PURRTCDT EQU   X'FE'               ERROR RETURN CODE TEST
+PURERRCD EQU   X'E7'               ERROR CODE, NOT PURIO,PURTP @YM06011
+PURRTCD0 EQU   0                   RETURN CODE OF 0
+PURRTCD4 EQU   4                   RETURN CODE OF 4
+PURRTCD8 EQU   8                   RETURN CODE OF 8
+PURRTCDC EQU   12                  RETURN CODE OF 12
+PURRTCD1 EQU   16                  RETURN CODE OF 16
+PURRTCD2 EQU   20                  RETURN CODE OF 20           @YM3104P
+SUBPL0   EQU   0                   SUBPOOL 0
+PREGSAVL EQU   72                  18 WORD SAVE AREA
+PWASDUMP SDUMP MF=L                SDUMP LIST FORM
+PWADLIST DC    2A(0)               SDUMP LIST FOR PURGE CODE
+         ORG   PWADLIST
+PWADLST1 DC    A(0)                FIRST LIST ENTRY
+PWADLST2 DC    A(0)                SECOND LIST ENTRY
+PWADLSTE EQU   X'80'               END OF DUMP LIST INDICATOR
+PWAESTAE ESTAE MF=L                ESTAE LIST FORM
+PWAASCBP DC    A(0)                ACTIVE ASCB POINTER
+PWAUCBP  DC    A(0)                ACTIVE UCB POINTER
+PWALCHP  DC    A(0)                ACTIVE LCH POINTER
+PWASYNCH DC    A(0)                ACTIVE I/O SYNCH LOCK
+PERRFLG0 DC    XL1'0'              FLAGS USED BY FRR AND ESTAE
+PERPGCT  EQU   X'80'               IOCPGCT IS ACTIVE
+PERIOSP  EQU   X'40'               ASCBIOSP IS ACTIVE
+PERSTATS EQU   X'20'               STATUS IS START ACTIVE
+PERENQ   EQU   X'10'               SRB ENQ IS ACTIVE
+PERSDBF  EQU   X'08'               4K SDWA BUFFER IS HELD
+PERFIXA  EQU   X'04'               PAGE FIX IS ACTIVE          @Y30IPLG
+PERRFLG1 DC    XL1'0'              FLAGS USED BY FRR AND ESTAE
+PERLOCAL EQU   X'80'               LOCAL LOCK IS HELD
+PERLCH   EQU   X'40'               LCH LOCK IS HELD
+PERUCB   EQU   X'20'               UCB LOCK IS HELD
+PERCMS   EQU   X'10'               CMS LOCK IS HELD
+PERESTAE EQU   X'08'               ESTAE IS ACTIVE
+PERSYNCH EQU   X'04'               IOSYNCH LOCK IS HELD
+PURENQ   ENQ   (SYSZEC16,PURGE,E,5,STEP),RET=HAVE,MF=L         @YM05797
+PURENQLN EQU   *-PURENQ            LENTH OF ENQ LIST           @YM05797
+         DS    0F                  ALIGN TO FULLWORD
+PWALNG   EQU   *-PWA               LENGTH OF PURGE WORK AREA
+         TITLE 'IGC0001F - FRR PARAMETER AND DUMP DSECTS'
+*****************************************************************
+*                                                               *
+*        FRR PARAMETER DSECT                                    *
+*                                                               *
+*****************************************************************
+         SPACE
+PFRRPARM DSECT
+PFRRPWAP DS    1F                  PURGE WORK AREA POINTER
+PFRRFLG1 DS    XL1                 FLAG FOR FRR                @Y30IPLG
+*PERLOCAL EQU  X'80'               LOCAL LOCK HELD DFINED PWA  @Y30IPLG
+PFRRNOWA EQU  X'01'                 INDICATE TO FRR NO PWA     @Y30IPLG
+         DS    XL3                 RESERVED
+         DS    4F                  RESERVED
+         SPACE 4
+*****************************************************************
+*                                                               *
+*        SVC DUMP 4K BUFFER                                     *
+*                                                               *
+*****************************************************************
+SDBF     DSECT
+SDBFPTR  DS    1A                  POINTER TO DUMP START
+SDBFCNT  DS    1H                  BUFFER BYTE COUNT
+SDBFSTRT DS    0H                  START OF SVC DUMP
+         DS    1H                  RESERVED HALFWORD
+SDBFPWA  DS    (PWALNG/4)F         PURGE WORK AREA
+SDBFVARY DS    F                   VARIABLE AREA FOR
+*                                  *UCB AND OR LCH AND IOQE'S
+         TITLE 'IGC0001F - PIRL DSECT'
+         IECDPIRL
+         TITLE 'IGC0001F - DDR COMMON DSECT'
+         IHADDR LIST=YES
+         TITLE 'IGC0001F - DEB DSECT'
+         IEZDEB
+         TITLE 'IGC0001F - LCH DSECT'
+         IECDLCH
+         TITLE 'IGC0001F - SRB DSECT'
+         IHASRB
+         TITLE 'IGC0001F - TCB DSECT'
+         IKJTCB
+         TITLE 'IGC0001F - PSA DSECT'
+         IHAPSA
+         TITLE 'IGC0001F - LCCA DSECT'
+         IHALCCA
+         TITLE 'IGC0001F - IRT DSECT'
+         IECDIRT
+         TITLE 'IGC0001F - UCB DSECT'
+         IEFUCBOB PREFIX=YES,LIST=YES
+         TITLE 'IGC0001F - IOCOM DSECT'
+         IECDIOCM
+         TITLE 'IGC0001F - IOCOM EXTENSION EXTENSION DSECT'
+         IECDIOCX
+         TITLE 'IGC0001F - IOQ DSECT'
+         IECDIOQ
+         TITLE 'IGC0001F - VECTOR OF IOS DRIVERS DSECT'
+         IECDVOID
+         TITLE 'IGC0001F - ERP WORK AREA DSECT'
+         IECDERWA
+         TITLE 'IGC0001F - IOSB DSECT'
+         IECDIOSB
+         TITLE 'IGC0001F - SIAB DSECT'
+         IECDSIAB
+         TITLE 'IGC0001F - CVT DSECT'
+         CVT DSECT=YES,LIST=YES
+         TITLE 'IGC0001F - ASVT DSECT'
+         IHAASVT
+         TITLE 'IGC0001F - ASCB DSECT'
+         IHAASCB
+         TITLE 'IGC0001F - ASXB DSECT'
+         IHAASXB
+         TITLE 'IGC0001F - FRR DSECT'
+         IHAFRRS
+         TITLE 'IGC0001F - SDWA DSECT'
+         IHASDWA
+         TITLE 'IGC0001F - RB DSECT'
+         IHARB DSECT=YES
+*
+*
+         ORG    RBRSV135
+RBRETSAV DS    F                   SAVE AREA FOR RETURN FROM PURGE
+RBPPLSAV DS    F                   SAVE AREA FOR PURGE PARM LIST PTR
+RBPWASAV DS    F                   SAVE AREA FOR PURGE WRK AREA ADDR
+         TITLE 'IGC0001F - REGISTER DEFINITIONS'
+*****************************************************************
+*                                                               *
+*        REGISTER DEFINITIONS                                   *
+*                                                               *
+*****************************************************************
+         SPACE
+R0       EQU   0                   WORK REG 0
+RCVRY00  EQU   R0                  RECOVERY REG 0
+RPAR     EQU   1                   INPUT PARAMETER LIST POINTER
+RSRB     EQU   RPAR                POINTER TO SRB
+RCVRY01  EQU   RPAR                RECOVERY REG 1
+R2       EQU   2                   WORK REG 2
+RCVRY02  EQU   R2                  RECOVERY REG 2
+RBASE    EQU   3                   BASE REG
+RCVRY03  EQU   RBASE               RECOVERY REG 3
+R4       EQU   4                   WORK REG
+RCVRY04  EQU   R4                  RECOVERY REG 4
+RSVRB    EQU   5                   POINTER TO CURRENT SVRB
+RCUR     EQU   RSVRB               CURRENT IOQ
+R5       EQU   RSVRB               WORK REG
+RCVRY05  EQU   RSVRB               RECOVERY REG 5
+RCORE    EQU   6                   POINTER TO PURGE WORK AREA
+RCVRY06  EQU   RCORE               RECOVERY REG 6
+RUCB     EQU   7                   POINTER TO UCB PREFIX
+RCVRY07  EQU   RUCB                RECOVERY REG 7
+RPIRL    EQU   8                   POINTER TO PIRL
+RCVRY08  EQU   RPIRL               RECOVERY REG 8
+RNINE    EQU   9                   WORK REG 9
+RBACK    EQU   RNINE               BACK POINTER
+RCVRY09  EQU   RNINE               RECOVERY REG 9
+R10      EQU   10                  WORK REG 10
+RIOSB    EQU   R10                 POINTER TO IOSB
+RCVRY10  EQU   R10                 RECOVERY REG 10
+RB       EQU   11                  WORK REG 11
+RCVRY11  EQU   RB                  RECOVERY REG 11
+RC       EQU   12                  WORK REG 12
+RCVRY12  EQU   RC                  RECOVERY REG 12
+RD       EQU   13                  WORK REG 13
+RCVRY13  EQU   RD                  RECOVERY REG 13
+RET      EQU   14                  RETURN REG
+RCVRY14  EQU   RET                 RECOVERY REG 14
+RF       EQU   15                  WORK REG 15 AND ENTRY REG
+RCVRY15  EQU   RF                  RECOVERY REG 15
+         TITLE 'IGC0001F - MISCELLANEOUS EQUATES'
+*****************************************************************
+*                                                               *
+*        MISCELLANEOUS EQUATES                                  *
+*                                                               *
+*****************************************************************
+         SPACE
+FREE160  EQU  X'20'                160 BYTE BLOCK
+ZERO     EQU   0                   CONSTANT OF ZERO
+ONE      EQU   1                   CONSTANT OF ONE
+FOUR     EQU   4                   CONSTANT OF FOUR
+SEVEN    EQU   7                   CONSTANT OF SEVEN
+K00      EQU   0                   DISP/LENGTH OF 0
+K01      EQU   1                   DISP/LENGTH OF 1
+K02      EQU   2                   DISP/LENGTH OF 2
+K03      EQU   3                   DISP/LENGTH OF 3
+K04      EQU   4                   DISP/LENGTH OF 4
+K05      EQU   5                   DISP/LENGTH OF 5
+K08      EQU   8                   DISP/LENGTH OF 8
+K12      EQU   12                  DISP/LENGTH OF 12
+K16      EQU   16                  DISP/LENGTH OF 16
+K24      EQU   24                  DISP/LENGTH OF 24
+NOP      EQU   3                   NOP
+MSASID   EQU   1                   MASTER SCHEDULAR ASID
+FF       EQU   255                 CONSTANT OF 255
+SILI     EQU   X'20'               SILI INDICATOR
+XFF      EQU   X'FF'               ANDING CONSTANT
+BRINCR   EQU   4                   RECOVERY BRANCH TABLE INCREMENT
+LOCKS00  EQU   0                   CLEAR SDWA LOCKS
+NIP02TST EQU   X'F0'               TEST FOR IEAVNP02 IN CONTROL
+*                                  *SEE ENTRY/LABEL IECVNP02
+PGFIXIND EQU   X'40'               PAGE FIX INDICATOR
+PGFIXEOL EQU   X'80'               PAGE FIX/FREE END OF LIST
+PGFREIND EQU   X'20'               PAGE FREE INDICATOR
+DBLENTRY EQU   X'80'               SIRB/EWA DOUBLE ENTRY IND
+EXCPTST  EQU   X'00'               TEST FOR EXCP DSID PURGE    DCR21082
+EXCPID   EQU   2                   EXCP DRIVER ID              DCR21082
+UCBBOFF1 EQU   X'49'               NRY,CUB,QISCE, BITS LEFT ON @YM04940
+UCBBOFF2 EQU   X'9F'               IORST,RESVH, & RSRVD BITS ON@YM04940
+         TITLE 'IGC0001F - MAIN ROUTINE'
+*****************************************************************
+*                                                               *
+*        ESTABLISH ADDRESSABILITY                               *
+*                                                               *
+*****************************************************************
+         SPACE
+IGC016   CSECT
+         SPACE
+         ENTRY IECVNP02            LABEL USED BY IEAVNP02
+*                                  *TO MODIFY INSTRUCTION
+*                                  *USED TO DETERMINE IF
+*                                  *NIP IS IN CONTROL
+         SPACE
+MAINTAIN EQU   *                   MAINTENANCE REFERENCE
+         SPACE
+         BALR  RBASE,R0            ESTABLISH BASE
+         SPACE
+         USING *,RBASE
+         USING PSA,R0
+         USING RBBASIC,RSVRB
+         USING CVTMAP,RF
+         USING IOCOM,RC
+         USING PWA,RCORE
+         USING PIRL,RPIRL
+         USING IOSB,RIOSB
+         USING SRB,RSRB
+         USING UCB,RUCB
+         SPACE
+         ST    RET,RBRETSAV        SAVE PURGE RETURN ADDRESS
+         SPACE
+         ST    RPAR,RBPPLSAV       SAVE PARM LIST POINTER IN SVRB
+         SPACE
+         L     RF,CVTPTR           GET POINTER TO CVT          @YM3154P
+         L     RC,CVTIXAVL         PICK UP IOCOM ADDRESS       @YM3154P
+         SPACE
+         LTR   RPAR,RPAR           DECREMENT QUIESCE COUNT     @YM3154P
+         BNM   PRG003              NO, NORMAL PURGE REQUEST    @YM3154P
+         TITLE 'IGC0001F - DECREMENT IPIB QUIESCE COUNT ROUTINE'
+***************************************************************
+*                                                             *
+*        IPIB QUIESCE COUNT DECREMENT ENTRY                   *
+*                                                             *
+***************************************************************
+         SPACE
+         L     RF,IOCQCNT          GET ADDR OF IECVPURG        @YM3154P
+         LR    R0,RPAR             IND LOCAL LOCK NOT HELD     @YM3154P
+         LCR   RPAR,RPAR           MAKE IPIB ADDR POSITIVE     @YM3154P
+         LA    RET,0(RPAR)         CLEAR HIGH ORD BYTE IPIB ADD@YM06598
+         L     R10,PSAAOLD         GET CURRENT ASCB ADDR       @YM06598
+         CS    RET,RET,ASCBIOSP-ASCB(R10)  CHECK IF VALID IPIB @YM06598
+         BNE   PRGINVAL            IPIB NOT VALID, RETURN      @YM06598
+** NOTE THERE CAN BE A MAX OF 2 IPIBS PER MEM & 1ST MUST BE A QUIESCE
+         SPACE
+         BALR  RET,RF              CALL IECVPURG               @YM3154P
+         SPACE
+PRGINVAL L     RET,RBRETSAV        RESTORE RETURN ADDR         @YM3154P
+         SPACE
+         BR    RET                 RETURN TO CALLER            @YM3154P
+         TITLE 'IGC0001F - MAIN ROUTINE'
+***************************************************************
+*                                                             *
+*        GET CORE FOR I/O RESTORE LIST (PIRL)                 *
+*                                                             *
+***************************************************************
+         SPACE
+PRG003   LR    R2,RPAR             SAVE PARM LIST ADDR         @YM3154P
+***      NOTE, SPACE NO LONGER GOTTEN FOR SAVE AREA IN PIRL    @YM04935
+         L     R4,PSATOLD          PICK UP TCB/ASCB POINTERS   @Y30IPLG
+         L     RUCB,PSAAOLD        GET CURRENT ASCB ADDR       @Y30IPLG
+         LH    RNINE,IOCVOICT      GET COUNT OF VOID ENTRIES
+         SLL   RNINE,3             MULT BY 8 FOR NUM BYTES IN PIRL
+*    EXTRA 12 BYTES OBTAINED FOR PIRL, USED BY RESTORE IN A    @ZA05813
+*    FREEMAIN TO VALIDITY CHECK PIRL                           @ZA05813
+         LA    R0,PIRRSTR-PIRL+12(,RNINE)  ADD PIRL HEADER +12 @ZA05813
+*                                  LNTH OF PIRL
+         LR    RNINE,R0            SAVE LENGTH OF PIRL         @Y30IPLG
+         SPACE
+*        NOTE REGS 10-15 LOST HERE
+         L    R10,PGLOCALA       GET ADDR FOR SPCL LOC LOK RTN @Y30IPLG
+         BALR  RF,R10              GET LOCAL LOCK AND FRR      @Y30IPLG
+         SPACE
+         ICM   R0,K08,PIRLSUBP     INDICATE SUB POOL 254      @Y30IPLG
+         SPACE
+*    NOTE: STORAGE ACTUALLY COMES FROM SUBPOOL 254 INSTEAD OF 0
+         SPACE
+         GETMAIN R,LV=(0),BRANCH=YES       SPACE FOR PIRL      @Y30IPLG
+         SPACE
+         BCTR  RNINE,R0            DECREMENT FOR EX INST
+         EX    RNINE,PCLEAR        CLEAR GOTTEN AREA
+         LR    RPIRL,RPAR          SAVE PIRL ADDRESS IN RPIRL
+         LA    RNINE,1(,RNINE)     ADD ONE TO GET BACK LNTH   @Y30IPLG
+         SPACE
+***************************************************************
+*                                                             *
+*        GET CORE FOR PURGE WORK AREA (PWA),                  *
+*        WHICH INCLUDES PURGE PARAMETER LIST (PPL),           *
+*        AND IOS PURGE INTERFACE BLOCK (IPIB).                *
+*                                                             *
+***************************************************************
+         SPACE
+         L     R0,COREMASK    GET SUBPOOL & LNTH              @Y30IPLG
+         SPACE
+         GETMAIN R,LV=(0),BRANCH=YES    GET SPACE FOR PWA     @@Y30IPLG
+         SPACE
+         ST    RPAR,RBPWASAV       SAVE ADDRESS OF WORK AREA IN SVRB
+         LR    RCORE,RPAR          SET BASE FOR WORK AREA
+         XC    PWA(PWASAVP-PWA),PWA     CLEAR 1ST PWASAVP-PWA  @YM05797
+         XC    PWASAVP(PURENQ-PWASAVP),PWASAVP    CLEAR REST   @YM07220
+*                                  DONT NEED TO ZERO ENQ LIST
+         STH   RNINE,PWPIRLNG         SAVE PIRL LENGTH         @Y30IPLG
+         MVC   0(K12,RCORE),0(R2) MOVE PARM LIST TO WORK AREA  @Y30IPLG
+         L    RF,CVTPTR            GET CVT PTR (RELOAD IT)     @Y30IPLG
+         L    RC,CVTIXAVL          GET IOCOM ADDR (RELOAD)     @Y30IPLG
+         EJECT
+*****************************************************************
+*                                                               *
+*        ISSUE ESTAE TO PROTECT RESOURCES NOT COVERED BY FRR    *
+*                                                               *
+*****************************************************************
+         SPACE
+         L     RUCB,PURGESTA       GET ESTAE ENTRY ADDR        @YM3104P
+         SPACE
+         ESTAE (RUCB),PARAM=(6),RECORD=YES,PURGE=NONE,ASYNCH=YES,      *
+               MF=(E,PWAESTAE),BRANCH=YES,SVEAREA=PWREGSAV     @Y30IPLG
+*        LIST FORM IS NOT MOVED IN                             @YM04162
+*                                                    AND ALSO: @YM3104P
+         SPACE
+         LTR   RF,RF               ANY PROBLEM WITH ESTAE
+         BNZ   PRG005              YES, SKIP SETTING ESTAE ACTIVE
+         SPACE
+         OI    PERRFLG1,PERESTAE   IND ESTAE ACTIVE
+         EJECT
+***************************************************************
+*                                                             *
+*        PAGE FIX MODULE                                      *
+*                                                             *
+***************************************************************
+         SPACE
+PRG005   TM    PPLOPT1,PPLEXR      DOES FOURTH WORD OF PPL EXIST
+         SPACE
+*        IMPORTANT NOTE ABOUT LABEL IECVNP02:                   *
+*              IEAVNP02 CHANGES THE FOLLOWING BRANCH TO AN      *
+*              UNCONDITIONAL BRANCH TO PRG010.  THIS IS         *
+*              USED AS A TEST TO DETERMINE IF IEAVNP02 IS       *
+*              IN CONTROL.                                      *
+         SPACE
+IECVNP02 BZ    PRG010              NO LEAVE FOURTH WORD ZERO
+         SPACE
+         MVC   K12(K04,RCORE),K12(R2) MOVE FOURTH WORD TO WORK AREA
+         SPACE
+PRG010   ST    RPIRL,PWASAVP       SET PIRL ADDR
+         LA    R0,PWAECB           GET ECB ADDR                @Y30IPLG
+         LR    RPAR,RBASE          GET PURGE BEGINNING         @Y30IPLG
+         BCTR  RPAR,R0             DECREMENT BY 2 SO THAT IT   @Y30IPLG
+         BCTR  RPAR,R0             POINTS TO BEGINNING         @Y30IPLG
+         LA    RPAR,0(RPAR)        INDICATE R FORM             @Y30IPLG
+         ST    RPAR,PWAFIX3        STORE BEGINNING ADDR        @Y30IPLG
+         OI    PWAFIX3,PGFREIND    SET LIST FOR FREE           @Y30IPLG
+         O     RPAR,RFIX       INDICATE FIX REQUEST            @Y30IPLG
+         LA    R2,PRGEND           GET END OF PURGE            @Y30IPLG
+         LA    R2,PURGEEND-PRGEND(R2)  POINT TO END OF FRR     @Y30IPLG
+         ST    R2,PWAFIX4          SAVE END ADDR OF MODULE     @Y30IPLG
+         OI    PWAFIX4,PGFIXEOL    INDICATE LIST END           @Y30IPLG
+         XR    R4,R4               ZERO R4 FOR FAST PATH       @Y30IPLG
+         L     RNINE,IOCOMEX       GET POINTER TO IOCOM EXT    @Y30IPLG
+         L     RF,IOXPSIX-IOX(,RNINE) GET FAST PATH TO PAGE FIX@Y30IPLG
+         L     RUCB,PSAAOLD        LOAD ASCB PTR IN R7         @Y30IPLG
+         OI    PERRFLG0,PERFIXA    INDICATE FIX ACTIVE         @Y30IPLG
+         BALR  RET,RF              CALL PAGE FIX               @Y30IPLG
+         SPACE
+         LTR   RF,RF               ZERO RETURN CODE ?          @Y30IPLG
+         BZ    PRG011              YES, SKIP WAIT
+         BAL   RF,PFLOCAL          FREE THE LOCAL LOCK TO WAIT @Y30IPLG
+         SPACE
+         SPACE
+         WAIT  ECB=PWAECB                                      @YM01204
+         EJECT
+***************************************************************
+*                                                             *
+*        PERFORM VALIDITY CHECKING AND INITIALIZE WORK AREAS  *
+*                                                             *
+***************************************************************
+         SPACE
+         B     PRG0115             DONT FREE LOCK TWICE        @Y30IPLG
+PRG011   BAL   RF,PFLOCAL          FREE LOCAL LOCK             @Y30IPLG
+PRG0115  LH    R10,IOCVOICT        GET COUNT OF VOID ENTRIES   @Y30IPLG
+         STC   R10,PIRCNT          SAVE COUNT OF PIRL ENTRIES
+         ST    RPIRL,IPIBPIRL      SAVE PIRL ADDRESS
+         LH    RNINE,PPLASID       GET ASID                    @YM01211
+         STH   RNINE,IPIBARG+K02   PUT ASID IN IPIB
+         SPACE
+         TM    PPLOPT2,PPLOTCB     TCB ASSOC RESTORE           @YM3155P
+         BZ    PRG012              NO, CONTINUE                @YM3155P
+         SPACE
+         OI    IPIBOPT,IPIBOTCB    IND TCB ASSOC RESTORE       @YM3155P
+         SPACE
+PRG012   TM    PPLOPT2,PPLTSKM     WAS CALLER TASK TERM        @YM3155P
+         BZ    PRG015              NO CONTINUE
+         SPACE
+         OI    PURGRETC,PURTT      INDICATE CALLED BY TASK TERM
+         SPACE
+PRG015   TM    PPLOPT2,PPLMEM      MEMORY PURGE SPECIFIED
+         BZ    PRG020              MEMORY PURGE NOT REQUESTED
+         L     RET,RBLINK          GET PREVIOUS RB             @YM04938
+         SPACE
+         TM    RBOPSW+K01-RBBASIC(RET),BIT7  CALLR IN SUP STAT @YM04938
+         BO    PRG260              NO CANNOT DO MEMORY PURGE
+         SPACE
+         OI    IPIBOPT,IPIBMEM     MEMORY PURGE SPECIFIED      @YM06596
+         SPACE
+         B     PRG080              CONTINUE
+         SPACE
+PRG020   EQU   *                   CHECK FOR TASK TERM         @YM01211
+         L     RF,PSATOLD          GET CURRENT TCB             @YM01204
+         SPACE
+         OC    PPLTCB+K01(K03),PPLTCB+K01 TCB ADDRESS SUPPLIED @YM01204
+         BZ    PRG030              NO USE CURRENT TCB          @YM01204
+         SPACE
+         MVC   IPIBARG+K01(K03),PPLTCB+K01 MOVE SUPPLIED       @YM01204
+*                                  *TCB ADDR TO IPIB           @YM01204
+         B     PRG040              GO CHECK TCB OPT            @YM01204
+         SPACE
+PRG030   ST    RF,IPIBARG          PLACE CURRENT TCB ADDR      @YM01204
+*                                  *IN IPIB                    @YM01204
+         SPACE
+PRG040   TM    PPLOPT1,PPLTASK     TCB PURGE SPECIFIED         @YM01204
+         BZ    PRG060              NO CHECK FOR DSID PURGE     @YM01204
+         L     RET,RBLINK          GET PREVIOUS RB PTR         @YM04938
+         SPACE
+         TM    RBOPSW+K01-RBBASIC(RET),BIT7  CALLR IN SUP STAT @YM04938
+         BZ    PRG050              YES DO NOT CHECK TCB        @YM01204
+         SPACE
+         L     RET,IPIBARG         GET SUPPLIED TCB POINTER    @YM04930
+         SPACE
+         CLC   TCBJSTCB-TCB+K01(K03,RET),TCBJSTCB-TCB+K01(RF)
+*                                  *DOES SUPPLIED TCB POINT
+*                                  *TO CURRENT JSTCB
+         BNE   PRG055              NO, DONT PURGE              @YM01204
+         SPACE
+PRG050   OI    IPIBOPT,IPIBTASK    INDICATE TCB OPTION         @YM01204
+*                                  ALSO PTM                    @YM07223
+         B     PRG070              GO GET CORE FOR PIRL        @YM01204
+         SPACE
+PRG055   OI    PURGRETC,PURTCB     INDICATE TCB NOT PURGABLE   @YM01204
+         B     PRG260              SKIP FURTHER PROCESSING     @YM01376
+         SPACE
+PRG060   L     RNINE,PPLDSID       GET DSID ARGUMENT           @YM01204
+         LA    RNINE,0(R0,RNINE)   CLEAR HIGH BYTE
+         SPACE
+         LTR   RNINE,RNINE         ANY DSID ADDRESS
+         BNZ   PRG065              YES, CONTINUE               @YM01376
+         SPACE
+         OI    PURGRETC,PURDSID    INDICATE DSID CANT          @YM01376
+*                                  *BE PURGED
+         B     PRG260              GO INDICATE PIRL BE FREED   @YM01376
+         SPACE
+PRG065   ST    RNINE,IPIBARG       PUT DISD IN IPIB ARGUMENT   @YM01376
+         MVC   IPIBDVID(K01),PPLDVRID COPY DRIVER ID           DCR21082
+         SPACE
+PRG070   TM    PPLOPT1,PPLRB       RB PURGE SPECIFIED          @YM01204
+         BO    PRG080              NO  DSID IS DEFAULT         @YM01204
+         SPACE
+         C     RF,IPIBARG          IS THIS CURRENT TCB         @YM01204
+*                                  AND ALSO PTM                @YM04930
+         BNE   PRG075              NO, RB PURGE OK             @YM01204
+         SPACE
+         TM    PPLOPT1,PPLHIO      QUIESCE OPTION              @YM01204
+         BZ    PRG090              YES, RB PURGE NOT OK        @YM01204
+         SPACE
+PRG075   OI    IPIBOPT,IPIBRBP     RB PURGE REQUESTED          @YM01204
+         SPACE
+PRG080   TM    PPLOPT1,PPLHIO      HALT OPTION SPECIFIED
+         BZ    PRG090              NO CHECK FOR POST OPT
+         SPACE
+         OI    IPIBOPT,IPIBHALT    SET HALT OPTION IN IPIB     @YM01204
+         SPACE
+PRG090   TM    PPLOPT1,PPLPOST     POST OPTION SPECIFIED
+         BZ    PRG100              NO   CHECK FOR RELATED
+         SPACE
+         OI    IPIBOPT,IPIBPOST    SET POST OPT IN IPIB
+         SPACE
+PRG100   TM    PPLOPT1,PPLREL      TEST FOR RELATED REQ OPTION
+         BZ    PRG110              NO GO SET RETURN CODE
+         SPACE
+         OI    IPIBOPT,IPIBREL     SET REL REQ PURGE
+         SPACE
+PRG110   TM    PPLOPT1,PPLHIO      QUIESCE OPTION
+         BO    PRG130              NO HALT
+         EJECT
+***************************************************************
+*                                                             *
+*        ENQUEUE ON PURGE RESOURCE SO THAT ONLY ONE PURGE     *
+*        WITH QUIESCE OPTION CAN BE GOING ON WITHIN A STEP.   *
+*                                                             *
+***************************************************************
+         SPACE
+         MVC   PURENQ(PURENQLN),PURNQLST  MOVE IN PARM LIST    @YM05797
+         ENQ   ,MF=(E,PURENQ)
+         SPACE
+         LTR   RF,RF               RETURN CODE=0               @YM3104P
+         BZ    PRG120              YES, CONTINUE               @YM3104P
+         SPACE
+         TM    IPIBOPT,IPIBMEM     MEMORY PURGE                @YM3104P
+*                                  *RCT IN CONTROL
+         BO    PRG120              YES, CONTINUE               @YM3104P
+         SPACE
+         OI    PURGRETC,PURNOENQ   INDICATE UNABLE TO ENQ      @YM3104P
+         OI    MASK1,MSKFREE       INDICATE FREE PIRL          @YM3104P
+         SPACE
+         B     PRG310              TERMINATE PURGE             @YM3104P
+         SPACE
+PRG120   OI    PERRFLG0,PERENQ     IND ENQ ACTIVE              @YM3104P
+         SPACE
+***************************************************************
+*                                                             *
+*        STOP SRB DISPATCHING                                 *
+*                                                             *
+***************************************************************
+         SPACE
+PRG130   EQU   *                   ISSUE STATUS STOP            OZ00086
+         OI    PERRFLG0,PERSTATS   IND STATUS ACTIVE
+         STATUS STOP,SRB
+         SPACE
+         EJECT
+         SPACE
+***************************************************************
+*                                                             *
+*        UPDATE PURGE COUNT IN IOCOM                          *
+*                                                             *
+***************************************************************
+         SPACE
+PRG150   L     RPAR,IOCPGCT-K02    GET WORD THAT CONTAINS PURGE COUNT
+         LA    R2,K01              SET  R2 TO ONE FOR INCREMENT
+         ALR   R2,RPAR             R2 NOW ONE MORE THAN RPAR
+         SPACE
+         CS    RPAR,R2,IOCPGCT-K02 STORE UPDATED COUNT
+         BNE   PRG150              BRANCH IF UPDATED BY ANYONE ELSE
+         SPACE
+         OI    PERRFLG0,PERPGCT    IND IOCPGCT ACTIVE
+         EJECT
+***************************************************************
+*                                                             *
+*        INITIALIZE PURGE COUNTS AND DETERMINE PURGE TYPE     *
+*                                                             *
+***************************************************************
+         SPACE
+         XC    PWAQCNT,PWAQCNT     CLEAR PURGE QUIESCE COUNT
+         XC    IPIBCNT,IPIBCNT     CLEAR IPIB COUNT
+***************************************************************
+*                                                             *
+*        PUT IPIB POINTER IN ASCB                             *
+*                                                             *
+***************************************************************
+         SPACE
+         STM   RB,RF,PWREGB        SAVE LOCK REGS              @YM01073
+PRG152   EQU   *
+         SPACE
+         BAL   RF,PGLOCAL          GO GET LOCAL LOCK AND FRR
+         SPACE
+*        LM    RB,RF,PWREGB        RESTORE LOCK REGS           @YM01073
+         SPACE
+         L     RF,CVTPTR           GET POINTER TO CVT
+         L     RC,CVTIXAVL         PICK UP IOCOM ADDRESS
+         LA    RB,IPIB             PUT POINTER TO IPIB IN RB
+         L     R10,PSAAOLD         GET CURRENT ASCB ADDR       @YM3089P
+         ST    R10,IPIBASCB        SET MEMORY PURGE IS RUNNING @ZA30265
+*                                  IN SO IECVPURG CAN POST     @ZA30265
+*                                  PROPERLY                    @ZA30265
+         XR    RF,RF               ZERO RF TEST FOR PREV IPIB  @YM07220
+         C     RF,ASCBIOSP-ASCB(,R10)   IS THERE AN IPIB ALRDY @YM07220
+         BE    PRG154              NO PREVIOUS IPIB IN MEM     @YM07220
+         SPACE
+         L     RF,ASCBIOSP-ASCB(,R10)   GET PREVIOUS IPIB      @YM07220
+         CLR   RF,RB               IS IT A 2ND PASS SAME IPIB  @YM07220
+         BE    PRG158              PATH FOR CHAIN OF DSID'S DEB@YM07336
+         SPACE
+         ST    RB,IPIBLNK-IPIB(,RF)     STORE 2ND IPIB IN 1ST  @YM07220
+*                                       THERE CAN BE MAX OF 2 @YM07220
+         B     PRG156              BRNCH ARND ST OF 1ST IPIB   @YM07220
+         SPACE
+PRG154   ST    RB,ASCBIOSP-ASCB(,R10) PUT POINTER TO IPIB IN ASCB
+         SPACE
+PRG156   ST    R10,PWAASCBP        SAVE ASCB PTR
+         SPACE
+         OI    PERRFLG0,PERIOSP    IND ASCBIOSP ACTIVE
+         SPACE
+         TM    PPLOPT2,PPLMEM      MEMORY PURGE
+         BO    PRG170              YES BYPASS DSID AND TCB PURGE
+         SPACE
+         TM    PPLOPT1,PPLTASK     TCB PURGE
+         BO    PRG170              YES BYPASS DSID PURGE
+PRG158   L     RET,RBLINK          GET PREVIOUS RB PTR         @YM04938
+         SPACE
+         TM    RBOPSW+K01-RBBASIC(RET),BIT7  CALLR IN SUP STAT @YM04938
+         BO    PRG160              NO DO VAL CHECK
+         SPACE
+         TM    PPLOPT2,PPLVC       VAL CHK REQ
+         BZ    PRG170              NO BYPASS VAL CHECK
+         SPACE
+***************************************************************
+*                                                             *
+*        PERFORM DEB CHECK                                    *
+*                                                             *
+***************************************************************
+         SPACE
+PRG160   L     RPAR,IPIBARG        GET POINTER TO DSID
+         SLR   R0,R0               INDICATE VERIFY
+         L     RF,CVTPTR           GET CVT PTR                @YM00977
+         L     R10,CVTTCBP         GET TCB POINTER
+         L     R10,K04(R0,R10)     GET ADDRESS OF CURRENT TCB
+         L     RF,CVTEXT2-CVTMAP(,RF) GET POINTER TO EXTENSION
+         L     RF,CVTDEBVR-CVTXTNT2(,RF) GET POINTER TO DEB CHECK RTNE
+         SPACE
+         BALR  RET,RF              GO CHECK DEB
+         B     PRG170              VALID DEB
+         B     PRG180              NO GO INDICATE ERROR
+         EJECT
+***************************************************************
+*                                                             *
+*        CALL PURGE SUBROUTINES                               *
+*        IF IEAVNP02 IS IN CONTROL, ONLY LCH AND UCB PURGES.  *
+*                                                             *
+***************************************************************
+         SPACE
+PRG170   CLI   IECVNP02+K01,NIP02TST IS IEAVNP02 IN CONTROL
+         BE    PRG175              YES, LCH AND UCB PURGE ONLY
+         SPACE
+         BAL   RET,SIRBPURG        GO TO SIRB PURGE SUBROUTINE
+         SPACE
+PRG175   BAL   RET,LCHPURG         GO TO LCH PURGE SUBROUTINE
+         SPACE
+         BAL   RET,UCBPURG         GO TO UCB PURGE SUBROUTINE
+         SPACE
+         CLI   IECVNP02+K01,NIP02TST IS IEAVNP02 IN CONTROL
+         BNE   PRG176              IEAVNP02 NOT IN CONTROL     @YM06325
+         BAL   RF,PFLOCAL          RELEASE LOCAL LOCK AND FRR  @YM06325
+         BAL   RET,IPIBPURG        GO TO IPIB PURGE SUBROUTINE @ZA08098
+         B     PRG178              YES, SKIP REMAINDER OF PURGES
+         SPACE
+PRG176   BAL   RET,DDRPURG         GO TO DDR PURGE SUBROUTINE
+         SPACE
+*        STM   RB,RF,PWREGB        SAVE LOCK REGS              @YM01073
+         SPACE
+         BAL   RF,PFLOCAL          GO RELEASE LOCAL LOCK AND FRR
+         SPACE
+*        LM    RB,RF,PWREGB        RESTORE LOCK REGS           @YM01073
+         SPACE
+         BAL   RET,SPLPURG         GO TO SPL PURGE SUBROUTINE
+         SPACE
+         TM    PPLOPT1,PPLHIO      IF QUISCE,DONT DO IPIBPURG  @YM07220
+         BNO   PRG177              GO ON TO DVRPURG            @YM07220
+         BAL   RET,IPIBPURG        GO TO IPIB PURGE SUBROUTINE
+         SPACE
+PRG177   BAL   RET,DVRPURG         GO TO DRIVER PURGE SUBROUTINE
+         EJECT
+***************************************************************
+*                                                             *
+*        FREE UP IOS BLOCKS FOR SPECIFIED MEMORY              *
+*                                                             *
+***************************************************************
+         SPACE
+PRG178   L     RF,CVTPTR           GET CVT POINTER
+         L     RC,CVTIXAVL         GET IOCOM ADDRESS
+         L     R10,CVTTCBP         GET POINTER TO TCB POINTER
+         L     RSVRB,K04(,R10)     GET CURR TCB POINTER
+         L     RSVRB,0(,RSVRB)     GET CURR RB PTR
+         L     R10,PSAAOLD         PICK UP PTR TO CURR ASCB    @YM04934
+         SPACE
+         TM    IPIBOPT,IPIBMEM     MEMORY PURGE
+         BZ    PRG190              NO BRANCH
+         SPACE
+         TM    PPLOPT1,PPLHIO      HALT OPTION                 @YM01211
+         BZ    PRG190              NO, BRANCH                  @YM01211
+         SPACE
+*        STM   RB,RF,PWREGB        SAVE LOCK REGS              @YM01073
+         SPACE
+         BAL   RF,PGLOCAL          GO GET LOCAL LOCK AND FRR
+         SPACE
+*        LM    RB,RF,PWREGB        RESTORE LOCK REGS           @YM01073
+         SPACE
+         LH    RB,PPLASID          GET ASID
+         L     RD,PWASAVP          GET POINTER TO SAVE AREA
+         ST    RD,PWREGSAV         CHAIN TO WORK AREA SAVE AREA
+         SPACE
+         LA    RD,PWREGSAV         POINT TO WORK AREA SAVE AREA
+         L     RF,IOCORMGT         GET CORE MANAGER ADDRESS
+         SPACE
+         BAL   RET,K08(,RF)        BAL TO PURGE/FREE ENTRY
+         SPACE
+*        STM   RB,RF,PWREGB        SAVE LOCK REGS              @YM01073
+         SPACE
+         BAL   RF,PFLOCAL          GO RELEASE LOCAL LOCK AND FRR
+         SPACE
+*        LM    RB,RF,PWREGB        RESTORE LOCK REGS           @YM01073
+         SPACE
+         B     PRG200              GO UPDATE COUNT IN WORK AREA
+         EJECT
+***************************************************************
+*                                                             *
+*      DETERMINE IF PURGE SHOULD PROCEED OR MAKE ANOTHER PASS *
+*                                                             *
+***************************************************************
+         SPACE
+PRG180   OI    PURGRETC,PURDSID    INDICATE THAT DSID CANNOT BE PURGED
+         BAL   RF,PFLOCAL          FREE LOCAL LOCK, LOSE RD-RF @YM06012
+         SPACE
+PRG190   TM    PPLOPT2,PPLMEM      MEMORY PURGE
+         BO    PRG200              YES, GO UPDATE COUNT IN WORK AREA
+         SPACE
+         TM    PPLOPT1,PPLTASK     TASK PURGE
+         BO    PRG200              YES, GO UPDATE COUNT IN WORK AREA
+         SPACE
+         TM    PPLOPT1,PPLDS       SINGLE DSID PURGE
+         BO    PRG200              YES, GO UPDATE COUNT IN WORK AREA
+         SPACE
+         L     RPAR,IPIBARG        CHAINED DSID PURGE
+         L     RPAR,K04(,RPAR)     GET POINTER TO NEXT DSID
+         LA    RPAR,0(RPAR)        CLEAR HIGH ORDER BYTE
+         SPACE
+         LTR   RPAR,RPAR           END OF LIST
+         BZ    PRG200              YES NOTHING MORE TO PURGE
+         SPACE
+         ST    RPAR,IPIBARG        NO STORE NEW ARGUMENT IN IPIB
+         SPACE
+         B     PRG152              MAKE ANOTHER PASS           @YM07336
+         EJECT
+***************************************************************
+*                                                             *
+*        UPDATE PURGE COUNT IN WORK AREA                      *
+*                                                             *
+***************************************************************
+         SPACE
+PRG200   MVC   PWAQCNT,IPIBCNT     UPDATE COUNT IN WORK AREA
+         SPACE
+***************************************************************
+*                                                             *
+*        DECREMENT PURGE COUNT IN IOCOM                       *
+*                                                             *
+***************************************************************
+         SPACE
+PRG210   L RPAR,IOCPGCT-K02        GET WORD THAT HOLDS THE PURGE COUNT
+         LR    R2,RPAR             COPY PURGE COUNT
+         BCTR  R2,R0               SUBTRACT 1
+         SPACE
+         CS    RPAR,R2,IOCPGCT-K02 STORE UPDATED COUNT
+         BNE   PRG210              BRANCH IF UPDATED BY ANY ONE ELSE
+         SPACE
+         NI    PERRFLG0,XFF-PERPGCT IND IOCPGCT NOT ACTIVE
+         L     R4,PWAQCNT          GET WORK AREA QUIESCE COUNT @ZA06065
+         LTR   R4,R4               I/O OUTSTANDING?            @ZA06065
+         BNZ   PRG220          YES - GO TO WAIT FOR COMPLETION @ZA06065
+         TM    IPIBOPT,IPIBMEM     NO - IS IT RCT?             @ZA06065
+         BNO   PRG220              NOT RCT - DO STATUS START   @ZA06065
+         TM    PPLOPT2,PPLBSS  DID RCT REQ STATUS START BYPASS @ZA06065
+         BO    PRG230              YES - SKIP STATUS START     @ZA06065
+         EJECT
+***************************************************************
+*                                                             *
+*        ALLOW SRB DISPATCHING                                *
+*                                                             *
+***************************************************************
+         SPACE
+PRG220   EQU   *                   ISSUE STATUS START
+         STATUS START,SRB          RESUME SRB DISPATCHING
+         SPACE
+         NI    PERRFLG0,XFF-PERSTATS  IND STATUS START NOT ACTIVE
+         SPACE
+***************************************************************
+*                                                             *
+*        WAIT FOR I/O TO COMPLETE                             *
+*                                                             *
+***************************************************************
+         SPACE
+*        L     R4,PWAQCNT          GET WORK AREA QUIESCE COUNT @ZA06065
+         SPACE
+         LTR   R4,R4               ANY I/O OUTSTANDING
+         BZ    PRG230              NO - PURGE COMPLETED
+         SPACE
+         WAIT  1,ECB=IPIBECB       YES - WAIT FOR IT TO COMPLETE
+         SPACE
+         B     PRG130              MAKE ANOTHER PASS TO SEE IF NEW WORK
+         SPACE
+***************************************************************
+*                                                             *
+*        DEQUEUE PURGE RESOURCES                              *
+*                                                             *
+***************************************************************
+         SPACE
+PRG230   EQU   *
+         L     RF,PRGCOMP          GET ADDR OF COMPRESS INTERFACE
+*                                                              @Y40FPLG
+         BALR  RET,RF              GO SEE IF WE SHOULD COMPRESS
+         SPACE
+         TM    PPLOPT1,PPLHIO      QUIESCE OPTION
+         BO    PRG260              NO HALT
+         SLR   RF,RF               CLEAR REG                   @YM07220
+         L     RET,PSAAOLD         GET ASCB PTR TO QSC IPIB    @YM07220
+         ST    RF,ASCBIOSP-ASCB(RET)    ZERO IPIB PTR          @YM07220
+         NI    PERRFLG0,XFF-PERIOSP IND ASCBIOSP NOT ACTIVE    @YM07220
+         SPACE
+         DEQ  ,MF=(E,PURENQ)       YES DEQUE PURGE RESOURCE
+         SPACE
+         NI    PERRFLG0,XFF-PERENQ IND ENQ NOT ACTIVE
+         EJECT
+***************************************************************
+*                                                             *
+*        SCAN PIRL ENTRIES                                    *
+*                                                             *
+***************************************************************
+         SPACE
+         LA    RPAR,PIRRSTR        GET POINTER TO FIRST PIRL ENTRY
+*                                  *SEE IF ANY THING ON PIRL
+*                                  *IF NOT FREE IT
+         SLR   RET,RET             CLEAR REG
+         IC    RET,PIRCNT          GET NUMBER OF PIRL ENTRIES
+         SPACE
+PRG250   L     RF,0(RPAR)          PICK UP A PIRL ENTRY
+         SPACE
+         LTR   RF,RF               ANYTHING ON THIS ENTRY
+         BNZ   PRG270              YES DO NOT FREE PIRL
+         SPACE
+         LA    RPAR,PIRENTL(RPAR)  POINT TO NEXT ENTRY
+         SPACE
+         BCT   RET,PRG250          ANY MORE ENTRIES
+         SPACE
+PRG260   OI    MASK1,MSKFREE       INDICATE PIRL TO BE FREED
+         SPACE
+         TM    PPLOPT1,PPLHIO      IS IT HALT OPTION
+         BO    PRG310              YES DO NOT MOVE PIRL TO ANCHOR
+         SPACE
+         MVC   IPIBPIRL,FWORD      INDICATE THAT NO PIRL EXISTS
+         SPACE
+PRG270   TM    PPLOPT1,PPLHIO      IS IT HALT OPTION
+         BO    PRG310              YES NO ANCHOR PROVIDED
+         SPACE
+         L     RF,CVTPTR           GET CVT POINTER
+         L     RC,CVTIXAVL         GET IOCOM POINTER
+         L     R10,CVTTCBP         GET TCB POINTER
+         L     R10,K04(,R10)       GET CURR TCB POINTER
+         L     RSVRB,0(,R10)       GET POINTER TO CURR RB
+         SPACE
+         CLC   PPLPIRL+K01(K03),FWORD  WAS ANCHOR ADDR=F'S
+         BE    PRG310              YES, ANCHOR NO PROVIDED
+         EJECT
+***************************************************************
+*                                                             *
+*        PERFORM DEB CHECK FOR NON-SUPERVISOR CALLERS         *
+*                                                             *
+***************************************************************
+         L     RET,RBLINK          GET PREVIOUS RB PTR         @YM04938
+         SPACE
+         TM    RBOPSW+K01-RBBASIC(RET),BIT7  CALLR IN SUP STAT @YM04938
+         BZ    PRG300              YES BYPASS VAL CHECK        @YM01150
+         SPACE
+         L     RPAR,PPLPIRL        GET POINTER TO ANCHOR
+         LA    RPAR,K00(RPAR)      CLEAR HI ORDER BYTE         @YM01150
+         SPACE
+         LTR   RPAR,RPAR           DOES ADDR = 0               @YM01150
+         BZ    PRG310              YES, SKIP DEB CHECK         @YM01150
+         SPACE
+         LA    R4,DEBUSRPG-DEBBASIC GET OFFSET TO DEB USER PURGE
+         SLR   RPAR,R4             POINT TO BEGINNING OF DEB
+         SLR   R0,R0               INDICATE VERIFY
+         L     RF,CVTPTR           GET POINTER TO CVT
+         L     R10,CVTTCBP-CVTMAP(,RF) GET TCB POINTER
+         L     R10,K04(R0,R10)     GET ADDRESS OF CURRENT TCB
+         SPACE
+         USING TCB,R10
+         L     RF,CVTEXT2-CVTMAP(,RF) GET POINTER TO EXTENSION
+         L     RF,CVTDEBVR-CVTXTNT2(,RF) GET POINTER TO DEB CHECK RTNE
+         STM   RIOSB,RB,PWREGA                                 @YM04945
+         SPACE
+         BALR  RET,RF              GO CHECK DEB
+PRG280   B     PRG300              GO GET ANCHOR ADDR          @YM06013
+         SPACE
+*  LINE DELETED FOR PTM VS03495                                @YM3495P
+*   COME HERE IF DEB GOOD
+         SPACE
+*   COME HERE IF DEB NOT GOOD
+*        B     PRG290              BRANCH TO NEXT INSTRUCTION
+         LM    RIOSB,RB,PWREGA                                 @YM04945
+*                                                              @YM06013
+         EJECT
+***************************************************************
+*                                                             *
+*        MOVE PIRL ADDR TO ANCHOR                             *
+*                                                             *
+***************************************************************
+         SPACE
+         L     R4,PPLPIRL          GET PIRL ADDR
+         LA    R4,0(R4)            CLEAR HI ORDER BYTE         DCR21082
+         SPACE
+         MODESET EXTKEY=RBT234,WORKREG=2  CHANGE TO CALLER KEY @YM05497
+         SPACE
+         MVC   K01(K03,R4),IPIBPIRL+K01  MOVE PIRL ADDRESS TO ANCHOR
+         SPACE
+         MODESET EXTKEY=ZERO           CHANGE BACK TO KEY ZERO
+         SPACE
+         DROP  R10
+         USING IOSB,RIOSB
+         SPACE
+         B     PRG310              GO SET RETURN CODE
+         SPACE
+PRG300   LM    RIOSB,RB,PWREGA                                 @YM06013
+         L     R4,PPLPIRL          GET ANCHOR ADDRESS
+         LA    R4,0(R4)            CLEAR HI ORDER BYTE         DCR21082
+         MVC   K01(K03,R4),IPIBPIRL+K01  MOVE PIRL ADDRESS TO ANCHOR
+         EJECT
+***************************************************************
+*                                                             *
+*        SET RETURN AND CONDITION CODES                       *
+*                                                             *
+***************************************************************
+         SPACE
+PRG310   L     RPAR,RBPPLSAV       GET POINTER TO USERS PPL
+         SLR   R4,R4               R4 NOW HAS RETURN CODE
+         SPACE
+         TM    PPLOPT1,PPLEXR      RETURN CODE REQUESTED
+         BZ    PRG320              NO RETURN CODE OF ZERO
+         TM    PURGRETC,PURRTCDT
+         BZ    PRG320
+         SPACE
+         TM    PURGRETC,PURERRCD   ANY ERROR CODE
+         BZ    PRG320              NO ERRORS, GIVE 7F          @YM06011
+         TM    PURGRETC,PURERRCD   ANY BITS BUT HIO & PURTP    @YM06011
+         BNZ   PRG330              YES GIVE COMP CODE OF 40
+         SPACE
+PRG320   MVI   PPLCC-PPLOPT1(RPAR),PURGOOD  NO GIVE 7F
+         SPACE
+         B     PRG340              USE THIS RETURN CODE
+         SPACE
+PRG330   MVI   PPLCC-PPLOPT1(RPAR),PURNG  PURGE NOT COMPLETED GOOD
+         SPACE
+         LA    R4,PURRTCD2         SET RETURN CODE=20          @YM3104P
+         SPACE
+         TM    PURGRETC,PURNOENQ   UNABLE TO ENQ ON PURGE      @YM3104P
+         BO    PRG340              YES, USE THIS RETURN CODE   @YM3104P
+         SPACE
+         TM    PURGRETC,PURTT      WAS PURGE CALLED BY TASK TERM
+         BZ    PRG331              NO CODE WILL BE 8 OR LESS
+         SPACE
+         LA    R4,PURRTCD1         SET RETURN CODE TO 16
+         SPACE
+         TM    PURGRETC,PURTP      WAS TP I/O HALTED
+         BO    PRG340              YES USE THIS CODE
+         SPACE
+         LA    R4,PURRTCDC         SET CODE TO 12
+         SPACE
+         TM    PURGRETC,PURIO      WAS ANY I/O HALTED
+         BO    PRG340              YES USE THIS CODE
+         SPACE
+PRG331   LA    R4,PURRTCD8         SET CODE TO EIGHT           @YM01073
+         SPACE
+         TM    PURGRETC,PURDSID    WAS A DSID NOT PURGABLE
+         BO    PRG340              YES USE THIS CODE
+         SPACE
+         LA    R4,PURRTCD4         SET CODE  TO FOUR
+         SPACE
+         TM    PURGRETC,PURTCB     WAS A TCB NOT PURGABLE
+         BO    PRG340              YES USE THIS CODE
+         SPACE
+         IC    R4,PURGRETC         SET UP BAD CODE
+*                                  *THIS IS A CANNOT HAPPEN
+*                                  *SITUATION FOR ERROR CHECKING
+         EJECT
+***************************************************************
+*                                                             *
+*        RELEASE ESTAE                                        *
+*                                                             *
+***************************************************************
+         SPACE
+PRG340   EQU   *                   ISSUE ESTAE
+         LR   RNINE,R4         SAVE RTN CODE                   @Y30IPLG
+         BAL   RF,PGLOCAL          GET LOCAL LOCK TO BRNCH SVC @Y30IPLG
+         SPACE
+         ESTAE 0,MF=(E,PWAESTAE),BRANCH=YES,SVEAREA=PWREGSAV   @Y30IPLG
+         SPACE
+***************************************************************
+*                                                             *
+*        ISSUE PAGE FREE FOR MODULE AND PIRL                  *
+*                                                             *
+***************************************************************
+         SPACE
+         LA    RPAR,PWAFIX3        GET PARMS FOR PAGE FREE     @Y30IPLG
+         ICM   RPAR,K08,LISTIND       INDICATE LIST            @Y30IPLG
+         SPACE
+         LR    RNINE,R4            SAVE RETURN CODE            @Y30IPLG
+         XR    R4,R4               ZERO R4 FOR FAST PATH      @Y30IPLG
+         L     RUCB,PSAAOLD        GET OLD ASCB PTR            @Y30IPLG
+         L     R10,IOCOMEX                                     @Y30IPLG
+         L     RF,IOXPSIF-IOX(,R10)    GET FAST PATH TO PGFREE @Y30IPLG
+         SPACE
+         BALR  RET,RF              CALL PAGE FREE FAST PATH    @Y30IPLG
+         SPACE
+         EJECT
+***************************************************************
+*                                                             *
+*        FREE PIRL CORE                                       *
+*                                                             *
+***************************************************************
+         SPACE
+         L     R4,PSATOLD          LOAD R4 CURENT TCB FOR FREE @Y30IPLG
+         TM    MASK1,MSKFREE       PIRL TO BE FREED            @YM01266
+         BZ    PRG350              NO DO NOT FREE              @YM01449
+         SPACE
+         L     RPAR,PWASAVP        GET PIRL ADDR               @YM01449
+         LH    R0,PWPIRLNG         GET LENGTH                  @YM01449
+         ICM   R0,K08,PIRLSUBP     INDICATE SP 254             @Y30IPLG
+         SPACE
+         FREEMAIN R,LV=(0),A=(1),BRANCH=YES                    @Y30IPLG
+         SPACE
+***************************************************************
+*                                                             *
+*        FREE PURGE WORK AREA                                 *
+*                                                             *
+***************************************************************
+         SPACE
+PRG350   LR    RPAR,RCORE          GET PWA PTR                 @YM01449
+         L     R0,COREMASK         INDICATE SP 245 & LNTH     @Y30IPLG
+         SPACE
+         FREEMAIN R,LV=(0),A=(1),BRANCH=YES                    @Y30IPLG
+*        ALSO NEM SUPPORT-                                     @Y30IPLG
+         SPACE
+         XR    RCORE,RCORE         ZERO R6 TO AVOID PIC WHEN   @ZM30179
+*                                  NO PWA, USING PFLOCAL2      @ZM30179
+         BAL   RF,PFLOCAL2     FREE LOCAL LOCK (LOOSE R11-R15) @Y30IPLG
+         SPACE
+***************************************************************
+*                                                             *
+*        RETURN TO CALLER                                     *
+*                                                             *
+***************************************************************
+         SPACE
+PUR300   L     RET,RBRETSAV        GET RETURN ADDRESS
+         SPACE
+         LR    RF,RNINE            PUT RETURN CODE IN REG 15  @Y30IPLG
+         SPACE
+         BR    RET                 RETURN TO CALLER
+         TITLE 'IGC0001F - BASIC PURGE SUBROUTINE'
+***************************************************************
+*                                                             *
+*        BASIC PURGE SUBROUTINE                               *
+*                                                             *
+***************************************************************
+         SPACE
+BASICPRG ST    RET,PWRET2          SAVE RETURN REG
+         SPACE
+***************************************************************
+*                                                             *
+*        CALL APPLICABILITY ROUTINE AND VALIDATE PURGE        *
+*                                                             *
+***************************************************************
+         SPACE
+         BAL   RET,PURAPLSR        GO CHECK THIS BLOCK
+         SPACE
+         B     PBSC020             APPLICABLE CONTINUE
+*                                  *BRANCH TO NEXT IF NOT APPLICABLE
+         TM    MASK1,MSKDEQ        DEQ
+         BZ    PBSC010             NO
+         SPACE
+         LR    RBACK,RPAR
+         SPACE
+PBSC010  L     RET,PWRET2          GET RETURN ADDR
+         MVI   MASK1,MSKOFF        TURN OFF MASK BITS
+         SPACE
+         B     K04(,RET)           RETURN OFFSET 4
+         EJECT
+***************************************************************
+*                                                             *
+*        INCREMENT QUIESCE COUNT IN IPIB AND PWA              *
+*                                                             *
+***************************************************************
+         SPACE
+PBSC020  STM   RPAR,R2,IPIBIO      SAVE R1 AND R2
+         SPACE
+         TM    PPLOPT1,PPLHIO      HALT OPTION SPECIFIED
+         BO    PBSC050             YES NOT QUIESCE
+         SPACE
+PBSC030  L     RPAR,IPIBCNT        PICK UP QUIESCE COUNT
+         LA    R2,K01(,RPAR)       INCREMENT COUNT IN R2
+         SPACE
+         CS    RPAR,R2,IPIBCNT     STORE UPDATED COUNT
+         BNZ   PBSC030             BRANCH IF UPDATED BY ANYONE ELSE
+         SPACE
+         L     RPAR,PWAQCNT        GET QUIESCE COUNT
+         LA    RPAR,K01(,RPAR)     INCREMENT COUNT
+         ST    RPAR,PWAQCNT        RESET QUIESCE COUNT
+         SPACE
+         LM    RPAR,R2,IPIBIO
+         LA    RB,IPIB
+         ST    RB,IOSIPIB          PLACE IPIB POINTER IN IOSB
+         SPACE
+PBSC040  L     RET,PWRET2          RESTORE RETURN REG
+         MVI   MASK1,MSKOFF        TURN OFF MASK BITS
+         SPACE
+         BR    RET                 RETURN TO CALLER
+         EJECT
+***************************************************************
+*                                                             *
+*        ISSUE HALT I/O                                       *
+*                                                             *
+***************************************************************
+         SPACE
+PBSC050  CLI   UCBTBYT3,UCB3COMM   IS IT TP DEVICE                  CTC
+         BNE   PBSC055             NO CONTINUE                      CTC
+         SPACE
+         OI    PURGRETC,PURTP      INDICATE TP I/O
+         SPACE
+PBSC055  OI    PURGRETC,PURIO      INDICATE I/O HALTED
+         SPACE
+         TM    MASK1,MSKHIO        HALT I/O INTERFACE SPECIFIED
+         BZ    PBSC060             INTERFACE NOT SPECIFIED
+         SPACE
+         TM    UCBFLA,UCBACTV      IS UCB ACTIVE
+         BZ    PBSC058             NO, CONTINUE                @YM04940
+         SPACE
+         L     R2,SRBPARM-SRB(,RPAR) PUT IOSB POINTER IN R2
+         LA    RD,PWREGSAV         GET SAVE AREA ADDR
+         L     RF,CVTPTR           GET CVT PTR
+         L     RF,CVTIXAVL-CVTMAP(,RF) GET IOCOM ADDR
+         L     RF,IOCHIO-IOCOM(,RF) GET HALT I/O ROUTINE ADDR
+         NI    MASK1,XFF-MSKUCB    MAKE SURE BIT IS OFF        @OZ00762
+         SPACE
+         BALR  RET,RF              LINK TO HALT I/O ROUTINE
+         SPACE
+         CH    RF,HLTRTRY          DID HALT WORK,              @OZ00762
+         BNE   PBSC057             YES, GO ON, NORMAL          @OZ00762
+         MVI   MASK1,MSKUCB        INDICATE RETRY THE HALT     @OZ00762
+         LM    RPAR,R2,IPIBIO      RELOAD REGS                 @OZ00762
+         L     RET,PWRET2          RELOAD RETURN               @OZ00762
+         B     K08(,RET)           RETURN TO UCBPURG,IND RETRY @OZ00762
+         SPACE
+PBSC057  OI    MASK1,MSKRDV        INDICATE REDRIVE IOS        @OZ00762
+         TM    UCBFLA,UCBPST       POST ON?                    @ZA12644
+         BO    PBSC058             YES - COMPLETE PURGE        @ZA12644
+         TM    UCBFLB,UCBSPST      SENSEPOST ON? YES - PURGE   @ZA12644
+         BNO   PBSC095             NO - DON'T FREE BLOCKS      @ZA12644
+PBSC058  NI    UCBFLA,UCBBOFF1     BSY,PST,PSNS,CUB,SAP,ACTV   @YM04940
+         NI    UCBFLB,UCBBOFF2     ASNS,SPST BITS OFF          @YM04940
+         EJECT
+***************************************************************
+*                                                             *
+*        REMOVE FROM LCH WITH POINTERS PROVIDED               *
+*                                                             *
+***************************************************************
+         SPACE
+PBSC060  LM    RPAR,R2,IPIBIO      RESTORE R1 AND R2
+         SPACE
+         TM    MASK1,MSKDEQ        DEQUEUE REQUESTED
+         BZ    PBSC070             NO DO NOT DEQUEUE
+         SPACE
+         NI    UCBFLA,XFF-UCBCUB   TO INSURE NOT LEFT ON        OZ00088
+         SPACE
+         L     RB,IOQLNK-IOQ(,RCUR) GET PTR TO NEXT IOQ
+         ST    RB,0(,RBACK)        SET PTR
+         SPACE
+         LTR   RB,RB               IS POINTER F'S
+         BP    PBSC070             NO DO NOT UPDATE LCHLST
+         SPACE
+         ST    RBACK,LCHLST-LCH(,R2)  YES UPDATE LCHLST        @YM04944
+         SPACE
+***************************************************************
+*                                                             *
+*    CALL ENQUE ROUTINE AND ENQUE SRB ON PIRL AND FREE IOQE'S *
+*                                                             *
+***************************************************************
+         SPACE
+PBSC070  L     RF,PSRBENQA         GET ADDR OF PSRBENQ         @Y30IPLG
+         BALR  RET,RF              GO ENQUEUE SRB ON PIRL      @Y30IPLG
+         EJECT
+***************************************************************
+*                                                             *
+*        FREE 160 BYTE BLOCK                                  *
+*                                                             *
+***************************************************************
+         SPACE
+PBSC080  L     RPAR,IOSERP-IOSB(,RIOSB) GET ERP WORK AREA PTR
+         LA    RPAR,0(,RPAR)       CLEAR HIGH BYTE
+         SPACE
+         LTR   RPAR,RPAR           ANY ERP FOR THIS IOSB
+         BZ    PBSC090             NO, SKIP EWA FREE CODE
+         SPACE
+         LA    RB,FREE160          INDICATE 160 BYTE BLOCK
+         L     RF,CVTPTR           GET CVT PTR
+         L     RF,CVTIXAVL-CVTMAP(,RF) GET IOCOM ADDRESS
+         L     RF,IOCORMGT-IOCOM(,RF)  GET ENTRY POINT TO IOS CORE MGR
+         LA    RD,PWREGSAV         POINT TO SAVE AREA
+         SPACE
+         BAL   RET,K04(,RF)        BAL TO 160 FREE ENTRY
+         XR    RPAR,RPAR           TO ZERO OUT ERP WA PTR      @ZM30454
+         ST    RPAR,IOSERP-IOSB(,RIOSB)   ZERO ERP WA PTR      @ZM30454
+         SPACE
+***************************************************************
+*                                                             *
+*        FREE 12 BYTE BLOCK                                   *
+*                                                             *
+***************************************************************
+         SPACE
+PBSC090  LTR   RPAR,RCUR           GET IOQE IN PARM REG
+         BZ    PBSC100             NO REDRV NECESSARY IF NO IOQ TO FREE
+         SPACE
+         STM   RIOSB,RC,PWREGA     SAVE REGS 10,11,12
+         L     RF,CVTPTR           GET CVT PTR
+         L     RF,CVTIXAVL-CVTMAP(,RF) GET IOCOM ADDRESS
+         L     RF,IOCORMGT-IOCOM(,RF)  GET ENTRY POINT TO IOS CORE MGR
+         SPACE
+         BAL   RET,K16(,RF)        BAL TO 12 BYTE FREE ENTRY
+         SPACE
+         LM    RIOSB,RC,PWREGA     RESTORE REGS
+         EJECT
+***************************************************************
+*                                                             *
+*        ISSUE IOSGEN CHANNEL RESTART                         *
+*                                                             *
+***************************************************************
+         SPACE
+PBSC095  TM    MASK1,MSKRDV        REDRIVE IOS REQUESTED       @ZA12644
+         BZ    PBSC100             NO
+         SPACE
+         SLR   RPAR,RPAR           ZERO      REG
+         SLR   R2,R2               ZERO REG 2
+         IC    RPAR,UCBCHA         INDICATE CHAN TO RESTART
+         IC    R2,UCBCPU           INDICATE CPU TO RESTART
+         SPACE 4
+         IOSGEN RESTART,REG=(RPAR,R2,RIOSB,RB)
+         SPACE 4
+PBSC100  LM    RPAR,R2,IPIBIO      RESTORE REGS 1 AND 2
+         L     RET,PWRET2          RESTORE RETURN ADDRESS
+         MVI   MASK1,MSKOFF        TURN OFF MASK BITS
+         SPACE
+         B     K08(,RET)           BRANCH BACK PLUS EIGHT
+     TITLE     'IGC0001F - APPLICABILITY CHECK SUBROUTINE'
+***************************************************************
+*                                                             *
+*        APPLICABILITY CHECK SUBROUTINE                       *
+*                                                             *
+***************************************************************
+         SPACE
+PURAPLSR L     RIOSB,SRBPARM       GET IOSB ADDR
+         SPACE
+         TM    PPLOPT1,PPLHIO      HALT OPTION SPECIFIED
+         BO    PAPL010             YES BRANCH
+         SPACE
+         LA    RB,IPIB             GET IPIB ADDR
+         SPACE
+         C     RB,IOSIPIB          ALREADY PURGED
+         BE    PAPL040             YES RETURN NOT APPLICABLE
+         SPACE
+PAPL010  TM    PPLOPT2,PPLMEM      MEMORY PURGE SPECIFIED
+         BZ    PAPL030             NO GO TEST FOR TCB OPT
+         SPACE
+         CLC   IOSASID-IOSB(K02,RIOSB),IPIBARG+K02 SRB FOR     @YM01372
+*                                  *THIS MEMORY
+         BNE   PAPL040             NO RETURN NOT APPLICABLE
+         SPACE
+PAPL020  LR    RF,RET              SHIFT TO USE RF TO BRANCH BACK
+         SPACE
+         BR    RF                  RETURN APPLICABLE
+         SPACE
+PAPL030  L     RB,PSAAOLD          GET CURRENT ASCB ADDR       @YM01321
+         CLC   ASCBASID-ASCB(K02,RB),IOSASID-IOSB(RIOSB)       @YM01372
+*                                  *DOES ASID EQUAL CURRENT ASID
+         BNE   PAPL040             TAKE NOT APPLICABLE RETURN  @YM01321
+         SPACE
+         TM    PPLOPT1,PPLTASK     TCB PURGE
+         BZ    PAPL050             NO CHECK FOR DSID PURGE
+         SPACE
+         CLC   SRBPTCB,IPIBARG     SRB FOR THIS TCB
+         BE    PAPL020             YES APPLICABLE
+         SPACE
+PAPL040  LR    RF,RET              SHIFT TO USE RF TO BRANCH BACK
+         SPACE
+         B     K04(,RF)            RETURN NOT APPLICABLE
+         SPACE
+PAPL050  CLC   IOSDSID-IOSB+K01(K03,RIOSB),IPIBARG+K01         @YM02151
+*                                  *IOSB DSID = DSID ARG
+         BE    PAPL020             YES APPLICABLE
+         SPACE
+         B     PAPL040             NO NOT APPLICABLE
+     TITLE     'IGC0001F - GET UCB LOCK SUBROUTINE'
+***************************************************************
+*                                                             *
+*        OBTAIN UCB LOCK SUBROUTINE                           *
+*                                                             *
+***************************************************************
+         SPACE
+PGUCBLK  STM   RB,RET,PWREGB       SAVE REGS 11,12,13,14
+         SPACE
+         TM    UCBWGT,UCBMTPXP     MULT EXP DEVICE
+         BZ    PGLK010             NO BRANCH AROUND
+         SPACE
+         C     RUCB,UCBBASE        IS THIS THE BASE UCB
+         BE    PGLK010             YES ALREADY POINTS TO BASE
+         SPACE
+         L     RB,UCBBASE          POINT TO BASE
+         LA    RB,UCBLOCK-UCB(,RB) POINT TO UCB LOCK
+         SPACE
+         B     PGLK020             GO SAVE LOCK ADDRESS
+         SPACE
+PGLK010  LA    RB,UCBLOCK          GET LOCK  ADDRESS
+         SPACE
+PGLK020  ST    RB,PWAUCBLK         SAVE LOCK ADDRESS
+         SPACE
+PGLK025  SETLOCK OBTAIN,TYPE=IOSUCB,MODE=UNCOND,ADDR=(11),             *
+               RELATED=(UCB,IGC016(PFLK015))
+         SPACE
+         LM    RB,RET,PWREGB       RESTORE REGS
+         SPACE
+         ST    RUCB,PWAUCBP        SAVE UCB PTR
+         OI    PERRFLG1,PERUCB     IND UCB LOCK HELD
+         SPACE
+         BR    RET                 RETURN TO CALLER
+     TITLE     'IGC0001F - FREE UCB LOCK SUBROUTINE'
+***************************************************************
+*                                                             *
+*        RELEASE UCB LOCK SUBROUTINE                          *
+*                                                             *
+***************************************************************
+         SPACE
+PFUCBLK  STM   RB,RET,PWREGB       SAVE REGS
+         SPACE
+         L     RB,PWAUCBLK         GET ADDRESS OF UCB LOCK
+         SPACE
+         TM    UCBWGT,UCBMTPXP     TEST FOR MULT EXP DEVICE
+         BZ    PFLK010             NO, SKIP BASE UCB
+         SPACE
+         L     RD,UCBBASE          POINT TO BASE UCB
+         SPACE
+         NI    UCBFLA-UCB(RD),XFF-UCBBSY  TURN OFF BUSY
+         SPACE
+PFLK010  NI    PERRFLG1,XFF-PERUCB IND UCB LOCK NOT HELD
+         SPACE
+PGLK015  SETLOCK  RELEASE,TYPE=IOSUCB,ADDR=(11),                       *
+               RELATED=(UCB,IGC016(PGLK025))
+         SPACE
+         LM    RB,RET,PWREGB       RESTORE REGS
+         SPACE
+         BR    RET                 RETURN TO CALLER
+         TITLE 'IGC0001F - LCH PURGE SUBROUTINE'
+***************************************************************
+*                                                             *
+*        LCH PURGE SUBROUTINE                                 *
+*                                                             *
+***************************************************************
+         SPACE
+LCHPURG  ST    RET,PWRET1          SAVE RETURN ADDRESS
+         SPACE
+         L     RNINE,IOCOMEX       GET POINTER TO IOCOM EXT
+         L     R2,IOCLCHTB         GET LCH POINTER
+         SLR   R4,R4               CLEAR REG
+         IC    R4,IOXHICH-IOX(,RNINE)   GET HIGHEST CHAN GENNED
+         LA    R4,K01(,R4)         PLUS 1 EQUALS NO OF SENSE LCHS
+         IC    RNINE,IOXLCHCT-IOX(,RNINE) GET LCH COUNT
+         SLL   RNINE,K24
+         SRL   RNINE,K24           CLEAR ANY HIGH ORDER BITS
+         ALR   RNINE,R4            TOTAL NUM OF LCHS
+         LR    R0,RNINE            PUT TOTAL LCHS IN R0
+         SPACE
+***************************************************************
+*                                                             *
+*        SCAN LCH'S FOR PURGEABLE IOQE'S                      *
+*                                                             *
+***************************************************************
+         SPACE
+PLCH010  LR    RBACK,R2            PUT BACK POINTER INTO RNINE
+         ST    R0,PQUEREG
+         L     R5,LCHFST-LCH(,R2)  GET FIRST IOQ
+         SPACE
+         LTR   R5,R5               END OF LIST
+         BNP   PLCH150             YES BRANCH OUT
+         SPACE
+         STM   RB,RET,PWREGB       SAVE LOCK REGS              @YM01073
+         SPACE
+         LA    RB,LCHLOCK-LCH(,R2) GET LOCK ADDRESS
+         ST    RB,PWALCHLK         SAVE LCH LOCK ADDR
+         SPACE
+PLCH015  SETLOCK OBTAIN,TYPE=IOSLCH,ADDR=(11),MODE=UNCOND,             *
+               RELATED=(LCH,IGC016(PLCH145))
+         SPACE
+         LM    RB,RET,PWREGB       RESTORE LOCK REGS           @YM01073
+         SPACE
+         OI    PERRFLG1,PERLCH     IND LCH LOCK HELD
+         ST    R2,PWALCHP          SAVE LCH PTR
+         SPACE
+         L     R5,LCHFST-LCH(,R2)  GET FIRST IOQ
+         B     PLCH030             SKIP LINK ENTRY
+         EJECT
+***************************************************************
+*                                                             *
+*        CALL APPLICABILITY ROUTINE AND VALIDATE SRB          *
+*                                                             *
+***************************************************************
+         SPACE
+PLCH020  L     R5,IOQLNK-IOQ(,RBACK)  GET LINK ENTRY
+         SPACE
+PLCH030  LTR   R5,R5               END OF LIST
+         BNP   PLCH140             YES BRANCH OUT
+         SPACE
+         L     RIOSB,IOQIOSB-IOQ(,R5) GET IOSB
+         L     RPAR,IOSSRB-IOSB(,RIOSB) GET SRB ADDRESS
+         SPACE
+         BAL   RET,PURAPLSR        GO CHECK SRB
+         SPACE
+         B     PLCH040             VALID GO GET UCB LOCK
+         SPACE
+         LR    RBACK,RCUR          UPDATE BACK POINTER
+         SPACE
+         B     PLCH020             DOES NOT APPLY GO GET NEXT
+         EJECT
+***************************************************************
+*                                                             *
+*        CHECK UCB FOR ACTIVE I/O                             *
+*                                                             *
+***************************************************************
+         SPACE
+PLCH040  L     RUCB,IOSUCB-IOSB(,RIOSB)    GET UCB ADDRESS
+         LA    RF,UCBPRFX          GET PREFIX OFFSET
+         SLR   RUCB,RF             BACKUP TO POINT TO PREFIX
+         SPACE
+         TM    PPLOPT1,PPLHIO      HALT OPTION
+         BZ    PLCH100             NO BRANCH
+         SPACE
+         BAL   RET,PGUCBLK         GO GET UCB LOCK
+         SPACE
+         CL    R5,UCBIOQ           IOQ-S MATCH
+         BNE   PLCH060             NO DEQ IOSB/SRB COUNT
+         SPACE
+         TM    UCBFLA,UCBPSNS+UCBSAP   PENDING SNS OR STAND ALONE PROC
+         BZ    PLCH060             BRANCH NO,MUST BE RESIDUE IOQ
+         SPACE
+         TM    UCBFLA,UCBPSNS      YES IS IT FOR PENDING SENSE
+         BNZ   PLCH120             BRANCH YES,COULD MEAN SWAP
+         SPACE
+***************************************************************
+*                                                             *
+*        DEVICE IS ENGAGED IN A STAND ALONE PROCESS  -        *
+*        SETMODE, RESERVE/RELEASE,STAND ALONE SEEK, ETC.      *
+*                                                             *
+***************************************************************
+         SPACE
+         TM    UCBFLB,UCBRESVH     IS DEVICE RESERVED
+         BZ    PLCH050             BRANCH NO
+         SPACE
+         CLI   UCBSQC,ZERO         IS SOFTWARE RES COUNT ZERO
+         BE    PLCH110             BRANCH YES  - MUST SWAP SRB/IOSB
+*                                  * TO FORCE IOS TO ISSUE
+*                                  * RELEASE CCW
+         SPACE
+***************************************************************
+*                                                             *
+*        NOTHING CRITICAL ON DEVICE - DETACH IOQ FROM         *
+*        DEVICE BY RESETTING UCB STATUS INDICATORS            *
+*                                                             *
+***************************************************************
+         SPACE 1
+PLCH050  NI    UCBFLA,XFF-UCBBSY-UCBSAP-UCBPST-UCBACTV  RESET
+*                                  *BSY,SAP,PST,ACTV
+         OI    MASK1,MSKRDV        SET REDRIVE INDICATOR
+         EJECT
+***************************************************************
+*                                                             *
+*        CALL BASIC PURGE AND PURGE LCH OF IOQE'S             *
+*                                                             *
+***************************************************************
+         SPACE
+PLCH060  OI    MASK1,MSKDEQ        INDICATE TO BASIC PRG TO DEQUE
+         SPACE
+         BAL   RET,BASICPRG        CALL BASIC PURGE
+         B     PLCH080             OFFSET 0
+         B     PLCH080             OFFSET 4
+*        B     PLCH070             BRANCH TO NEXT INSTRUCTION
+         SPACE
+***************************************************************
+*                                                             *
+*        DECREMENT UCB REQUEST COUNT                          *
+*                                                             *
+***************************************************************
+         SPACE
+PLCH070  L     RF,UPDTCNTA                                     @ZA06654
+         BALR  RET,RF                                          @ZA06654
+         SPACE
+         B     PLCH090             DO NOT UPDATE BACK POINTER
+         SPACE
+PLCH080  LR    RBACK,RCUR          UPDATE BACK POINTER
+         SPACE
+PLCH090  BAL   RET,PFUCBLK         GO FREE UCB LOCK
+         SPACE
+         B     PLCH020             GO GET NEXT LINK PTR
+         SPACE
+***************************************************************
+*                                                             *
+*        INCREMENT IPIB AND PWA COUNTS                        *
+*                                                             *
+***************************************************************
+         SPACE
+PLCH100  L     RF,IPIBCNT          GET IPIB COUNT
+         LR    RET,RF              FOR CS INSTR                @YM06014
+         LA    RF,K01(R0,RF)       INCREMENT COUNT
+         CS    RET,RF,IPIBCNT      STORE UPDATED CNT IF UNCHANG@YM06014
+         BNE   PLCH100             HAS BEEN CHANGED, LOOP AGAIN@YM06014
+         SPACE
+         L     RF,PWAQCNT          INCREMENT COUNT OF SRB'S FOUND
+         LA    RF,ONE(RF)          BUMP ONE
+         ST    RF,PWAQCNT          * STORE IN PURGE WORK AREA
+         SPACE
+         LA    RF,IPIB             IPIB ADDRESS
+         ST    RF,IOSIPIB          STORE IN IOSB
+         SPACE
+         B     PLCH020             GET NEXT LINK ENTRY         @YM01286
+         EJECT
+***************************************************************
+*                                                             *
+*        CALL BUILD IOSB/SRB ROUTINE AND                      *
+*        SWAP THE SRB AND IOSB ATTACHED TO THE IOQ            *
+*        WITH AN IOS SRB/IOSB                                 *
+*                                                             *
+***************************************************************
+         SPACE
+PLCH110  L     RF,PRGGBLKA         GET ADDR OF PRGGBLOK
+         BALR  RET,RF              GET AND FORMAT SRB/IOSB
+         SPACE
+         L     R0,IOSERP-IOSB(,RIOSB) ATTACH ERP WORK AREAS TO
+         ST    R0,IOSERP-IOSB(,RC) * NEW IOSB
+         SPACE
+         SLR   R0,R0               CLEAR REG
+         ST    R0,IOSERP-IOSB(,RIOSB) IOSERP IN OLD IOSB = 0
+         SPACE
+         ST    RC,IOQIOSB-IOQ(,RCUR) ATTACH NEW IOSB TO IOQ
+         SPACE 1
+***************************************************************
+*                                                             *
+*        CALL ENQUE ROUTINE AND ENQUE OLD SRB ON PIRL         *
+*        FOR APPROPRIATE DRIVER                               *
+*                                                             *
+***************************************************************
+         SPACE
+         L     RF,PSRBENQA         GET ADDR OF PSRBENQ         @Y30IPLG
+         BALR  RET,RF              GO ENQUEUE OLD SRB          @Y30IPLG
+         SPACE
+         B     PLCH080             UPDATE RBACK & FREE UCB LOCK@YM04933
+         EJECT
+***************************************************************
+*                                                             *
+*        PENDING SENSE FLAG ON IN UCB AND IOQ ON LCH AND      *
+*        UCB AT SAME TIME - IF SENSE ACTIVE ALSO,DEQUEUE      *
+*        FROM LCH AND HANDLE DURING UCB PURGE SCAN. IF        *
+*        NOT ACTIVE, MUST SWAP SRB/IOSB SO IOS WILL ISSUE     *
+*        SENSE WHEN RESOURCE FREE AND CLEAR A POSSIBLE        *
+*        CONTINGENT CONNECTION IN HARDWARE                    *
+*                                                             *
+***************************************************************
+         SPACE
+PLCH120  TM    UCBFLA,UCBACTV      IS DEVICE ACTIVE
+         BZ    PLCH110             GO SWAP SRB AND IOSB
+         SPACE 1
+         L     RB,IOQLNK-IOQ(,R5)  PICK UP NEXT IOQ ADDRESS
+         ST    RB,ZERO(,RBACK)     STORE IN IOQLNK OF LAST IOQ
+         SPACE
+         LTR   RB,RB               IS THIS ONE THE LAST
+         BP    PLCH130             BRANCH NO
+         SPACE
+         ST    RB,LCHLST-LCH(,R2)  UPDATE LCHLST IN LCH TABLE
+         SPACE
+PLCH130  NI    IOQFLA-IOQ(R5),XFF-IOQSLCH-IOQENQ  RESET IOQE IND
+         L     RF,UPDTCNTA                                     @ZA06654
+         BALR  RET,RF                                          @ZA06654
+         SPACE
+         B     PLCH090             GO FREE UCB LOCK
+         SPACE
+PLCH140  NI    PERRFLG1,XFF-PERLCH IND LCH LOCK NOT HELD
+         SPACE
+         STM   RB,RET,PWREGB       SAVE LOCK REGS              @YM01073
+         SPACE
+         LA    RB,LCHLOCK-LCH(,R2) GET LCH LOCK ADDRESS
+         SPACE
+PLCH145  SETLOCK RELEASE,TYPE=IOSLCH,ADDR=(11),                        *
+               RELATED=(LCH,IGC016(PLCH015))
+         SPACE
+         LM    RB,RET,PWREGB       RESTORE LOCK REGS           @YM01073
+         EJECT
+***************************************************************
+*                                                             *
+*        CHECK NEXT LCH OR RETURN TO CALLER                   *
+*                                                             *
+***************************************************************
+         SPACE
+PLCH150  LA    R2,LCHEL(R0,R2)     POINT TO NEXT LCH
+         L     R0,PQUEREG
+         SPACE
+         BCT   R0,PLCH010          DECREMENT LCH COUNT - EXIT IF ZERO
+         SPACE
+         L     RET,PWRET1          RESTORE RETURN ADDRESS
+         SPACE
+         BR    RET                 RETURN TO CALLER
+         TITLE 'IGC0001F - OBTAIN LOCAL LOCK AND ADD FRR'
+*****************************************************************
+*                                                               *
+*        OBTAIN LOCAL LOCK AND ADD FRR SUBROUTINE               *
+*                                                               *
+*****************************************************************
+         SPACE
+PGLOCAL  STM   RB,RET,PWREGB       SAVE RB-R14                 @YM01073
+         SETLOCK OBTAIN,TYPE=LOCAL,MODE=UNCOND,                        *
+               RELATED=(LOCAL,IGC016(PFLOC010))
+         SPACE
+         SPACE
+         LA    RB,PURGEFRR         GET FRR ADDR
+         SPACE
+         SETFRR A,FRRAD=(11),PARMAD=(12),WRKREGS=(13,14)
+         USING PFRRPARM,RC
+         MVI  PFRRFLG1,PERLOCAL    IND LOCAL LOCK HELD         @Y30IPLG
+*    NOTE FLAG IS IN FRR NOT IN PWA, MVI ZEROS OTHER BITS      @Y30IPLG
+         ST    RCORE,PFRRPWAP      SAVE WORK AREA PTR
+         DROP  RC
+         LM    RB,RET,PWREGB                                   @YM01073
+         SPACE
+         BR    RF                  RETURN TO MAIN ROUTINE
+         USING IOCOM,RC            REUSE RC FOR IOCOM
+         TITLE 'IGC0001F - RELEASE LOCAL LOCK AND DELETE FRR'
+*****************************************************************
+*                                                               *
+*        RELEASE LOCAL LOCK AND DELETE FRR SUBROUTINE           *
+*                                                               *
+*****************************************************************
+         SPACE
+PFLOCAL  STM   RB,RET,PWREGB       SAVE RB-R14                 @YM01073
+PFLOCAL2 EQU   *              USED WHEN NO PWA, LM BELOW LOADS @Y30IPLG
+*                             GARBAGE, R11-R15 LOST            @Y30IPLG
+*        PWA BASE ZEROED IF PFLOCAL2 ENTRY,TO AVOID PIC ON LM  @ZM30179
+         SETFRR D,WRKREGS=(13,14)
+         SPACE
+*        NI    PERRFLG1,XFF-PERLOCAL  IND LOCAL LOCK NOT HELD  @Y30IPLG
+* THE ABOVE LINE DELETED, NO FRR AND POSIBLY NO PWA EXISTS     @Y30IPLG
+         SPACE
+PFLOC010 SETLOCK RELEASE,TYPE=LOCAL,                                   *
+               RELATED=(LOCAL,IGC016(PGLOCAL))
+         SPACE
+         LM    RB,RET,PWREGB                                   @YM01073
+         BR    RF                  RETURN TO MAIN ROUTINE
+         TITLE 'IGC0001F - UCB PURGE SUBROUTINE'
+***************************************************************
+*                                                             *
+*        UCB PURGE SUBROUTINE                                 *
+*                                                             *
+***************************************************************
+         SPACE
+UCBPURG  ST    RET,PWRET1          SAVE RETURN ADDRESS
+         SPACE
+         L     R4,CVTPTR           GET CVT PTR
+         L     R4,CVTILK2-CVTMAP(,R4)   GET UCB LOOKUP TABLE
+         SPACE
+***************************************************************
+*                                                             *
+*        SCAN UCB LOOK-UP TABLE                               *
+*                                                             *
+***************************************************************
+         SPACE
+PUCB010  LH    RUCB,ZERO(,R4)      GET UCB POINTER             @YM07689
+         LA    R4,K02(,R4)         ADDR OF NXT UCB POINTER     @YM07689
+         SPACE
+         LTR   RUCB,RUCB           IS THERE A UCB ADDR         @YM07689
+         BNP   PUCB070             BRANCH NOT A UCB ADDR       @YM07689
+         SPACE
+PUCB015  LH    RF,UCBFLA-UCBOB(,RUCB)  TO TEST POST & SENSE PST@YM07689
+         N     RF,TESTPST          POST & SENSE POST FLAGS     @YM07689
+         BZ    PUCB010             BRANCH IF UCB NOT ACTIVE    @YM07689
+         EJECT
+***************************************************************
+*                                                             *
+*        CALL APPLICABILITY ROUTINE AND VALIDATE UCB          *
+*                                                             *
+***************************************************************
+         SPACE
+PUCB020  LA    RF,UCBPRFX          GET LENGTH OF PREFIX        @YM07689
+         SLR   RUCB,RF             POINT RUCB TO PREFIX        @YM07689
+         SPACE
+PUCB022  BAL   RET,PGUCBLK         GO GET UCBLOCK              @OZ00762
+         SPACE
+         TM    UCBFLA,UCBPST       POST STILL ON
+         BNZ   PUCB030             YES CONTINUE
+         SPACE
+         TM    UCBFLB,UCBSPST      SENSE POST ON
+         BZ    PUCB060             POST OR SENSE POST NOT ON
+*                                  GO FREE UCB LOCK
+         SPACE
+PUCB030  L     RCUR,UCBIOQ         GET IOQ POINTER
+         L     RIOSB,IOQIOSB-IOQ(,RCUR) GET IOSB POINTER
+         L     RPAR,IOSSRB         PUT SRB POINTER IN RPAR
+         SPACE
+         TM    PPLOPT1,PPLHIO      HALT OPTION
+         BZ    PUCB050             BRANCH IF QUIESCE
+         SPACE
+         BAL   RET,PURAPLSR        SEE IF APPLICABLE
+         B     PUCB040             YES CONTINUE WITH PURGE
+         B     PUCB060             NO DO NOT PURGE
+         EJECT
+***************************************************************
+*                                                             *
+*        CALL BUILD IOSB/SRB ROUTINE                          *
+*        CALL ENQUE ROUTINE TO ENQUE OLD SRB TO PIRL          *
+*                                                             *
+***************************************************************
+         SPACE
+PUCB040  TM    UCBFLA,UCBPSNS      PENDING SENSE
+         BZ    PUCB050             NO GO SET HIO INDICATOR
+         SPACE
+         TM    UCBFLA,UCBACTV      IS CHANNEL PROG ACTIVE
+         BO    PUCB050             YES GO SET HIO INDICATOR
+         SPACE
+*        BAL   RET,PRGGBLOK        GO BUILD A NEW SRB/IOSB
+         L     RF,PRGGBLKA         GET ADDR OF PRGGBLOK
+         BALR  RET,RF              GET AND FORMAT SRB/IOSB
+         SPACE
+         ST    RC,IOQIOSB-IOQ(,RCUR) CHAIN NEW IOSB TO IOQ
+         SPACE
+         L     R0,IOSERP-IOSB(,RIOSB) GET EWA PTR
+         ST    R0,IOSERP-IOSB(,RC) CHAIN ERP WA TO NEW IOSB
+         SPACE
+         SLR   R0,R0
+         ST    R0,IOSERP-IOSB(,RIOSB) OLD IOSB EWA = ZEROS
+         SPACE
+         L     RF,PSRBENQA         GET ADDR OF PSRBENQ         @Y30IPLG
+         BALR  RET,RF              ENQUEUE OLD SRB ON PIRL     @Y30IPLG
+         SPACE
+         B     PUCB060             GO FREE UCB LOCK
+         EJECT
+***************************************************************
+*                                                             *
+*        CALL BASIC PURGE AND PURGE SRB FROM UCB              *
+*                                                             *
+***************************************************************
+         SPACE
+PUCB050  OI    MASK1,MSKHIO        INDICATE SRB PURGED FROM UCB
+         SPACE
+         BAL   RET,BASICPRG        GO PURGE SRB FROM UCB
+         B     PUCB060             * ALL THREE RETURNS
+         B     PUCB060             * MUST
+*        B     PUCB060             * GO TO NEXT INSTRUCTION
+         SPACE
+PUCB060  BAL   RET,PFUCBLK         * GO FREE LOCK
+         SPACE
+         TM    MASK1,MSKUCB        CHECK IF RETRY NEEDED       @OZ00762
+         BNO   PUCB010             LOOP FOR NEXT UCB           @OZ02555
+         SPACE
+         SPACE
+         NI    MASK1,FF-MSKUCB     TURN OFF RETRY BIT          @OZ02555
+         B     PUCB022             GO RETRY TO HALT REQUEST    @OZ02555
+PUCB070  BZ    PUCB010             BRANCH ON A FILLER, LOOP    @YM07689
+         CH    RUCB,FWORD          CHECK FOR FFFF TABLE END    @Z30ANLG
+         BE    PUCB080             FOUND END OF TABLE          @Z30ANLG
+         N     RUCB,HIGH2          16 BIT ADDR, N OFF 2 BYTES  @Z30ANLG
+         B     PUCB015             CHECK IF UCB APPLICABLE     @Z30ANLG
+*                                  ELSE END OF TABLE, RETURN   @YM07689
+         SPACE
+         SPACE
+***************************************************************
+*                                                             *
+*        RETURN TO CALLER                                     *
+*                                                             *
+***************************************************************
+         SPACE
+PUCB080  L     RET,PWRET1          GET RETURN ADDRESS
+         SPACE
+         BR    RET                 RETURN TO CALLER
+         TITLE 'IGC0001F - SPL PURGE SUBROUTINE'
+***************************************************************
+*                                                             *
+*        SPL PURGE SUBROUTINE                                 *
+*                                                             *
+***************************************************************
+         SPACE
+SPLPURG  ST    RET,PWRET1          SAVE RETURN ADDRESS
+         SPACE
+         LA    RPAR,PWPRGPRM       GET DEQ PARM LIST ADDR
+         SPACE
+         XC    PWPRGPRM,PWPRGPRM   CLEAR AREA
+         XC    PDQPARML,PDQPARML   CLEAR DBLWORD PARM          @YM3127P
+         SPACE
+         LH    RF,PPLASID          GET ASID                    @YM3127P
+         STH   RF,PDQPASID         PUT ASID IN PARM LIST       @YM3127P
+         SPACE
+         TM    PPLOPT2,PPLMEM      MEMORY PURGE                @YM3127P
+         BZ    PSPL005             NO, CHECK TASK              @YM3127P
+         SPACE
+         LA    RF,PDQPASID         GET ASID PARM PTR           @YM3127P
+         ST    RF,PWPRGPRM         SET ASID ADDR IN PARM LIST  @YM3127P
+         SPACE
+         B     PSPL010             GO GET RMTR PARM            @YM3127P
+         SPACE
+PSPL005  TM    PPLOPT1,PPLTASK     IS THIS TASK PURGE          @YM3127P
+         BZ    PSPL010             NO, DONT NEED TCB ADDR      @YM01450
+         SPACE
+         MVC   PDQPTCBP,IPIBARG+K01 GET TCB ADDR               @YM01450
+         SPACE
+PSPL010  LA    RF,PDQPARML         GET ADDR OF ASIDTCB PARMS   @YM04943
+         ST    RF,PWPRGPRM+K04     *AND PUT IN PARM LIST       @YM01450
+         SPACE
+***************************************************************
+*                                                             *
+*        ISSUE PURGEDQ                                        *
+*                                                             *
+***************************************************************
+         SPACE
+         L     RF,CVTPTR           GET CVT PTR                 @YM04943
+         L     RC,CVTIXAVL         GET IOCOM ADDR           @YMXXX
+         L     RF,IOCPRGID         GET PURGE DEQUEUE ROUTINE ADDR
+         ST    RF,PWPRGPRM+K08     PUT ROUTINE ADDR IN PARM LIST
+         OI    IPIBFLG1,IPIBDQ     SHOW IECVPURG THAT PURGEDQ
+*                                  ISSUED                      @ZA12676
+         SPACE
+         PURGEDQ MF=(E,(1))
+         NI    IPIBFLG1,XFF-IPIBDQ TURN OFF PURGEDQ INDICATOR  @ZA12676
+         BAL   RF,PGLOCAL          GET LOCAL LOCK AND SET FRR  @ZA12675
+         EJECT
+***************************************************************
+*                                                             *
+*        CALL BASIC PURGE AND SCHEDULE SRB                    *
+*                                                             *
+***************************************************************
+         SPACE
+PSPL020  L     RPAR,IPIBSRB        GET SRB ADDR
+         SPACE
+         LTR   RPAR,RPAR           IS THERE AN ADDR
+         BZ    PSPL040             NO, GO RETURN
+         SPACE
+         MVC   IPIBSRB,SRBFLNK     GET SRB FORWARD CHAIN PTR
+         L     R10,SRBPARM         PICK UP IOSB ADDRESS
+         TM    PPLOPT1,PPLHIO      IS IT A HALT OPERATION      @OZ00091
+         BO    PSPL027             YES, BRANCH ARND PCI CODE   @OZ00091
+         SPACE
+         TM    IOSFLA,IOSIOSB      IF IOSIOSB, DONT COUNT      @OZ00091
+         BNO   PSPL027             NOT IOSIOSB, COUNT IF APPL  @OZ00091
+         CLI   IOSPROC,IOSAPCI     IS IT A PCI IOSB ?          @OZ00091
+         BNE   PSPL030             NO, ATTN, RESCHEDULE        @OZ00091
+         SPACE
+         ST    RPAR,PWREG1         SAVE SRB FOR THIS PCI IOSB  @OZ00091
+         L     R10,IOSPCHN         GET ENDING STATUS IOSB      @OZ00091
+         LTR   R10,R10             MAKE SURE THERE IS ONE      @OZ00091
+         BZ    PSPL030             JUST RESCHEDULE PCI IOSB    @OZ00091
+         L     RPAR,IOSSRB         GET SRB ADDRESS             @ZA09210
+         BAL   RET,BASICPRG        COUNT E.S. IOSB IF APPL     @OZ00091
+         B     PSPL024             GOOD RETURN, +0 VECTOR      @OZ00091
+PSPL024  L     RPAR,PWREG1         RELOAD SRB & +4 VECTOR      @OZ00091
+         B     PSPL030             RESCHEDULE PCI SRB          @OZ00091
+PSPL027  L     RUCB,IOSUCB         GET UCB ADDRESS
+         LA    RF,UCBPRFX          GET PREFIX LENGTH
+         SLR   RUCB,RF             BACK UP UCB POINTER TO PREFIX
+         SLR   RCUR,RCUR           TO INDICATE NO IOQ TO FREE  @YM04939
+         SPACE
+         BAL   RET,BASICPRG        CALL BASIC PURGE SUBROUTINE
+         B     PSPL030             GOOD RETURN
+         B     PSPL030             OFFSET 4
+         B     PSPL020             OFFSET 8
+         SPACE
+PSPL030  SCHEDULE SRB=(1),SCOPE=GLOBAL
+         SPACE
+         B     PSPL020             GO CHECK FOR ANOTHER SRB ADDR
+         SPACE
+PSPL040  BAL RF,PFLOCAL            FREE LOCAL LOCK AND DEL FRR @ZA12675
+         L     RET,PWRET1          GET RETURN ADDR
+         SPACE
+         BR    RET                 RETURN TO CALLER
+         SPACE
+         TITLE 'IGC0001F - IPIB PURGE SUBROUTINE'
+***************************************************************
+*                                                             *
+*        IPIB PURGE SUBROUTINE                                *
+*                                                             *
+***************************************************************
+         SPACE
+IPIBPURG ST    RET,PWRET1          SAVE RETURN ADDRESS
+         SPACE
+         STM   RB,RD,PWREGB        SAVE REGS
+         SPACE
+         L     RF,CVTPTR           GET CVTPTR
+         L     RC,CVTIXAVL         GET IOCOM PTR
+         LA    RB,IOCSYNCH-IOCOM(RC)  GET LOCK ADDR
+         ST    RB,PWASYNCH         SAVE IOSYNCH LOCK
+         SPACE
+         SETLOCK OBTAIN,TYPE=IOSYNCH,MODE=UNCOND,ADDR=(11),            *
+               RELATED=(IOSYNCH,IGC016(PIBIB20))
+         SPACE
+         LM    RB,RD,PWREGB        RESTORE REGS
+         SPACE
+***************************************************************
+*                                                             *
+*        ZERO ASCB IPIB POINTER                               *
+*                                                             *
+***************************************************************
+         SPACE
+         SLR   RF,RF               CLEAR REG
+         L     RET,PSAAOLD         GET ASCB PTR
+         L     RC,ASCBIOSP-ASCB(RET)    GET 1ST IPIB ON QUEUE  @YM07220
+         C     RF,IPIBLNK-IPIB(,RC)     IS LINK PTR 0, : 1 IPIB@YM07220
+         BNE   PIPIB04             2 IPIBS, ZERO IPIBLNK       @YM07220
+         ST    RF,ASCBIOSP-ASCB(RET)  ZERO IPIB PTR
+         B     PIPIB06             SKIP IPIBLNK LOGIC          @YM07220
+PIPIB04  ST    RF,IPIBLNK-IPIB(,RC)     ZERO IPIBLNK           @YM07220
+         SPACE
+PIPIB06  NI    PERRFLG0,XFF-PERIOSP IND ASCBIOSP NOT ACTIVE
+         SPACE
+         L     RPAR,IPIBPSQ   TO GET ASYNCH RBS FROM IECIOSAM  @YM05500
+         EJECT
+***************************************************************
+*                                                             *
+*        SCAN IPIB FOR SRB'S                                  *
+*        AND CALL ENQUE ROUTINE TO ENQUE SRB'S                *
+*                                                             *
+***************************************************************
+         SPACE
+PIPIB10  LTR   RPAR,RPAR           ANY MORE SRB-S ON IPIB
+         BE    PIBIB20             NO EXIT
+         SPACE
+         L     R2,SRBFLNK-SRB(,RPAR) GET SRB PTR TO NEXT       @YM04934
+         SPACE
+         L     RF,PSRBENQA         GET ADDR OF SRB ENQ ROUT    @Y30IPLG
+         BALR  RET,RF              CALL SRB ENQ SUBROUTINE     @Y30IPLG
+         LR    RPAR,R2             UPDATE RPAR TO NXT SRB      @YM04934
+         SPACE
+         B     PIPIB10             GO TEST FOR MORE SRB'S
+         SPACE
+***************************************************************
+*                                                             *
+*        RETURN TO CALLER                                     *
+*                                                             *
+***************************************************************
+         SPACE
+PIBIB20  STM   RB,RD,PWREGB        SAVE REGS
+         SPACE
+         L     RB,PWASYNCH         GET IOSYNCH LOCK
+         SPACE
+         SETLOCK RELEASE,TYPE=IOSYNCH,ADDR=(11),                       *
+               RELATED=(IOSYNCH,IGC016(IPIBPURG))
+         SPACE
+         LM    RB,RD,PWREGB        RESTORE REGS
+         SPACE
+         L     RET,PWRET1          GET RETURN ADDR
+         SPACE
+         BR    RET                 RETURN TO CALLER
+         TITLE 'IGC0001F - DRIVER PURGE SUBROUTINE'
+***************************************************************
+*                                                             *
+*        DRIVER PURGE SUBROUTINE                              *
+*                                                             *
+***************************************************************
+         SPACE
+DVRPURG  ST    RET,PWRET1          SAVE RETURN ADDR
+         SPACE
+         L     RF,CVTPTR           GET CVT PTR
+         L     RC,CVTIXAVL         GET POINTER TO IOCOM
+         L     RB,IOCVOID          GET POINTER TO VOID
+         SPACE
+         LA    RPAR,IPIB           POINT TO IPIB               DCR21082
+         LA    RD,PWREGSAV         GET SAVE AREA FOR DRIVERS   DCR21082
+         SLR   R2,R2               ZERO DSID PURGE INDEX CHECK DCR21082
+         SPACE
+         TM    IPIBOPT,IPIBMEM+IPIBTASK  IS THIS DISD PURGE    DCR21082
+         BNZ   PDVR030             NO, NOT DSID PURGE          DCR21082
+         SPACE
+         CLI   IPIBDVID,EXCPTST    IS THIS EXCP DSID           DCR21082
+         BNE   PDVR010             NO, SKIP SPECIAL            DCR21082
+         SPACE
+         LA    R4,EXCPID           GET EXCP DRIVER ID          DCR21082
+         SPACE
+         B     PDVR020             CONTINUE                    DCR21082
+         SPACE
+PDVR010  SLR   R4,R4               CLEAR REG                   DCR21082
+         IC    R4,IPIBDVID         GET DRIVER ID               DCR21082
+         SPACE
+PDVR020  LR    R2,R4               COPY DRIVER ID              DCR21082
+         SLL   R2,2                DRIVER ID*4                 DCR21082
+         SLL   R4,3                PIRL INDEX=8*DRIVER ID      DCR21082
+         ALR   R2,R4               VOID INDEX=12*DRIVER ID     DCR21082
+         SPACE
+PDVR030  LH    R4,IOCVOICT         GET NUM OF VOID ENTRIES     DCR21082
+         SLR   RNINE,RNINE         CLEAR INDEX FOR VOID ENT
+         LR    RC,RPIRL            PUT PIRL POINTER IN RC
+         SPACE
+*        XC    IPIBIO(K08),IPIBIO  CLEAR IPIBIO AND DRVU       DCR21082
+*        THIS DONE AUTOMATICALLY BELOW, BEFORE CALL TO DRVR PURGE
+         EJECT
+***************************************************************
+*                                                             *
+*        CALL DRIVER PURGE SUBROUTINES                        *
+*                                                             *
+***************************************************************
+         SPACE
+PDVR040  LTR   R2,R2               DSID PURGE                  DCR21082
+         BZ    PDVR050             NO, CALL ALL DRIVERS        DCR21082
+         SPACE
+         CR    R2,RNINE            DRIVER INDEX=CALLERS INDEX  DCR21082
+         BE    PDVR050             YES, MUST CALL THIS DRIVER  DCR21082
+         SPACE
+         OC    PIRRSTR-PIRL(K04,RC),PIRRSTR-PIRL(RC)  IS THERE DCR21082
+*                                  *AN I/O REQUEST LIST ON PIRL
+         BZ    PDVR060             NO, SKIP CALL TO DRIVER     DCR21082
+         SPACE
+PDVR050  MVC   IPIBSRB,PIRRSTR-PIRL(RC) MOVE CURR PIRL ENTRY   DCR21082
+*                                  *TO IPIB
+         SPACE
+         L     RF,VOIPRG-VOID(RNINE,RB)  GET ADDR OF DRIVER
+*                                  *PURGE SUBROUTINE
+         MVC   IPIBIO(K08),PIRRSTR-PIRL(RC) SAVE PIRL ENTRY    @YM04941
+         SPACE
+         BALR  RET,RF              BRANCH TO DVR PURGE ROUTINE
+         SPACE
+         MVC   PIRRSTR-PIRL(K08,RC),IPIBIO  COPY POINTER TO    DCR21082
+*                                  *I/O REQUEST CHAIN
+         SPACE
+PDVR060  LA    RNINE,VOIEL(,RNINE) POINT TO NEXT DVR           @YM07243
+         LA    RC,PIRENTL(,RC)     POINT TO NEXT PIRL ENTRY
+         SPACE
+         BCT   R4,PDVR040          BRANCH IF MORE DVRS         DCR21082
+         SPACE
+         L     RPIRL,IPIBPIRL      GET IPIB PTR
+         L     RET,PWRET1          GET RETURN ADDRESS
+         SPACE
+         BR    RET                 RETURN TO MAINLINE PURGE
+         TITLE 'IGC0001F - DDR PURGE SUBROUTINE'
+***************************************************************
+*                                                             *
+*        DDR PURGE SUBROUTINE                                 *
+*                                                             *
+***************************************************************
+         SPACE
+DDRPURG  ST    RET,PWRET1          SAVE RETURN ADDRESS
+         SPACE
+         L     RF,PSAAOLD          GET CURRENT ASCB PTR        @YM01204
+         SPACE
+         NI    MASK1,XFF-MSKDDRM   RESET DDR MAST SCHED MASK
+         SPACE
+         CLC   ASCBASID-ASCB(K02,RF),MSTRMEM  MASTER MEMORY    @YM3127P
+         BE    PDDR070             YES, ONLY ONE PASS          @YM3127P
+         SPACE
+***************************************************************
+*                                                             *
+*        SCAN DDR COM'S                                       *
+*                                                             *
+***************************************************************
+         SPACE
+PDDR010  L     RB,ASCBASXB-ASCB(,RF) GET POINTER TO ASXB
+         L     R4,ASXBDDR-ASXB(,RB)  GET POINTER TO DDRCOM
+         SPACE
+         USING DDRCOM,R4
+PDDR020  LA    R4,0(,R4)           CLEAR HIGH BYTE
+         SPACE
+         LTR   R4,R4               ANY DDRCOM
+         BZ    PDDR070             NO COM BRANCH OUT
+         SPACE
+         TM    DDRSRC,DDRSYS       SYS INITIATED SWAP
+         BO    PDDR030             GO GET PTR TO IOSB
+         SPACE
+         B     PDDR060             OPER INITIATED SO INCR
+*                                  *QUIESCE COUNT
+         SPACE
+***************************************************************
+*                                                             *
+*        CALL APPLICABILITY ROUTINE AND VALIDATE SRB          *
+*                                                             *
+***************************************************************
+         SPACE
+PDDR030  L     R2,DDRUIOSB-DDRCOM(,R4) GET POINTER TO IOSB
+         LTR   R2,R2               IF NO IOSB, CHECK NEXT      @OZ00082
+         BZ    PDDR060             NO IOSB                     @OZ00082
+         L     RPAR,IOSSRB-IOSB(,R2)  POINT TO SRB
+         SPACE
+         BAL   RET,PURAPLSR        DOES THE SRB APPLY TO THIS PURGE
+         B     PDDR040             YES IT DOES APPLY
+         B     PDDR060             NO IT DOES NOT
+         EJECT
+***************************************************************
+*                                                             *
+*        CALL ENQUE ROUTINE AND ENQUE SRB ON PIRL             *
+*                                                             *
+***************************************************************
+         SPACE
+PDDR040  TM    PPLOPT1,PPLHIO      HALT OR QUIESCE
+         BZ    PDDR050             QUIESCE GO INCREMENT QUIESCE COUNT
+         SPACE
+         L     RF,PSRBENQA         GET ADDR OF PSRBENQ         @Y30IPLG
+         BALR  RET,RF              GO ENQ ON THE PIRL          @Y30IPLG
+         SPACE
+         OI    DDRSTAT,DDRPRG      INDICATE SRB PURGED         @OZ00762
+         SPACE
+         XC    DDRUIOSB,DDRUIOSB   CLEAR POINTER TO IOSB
+         SPACE
+         L     RUCB,IOSUCB-IOSB(,R10) GET UCB ADDRESS
+         LA    RF,UCBPRFX          GET PREFIX LENGTH
+         SLR   RUCB,RF             BACK UP UCB POINTER TO PREFIX
+         SPACE
+         OI    PURGRETC,PURIO      IND I/O HALTED
+         SPACE
+         CLI   UCBTBYT3,UCB3COMM   IS IT TP DEVICE                  CTC
+         BNE   PDDR060                                              CTC
+         SPACE
+         OI    PURGRETC,PURTP      INDICATE TP I/O HALTED
+         SPACE
+         B     PDDR060             CONTINUE
+         SPACE
+***************************************************************
+*                                                             *
+*        INCREMENT IPIB QUIESCE COUNT                         *
+*                                                             *
+***************************************************************
+         SPACE
+PDDR050  L     RF,IPIBCNT          PICK UP QUIESCE COUNT       @YM01376
+         LR    RET,RF              FOR CS INSTR                @YM06014
+         LA    RF,K01(,RF)         ADD ONE
+         CS    RET,RF,IPIBCNT                                  @YM06014
+         BNE   PDDR050                                         @YM06014
+         SPACE
+         LA    RF,IPIB             GET IPIB ADDR               @YM01286
+         ST    RF,IOSIPIB-IOSB(,R10)  IPIB ADDR IN IOSB        @YM01286
+         SPACE
+PDDR060  L     R4,DDRNXT           POINT TO NEXT DDR COM
+         SPACE
+         B     PDDR020             GO TEST FOR DDR COM
+         EJECT
+***************************************************************
+*                                                             *
+*        CONTINUE UNTIL MASTER MEMORY IS CHECKED              *
+*                                                             *
+***************************************************************
+         SPACE
+PDDR070  TM    MASK1,MSKDDRM       MASTER MEM CHECKED YET
+         BO    PDDR080             YES EXIT
+         SPACE
+         OI    MASK1,MSKDDRM       SET MAST MEM BEING CHECKED
+         SPACE
+         L     RF,CVTPTR           GET CVT PTR
+         L     RF,CVTASVT          GET PTR TO ASVT             @YM04180
+         DROP  RF                  FOR 1 INSTR USE RF AS BASE  @YM04180
+         USING ASVT,RF              TO ASVT
+         L     RF,ASVTENTY         PTR TO 1ST ASCB IE. MASTER  @YM04180
+*                                   MEM ASCB
+         DROP  RF                                              @YM04180
+         USING CVTMAP,RF           RESTORE RF AS BASE TO CVT   @YM04180
+         STM   RB,RF,PWREGB        SAVE REGS
+         SPACE
+PDDR075  SETLOCK OBTAIN,TYPE=CMS,MODE=UNCOND,                          *
+               RELATED=(CMS,IGC016(PDDR085))
+         LM    RB,RF,PWREGB        RESTORE REGS
+         SPACE
+         OI    PERRFLG1,PERCMS     IND CMS LOCK HELD
+         SPACE
+         B     PDDR010             GO GET ASCB EXT PTR
+         SPACE
+***************************************************************
+*                                                             *
+*        RETURN TO CALLER                                     *
+*                                                             *
+***************************************************************
+         SPACE
+PDDR080  STM   RB,RET,PWREGB       SAVE LOCK REGS              @YM01073
+         SPACE
+         NI    PERRFLG1,XFF-PERCMS  IND CMS LOCK NOT HELD
+         SPACE
+PDDR085  SETLOCK RELEASE,TYPE=CMS,                                     *
+               RELATED=(CMS,IGC016(PDDR075))
+         SPACE
+         LM    RB,RET,PWREGB       RESTORE LOCK REGS           @YM01073
+         SPACE
+         L     RET,PWRET1          GET RETURN ADDR
+         SPACE
+         BR    RET                 RETURN TO CALLER
+         TITLE 'IGC0001F - SIRB PURGE SUBROUTINE'
+***************************************************************
+*                                                             *
+*        SIRB PURGE SUBROUTINE                                *
+*                                                             *
+***************************************************************
+         SPACE
+SIRBPURG ST    RET,PWRET1          SAVE RETURN ADDR
+         L     RF,CVTPTR           GET CVT PTR
+         L     RC,CVTIXAVL         GET IOCOM ADDRESS
+         SPACE
+         TM    IPIBOPT,IPIBMEM     MEMORY PURGE                @YM3090P
+         BZ    PSIRB05             NO, USE CURRENT ASCB        @YM3114P
+         SPACE
+         TM    PPLOPT1,PPLHIO      HALT OPTION                 @YM3114P
+         BO    PSIRB90             YES, EXIT NOW               @YM3114P
+*                                  *OUT OF CORE ABEND
+         SPACE
+PSIRB05  L     RF,PSAAOLD          GET CURRENT ASCB PTR        @YM3114P
+         SPACE
+         L     R4,ASCBASXB-ASCB(,RF) GET ASXB OUT OF THE ASCB
+         SLR   RCUR,RCUR           INDICATE NO IOQE TO FREE
+*        NOTE RCUR MUST BE ZERO BEFORE CALL TO BASICPRG
+         LA    RBACK,ASXBFSRB-ASXB-K04(,R4) SET BACKLINK POINTER
+         L     RPAR,ASXBFSRB-ASXB(,R4) LOAD THE FIRST ON THE QUEUE
+         SPACE
+         LTR   RPAR,RPAR           ANY SRBS ON THE QUEUE
+         BZ    PSIRB60             NO, GO LOOK AT SIRB
+         EJECT
+***************************************************************
+*                                                             *
+*        CALL APPICABILITY ROUTINE AND VALIDATE SRB           *
+*                                                             *
+***************************************************************
+         SPACE
+PSIRB10  L     R2,SRBFLNK          LOAD THE FORWARD LINK POINTER
+         SPACE
+         BAL   RET,PURAPLSR        APPLICABILITY CHECK THE SRB
+         B     PSIRB20             APPLICABLE
+         B     PSIRB40             NOT APPLICABLE
+         SPACE
+PSIRB20  EQU   *                                               @YM07227
+         TM    PPLOPT1,PPLHIO      IS THIS A HALT ?            @YM07227
+         BNO   PSIRB30             NO, DON'T DEQUE             @YM07227
+         ST    R2,SRBFLNK-SRB(,RBACK) STORE THE FORWARD LINK INTO THE
+*                                  CHAIN OF THE BACK LINK POINTER
+         SPACE
+         LTR   R2,R2               LAST IN THE QUEUE
+         BP    PSIRB30             NO,DO NOT UPDATE LAST POINTER
+         SPACE
+         ST    RBACK,ASXBLSRB-ASXB(,R4) BACK LINK NOW IS LAST
+         SPACE
+         C     R2,ASXBFSRB-ASXB(,R4) IS QUEUE NOW EMPTY
+         BNE   PSIRB30             NO, LAST POINTER SET
+         SPACE
+         ST    R2,ASXBLSRB-ASXB(,R4) SET FIRST AND LAST THE SAME
+         SPACE
+PSIRB30  L     R10,SRBPARM         PICK UP IOSB ADDRESS        @YM04936
+         L     RUCB,IOSUCB-IOSB(,R10) GET UCB ADDRESS
+         LA    RF,UCBPRFX          GET PREFIX LENGTH
+         SLR   RUCB,RF             BACK UP UCB POINTER TO PREFIX
+         SPACE
+***************************************************************
+*                                                             *
+*        CALL BASIC PURGE AND PURGE SRB                       *
+*                                                             *
+***************************************************************
+         SPACE
+         BAL   RET,BASICPRG        PURGE THIS SRB
+         B     PSIRB50             CONTINUE SCAN
+         B     PSIRB50             CONTINUE SCAN
+         B     PSIRB50             CONTINUE SCAN
+         SPACE
+PSIRB40  LR    RBACK,RPAR          SET NEW BACKLINK POINTER
+         SPACE
+PSIRB50  LTR   RPAR,R2             ANY MORE SRBS ON THE QUEUE
+         BP    PSIRB10             CONTINUE PROCESSING SRBS
+         EJECT
+***************************************************************
+*                                                             *
+*        VALIDATE AND CALL BASIC PURGE AND PURGE SIRB         *
+*                                                             *
+***************************************************************
+         SPACE
+PSIRB60  L     R4,ASXBSIRB-ASXB(,R4)  GET POINTER TO SIRB
+         SPACE
+         TM    RBSTAB2-RBBASIC(R4),RBFACTV IS SIRB ACTIVE
+         BZ    PSIRB90             NOTHING TO PURGE
+         SPACE
+         L     RPAR,RBIQEA-RBBASIC(,R4) GET POINTER TO SRB
+         SPACE
+         LTR   RPAR,RPAR           TEST FOR ERP WA APPENDED
+         BNP   PSIRB90             YES, DO NOT PURGE AGAIN     @ZA11319
+         SPACE
+         L     R2,SRBPARM          LOAD THE IOSB ADDRESS
+         L     RNINE,IOSERP-IOSB(,R2) LOAD POINTER TO ERP WORK AREA
+         XC    IOSERP-IOSB(K04,R2),IOSERP-IOSB(R2) ZERO IOSERP
+         L     RUCB,IOSUCB-IOSB(,R2) GET UCB ADDRESS
+         LA    RF,UCBPRFX          GET PREFIX LENGTH           @YM04937
+         SLR   RUCB,RF             BACK UP UCB PTR TO PREFIX   @Y
+         SPACE
+         BAL   RET,BASICPRG        PURGE IF APPLICABLE
+         B     PSIRB80             RESTORE IOSERP RETURN
+         B     PSIRB80             RESTORE IOSERP RETURN
+*        B     PSIRB70             SRB DEQUEUED FROM SIRB
+         SPACE
+PSIRB70  L     RF,IOCQCNT          GET ADDRESS OF PURGE
+         LA    RF,K04(RF)          *CLEAN-UP ROUTINE (IECVPURG)
+         SPACE
+         ST    RF,RBOPSW+K04-RBBASIC(,R4)  UPDATE NSI IN SIRB  @YM04931
+         ST    RNINE,RBIQEA-RBBASIC(,R4) SAVE ERP WA IN SIRB
+         OI    RBIQEA-RBBASIC(R4),DBLENTRY SET TO NEGATIVE FOR
+*                                  DOUBLE ENTRY TEST
+         B     PSIRB90             BRANCH TO RETURN POINT
+         SPACE
+PSIRB80  ST    RNINE,IOSERP-IOSB(,R2) STORE ADDRESS OF ERP AREA BACK
+         SPACE
+PSIRB90  L     RET,PWRET1          RESTORE RETURN ADDRESS
+         SPACE
+         BR    RET                 RETURN TO MAIN ROUTINE
+         TITLE 'IGC0001F - DEFINED CONSTANTS'
+***************************************************************
+*                                                             *
+*        DEFINED CONSTANTS                                    *
+*                                                             *
+***************************************************************
+         SPACE
+PURNQLST ENQ   (SYSZEC16,PURGE,E,5,STEP),RET=HAVE,MF=L         @YM3104P
+*                                  AND ALSO                    @YM05797
+SYSZEC16 DC    C'SYSZEC16'         RESOURCE NAME
+PURGE    DC    C'PURGE'            RESOURCE NAME
+         SPACE
+PIRLSUBP DC    AL1(254)            SUB POOL 254 FIXED, JOB STP @Y30IPLG
+LISTIND  DC  X'80'    INDICATE LIST FORM                       @Y30IPLG
+MSTRMEM  DC    H'1'                MASTER MEMORY CONSTANT      @YM3127P
+         SPACE
+PCLEAR   XC    0(K00,RPAR),0(RPAR) CLEAR CORE FOR PIRL
+HLTRTRY  DC    X'00FF'             TO CHECK FOR
+         DS    0F
+HIGH2    DC    X'0000FFFF'         TO AND OFF 2 HIGH ORDER BYTES
+RFIX     DC    X'42000000'         TO INDICATE R FORM OF PFIX  @Y30IPLG
+*     VARY STORAGE CAN'T HANDLE SHORT PGFIX SO INDICATE LONG   @ZM34501
+         SPACE
+         DS    0F
+COREMASK DC   AL1(245),AL3(PWALNG) SUBPOOL AND LENGTH FOR GETMAIN
+         SPACE
+*                                  IN MASTER MEM, ASID 1       @YM04942
+         SPACE
+FWORD    DC    F'-1'               NEGATIVE ONE
+         ORG   FWORD+1
+THREEF   DS    CL3                 3 BYTES OF F'S
+         ORG   FWORD+3
+ONEF     DS    CL1                 1 BYTE OF F'S
+*NOTE TESTPST SHOULD BE ON A HALF WORD BOUNDARY ***             PERFORM
+TESTPST  DC    X'0000',AL1(UCBPST),AL1(UCBSPST) POST&SENSE POST PERFORM
+PURGESTA DC    A(PRGESTAE)         ESTAE ENTRY ADDRESS         @YM3104P
+PRGGBLKA DC    A(PRGGBLOK)         ENTRY OF GET SRB/IOSB ROUTINE
+PSRBENQA DC    A(PSRBENQ)          ENTRY TO SRB ENQ ROUTINE    @Y30IPLG
+PGLOCALA DC    A(PGLOCAL2)   ADDR  OF LOCAL LOCK RTN NO PWA    @Y30IPLG
+PRGCOMP  DC    A(PRGCOMP0)         ADDR TO INTERFACE TO SMGR COMPRESS
+UPDTCNTA DC    A(UPDTCNT)          ADDR OF UCBCNT DECREMENT RTN@ZA06654
+         TITLE '    IGC0001F - MAINTENANCE AREA'
+*****************************************************************
+*                                                               *
+*        PATCH AREA FOR MAINTENANCE                             *
+*                                                               *
+*****************************************************************
+         SPACE
+RCVRYEST EQU   400                 SPACE EST FOR RECOVERY ROUTINES
+*                                  *IN BYTES
+         DS    0F
+ZAPID    DC    CL8'PURGEZAP'       PATCH AREA IDENTIFICATION
+PURGEZAP DC    (1+(((ZAPID-MAINTAIN)+(RCVRYEST))/220))A(0)
+         SPACE
+PRGEND   EQU   *                   END OF MAINLINE CODE
+         SPACE 3
+         DROP  R0,RSRB,R4,RCORE,RSVRB,RUCB,RPIRL,RC,RF
+         TITLE 'IGC0001F - FUNCTIONAL RECOVERY ROUTINE'
+*****************************************************************
+*                                                               *
+*        FUNCTIONAL RECOVERY ROUTINE                            *
+*                                                               *
+*        ESTABLISH ADDRESSABILITY                               *
+*                                                               *
+*        PERFORM BASIC INITIALIZATION                           *
+*                                                               *
+*****************************************************************
+         SPACE
+PURGEFRR BALR  RCVRY12,R0          ESTABLISH ADDRESSABILITY
+         USING *,RCVRY12
+         USING SDWA,RCVRY01
+         USING PWA,RCVRY10
+         USING PFRRPARM,RCVRY11
+         SPACE
+         L     RCVRY04,PSTART      GET ADDRESSABILITY TO START OF
+*                                  *IGC0001F FOR FRR MAINTENANCE
+         L     RCVRY11,SDWAPARM    GET PARAMETER PTR
+         L     RCVRY10,PFRRPWAP    GET WORK AREA PTR
+         SPACE
+         SETRP RECORD=YES
+         SPACE
+         LM    RCVRY02,RCVRY05,MODCSECT  GET MODULE/CSECT NAME
+         LM    RCVRY06,RCVRY07,RCVRYFRR  GET FRR NAME
+         STM   RCVRY02,RCVRY07,SDWAVRA   SHOW MODULE/CSECT/FRR NAME
+         SPACE
+         LA    RCVRY09,K24         GET BYTE COUNT
+         STC   RCVRY09,SDWAURAL    PUT COUNT IN SDWA           @OZ02704
+         SPACE
+         TM    SDWAERRC,SDWAPERC   HAS PERCOLATION OCCURED
+         BO    PRGFRR10            YES, SKIP FURTHER RECORDING
+         SPACE
+         STM   RCVRY02,RCVRY07,SDWAMODN  SHOW MODULE/CSECT/FRR NAME
+         EJECT
+*****************************************************************
+*                                                               *
+*        RELEASE LOCKS                                          *
+*                                                               *
+*****************************************************************
+         SPACE
+PRGFRR10 MVI   SDWAACF3,LOCKS00    CLEAR GLOBAL LOCKS
+         MVI   SDWAACF4,LOCKS00    CLEAR ADDITIONAL LOCKS
+         SPACE
+         TM    PFRRFLG1,PFRRNOWA    TEST IF PWA EXISTS         @Y30IPLG
+         BNO   PRGFRR15            CONTINUE NORMAL            @Y30IPLG
+         TM    PFRRFLG1,PERLOCAL    TEST IF LOCAL LOCK HELD   @Y30IPLG
+         BNO   PRGFRR90             NO, RETURN TO CALLER       @Y30IPLG
+         OI    SDWAACF4,SDWAFLLK    INDICATE LOCAL LOCK        @Y30IPLG
+         B     PRGFRR90             NO PWA RETRN TO CALLER     @Y30IPLG
+         SPACE
+PRGFRR15 TM    PERRFLG1,PERUCB     IS UCB LOCK HELD
+         BNO   PRGFRR20            NO, CONTINUE
+         SPACE
+         OI    SDWAACF4,SDWAIUCB   INDICATE UCB LOCK
+         L     RCVRY02,PWAUCBLK    GET UCB LOCK ADDR
+         ST    RCVRY02,SDWAIULW    PLACE IN SDWA
+         SPACE
+PRGFRR20 TM    PERRFLG1,PERLCH     IS LCH LOCK HELD
+         BNO   PRGFRR30            NO, CONTINUE
+         SPACE
+         OI    SDWAACF4,SDWAILCH   INDICATE LCH LOCK
+         L     RCVRY02,PWALCHLK    GET LCH LOCK ADDR
+         ST    RCVRY02,SDWAILLW    PLACE IN SDWA
+         SPACE
+PRGFRR30 TM    PERRFLG1,PERCMS     IS CMS LOCK HELD
+         BNO   PRGFRR40            NO, CONTINUE
+         SPACE
+         OI    SDWAACF4,SDWACMS    INDICATE CMS LOCK
+         SPACE
+PRGFRR40 TM    PFRRFLG1,PERLOCAL   IS LOCAL LOCK HELD          @Y30IPLG
+         BNO   PRGFRR50            NO, CONTINUE
+         SPACE
+         OI    SDWAACF4,SDWAFLLK   INDICATE LOCAL LOCK
+         EJECT
+*****************************************************************
+*                                                               *
+*        DETERMINE IF DUMP CAN BE TAKEN                         *
+*                                                               *
+*****************************************************************
+         SPACE
+PRGFRR50 TM    PERRFLG1,PERESTAE   IS ESTAE ACTIVE
+         BNO   PRGFRR90            NO, GO RETURN TO CALLER
+         SPACE
+         TM    SDWAMCHD,SDWAACR    IS THIS AN ACR ENTRY
+         BO    PRGFRR90            YES, GO RETURN TO CALLER
+         SPACE
+         USING CVT,RCVRY05
+         L     RCVRY05,CVTPTR      GET CVT PTR
+         L     RCVRY08,CVTSDBF     GET 4K BUFFER ADDR
+         LA    RCVRY08,0(RCVRY08)  CLEAR HIGH ORDER BYTE
+         L     RCVRY03,LOCKSDBF    SET HIGH ORDER BIT ON
+         OR    RCVRY03,RCVRY08     CREATE LOCKED BUFFER PTR
+         SPACE
+         CS    RCVRY08,RCVRY03,CVTSDBF  ATTEMPT SWAP
+         BNZ   PRGFRR90            NO, GO RETURN TO CALLER
+         SPACE
+         OI    PERRFLG0,PERSDBF    INDICATE BUFFER HELD
+         SPACE
+         DROP  RCVRY05
+         EJECT
+*****************************************************************
+*                                                               *
+*        COPY PURGE WORK AREA TO 4K BUFFER                      *
+*                                                               *
+*****************************************************************
+         SPACE
+         USING SDBF,RCVRY08
+         SPACE
+         LA    RCVRY02,SDBFSTRT    POINT TO BUFFER START
+         ST    RCVRY02,SDBFPTR     INSERT DUMP START ADDR
+         SPACE
+         MVC   SDBFPWA(PWASAVP-PWA),PWA   COPY 1ST PRT OF WRK  @YM07220
+         MVC   SDBFPWA+(PWASAVP-PWA)(PURENQ-PWASAVP),PWASAVP   @YM07220
+*                                  DONT NEED ENQ LIST          @YM05797
+         SPACE
+         LA    RCVRY02,SDBFVARY    INIT MOVING BUFFER PTR
+         LA    RCVRY09,SDBFVARY-SDBFSTRT  INIT BUFFER COUNT
+         SPACE
+*****************************************************************
+*                                                               *
+*        COPY UCB IF UCB LOCK IS HELD                           *
+*                                                               *
+*****************************************************************
+         SPACE
+         TM    PERRFLG1,PERUCB     IS UCB LOCK HELD
+         BNO   PRGFRR60            NO SKIP COPY OF UCB
+         SPACE
+         USING UCB,RCVRY03
+         L     RCVRY03,PWAUCBP     GET UCB PREFIX PTR
+         MVC   0(UCBDEV-UCBPXST,RCVRY02),UCBPXST  COPY UCB
+         DROP  RCVRY03
+         SPACE
+         LA    RCVRY02,UCBDEV-UCBPXST(RCVRY02)  BUMP MOVING PTR
+         LA    RCVRY09,UCBDEV-UCBPXST(RCVRY09)  BUMP COUNT REG
+         EJECT
+*****************************************************************
+*                                                               *
+*        COPY LCH ENTRY AND IOQE'S IF LCH LOCK HELD             *
+*                                                               *
+*****************************************************************
+         SPACE
+PRGFRR60 TM    PERRFLG1,PERLCH     IS LCH LOCK HELD
+         BNO   PRGFRR80            NO, GO SET BUFFER COUNT
+         SPACE
+         USING LCH,RCVRY03
+         L     RCVRY03,PWALCHP     GET LCH PTR
+         MVC   0(LCHEL,RCVRY02),LCHENTRY  COPY LCH
+         SPACE
+         LA    RCVRY02,LCHEL(RCVRY02)  BUMP MOVING PTR
+         LA    RCVRY09,LCHEL(RCVRY09)  BUMP COUNT REG
+         SPACE
+         L     RCVRY03,LCHFST      GET FIRST IOQE ON LCH
+         SPACE
+         USING IOQ,RCVRY03
+PRGFRR70 CH    RCVRY09,SDBFMAX     IS THERE SPACE FOR IOQE
+         BH    PRGFRR80            NO, GO SET BUFFER COUNT
+         SPACE
+         LTR   RCVRY03,RCVRY03     IS THERE AN IOQE
+         BNP   PRGFRR80            NO, GO SET BUFFER COUNT
+         SPACE
+         MVC   0(IOQL,RCVRY02),IOQLNK  COPY IOQE TO BUFFER
+         SPACE
+         LA    RCVRY02,IOQL(RCVRY02)  BUMP MOVING PTR
+         LA    RCVRY09,IOQL(RCVRY09)  BUMP COUNT REG
+         L     RCVRY03,IOQLNK      GET NEXT IOQE PTR
+         SPACE
+         B     PRGFRR70            GO TEST FOR SPACE
+         SPACE
+         DROP  RCVRY03
+         EJECT
+*****************************************************************
+*                                                               *
+*        SET 4K BUFFER BYTE COUNT                               *
+*                                                               *
+*        RETURN TO RECOVERY MANAGER                             *
+*                                                               *
+*****************************************************************
+         SPACE
+PRGFRR80 STH   RCVRY09,SDBFCNT     SET BUFFER BYTE COUNT
+         SPACE
+PRGFRR90 BR    RCVRY14             RETURN TO RECOVERY MANAGER
+         SPACE
+         DROP  RCVRY01,RCVRY08,RCVRY10,RCVRY11
+         EJECT
+*****************************************************************
+*                                                               *
+*        FRR CONSTANTS                                          *
+*                                                               *
+*****************************************************************
+         SPACE
+         DS    0F
+LOCKSDBF DC    X'80000000'         SDWA 4K BUFFER LOCK IND
+         DS    0H
+AVAILBUF EQU   X'FFA'              4090 MAX BUFFER BYTE COUNT
+SDBFMAX  DC    AL2(AVAILBUF-IOQL)  4K BUFFER TEST FOR IOQE'S
+         TITLE 'IGC0001F - ESTAE ROUTINE'
+*****************************************************************
+*                                                               *
+*        ESTAE RECOVERY ROUTINE                                 *
+*                                                               *
+*        ESTABLISH ADDRESSABILITY                               *
+*                                                               *
+*        PERFORM BASIC INITIALIZATION                           *
+*                                                               *
+*****************************************************************
+         SPACE
+         USING PWA,RCVRY02
+         SPACE
+PRGESTAE BALR  RCVRY12,R0          ESTABLISH ADDRESSABILITY
+         USING *,RCVRY12
+         SPACE
+         L     RCVRY04,PSTART      GET ADDRESSABILITY TO START OF
+*                                  *IGC0001F FOR ESTAE MAINTENANCE
+         SPACE
+         LA    RCVRY03,K12         GET NO RTCA CODE            @YM01286
+         SPACE
+         CR    RCVRY00,RCVRY03     IS THERE AN RTCA            @YM01286
+         BE    PESTAE10            NO, SKIP RECORDING ATTEMPT
+         SPACE
+         USING SDWA,RCVRY01
+         L     RCVRY02,SDWAPARM    GET PURGE WORK AREA PTR
+         SPACE
+         SETRP RECORD=YES
+         SPACE
+         LM    RCVRY03,RCVRY08,MODCSECT  GET MODULE/CSECT/ESTAE NAMES
+         STM   RCVRY03,RCVRY08,SDWAVRA   SHOW MODULE/CSECT/ESTAE NAMES
+         SPACE
+         LA    RCVRY09,K24         GET SIZE OF VARIABLE AREA
+         STC   RCVRY09,SDWAURAL    SHOW BYTE COUNT IN SDWA     @OZ02704
+         SPACE
+         TM    SDWAERRC,SDWAPERC   HAS PERCOLATION OCCURED
+         BO    PESTAE10            YES, SKIP FURTHER RECORDING
+         SPACE
+         STM   RCVRY03,RCVRY08,SDWAMODN  SHOW MODULE/CSECT/ESTAE NAMES
+         SPACE
+         DROP  RCVRY01
+         EJECT
+*****************************************************************
+*                                                               *
+*        DECREMENT PURGE COUNT IN IOCOM                         *
+*                                                               *
+*****************************************************************
+         SPACE
+         USING CVT,RCVRY05
+         SPACE
+PESTAE10 TM    PERRFLG0,PERPGCT    IS IOCOM PURGE COUNT ACTIVE
+         BNO   PESTAE20            NO, GO TO NEXT TEST
+         SPACE
+         L     RCVRY05,CVTPTR      GET CVT PTR
+         L     RCVRY05,CVTIXAVL    GET IOCOM ADDRESS
+         SPACE
+         USING IOCOM,RCVRY05
+PESTAE15 L     RCVRY06,IOCVOICT    GET WORD WITH PURGE COUNT
+         LR    RCVRY07,RCVRY06     COPY PURGE COUNT
+         BCTR  RCVRY07,R0          DECREMENT PURGE COUNT
+         SPACE
+         CS    RCVRY06,RCVRY07,IOCVOICT   ATTEMPT SWAP
+         BNE   PESTAE15            LOOP UNTIL SWAP COMPLETES
+         SPACE
+*****************************************************************
+*                                                               *
+*        CLEAR ASCB PURGE COUNT                                 *
+*                                                               *
+*****************************************************************
+         SPACE
+         USING ASCB,RCVRY05
+         SPACE
+PESTAE20 TM    PERRFLG0,PERIOSP    IS ASCB PURGE ACTIVE
+         BNO   PESTAE30            NO, GO TO NEXT TEST
+         SPACE
+         L     RCVRY05,PWAASCBP    GET ASCB PTR
+         SPACE
+         SLR   RCVRY06,RCVRY06     CLEAR REG
+         ST    RCVRY06,ASCBIOSP    ZERO ASCB PURGE ADDR
+         SPACE
+         DROP  RCVRY05
+         EJECT
+*****************************************************************
+*                                                               *
+*        RESUME SRB DISPATCHING                                 *
+*                                                               *
+*****************************************************************
+         SPACE
+PESTAE30 TM    PERRFLG0,PERSTATS   IS STATUS ACTIVE
+         BNO   PESTAE40            NO, GO TO NEXT TEST
+         SPACE
+         STATUS START,SRB          RESUME SRB DISPATCHING
+         SPACE
+*****************************************************************
+*                                                               *
+*        DEQUEUE PURGE RESOURCES                                *
+*                                                               *
+*****************************************************************
+         SPACE
+PESTAE40 TM    PERRFLG0,PERENQ     IS ENQ ACTIVE
+         BNO   PESTAE50            NO, GO TO NEXT TEST
+         SPACE
+         MVC   PURENQ(PURENQLN),RCVRYDEQ  MOVE IN PARM LIST    @YM05797
+         DEQ   ,MF=(E,PURENQ)      DEQUEUE PURGE RESOURCES     @YM05797
+         EJECT
+*****************************************************************
+*                                                               *
+*        ISSUE SVC DUMP                                         *
+*                                                               *
+*****************************************************************
+         SPACE
+PESTAE50 TM    PERRFLG0,PERSDBF    IS 4K BUFFER AVAIL
+         BNO   PESTAE90            NO, GO EXIT
+         SPACE
+         LM    RCVRY05,RCVRY06,PSTART  GET START/END OF PROGRAM
+         STM   RCVRY05,RCVRY06,PWADLIST  PLACE ADDRESSES IN DUMP LIST
+         OI    PWADLST2,PWADLSTE   IND END OF DUMP LIST
+         SPACE
+         SDUMP SDATA=(PSA,NUC,SQA,TRT),                                *
+               BUFFER=YES,                                             *
+               LIST=PWADLIST,                                          *
+               MF=(E,PWASDUMP)
+         EJECT
+*****************************************************************
+*                                                               *
+*        FREE PURGE WORK AREA                                   *
+*                                                               *
+*        RETURN TO RECOVERY MANAGER                             *
+*                                                               *
+*****************************************************************
+         SPACE
+PESTAE90 LR    RCVRY03,RCVRY02     SAVE PWA PTR                @Y30IPLG
+         TM    PERRFLG0,PERFIXA    IS PAGE FIX OUTSTANDING     @Y30IPLG
+         BNO   PESTAE95            GO FREE WORK AREA           @Y30IPLG
+         SPACE
+         LM    RCVRY01,RCVRY02,PWAFIX3  LOAD FIX PTRS          @Y30IPLG
+         PGFREE R,A=(1),EA=(2)     PAGE FREE PURGE             @Y30IPLG
+         SPACE
+PESTAE95 LR    RCVRY01,RCVRY03     GET PWA PTR                 @Y30IPLG
+         L     RCVRY00,RCVRY245    GET SUBPOOL AND LENGTH
+         SPACE
+         FREEMAIN R,LV=(0),A=(1)
+         SPACE
+         BR    RCVRY14             RETURN TO RECOVERY MANAGER
+         SPACE
+         DROP  RCVRY02
+         EJECT
+*****************************************************************
+*                                                               *
+*        ESTAE CONSTANTS                                        *
+*                                                               *
+*****************************************************************
+         SPACE
+         DS    0F
+RCVRY245 DC    AL1(245),AL3(PWALNG)  SUBPOOL AND LENGTH OF WORK AREA
+RCVRYDEQ ENQ   (RCVRYSYS,RCVRYPRG,E,5,STEP),RET=HAVE,MF=L      @YM3104P
+RCVRYSYS DC    C'SYSZEC16'         RESOURCE NAME
+RCVRYPRG DC    C'PURGE'            RESOURCE NAME
+PSTART   DC    A(IGC016)           PROGRAM STARTING ADDRESS
+PEND     DC    A(PURGEEND)         PROGRAM ENDING ADDRESS
+         TITLE 'IGC0001F - OBTAIN SRB/IOSB AND FORMAT'
+***************************************************************
+*                                                             *
+*        OBTAIN SRB/IOSB AND FORMAT SUBROUTINE                *
+*                                                             *
+*        OBTAIN AND FORMAT AN SRB/IOSB COMBINATION TO         *
+*        REPLACE A REQUESTOR SRB/IOSB FOUND ON A UCB OR       *
+*        A LCH. THE PURPOSE OF THE SWAP IS TO FORCE IOS       *
+*        TO COMPLETE A SENSE OPERATION OR A RELEASE.          *
+*                                                             *
+*        INPUT REGISTERS  -                                   *
+*              RIOSB - IOSB TO BE SWAPPED                     *
+*              RPAR- SRB TO BE SWAPPED                        *
+*              RET _ RETURN ADDRESS                           *
+*                                                             *
+*        OUTPUT REGISTERS  -                                  *
+*              RB  - NEW SRB                                  *
+*              RC  - NEW IOSB                                 *
+*                                                             *
+***************************************************************
+         SPACE
+         USING IOCOM,RC
+         USING CVTMAP,RF
+         SPACE
+         USING PWA,RCORE
+PRGGBLOK STM   RD,RET,PWREGD       SAVE REGS R13-R14
+         ST    RBASE,PWREGF        SAVE MAINLINE BASE
+         BALR  RBASE,0             SET BASE FOR THIS SUBROUTINE
+         USING *,RBASE
+         LA    RD,PWREGSAV         GET SAVEAREA ADDR           @YM01499
+         SPACE
+         L     RF,CVTPTR           GET CVT PTR
+         L     RC,CVTIXAVL         IOS COMMUNICATIONS AREA
+         L     RF,IOCORMGT         ADDRESS OF IOS STORAGE NGR
+         L     RB,COREMSK          INDICATE ONE 160 BYTE BLOCK
+         SPACE
+         BALR  RET,RF              CALL IOS STORAGE MANAGER
+         SPACE
+         USING SIAB,RB
+         XC    SIAB(SIABEL),SIAB   ZERO ALL 160 BYTES
+         LA    RC,SIABIOSB         GET IOSB ADDR
+         DROP  RB
+         SPACE
+         ST    RC,SRBPARM-SRB(RB)  SET NEW IOSB PTR IN SRB
+         ST    RB,IOSSRB-IOSB(,RC) SET NEW SRB PTR IN IOSB
+         SPACE
+         LA    RF,MSASID           MASTER SCHEDULER ASID
+         STH   RF,IOSASID-IOSB(,RC) STORE ASID INIOSB
+         SPACE
+         OI    IOSFLA-IOSB(RC),IOSIOSB SHOW IOS IOSB
+         OI    IOSOPT-IOSB(RC),IOSPSLL NO LOCAL LOCK WANTED
+         EJECT
+         L     RF,IOSUCB-IOSB(,RIOSB) SET UCB IN NEW IOSB EQUAL
+         ST    RF,IOSUCB-IOSB(,RC) * TO UCB IN OLD IOSB
+         MVI   IOSPROC-IOSB(RC),IOSAPURG  INDICATE IOSB FROM   @YM04932
+*                                  PURGE
+         SPACE
+         MVC   IOSEEKA-IOSB(L'IOSEEKA,RC),IOSEEKA-IOSB(RIOSB)
+*                                  COPY USERS SEEK ARGUMENT
+         LA    RF,IOSPCI-IOSB(RC)  USE IOSPCI AS A CCW
+         ST    RF,IOSVST-IOSB(RC)  VIRTUAL ADDRESS OF CCW
+         SPACE
+         MVI   ZERO(RF),NOP        SET NOP OP CODE
+         MVI   FOUR(RF),SILI       SUPPRESS WRONG LENGTH
+         MVI   SEVEN(RF),ONE       DATA COUNT EQUAL ONE
+         LRA   RET,ZERO(RF)        REAL ADDRESS OF CCW
+         ST    RET,IOSRST-IOSB(,RC) STORE IN IOBRST
+         SPACE
+         LM    RD,RET,PWREGD
+         L     RBASE,PWREGF
+         SPACE
+         BR    RET                 RETURN TO CALLER
+         SPACE
+         DS    0F
+COREMSK  DC   X'10000120'          MASK TO INDICATE 1 160 BYTE BLOCK
+         TITLE 'IGC0001F - SRB ENQUEUE SUBROUTINE'
+***************************************************************
+*                                                             *
+*        SRB ENQUEUE ROUTINE                                  *
+*                                                             *
+*        THIS SUBROUTINE ACCEPTS AN SRB ADDRESS               *
+*        IN REGISTER ONE DETERMINES THE PROPER ENTRY IN       *
+*        THE PIRL AND ENQUEUES THE SRB ON THE PIRL IN A       *
+*        PUSH DOWN ORDER.                                     *
+*                                                             *
+***************************************************************
+         SPACE
+         USING PSA,R0                                          @Y30IPLG
+         USING CVTMAP,RF                                       @Y30IPLG
+         USING IOCOM,RC                                        @Y30IPLG
+         USING PWA,RCORE                                       @Y30IPLG
+         USING PIRL,RPIRL                                      @Y30IPLG
+         USING IOSB,RIOSB                                      @Y30IPLG
+         USING SRB,RSRB                                        @Y30IPLG
+         USING UCB,RUCB                                        @Y30IPLG
+         DROP  RBASE                                           @Y30IPLG
+         USING *,RBASE                                         @Y30IPLG
+         SPACE
+PSRBENQ  ST    RBASE,PWRTEMP1      SAVE MAIN LINE BASE         @Y30IPLG
+         LR    RBASE,RF            LOAD BASE FOR THIS SUB      @Y30IPLG
+PSRBE001 L     RIOSB,SRBPARM       GET PTR TO IOSB             @YM04934
+         SPACE
+         CLI   IOSPROC,IOSAPCI     IS THIS A PCI SRB-IOSB?     @YM04946
+         BE    PSRBEN01            YES, THEN SRB-IOSBS BELONG TO
+*                                  IOS
+*                                  NO - NORMAL SRB-IOSB
+         LA    RD,PIRRSTR          POINT TO FIRST ENTRY
+         SLR   RF,RF               CLEAR WORK REG
+         IC    RF,IOSDVRID         GET DRIVER ID
+         SLL   RF,3                MULT BY 8
+         ALR   RF,RD               RF NOW POINTS TO DRIVERS PIRL ENTRY
+         SPACE
+         MVC   SRBFLNK,0(RF)       MOVE CURRENT ENTRY TO SRB LINK
+         SPACE
+         ST    RPAR,0(,RF)         STORE SRB ADDRESS IN CURRENT ENTRY
+         SPACE
+         L     RBASE,PWRTEMP1      RELOAD MAIN BASE            @Y30IPLG
+         BR    RET                 RETURN TO CALLER
+PSRBEN01 LR    RD,RIOSB            RD PTS TO 1ST IOSB
+PSRBEN02 L     RF,IOSIPIB-IOSB(RD)  TO CHECK FOR PCI IOSB
+         LA    RF,0(RF)            CLEAR HIGH ORDER BYTE
+         LTR   RF,RF               IS IT THE LAST
+         BZ    PSRBEN03            YES, GO TO CORMGT
+         C     RF,IOSPCHN-IOSB(RD)  IS IT THE LAST PCI IOSB
+         BE    PSRBEN03            YES, GO TO CORMGT
+         LR    RD,RF               NO, RD POINT TO NEXT IOSB
+         L     RF,IOSSRB-IOSB(RD)  RF, HAS SRB FROM NEXT IOSB
+         ST    RF,0(RPAR)          LINK SRBS FOR CORMGT
+         LR    RPAR,RF             RPAR PTS TO NEXT SRB
+         B     PSRBEN02            GET NEXT SRB-IOSB
+PSRBEN03 SLR   RB,RB               CLEAR WRK REG, NORMAL PATH
+         ST    RB,0(RPAR)          ZERO LAST LINK PTR FOR CORMGT
+         L     RPAR,IOSSRB-IOSB(RIOSB)  1ST SRB
+         LR    RIOSB,RF            CHECK FOR AN ENDING STATUS SRB-IOSB
+         LA    RB,FREE160          X'00000020' INDICATE 160 BYTE
+         L     RF,CVTPTR           GET CVTPTR
+         L     RF,CVTIXAVL-CVTMAP(,RF)  GET IOCOM ADDR
+         L     RF,IOCORMGT-IOCOM(,RF)   GET ENTRY TO IOS CORE MGR
+         LA    RD,PWREGSAV         GET SA
+         ST    RET,PWREGE          SAVE RETURN ADDR
+         BAL   RET,K04(,RF)        BRANCH TO CORMGT 160 BYTE FREE
+         L     RET,PWREGE          RELOAD RET
+         LTR   RIOSB,RIOSB         IS THERE AN ENDING STATUS
+         SPACE
+         L     RBASE,PWRTEMP1      RELOAD MAIN BASE            @Y30IPLG
+         BZR   RET                 RETURN TO CALLER
+         L     RPAR,IOSSRB-IOSB(,RIOSB)  PUT SRB ADDR IN RPAR
+         B     PSRBE001            LOOP FOR ENDING STATUS      @Y30IPLG
+        TITLE 'GET LOCAL LOC AND FRR, NO PWA'
+*************************************************************
+*                                                           *
+*         GET LOCAL LOCK & FRR 2ND                          *
+*                                                           *
+*************************************************************
+         SPACE
+         USING *,R10
+PGLOCAL2 EQU   *             NOTE R10-R15 LOST HERE            @Y30IPLG
+         SETLOCK OBTAIN,TYPE=LOCAL,MODE=UNCOND,                @Y30IPLG*
+               RELATED=(LOCAL,IGC016(PFLOC010))
+         L     RB,PRGFRRA           GET ADDR OF FRR            @Y30IPLG
+         SETFRR A,FRRAD=(11),PARMAD=(12),WRKREGS=(13,14)
+         DROP  RC
+         USING PFRRPARM,RC
+         MVI  PFRRFLG1,PFRRNOWA   INDICATE TO FRR MAY BE NO WA @Y30IPLG
+         OI   PFRRFLG1,PERLOCAL     INDICATE LOCAL LOCK HELD   @Y30IPLG
+         BR   RF        RETURN TO CALLER                       @Y30IPLG
+         EJECT
+         TITLE 'IECVSMGR COMPRESS INTERFACE'
+******************************************************
+*        TEST  IF COMPRESS SHOULD BE DONE
+*        IF SO, SCHEDULE IECSCOMP IN IECVSMGR
+******************************************************
+         SPACE
+         USING PSA,R0
+         USING CVTMAP,RF
+         USING IOCOM,RC
+         USING PWA,RCORE
+         USING SRB,RSRB
+         USING *,RBASE
+         SPACE
+PRGCOMP0 ST    RET,PWRET1          SAVE RETURN ADDR
+         ST    RBASE,PWRTEMP1      SAVE MAIN LINE BASE
+         LR    RBASE,RF            LOAD BASE FOR THIS SUBROUTINE
+         TM    PPLOPT1,PPLHIO      IS IT A HALT
+         BO    PRGCOMP9            ONLY CHECK ON QUISCE
+         SPACE
+         L     RF,CVTPTR           GET CVT PTR
+         L     RC,CVTIXAVL         GET IOCOM PTR
+         L     RB,IOCHD160         GET PTR TO 160 FREE QUE
+         LH    RPAR,K02(,RB)       GET FREE COUNT
+         CH    RPAR,COMPMIN        SEE IF MIN NO. OF BLOCKS
+         BL    PRGCOMP9            RETURN TO MAIN LINE
+         SLL   RPAR,31             TO CHECK FOR ODD OR EVEN
+         LTR   RPAR,RPAR           IF ODD, TRY COMPRESS
+         BZ    PRGCOMP9            EVEN, NOT THIS TIME (TO CUT DOWN)
+         SPACE
+*
+         STM   RB,RF,PWREGB        SAVE LOCK REGS
+         SETLOCK OBTAIN,TYPE=LOCAL,MODE=UNCOND,                        *
+               RELATED=(LOCAL,IGC016(PRGCOMP0))
+         L     RB,PRGFRRA          GET ADDR OF PURGE FRR
+         SETFRR A,FRRAD=(11),PARMAD=(12),WRKREGS=(13,14)
+         DROP  RC
+         USING PFRRPARM,RC
+         OI    PFRRFLG1,PERLOCAL   INDICATE LOCAL LOCK HELD
+         DROP  RC
+         USING IOCOM,RC
+*  CALL  IECVSMGR TO GET A 160 BYTE BLOCK TO SCHEDULE IECVSCOM
+         SPACE
+         LM    RB,RF,PWREGB        RELOAD REGS
+         L     RF,IOCORMGT         GET ENTRY TO GET 160 (IOS SMGR)
+         L     RB,COREMSK2         INDICATE ONE 160 BYTE BLOCK
+         LA    RD,PWREGSAV         GET SAVEAREA ADDR
+         BALR  RET,RF              CALL IECVSMGR
+         SPACE
+         STM   RB,RET,PWREGB       SAVE RB-14
+         SETFRR D,WRKREGS=(13,14)
+         SPACE
+         SETLOCK RELEASE,TYPE=LOCAL,RELATED=(LOCAL,IGC016(PRGCOM9))
+         LM    RB,RET,PWREGB
+         USING SIAB,RB
+         XC    SIAB(SIABEL),SIAB   ZERO 160 BYTES
+         LR    RSRB,RB             PUT SRB PTR IN REG1
+         LA    RB,K01              INDICATE MASTER ASID
+         STH   RB,SRBPASID         TO ASSOCIATE SRB
+         SLL   RB,K02              GET OFFSET IN ASVT
+         L     RF,CVTPTR           GET CVT PTR
+         L     RD,CVTASVT          GET ASCB VECTOR TABLE
+         USING ASVT,RD
+         L     RB,ASVTFRST(RB)     GET ASCB FOR THIS ASID
+         ST    RB,SRBASCB          PLACE IN SRB
+         L     RB,IOCSCOMP         GET ADDR IECVSCOM
+         ST    RB,SRBEP            PUT ADDR OF COMPRESS IN SRB
+         SCHEDULE SRB=(1),SCOPE=GLOBAL  SCHED COMPRESS
+         SPACE
+PRGCOMP9 L     RET,PWRET1          RELOAD RETURN ADDR
+         L     RBASE,PWRTEMP1      RELOAD BASE
+         BR    RET                 RETURN TO MAIN LINE
+COMPMIN  DC    AL2(97)        4 PAGE+1 MIN NUM OF FREE BLKS TO SCH
+*                                  STORAGEMANAGER COMPRESS
+         DS    0F
+COREMSK2 DC    X'10000120'         INDICATE GET 1 160 BYTE BLOCK
+         SPACE
+PRGFRRA  DC   A(PURGEFRR)           ADDR OF PURGE FRR RTN      @Y30IPLG
+        EJECT
+         TITLE 'DECREMENT UCBCNT FIELD'                        @OZ06654
+***************************************************************@OZ06654
+*        DECREMENT UCBCNT FIELD SUBROUTINE                    *@OZ06654
+*                                                             *@OZ06654
+*        IF A MULTIPLE EXPOSURE UCB THE COUNT IN THE BASE UCB *@OZ06654
+*        MUST BE DECREMENTED                                  *@OZ06654
+*                                                             *@OZ06654
+*        INPUT REGISTERS -                                    *@OZ06654
+*              RUCB - UCB ADDRESS                             *@OZ06654
+*              RET  - RETURN ADDRESS                          *@OZ06654
+*                                                             *@OZ06654
+*        OUTPUT REGISTERS -                                   *@OZ06654
+*              NONE                                           *@OZ06654
+*                                                             *@OZ06654
+***************************************************************@OZ06654
+         USING UCB,RUCB                                        @OZ06654
+         USING *,RF                ESTABLISH BASE              @OZ06654
+         USING PWA,RCORE                                       @OZ06654
+UPDTCNT  ST    RD,PWREGD           SAVE REG 13                 @OZ06654
+         ST    RET,PWREGE          SAVE REG 14                 @OZ06654
+         LR    RD,RUCB             GET UCB ADDRESS             @OZ06654
+         TM    UCBWGT,UCBMTPXP     IS IT MULT EXP              @OZ06654
+         BZ    NORMUP              NO- GO DECREMENT COUNT      @OZ06654
+         L     RD,UCBBASE          YES- GET ADDR OF BASE UCB   @OZ06654
+NORMUP   IC    RET,UCBCNT-UCB(RD)  PICK UP COUNT               @OZ06654
+         BCTR  RET,0               DECREMENT BY 1              @OZ06654
+         STC   RET,UCBCNT-UCB(RD)  PUT NEW COUNT IN UCB        @OZ06654
+         L     RD,PWREGD           RESTORE REG 13              @OZ06654
+         L     RET,PWREGE          RESTORE REG 14              @OZ06654
+         BR    RET                 RETURN                     @OZ06654
+*****************************************************************
+*                                                               *
+*        MODULE IDENTIFICATION CONSTANTS                        *
+*                                                               *
+*****************************************************************
+         SPACE
+         LCLC  &ADATE
+&ADATE   SETC  '&SYSDATE'          SET DATE
+         SPACE
+         DS    0F
+MODCSECT DC    CL8'IGC0001F'       MODULE NAME
+         DC    CL8'IGC016'         CSECT NAME
+RCVESTAE DC    CL8'PRGESTAE'       ESTAE NAME
+RCVRYFRR DC    CL8'PURGEFRR'       FRR NAME
+ASSMDATE DC    CL8'&ADATE'         ASSEMBLY DATE
+         SPACE
+PURGEEND DS    0F                  END OF PURGE PROGRAM
+         SPACE
+         END

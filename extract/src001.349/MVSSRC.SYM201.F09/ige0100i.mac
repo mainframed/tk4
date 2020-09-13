@@ -1,0 +1,1363 @@
+         TITLE 'IGE0100I       LOAD 2       1/2 INCH MAG TAPE ERP''S'
+         MACRO
+         DATEM
+         LCLC  &FILL
+&FILL    SETC  'CL8'.''''.'&SYSDATE'.''''
+         DC    &FILL
+         MEND
+IGE0100I START X'00'                   LOAD 2
+*
+***********************************************************************
+*                                                                     *
+* STATUS:                                                             *
+*    CHANGE LEVEL:  VS2/REL3                                          *
+*                                                                     *
+* FUNCTION/OPERATION:                                                 *
+*    PART 1 - ERP ERRORS                                              *
+*        1.  PRINT A MESSAGE AND REISSUE SIO IF ERG.  CONTINUE IF     *
+*            NOISE ON USER READ OR NOISE ON ERP READ.                 *
+*        2.  PRINT A MESSAGE AND REISSUE SIO IF AN UNSOLICITED        *
+*            DEVICE END FROM A NEW DEVICE TYPE.                       *
+*        3.  PRINT A MESSAGE AND EXIT WITH PERMANENT ERROR IF AN      *
+*            IOB INTERCEPT ON DATA SECURITY ERASE ON A NEW            *
+*            DEVICE TYPE.                                             *
+*        4.  EXIT WITH PERMANENT ERROR IF OTHER IOB INTERCEPT         *
+*            CONDITION                                                *
+*        5.  HANDLE UNIT CHECK DURING REPOSITIONING                   *
+*    PART 4 - TAPE ERRORS                                             *
+*        1.  HANDLE ERRORS OTHER THAN NORMAL DATA CHECK ON READ       *
+*            OR WRITE TYPE COMMANDS AND REPOSITIONING ERRORS.         *
+*        2.  ENTERED FROM LOAD 1 FOR:                                 *
+*            A.  UNIT CHECK AND NO SENSE DATA                         *
+*            B.  UNIT CHECK AND SENSE - CR, IR, BO, EQ, OR            *
+*            C.  LOAD POINT ON READ                                   *
+*            D.  CHANNEL DATA CHECK                                   *
+*    PART 9 - ICC AND CCC                                             *
+*        1.  ANALYZE THE ERROR RECOVERY INTERFACE BLOCK (ERPIB)       *
+*            TO DETERMINE WHETHER OR NOT A CHANNEL ERROR CONDITION    *
+*            CAN BE RETRIED.                                          *
+*        2.  IF SO, THE CHANNEL PROGRAM IS RETRIED ONLY ONCE.         *
+*        3.  IF THE ERROR IS NOT RECOVERED ON RETRY OR IS A NON-      *
+*            RETRIABLE TYPE, THEN IT IS TO BE CONSIDERED A            *
+*            PERMANENT ERROR.  THE LOGOUT BIT IS SET AND CONTROL      *
+*            IS TRANSFERRED TO THE WRITE-TO-OPERATOR ROUTINE.         *
+*                                                                     *
+* ENTRY POINTS:                                                       *
+*        ER2402 IS CALLED BY IGE0000I (LOAD 1) VIA XCTL               *
+*                                                                     *
+* INPUT:                                                              *
+*    REGISTER 1 CONTAINS A POINTER TO THE IOSB                        *
+*                                                                     *
+* OUTPUT:                                                             *
+*    SEVEN SPECIAL CONSOLE MESSAGES - VIA SVC 35                      *
+*        ERRMSG1   'ERROR ON ERG'                                     *
+*        ERRMSG2   'NOISE - USER'                                     *
+*        ERRMSG3   'NOISE - ERP '                                     *
+*        ERRMSG4   'UNEX INTRPT '                                     *
+*        ERRMSG5   'DSE FAILED  '                                     *
+*        ERRMSG6   'CTRL BLK ERR'                                     *
+*        ERRMSG7   'UNEX LOAD PT'                                     *
+*                                                                     *
+* EXTERNAL ROUTINES:                                                  *
+*    INTERPRETER ROUTINE - CHECKS SENSE & STATUS BITS                 *
+*                                                                     *
+* EXITS - NORMAL:                                                     *
+*         1.  SVC 15/3 EXIT TO IOS TO REPOSITION TAPE AND TO          *
+*             REEXECUTE THE CHANNEL PROGRAM.                          *
+*         2.  XCTL TO IGE0000I (LOAD 1)                               *
+*         3.  XCTL TO IGE0025C (WTO ROUTINE)                          *
+*         4.  XCTL TO IGE0025F (OBR ROUTINE)                          *
+*                                                                     *
+* EXITS - ERROR:  N/A                                                 *
+*                                                                     *
+* TABLES/WORK AREAS:                                                  *
+*    THE ERPIB TABLE IS ANALYZED TO DETERMINE IF THE ERROR            *
+*    CONDITION CAN BE RETRIED.                                        *
+*                                                                     *
+* ATTRIBUTES:                                                         *
+*    REENTRANT                                                        *
+*                                                                     *
+* NOTES:                                                              *
+*    VS2/REL2 - LOADS 2, 4, 8 & 9 OF PREVIOUS RELEASES HAVE           *
+*    BEEN COMBINED TO CREATE LOAD 2 OF THIS RELEASE.                  *
+*    THIS LOAD INCLUDES:                                              *
+*        1.  HANDLING ALL ERP-GENERATED ERRORS                        *
+*        2.  HANDLING TAPE ERRORS OTHER THAN NORMAL DATA CHECK        *
+*            ON READ OR WRITE.                                        *
+*        3.  INTERFACE CONTROL CHECK                                  *
+*        4.  CHANNEL CONTROL CHECK                                    *
+*                                                                     *
+*    PTM YM6412  REPOSITION BIT NOT TURNED OFF ON PERM ERR EXIT       *
+*    APAR FIX TO IOSGEN MACRO USAGE                          @OZ00664 *
+*    APAR FIX TO IOSGEN MACRO USAGE                          @ZA05134 *
+*    FIX FOR LOW CORE OVERLAY PROBLEM                        @ZA14748 *
+*    ROUTE AND DESCRIPTOR CODES                              @ZA30415 *
+*    TURN ON EWADDMSG FOR WTO                                @ZA31011 *
+***********************************************************************
+         EJECT
+*              R E G I S T E R   A S S I G N M E N T S
+*
+R0       EQU   0                       WORK REG
+R1       EQU   1                       WORK REG
+IOSREG   EQU   1                       IOSB REG
+MSGREG   EQU   2                       MESSAGE REGISTER
+CCWREG   EQU   3                       CCW ADDRESS REG
+R4       EQU   4                       WORK REGISTER
+R5       EQU   5                       WORK REGISTER
+UCBREG   EQU   7                       UCB ADDRESS REGISTER
+UXREG    EQU   8                       UCB EXTENSION ADDRESS
+SAVREG   EQU   9                       SAVE REGISTER
+EWAREG   EQU   10                      EXTENDED WORK AREA
+R11      EQU   11                      WORK REGISTER
+R13      EQU   13                      WORK REGISTER
+LNKREG   EQU   14                      LINK REGISTER
+XCTLREG  EQU   14                      RETURN REGISTER FOR XCTL
+BASREG   EQU   15                      BASE REGISTER
+         EJECT
+*
+*                U S E R   C C W   D S E C T
+*
+CCW      DSECT                         ERROR CCW IN USER'S CHAIN
+CCWOP    DS    CL1                     CCW COMMAND CODE
+         ORG   CCWOP                   **
+CCWADR   DS    CL4                     CCW DATA ADDRESS
+CCWFLS   DS    CL2                     CCW FLAGS
+CCWCNT   DS    CL2                     CCW BYTE COUNT
+         EJECT
+*
+*   EWACNT1 - ERROR COUNT 1 REFERENCES
+*
+OVRCNT5  EQU   X'50'                   OVERRUN COUNT MAX. VALUE
+WRTIND   EQU   X'80'                   INDICATOR TO STAT ROUTINE
+ERPCTL   EQU   X'08'                   ERP CONTROL FLAG
+ICCFLG   EQU   X'80'                   ICC/CCC FLAG
+*
+*
+*   EWAFLG3 - EWA FLAG 3 REFERENCES
+*
+EWTROR   EQU   X'80'                   READ OPPOSITE IN PROGRESS
+EWTRTN2  EQU   X'40'                   RETURN FROM LOAD 2
+EWTTPC   EQU   X'20'                   TAPE CLEANING BIT
+EWTBKS   EQU   X'10'                   BACKSPACE ERASE CLEANING FLAG
+EWTOVER  EQU   X'08'                   SDR OVERFLOW
+EWTPT4A  EQU   X'04'                   ENTRY FOR LOAD 2, PART 4A
+EWTPT4B  EQU   X'02'                   ENTRY FOR LOAD 2, PART 4B
+EWTRBLD  EQU   X'01'                   REBUILD IDAL LIST
+*
+*   EWACNTR3 - EWA COUNTER 3 REFERENCES
+*
+EWTUEX   EQU   X'80'                   UNIT EXCEPTION FLAG
+EWTNB    EQU   X'40'                   NOISE BIT
+EWTRST   EQU   X'20'                   RESTART FLAG
+EWTROC   EQU   X'10'                   USE ROR CCW
+EWTEXIT  EQU   X'02'                   TEMPORARY ERROR EXIT FLAG
+EWTDEP   EQU   X'01'                   DEVICE END POST BIT
+*
+*   DEB REFERENCES
+*
+DEBOFL   EQU   8                       DEBOFLGS
+*
+*   DCB REFERENCES
+*
+DCBBLK   EQU   12                      DCB BLOCK COUNT
+*
+*   COMMANDS
+*
+CMDCTL   EQU   X'03'                   CONTROL
+CMDERG   EQU   X'17'                   ERASE GAP
+CMDBSR   EQU   X'27'                   BACK SPACE RECORD
+CMDRDB   EQU   X'0C'                   READ BACKWARDS
+CMDRWU   EQU   X'0F'                   REWIND UNLOAD
+CMDWRT   EQU   X'01'                   WRITE
+CMDTIC   EQU   X'08'                   TIC
+CMDTIE   EQU   X'1B'                   TIE
+CMDREW   EQU   X'07'                   REWIND
+CMDRED   EQU   X'02'                   READ COMMAND
+CMDWTM   EQU   X'1F'                   WRITE TAPE MARK
+CMDBSF   EQU   X'2F'                   BACKSPACE FILE
+CMDFSR   EQU   X'37'                   FORWARD SPACE RECORD
+CMDFSF   EQU   X'3F'                   FORWARD SPACE FILE
+CMDNOP   EQU   X'03'                   NOP
+CMDMD1   EQU   X'03'                   MODE SETS (LO-ORDER 4 BITS)
+CMDBIT4  EQU   X'08'                   MODE SET (BIT 4)
+CMDBIT5  EQU   X'04'                   MODE SET (BIT 5)
+CMDSNS   EQU   X'04'                   SENSE
+*
+*   STATUS INDICATORS
+*
+CSWDVE   EQU   X'04'                   DEVICE END
+CSWUCK   EQU   X'02'                   UNIT CHECK
+CSWUEX   EQU   X'01'                   UNIT EXCEPTION
+CSWCDC   EQU   X'08'                   CHANNEL DATA CHECK
+CSWCCC   EQU   X'04'                   CHANNEL CONTROL CHECK
+CSWICC   EQU   X'02'                   INTERFACE CONTROL CHECK
+         EJECT
+*
+*                  M I S C E L L A N E O U S
+*
+APPEND   EQU   X'01'                   APPENDAGE BIT
+BLANK    EQU   X'40'                   EBCDIC BLANK
+BLKCNT   EQU   12                      BLK COUNT OFFSET FROM DCB
+CNT3     EQU   X'40'                   3 RETRIES
+C1       EQU   1                       COUNT OF 1
+C2       EQU   2                       COUNT OF 2
+C3       EQU   3                       COUNT OF 3
+C4       EQU   4                       COUNT OF 4
+C5       EQU   5                       COUNT OF 5
+C6       EQU   6                       COUNT OF 6
+C8       EQU   8                       COUNT OF 8
+C16      EQU   16                      COUNT OF 16
+C61      EQU   61                      COUNT OF 61
+C288     EQU   288                     COUNT OF 288
+EMUL     EQU   X'10'                   EMULATOR BIT
+EXCPER   EQU   15                      ERROR EXCP
+FULL     EQU   X'FF'                   COUNTER FULL
+HEXC7    EQU   X'C7'                   HEX 'C7'
+HEX24    EQU   X'18'                   COUNT OF 24
+HEX80    EQU   X'80'                   HEX '80'
+HEXF9    EQU   X'F9'                   HEX 'F9'
+IOSCRC   EQU   X'08'                   CRC FLAG
+IOSREP   EQU   X'10'                   REPOSITION FLAG
+LOAD1    EQU   9                       LOAD NAME FOR LOAD 1
+LOC16    EQU   16                      COMMUNICATION VECTOR TABLE
+MASK     DC    X'0000FFFF'             COMPARE MASK
+PROG     EQU   X'FF'                   ERP IN PROGRESS
+RETURN   EQU   3                       EXIT SVC
+SERLOG   EQU   256                     LOAD NAME TO OBR
+TRCOMMA  EQU   X'EE'                   WILL TRANSLATE TO ','
+VECTXL   EQU   44                      VECTOR TO XCTL ROUTINE
+VECT68   EQU   68                      INTERPRETER ROUTINE
+WTORTN   EQU   253                     LOAD NAME TO WTO ROUTINE
+ZERO     EQU   X'00'                   ZERO
+*
+*
+         EJECT
+*
+*           MISCELLANEOUS - FOR PART 9
+*
+*   ERPIB BYTE 4 REFERENCES
+*
+IBUNR1   EQU   X'31'                   UNR OR TIO OR HIO
+IBSIB1   EQU   X'C0'                   SIO OR I/O RUPT BITS
+IBSIO1   EQU   X'80'                   SIO BIT
+IBSNS1   EQU   X'04'                   VALID SENSE
+*
+*   ERPIB BYTE 6 REFERENCES
+*
+IBALL2   EQU   X'1C'                   VALIDITY BITS
+*
+*   ERPIB BYTE 7 REFERENCES
+*
+IB3001   EQU   X'01'                   00 001
+IB3002   EQU   X'02'                   00 010
+IB3003   EQU   X'03'                   00 011
+IB3004   EQU   X'04'                   00 100
+IB3005   EQU   X'05'                   00 101
+IB3041   EQU   X'41'                   01 001
+IB3042   EQU   X'42'                   01 010
+IB3043   EQU   X'43'                   01 011
+IB3045   EQU   X'45'                   01 101
+IB3081   EQU   X'81'                   10 001
+IB3082   EQU   X'82'                   10 010
+IB30C0   EQU   X'C0'                   11 000
+IGE0100I CSECT
+* A-000000-999999                                                Y026XZ
+         EJECT
+***********************************************************************
+*                             P A R T   1                             *
+*                                                                     *
+*                             ERP  ERRORS                             *
+***********************************************************************
+         USING *,BASREG
+         USING IOSB,IOSREG
+         USING EWA,EWAREG
+         USING UCB,UCBREG
+         USING UCBMT,UXREG
+         USING CCW,CCWREG
+ERP2     B     ER2402                  BRANCH AROUND DECLARE
+         DC    C'** IGE0100I-TAPE ERP 08-21-74 **'       **
+         DS    0F                      ALIGN
+ER2402   EQU   *
+         L     UCBREG,IOSUCB           GET UCB ADDRESS FROM IOSB
+         SH    UCBREG,H512             POINT TO UCB PREFIX       Y02032
+         L     UXREG,UCBXTN            GET ADDR OF UCB EXTENSION
+*
+         L     EWAREG,IOSERP           GET EWA ADDR FROM IOSB    Y02032
+         L     CCWREG,IOSCSW-C1        GET ADDRESS TO CCW
+         LA    CCWREG,0(CCWREG)        CLEAR HIGH ORDER BYTE     A29974
+         SH    CCWREG,EIGHT            POINT TO FAILING COMMAND
+*
+         TM    IOSTSB,CSWCCC+CSWICC    IS ICC OR CCC ON?
+         BC    7,PART9                 YES - GO TO PART 9
+*
+         TM    EWAFLG3,EWTPT4A         ENTRY TO PART 4A?         Y02032
+         BO    PART4A                  YES - GO TO PART 4
+*
+         TM    EWAFLG3,EWTPT4B         ENTRY TO PART 4B?         Y02032
+         BO    PART4B                  YES - GO TO PART 4B
+*
+         CLI   IOSCOD,IOSTAPEC         X'4B' IN COMPLETION CODE? A29974
+         BE    B223                    YES - GO TO PERM ERROR    A29974
+         LA    MSGREG,ERRMSG4          GET ERROR MSG ADDR        S21048
+*
+         TM    IOSFLC,IOSVERIF         UNSOLICITED DEVICE END?   S21048
+         BO    B325                    YES-GO SET UP WTO MACRO   S21048
+*
+         CLI   IOSCOD,IOSFINTC         IOB INTERCEPT
+         BNE   B200                    NO - CONTINUE
+*
+*   I O B   I N T E R C E P T
+*
+         TM    UCBTBYT4,UCB3400        3400 TAPE UNIT?
+         BNO   B100                    NO - BRANCH AROUND DSE    S21048
+         LA    MSGREG,ERRMSG5          SET FOR DSE FAIL MSG      S21048
+         TM    EWTSNS7,EWTDSE          DSE ERR BIT ON IN SENSE?  S21048
+         BO    B325                    YES-GO SET UP WTO MACRO   S21048
+*
+B100     EQU   *
+         NI    IOSFLA,X'FF'-IOSERR-IOSSMDA   RESET ERP FLAGS   @YM06412
+         MVI   IOSCOD,IOSINTC          SET INTERCEPT CODE TO X'44'
+         B     B370                    EXIT ERP VIA SVC 15/3 OR OBR
+         EJECT
+*
+*                        U N I T   C H E C K
+*
+*        HAVE UNIT CHECK - CHECK SENSE IN SEQUENCE
+*        1.  DATA CHECK, NOT REPOSITIONING, IS NOISE RECORD
+*        2.  ALL OTHER CONDITIONS ARE UNIT CHECK DURING REPOSITIONING
+*              BUS OUT                 POSSIBLE ANYTIME
+*              INTERVENTION REQUIRED   POSSIBLE ANYTIME
+*              LOAD POINT              BSR ONLY
+*              DATA CHECK              ERG ONLY
+*              OVERRUN ERG
+*              ANY OTHER SENSE         LOGOUT
+*        3.  EQUIPMENT CHECK IS VALID ERROR ONLY WITH DEVICE END
+*
+*        REGS 0,9,11,12,14,15 ARE AFFECTED BY INTERPRETER
+*
+B200     EQU   *
+         TM    EWTSNS0,EWTEQU          EQUIPMENT CHECK?          Y02032
+         BZ    B205                    NO - CONTINUE TEST        Y02032
+         TM    IOSTSA,CSWDVE           DEVICE END?               Y02032
+         BO    D840                    YES - XCTL TO WTO         Y02032
+*
+B205     EQU   *
+         LR    SAVREG,BASREG           SAVE REG 15
+         L     BASREG,LOC16            GET ADDR OF CVT
+         L     BASREG,VECT68(BASREG)   GET INTERPRETER ADDRESS
+B210     EQU   *
+         BALR  LNKREG,BASREG           LINK TO INTERPRETER RTN
+*
+         DC    X'02'                   BUS OUT CHECK
+         DC    AL1(B220-B210-2)        *
+         DC    X'01'                   INTERVENTION REQUIRED
+         DC    AL1(B240-B210-4)        *
+         DC    X'00'                   COMMAND REJECT
+         DC    AL1(B250-B210-6)        *
+         DC    X'05'                   OVERRUN
+         DC    AL1(B220-B210-8)        *
+         DC    X'0C'                   LOAD POINT
+         DC    AL1(B260-B210-10)       *
+         DC    X'04'                   DATA CHECK
+         DC    AL1(B270-B210-12)       *
+         DC    X'2F'                   END OF TEST
+         DC    AL1(B250-B210-14)       *
+*
+*   B U S   O U T   C H E C K ,   O V E R R U N
+*
+B220     EQU   *
+         TM    EWACNTR1,OVRCNT5        5 BUS OUTS?               Y02032
+         BO    D840                    YES - XCTL TO WTO
+*
+         IC    R13,EWACNTR1            GET COUNT                 Y02032
+         LA    R13,C16(R13)            ADD ONE TO COUNT
+         STC   R13,EWACNTR1            STORE COUNT               Y02032
+*
+         LTR   CCWREG,CCWREG           NEGATIVE ADDRESS?         A29974
+         BNM   B225                    NO - CONTINUE             A29974
+B222     EQU   *
+         MVI   IOSCOD,IOSTAPEC         PUT X'4B' IN IOSB CODE    A29974
+B223     EQU   *
+         NI    IOSFLA,X'FF'-IOSERR-IOSSMDA  MARK AS PERM ERROR @YM06412
+         LA    MSGREG,ERRMSG6          SET FOR CONTROL BLK MSG   A29974
+         B     B327                    GO SET UP MSG FOR WTO     A29974
+*
+B225     EQU   *
+         CLI   CCWOP,CMDCTL            BUS OUT ON NOP?           A29974
+         BNE   B405                    NO - BSR DONE - SVC 15/3
+*
+*   HAD BUS OUT ON NOP COMMAND FETCH.
+*   GO TO LOAD 1 - IGNORE BUS OUT.
+*
+         OI    EWAFLG3,EWTRTN2         SET LOAD 2 RETURN BIT     Y02032
+         LA    R13,LOAD1               GET LOAD 1 ADDRESS
+         B     XCTL3                   XCTL TO LOAD 1
+*
+*   I N T E R V E N T I O N   R E Q U I R E D
+*
+B240     EQU   *
+         TM    IOSTSA,CSWDVE           DEVICE END?
+         BO    B245                    YES - SET UP MESSAGE      Y02032
+*
+         TM    EWTSNS1,EWTSTA+EWTSTB   NON-EXISTENT UNIT?        Y02032
+         BZ    D840                    YES - PERM ERROR, XCTL TO WTO
+         B     D870                    NO - XCTL TO WTO          Y02032
+*
+B245     EQU   *
+         LA    MSGREG,ERRMSG1          SET FOR 'ERASE GAP' MSG
+         TM    IOSSNS,EWTDATA          IS IT DATA CHECK?         Y02032
+         BO    B270                    YES - MUST BE ERG
+*
+*   E Q U I P   C H E C K,    D A T A   C H E C K,
+*   C O M M A N D   R E J E C T   OR NONE
+*
+B250     EQU   *
+         B     D840                    XCTL TO WTO
+*
+*   L O A D   P O I N T
+*
+B260     EQU   *
+         TM    EWAFLG3,EWTTPC          TAPE CLEANER ACTION       Y02032
+         BO    B380                    YES - GO SET UP TO REPOSITION
+*
+         MVI   IOSCOD,IOSTAPEC         PUT X'4B' IN IOSB CODE    A29972
+         NI    IOSFLA,X'FF'-IOSERR-IOSSMDA  MARK PERM ERROR    @YM06412
+         LA    MSGREG,ERRMSG7          SET FOR LOAD POINT MSG    A29972
+         B     B330                    GO SET UP MESSAGE         A29972
+*
+B270     EQU   *
+         TM    EWAFLG3,EWTROR          ROR IN PROGRESS?          Y02032
+         BO    B280                    YES - CONTINUE
+         TM    IOSFLA,IOSREP           REPOSITIONING?
+         BO    B310                    YES - GO UPDATE ERG COUNT
+*
+B280     EQU   *
+         TM    UCBNB,FULL              IS NOISE COUNT FULL?
+         BO    B290                    YES - BRANCH AROUND COUNT
+         IC    R13,UCBNB               GET NOISE COUNT
+         LA    R13,C1(R13)             ADD ONE TO COUNT
+         STC   R13,UCBNB               STORE BACK
+*
+B290     EQU   *
+         L     R13,EWTDEB              GET DEB ADDRESS           Y02032
+         CL    R13,FZERO               VALID DEB ADDR            Y02032
+         BE    B300                    NO - SKIP EMULATOR        Y02032
+         TM    DEBOFL(R13),EMUL        IS EMULATOR BIT ON?
+         BZ    B300                    NO - SKIP PERMANENT ERROR BIT
+         NI    IOSFLA,X'FF'-IOSERR-IOSSMDA  PERMANENT ERROR    @YM06412
+*
+*   TEST FOR PREVIOUS MESSAGE
+*
+B300     EQU   *
+         TM    EWACNTR3,EWTNB          PREVIOUS MESSAGE?         Y02032
+         BO    B370                    YES - DON'T WRITE MESSAGE
+         OI    EWACNTR3,EWTNB          NO - SET MESSAGE SWITCH   Y02032
+         LA    MSGREG,ERRMSG2          SET FOR USER MESSAGE
+         TM    EWACNTR2,PROG           IS ERP IN PROGRESS?       Y02032
+         BZ    B330                    NO - BRANCH TO WRITE MESSAGE
+         LA    MSGREG,ERRMSG3          YES - SET FOR ERP MESSAGE
+         B     B330                    BRANCH TO WRITE MESSAGE
+*
+*   UPDATE ERG DATA CHECK COUNT
+*
+B310     EQU   *
+         IC    R13,EWACNTR2            GET ERG COUNTER           Y02032
+         LA    R13,C16(R13)            ADD ONE TO COUNT
+         STC   R13,EWACNTR2            STORE UPDATED COUNT       Y02032
+         LH    R13,UCBERG              GET ERG COUNT
+         CH    R13,ALLF                IS COUNT FULL?
+         BE    B320                    YES - BRANCH AROUND COUNT
+         LA    R13,C1(R13)             ADD ONE TO COUNT
+         STH   R13,UCBERG              STORE UPDATED COUNT
+*
+B320     EQU   *
+         LA    MSGREG,ERRMSG1          SET FOR ERG - CONT MESSAGE
+         TM    EWACNTR2,CNT3           THREE RETRIES?            Y02032
+         BO    D840                    YES - XCTL TO WTO
+         B     B330                    NO - SET UP FOR WTO MACRO
+         EJECT
+*
+*   BUILD OPERATOR MESSAGES AND ISSUE WTO
+*
+B325     EQU   *
+         OI    IOSFLA,IOSEX+IOSERR     SET ERP IN CONTROL        S21048
+*
+B327     EQU   *
+         MVC   EWTWTO(C61),WTOMSG      MOVE MSG AREA TO EWA      Y02032
+         MVC   EWTOPCDE(C2),NULLOP     PUT '***' IN OPCODE       S21048
+         B     B340                    BR - SET UP MESSAGE       S21048
+*
+B330     EQU   *
+         LTR   CCWREG,CCWREG           NEGATIVE ADDRESS?         A29974
+         BM    B222                    YES - GO SET X'4B'        A29974
+         MVC   EWTWTO(C61),WTOMSG      MOVE MSG AREA TO EWA      Y02032
+         UNPK  EWTOPCDE,CCWOP(C2)      UNPACK OPCODE AND 1 BYTE  Y02032
+*
+B340     EQU   *
+         OI    EWACNTR2,APPEND         SET SWITCH FOR APPENDAGE  Y02032
+         MVC   EWTUNID(C3),UCBNAME     MOVE TO MESSAGE AREA      Y02032
+*
+*   MOVE IN MESSAGE TEXT AS POINTED TO BY MSGREG
+*
+         MVC   EWTTEXT,0(MSGREG)       MOVE IN MESSAGE           Y02032
+*
+*   TRANSLATE ALL FIELDS TO PRINTABLE FORM
+*
+         MVI   EWTOPCDE+C2,TRCOMMA     TRANSLATE CODE FOR COMMA  Y02032
+*
+         UNPK  EWTSTAT,IOSTATUS(C3)    UNPACK STATUS + 1 BYTE    Y02032
+         MVI   EWTSTAT+C4,TRCOMMA      TRANSLATE CODE FOR COMMA  Y02032
+*
+         UNPK  EWTSENSE,IOSSNS(C3)     UNPACK SENSE AND 1 BYTE   Y02032
+         MVI   EWTSENSE+C4,TRCOMMA     TRANSLATE CODE FOR COMMA  Y02032
+*
+         L     R13,EWTDCB              GET DCB ADDR FROM EWA     Y02032
+         CL    R13,FZERO               VALID DCB ADDR?           Y02032
+         BE    B350                    NO - SKIP BLK COUNT       Y02032
+         UNPK  EWTLOC,DCBBLK(C5,R13)   UNPACK DCB BLOCK COUNT    Y02032
+B350     EQU   *
+         MVI   EWTLOC+C8,TRCOMMA       TRANSLATE CODE FOR COMMA  Y02032
+*
+         TR    EWTOPCDE(L'EWTOPCDE+L'EWTSTAT+L'EWTSENSE+L'EWTLOC),TRANS
+*
+*   MOVE IN VOLUME SERIAL NUMBER IF AVAILABLE
+*
+         MVC   EWTVOL(C6),UCBVOLI      MOVE IT TO MESSAGE AREA   Y02032
+         CLI   UCBVOLI,ZERO            IS IT A VALID VOL SER?
+         BNE   B360                    YES - BRANCH TO CONTINUE
+*
+         MVI   EWTVOL,BLANK            NO - MOVE IN BLANKS       Y02032
+         MVC   EWTVOL+C1(C5),EWTVOL    MOVE BLANKS               Y02032
+*
+*   WRITE THE MESSAGE TO THE OPERATOR AND CONTINUE
+*
+B360     EQU   *
+         LR    R11,BASREG              SAVE REG 15
+         LR    R4,IOSREG               SAVE REG 1                A40906
+         LA    IOSREG,EWTWTO           POINT AT THE MESSAGE      Y02032
+         WTO   MF=(E,(1))              WRITE ON CONSOLE
+         OI    EWAFLG3,EWTRBLD         FLAG TO REBUILD IDAL LIST S21048
+*
+         LR    BASREG,R11              RESTORE REG 15
+         LR    IOSREG,R4               RESTORE REG 1
+         CLI   IOSCOD,IOSTAPEC         X'4B' COMPLETION CODE?    A29974
+         BE    B370                    YES - SVC 15/3            A29974
+*
+         CLI   IOSCOD,IOSFINTC         WAS IT AN INTERCEPT?      S21048
+         BNE   B370                    NO - EXIT VIA SVC 15/3    S21048
+*
+         OI    IOSFLB,IOSLOG           SET LOGOUT                S21048
+         MVI   IOSCOD,IOSINTC          SET INTERCEPT CODE - 44   S21048
+         NI    IOSFLA,X'FF'-IOSERR-IOSSMDA  SET ERP PERM ERR   @YM06412
+*
+B370     EQU   *
+         TM    IOSFLC,IOSVERIF         UNSOLICITED DEVICE END?   S21048
+         BZ    B375                    NO - BR AROUND RESET      S21048
+*
+         LR    R4,UCBREG               SET UP POINTER TO UCB-24  Y02032
+         L     R13,F24                 TO RESET UNSOL. DEV. END  Y02032
+         SR    R4,R13                  SUBTRACT 24               Y02032
+         NI    0(R4),X'FF'-UCBUDE      RESET UNSOL. DEVICE END IN UCB
+         NI    IOSFLC,X'FF'-IOSVERIF   RESET UNSOL. DEVICE END IN IOSB
+*
+B375     EQU   *
+         TM    EWAFLG3,EWTOVER         IS OVERFLOW ON?           S21048
+         BO    D2040                   YES - XCTL TO OBR         S21048
+         B     B405                    NO - EXIT VIA SVC 15/3
+*
+*   SET UP TO REPOSITION OFF LOAD POINT
+*
+B380     EQU   *
+         SR    R4,R4                   CLEAR REGISTER
+         IC    R4,EWACNTR1             GET POSITIONING COUNT     Y02032
+         LA    R13,C3                  MAX COUNT (RF ALWAYS DECR 1)
+         SR    R13,R4                  NUMBER OF BACK SPACES
+         BZ    B410                    ZERO - DONE, EXIT
+*
+         TM    EWAFLG3,EWTBKS          RD BK TAPE CLEANING?      Y02032
+         BO    B390                    YES - SKIP
+         BCTR  R13,R0                  READ FWD - ONE LESS RECORD
+*
+B390     MVI   IOSMDB,CMDFSR           REVERSE DIRECTION
+B400     STC   R13,EWACNTR1            RESTORE POSITIONING COUNT
+         NI    EWAFLG3,X'FF'-EWTTPC-EWTBKS  RESET CLEAN & BKS CLEAN
+*
+B405     EQU   *
+         SVC   EXCPER                  SVC 15
+         SVC   RETURN                  SVC 3
+*
+B410     EQU   *
+         TM    EWAFLG3,EWTBKS          READ BACK TAPE CLEANING?  Y02032
+         BO    B390                    YES - ONE MORE RECORD TO GO
+         NI    IOSFLA,X'FF'-IOSREP     NO - DONE, NO MORE POSITIONING
+*
+*   RESTORE DEVICE END POST BIT
+*
+         TM    EWACNTR3,EWTDEP         WAS IT ON ORIGINALLY?     Y02032
+         BO    B415                    YES - LEAVE IT ON         Y02032
+         NI    IOSOPT,X'FF'-IOSDEP     NO  - TURN IT OFF         Y02032
+B415     EQU   *
+         TM    EWAFLG3,EWTROR          ROR IN PROGRESS?          Y02032
+         BNO   B390                    NO - GO REVERSE DIRECTION
+*
+         OI    EWACNTR3,EWTROC         SET IOS USE RORCCW        Y02032
+         B     B400                    GO READ OFF LOAD POINT
+*************   E N D   O F   P A R T   1   *************
+         EJECT
+***********************************************************************
+*                            P A R T   4                              *
+*                                                                     *
+*                          ERROR HANDLING                             *
+***********************************************************************
+*        THIS PART HANDLES ERRORS OTHER THAN NORMAL DATA CHECK        *
+*        ON READ OR WRITE TYPE COMMANDS AND REPOSITIONING ERRORS.     *
+***********************************************************************
+*
+*   NOT REPOSITIONING
+*   TEST SENSE INFORMATION
+*   REGS 0,9,11,12,14,15 ARE AFFECTED BY INTERPRETER ROUTINE
+*   EQUIPMENT CHECK IS A VALID ERROR ONLY WITH DEVICE END
+*
+PART4A   EQU   *
+         NI    EWAFLG3,X'FF'-EWTPT4A   TURN OFF ENTRY BIT        Y02032
+         TM    EWTSNS0,EWTEQU          EQUIPMENT CHECK?          Y02032
+         BZ    D100                    NO - CONTINUE TEST        Y02032
+         TM    IOSTSA,CSWDVE           DEVICE END?               Y02032
+         BO    D840                    YES - XCTL TO WTO         Y02032
+D100     EQU   *
+         LR    SAVREG,BASREG           SAVE BASE REG
+         L     BASREG,LOC16            GET ADDR OF CVT
+         L     BASREG,VECT68(BASREG)   GET ADDR TO INTERPRETER ROUTINE
+*
+D120     EQU   *
+         BALR  LNKREG,BASREG           LINK TO INTERPRETER RTN
+*
+         DC    X'02'                   BUS OUT CHECK
+         DC    AL1(D700-D120-2)        *
+         DC    X'01'                   INTERVENTION REQUIRED
+         DC    AL1(D190-D120-4)        *
+         DC    X'00'                   COMMAND REJECT
+         DC    AL1(D170-D120-6)        *
+         DC    X'05'                   OVERRUN
+         DC    AL1(D700-D120-8)        *
+         DC    X'0C'                   TAPE LOAD POINT
+         DC    AL1(D220-D120-10)       *
+         DC    X'07'                   DATA CONVERTER CHECK
+         DC    AL1(D160-D120-12)       *
+         DC    X'0F'                   NOT CAPABLE
+         DC    AL1(D170-D120-14)       *
+         DC    X'2F'                   END OF TEST
+         DC    AL1(D150-D120-16)       *
+*
+*   TEST REMAINING SENSE WHEN INTERVENTION REQUIRED IS IGNORED
+*   REGS 0,9,11,12,14,15 ARE AFFECTED BY INTERPRETER ROUTINE
+*
+D130     EQU   *
+         LR    SAVREG,BASREG           SAVE BASE REG
+         L     BASREG,LOC16            GET ADDR OF CVT
+         L     BASREG,VECT68(BASREG)   GET ADDR TO INTERPRETER ROUTINE
+D140     EQU   *
+         BALR  LNKREG,BASREG           LINK TO INTERPRETER RTN
+*
+         DC    X'05'                   OVERRUN
+         DC    AL1(D700-D140-2)        *
+         DC    X'07'                   DATA CONVERTER CHECK
+         DC    AL1(D160-D140-4)        *
+         DC    X'0F'                   NOT CAPABLE
+         DC    AL1(D170-D140-6)        *
+         DC    X'2F'                   END OF TEST
+         DC    AL1(D150-D140-8)        *
+         EJECT
+*
+*   ENTER HERE FOR LOGOUT
+*
+D150     EQU   *
+         B     D840                    BRANCH TO SET LOGOUT
+*
+*   DATA CONVERTER CHECK
+*
+D160     EQU   *
+         B     D860                    GO XCTL TO WTO
+*
+*   COMMAND REJECT AND NOT CAPABLE
+*
+D170     EQU   *
+         B     D860                    BRANCH TO SET MESSAGE TYPE
+*
+*   I N T E R V E N T I O N   R E Q U I R E D
+*        NON EXISTENT    -  I/O ERR     -  LOGOUT
+*        NO DEVICE END   -  MESSAGE     -  WTO AND REISSUE
+*        INTERCEPTED 7E  -  NO MESSAGE  -  UCB NOT READY, 7F, RETURN
+*        REWIND UNLOAD   -  NO MESSAGE  -  UCB NOT READY, 7F, UC OFF
+*                                       -  RESTRT FLAG OFF, IOSB NO ERR
+*        IGNORE INT REQ  -  NO MESSAGE  -  FINISH SENSE CHECK
+*
+D190     EQU   *
+         OI    EWACNTR1,ERPCTL         SET ERP CONTROL FLAG      Y02032
+         TM    IOSCC,IOSCC3            NON-EXISTENT CONTROL UNIT?
+         BO    D870                    YES - BRANCH TO WTO
+*
+         TM    EWTSNS1,EWTSTA+EWTSTB   STATUS A & B BOTH OFF?    Y02032
+         BZ    D840                    YES - BR, ERROR, NO DRIVE
+*
+         TM    IOSTSA,CSWDVE           DEVICE END?
+         BZ    D870                    NO - BRANCH TO WTO & REISSUE
+*
+         LTR   CCWREG,CCWREG           NEGATIVE ADDRESS?         A29974
+         BM    B222                    YES - GO SET X'4B'        A29974
+         CLI   CCWOP,CMDRWU            REWIND UNLOAD?
+         BE    D200                    YES - GO SET IOSB TO NO ERROR
+*
+         TM    EWTSNS0,EWTCREJ         COMMAND REJECT?           Y02032
+         BO    D860                    YES - GO SET MESSAGE TYPE
+*
+         TM    IOSTSB,CSWCDC           CHANNEL DATA CHECK?
+         BO    D700                    YES - GO CHECK STATUS
+         NI    EWTSNS0,X'FF'-EWTINT    TURN OFF INT REQ IN EWA   Y02032
+         NI    IOSSNS,X'FF'-EWTINT     TURN OFF INT.REQ. IN IOSB Y02032
+         LA    R13,LOAD1               GET LOAD 1 ADDRESS        Y02032
+         B     XCTL3                   XCTL TO LOAD 1            Y02032
+*
+*   REWIND UNLOAD - NO ERROR
+*
+D200     EQU   *
+         NI    IOSFLA,X'FF'-IOSEX-IOSERR    SET IOSB TO NO ERROR
+         NI    IOSTSA,X'FF'-CSWUCK     SET UNIT CHECK OFF
+*
+         MVI   IOSCOD,IOSNRMC          SET NORMAL COMPLETION CODE (7F)
+*
+*   SET UCB NOT READY FLAG, USING IOSGEN
+*
+         LA    R13,EWTIDAL             POINT TO WORK AREA FOR IOSGEN
+         AH    UCBREG,H512             POINT TO UCB PROPER     @OZ00664
+         IOSGEN UCBFLG,UCB=(UCBREG),VAR=ON,TABLE=UCBNRY,REG=UNCOND
+         SH    UCBREG,H512             POINT TO UCB PREFIX     @ZA05134
+         B     D2025                   EXIT VIA SVC 15/3
+*
+*   LOAD POINT
+*
+D220     EQU   *
+         NI    IOSFLA,X'FF'-IOSERR-IOSSMDA  SET IOSB PERM ERR  @YM06412
+         B     D2025                   EXIT VIA SVC 15/3
+         EJECT
+***********************************************************************
+*                          P A R T   4 B                              *
+***********************************************************************
+PART4B   EQU   *
+         NI    EWAFLG3,X'FF'-EWTPT4B   TURN OFF ENTRY BIT        Y02032
+*
+*   TEST STATUS INFORMATION
+*   REGS 0,9,11,12,14,15 ARE USED BY INTERPRETER ROUTINE
+*
+D700     EQU   *
+*
+         LR    SAVREG,BASREG           SAVE REG 15
+         L     BASREG,LOC16            GET ADDR OF CVT
+         L     BASREG,VECT68(BASREG)   GET ADDR OF INTERPRETER ROUTINE
+D710     EQU   *
+         BALR  LNKREG,BASREG           LINK TO INTERPRETER RTN
+*
+         DC    X'16'                   UNIT CHECK
+         DC    AL1(D780-D710-2)        *
+         DC    X'1C'                   CHANNEL DATA CHECK
+         DC    AL1(D770-D710-4)        *
+         DC    X'1F'                   CHAINING CHECK
+         DC    AL1(D770-D710-6)        *
+         DC    X'1A'                   PROGRAM CHECK
+         DC    AL1(D760-D710-8)        *
+         DC    X'1B'                   PROTECTION CHECK
+         DC    AL1(D760-D710-10)       *
+         DC    X'2F'                   END OF TEST - RECOVERED
+         DC    AL1(D720-D710-12)       *
+*
+*   RECOVERED
+*
+D720     EQU   *
+         XC    EWACNTR1(C2),EWACNTR1   ZERO ERROR COUNTS
+         NI    EWACNTR3,X'FF'-EWTRST   RESET RESTART BIT
+         NI    IOSFLA,X'FF'-IOSEX-IOSERR   SET FOR TEMP ERROR EXIT
+         OI    EWACNTR3,EWTEXIT        SET TEMP EXIT BIT ON
+*
+         LTR   CCWREG,CCWREG           NEGATIVE ADDRESS?
+         BM    B222                    YES-SET '4B' & EXIT, PERM ERR
+*
+         LA    R13,LOAD1               GET LOAD 1 ADDRESS
+         B     XCTL3                   XCTL TO LOAD 1
+*
+*   PROGRAM CHECK OR PROTECTION CHECK
+*
+D760     EQU   *
+         NI    IOSFLA,X'FF'-IOSERR-IOSSMDA RESET ERP CTL FLAGS @YM06412
+         MVI   EWAFLG3,ZERO            CLEAR ERROR FLAGS
+         B     D2025                   EXIT VIA SVC 15/3
+*
+*   CHAINING CHECK OR CHANNEL DATA CHECK
+*
+D770     EQU   *
+         MVI   IOSSNS,ZERO             ZERO SENSE
+*
+*   UNIT CHECK (BUS OUT OR OVERRUN)
+*
+D780     EQU   *
+         TM    EWACNTR1,OVRCNT5        IS OVERRUN COUNT 5?       Y02032
+         BO    D840                    YES - SET LOGOUT & EXIT
+         IC    R13,EWACNTR1            GET OVERRUN COUNT         Y02032
+         LA    R13,C16(R13)            ADD ONE TO COUNT
+         STC   R13,EWACNTR1            STORE COUNT BACK          Y02032
+*
+         LTR   CCWREG,CCWREG           NEGATIVE ADDRESS?         A29974
+         BM    B222                    YES - SET X'4B' & GO TO PART 1
+*
+         TM    IOSSNS,EWTBUSO          BUS OUT?                  Y02032
+         BZ    D800                    NO - GO CHECK FOR OVERRUN
+*
+*   BUS OUT
+*
+         TM    IOSTSA,CSWDVE           DEVICE END?
+         BZ    D790                    NO - GO CHECK TRACK IN ERROR
+*
+         CLI   CCWOP,CMDWRT            WRITE COMMAND?
+         BE    D810                    YES - GO REPOSITION
+*
+D790     EQU   *
+         CLI   CCWOP,CMDTIE            TRACK IN ERROR?
+         BNE   B405                    NO - GO RETRY
+         B     D820                    YES - GO TEST CHAINING
+*
+*   OVERRUN
+*
+D800     EQU   *
+         CLI   CCWOP,CMDTIE            TRACK IN ERROR?
+         BE    D820                    YES - GO TEST CHAINING
+*
+D810     EQU   *
+         OI    IOSFLA,IOSREP           SET REPOSITION
+         OI    IOSOPT,IOSDEP           SET DEVICE END POST BIT   Y02032
+         B     B405                    GO REPOSITION
+*
+D820     EQU   *
+         TM    CCWFLS,IOSCCHN          COMMAND CHAINING?
+         BO    D840                    YES - SET LOGOUT & XCTL TO WTO
+         B     B405                    GO RETRY - SVC 15/3
+         EJECT
+*
+*   G E N E R A L   E X I T   A R E A
+*
+D840     EQU   *
+         OI    IOSFLB,IOSLOG           SET LOGOUT
+D860     EQU   *
+         OI    IOSFLB,IOSMSG           SET MESSAGE TYPE
+         NI    IOSFLA,X'FF'-IOSERR-IOSSMDA SET PERM ERROR EXIT @YM06412
+D870     EQU   *
+         LA    R13,WTORTN              LOAD NAME FOR WTO
+         B     XCTL1                   GO TO XCTL ROUTINE
+*
+D2025    EQU   *
+         TM    IOSFLB,IOSLOG           LOG OR OVERFLOW ON?
+         BO    D2040                   YES - EXIT VIA OBR
+         TM    EWAFLG3,EWTOVER         SDR OVERFLOW ON?          Y02032
+         BZ    B405                    NO - EXIT VIA SVC 15/3
+*
+D2040    EQU   *
+         LA    R13,SERLOG              GET ADDRESS OF OBR
+XCTL1    EQU   *                       SET UP OBR INFO IN EWA    Y02032
+         L     R5,EWTDCB               GET DCB ADDR              Y02032
+         LA    R4,EWTVOLID             GET ADDR OF OBR AREA      Y02032
+         ST    R4,EWADCNT              STORE ADDR IN EWA         Y02032
+         MVI   EWADCNT,HEX24           MOVE IN #BYTES OF OBR     Y02032
+         MVC   EWTVES,UCBCTD           GET VES INFO              Y02032
+         CL    R5,FZERO                VALID DCB?                Y02032
+         BE    XCTL2                   NO - SKIP BLOCK COUNT     Y02032
+         OI    EWAFLG1,EWADDMSG        SET WTO FLAG ON         @ZA31011
+         CLC   BLKCNT(4,R5),MASK       IS BLKCNT = TO 65K?     @ZA08856
+         BNH   MOVIT                   BR IF BLKCNT IS LESS    @ZA08856
+         MVC   EWTBLK,MASK+2           MOVE FFFF TO RECORD     @ZA08856
+         B     XCTL3                   GO XCTL                 @ZA08856
+MOVIT    EQU   *
+         MVC   EWTBLK,BLKCNT+C2(R5)    YES - GET BLOCK COUNT   @ZA08856
+         B     XCTL3                   GO XCTL                   Y02032
+XCTL2    EQU   *
+         MVC   EWTBLK,FZERO            SET BLOCK COUNT TO 0      Y02032
+XCTL3    EQU   *
+         MVC   EWTVOLID,UCBVOLI        GET VOL SER               Y02032
+         L     XCTLREG,LOC16           GET ADDR OF CVT
+         L     XCTLREG,VECTXL(XCTLREG) GET ADDR FOR XCTL ROUTINE
+         BR    XCTLREG                 BR TO XCTL
+         EJECT
+***********************************************************************
+*                            P A R T   9                              *
+*                                                                     *
+*                            ICC  &  CCC                              *
+***********************************************************************
+*        ANALYZE THE ERROR RECOVERY INTERFACE BLOCK (ERPIB) TO        *
+*        DETERMINE WHETHER OR NOT A CHANNEL ERROR CONDITION CAN       *
+*        BE RETRIED.  IF SO, THE CHANNEL PROGRAM IS RETRIED ONLY      *
+*        ONCE.  IF THE ERROR IS NOT RECOVERED ON RETRY OR IS OF       *
+*        A TYPE THAT CANNOT BE RETRIED, THEN IT IS TO BE CONSIDERED   *
+*        A PERMANENT ERROR, THE LOGOUT BIT IS SET, AND CONTROL        *
+*        IS TRANSFERRED TO THE WRITE-TO-OPERATOR ROUTINE (IGE0025C)   *
+***********************************************************************
+*
+PART9    EQU   *
+*
+*   CHECK ICC/CCC FLAG.  IF RETRY OF ICC/CCC CAUSED
+*   ICC OR CCC, WE WILL NOT RETRY AGAIN.
+*
+         TM    EWACNTR1,ICCFLG         ICC/CCC FLAG ON?          Y02032
+         BO    F390                    YES - BRANCH TO PERM ERROR
+*
+*   IS IOB INTERCEPTED?
+*
+         CLI   IOSCOD,IOSFINTC         INTERCEPTED - 7E?
+         BE    F380                    YES - GO SET CODE, PERM ERROR
+*
+*   TEST OF ERPIB NO-RETRY BITS
+*
+         TM    EWARGFG1,IBUNR1         ANY NO-RETRY BIT ON?      Y02032
+         BC    7,F390                  YES - BRANCH TO PERM ERROR
+*
+*   EITHER SIO OR I/O INTERRUPT STORED A CSW, NOT BOTH?
+*
+         TM    EWARGFG1,IBSIB1         SIO OR I/O INTERRUPT BIT?
+         BC    9,F390                  BRANCH BOTH ON OR BOTH OFF
+*                                      PERMANENT ERROR
+*
+*   DID SIO INSTRUCTION STORE A CSW?
+*
+         TM    EWARGFG1,IBSIO1         SIO FAIL?                 Y02032
+         BO    F370                    YES - BRANCH TO RETRY
+*
+*   TEST FOR ANY VALIDITY INDICATOR OFF
+*
+         TM    EWAXCSW1,IBALL2         ANY OFF?                  Y02032
+         BC    12,F390                 YES - BRANCH TO PERM ERROR
+*
+*   TEST FOR ERROR ON NORMAL ERP REPOSITIONING
+*
+         TM    IOSFLA,IOSREP           REPOSITIONING?
+         BO    F390                    YES - BRANCH TO PERM ERROR
+*
+*   TEST FOR UNIT CHECK
+*
+         TM    IOSTSA,CSWUCK           UNIT CHECK?
+         BZ    F310                    NO - GO RESET CRC BIT
+*
+*   TEST FOR EQUIPMENT CHECK
+*   OTHER SENSE BITS IGNORED
+*
+         TM    IOSSNS,EWTEQU           EQUIPMENT CHECK?          Y02032
+         BO    F390                    YES - BRANCH TO PERM ERROR
+*
+*   RESET CRC BIT
+*
+F310     EQU   *
+         NI    IOSFLA,X'FF'-IOSCRC     RESET CRC BIT
+*
+*   TEST FOR CHAIN BITS - COMMAND AND/OR DATA CHAINING?
+*
+         TM    IOSFLA,IOSACHN          DC OR CC?
+         BZ    F314                    NEITHER - GO SET DIRECTION
+         BO    F390                    BOTH - BRANCH TO PERM ERROR
+*
+*   TEST FOR COMMAND CHAINING
+*
+         TM    IOSFLA,IOSCCHN          COMMAND CHAINING?
+         BO    F312                    YES - BR AROUND DATA CHAINING
+*
+*   DATA CHAINING ONLY - START AT TOP OF CHANNEL PROGRAM
+*
+         L     CCWREG,IOSVST           GET START ADDRESS (VIRTUAL)
+         B     F314                    GO SET DIRECTION
+*
+*   COMMAND CHAINING
+*
+F312     EQU   *
+         TM    EWACNTR3,EWTRST         1ST ENTRY (RESTART FLAG OFF)?
+         BZ    F313                    YES - GO SET RESTART
+*
+*   NOT FIRST ENTRY
+*
+         NI    IOSMDB,ZERO             CLEAR MOD BYTE
+         LR    R13,CCWREG              SET WORK REG TO CCW ADDRESS
+         S     R13,IOSVST              COMPARE TO RESTART ADDRESS
+         BZ    F314                    EQUAL - GO SET DIRECTION
+*
+*   COMMAND CHAINING AND CHAIN BROKE IN DIFFERENT PLACE
+*
+         XC    EWACNTR1(C2),EWACNTR1   CLEAR ERROR COUNTS        Y02032
+F313     EQU   *
+         OI    EWACNTR3,EWTRST         SET RESTART FLAG          Y02032
+         ST    CCWREG,IOSVST           SET ADDRESS TO RESTART
+         LRA   R13,CCW                 TRANSLATE VIRTUAL RESTART ADDR
+         ST    R13,IOSRST              STORE IN REAL RESTART ADDRESS
+*
+F314     EQU   *
+         NI    EWAXCSW2,HEXC7          ZERO UNUSED BITS          Y02032
+         TM    EWAXCSW2,IB30C0         TERM CODE = '11'?         Y02032
+         BO    F390                    YES - BRANCH TO PERM ERROR
+*
+         CLI   CCWOP,CMDRED            IS COMMAND A READ?
+         BE    G200                    YES - GO CHECK TERM & SEQ CODES
+*
+         CLI   CCWOP,CMDRDB            READ BACKWARDS?
+         BE    G200                    YES - GO CHECK CODES
+*
+         CLI   CCWOP,CMDWRT            WRITE?
+         BE    G200                    YES - GO CHECK CODES
+*
+         CLI   CCWOP,CMDERG            ERASE GAP?
+         BE    G200                    YES - GO CHECK CODES
+*
+         CLI   CCWOP,CMDWTM            WRITE TAPE MARK?
+         BE    G200                    YES - GO CHECK CODES
+*
+         CLI   CCWOP,CMDBSR            BACK SPACE RECORD?
+         BE    G200                    YES - GO CHECK CODES
+*
+         CLI   CCWOP,CMDBSF            BACK SPACE FILE?
+         BE    G200                    YES - GO CHECK CODES
+*
+         CLI   CCWOP,CMDSNS            SENSE?
+         BE    G000                    YES - GO CHECK CODES
+*
+         CLI   CCWOP,CMDTIC            TRANSFER IN CHANNEL?
+         BE    F390                    YES - BRANCH TO PERM ERROR
+*
+         CLI   CCWOP,CMDFSR            FORWARD SPACE RECORD?
+         BE    G200                    YES - GO CHECK CODES
+*
+         CLI   CCWOP,CMDFSF            FORWARD SPACE FILE?
+         BE    G200                    YES - GO CHECK CODES
+*
+         CLI   CCWOP,CMDREW            REWIND?
+         BE    G100                    YES - GO CHECK CODES
+*
+         CLI   CCWOP,CMDRWU            REWIND UNLOAD?
+         BE    G100                    YES - GO CHECK CODES
+*
+         CLI   CCWOP,CMDNOP            NO-OP?
+         BE    G100                    YES - GO CHECK CODES
+*
+         TM    CCWOP,CMDMD1            MODE SET, TIE OR LWR?
+         BNO   F390                    NO - BRANCH AROUND
+         TM    CCWOP,CMDBIT4           TEST FOR LO-ORDER = 'X3'
+         BO    F315                    NO - GO CHECK FOR 'XB'
+         TM    CCWOP,CMDBIT5           2ND TEST FOR 'X3'
+         BZ    G100                    'X3' - GO CHECK CODES
+         B     F390                    NOT 'X3' OR 'XB' - BR AROUND
+F315     EQU   *
+         TM    CCWOP,CMDBIT5           TEST FOR LO-ORDER = 'XB'
+         BZ    G100                    YES - GO CHECK CODES
+         B     F390                    NO - BRANCH TO PERM ERROR
+         EJECT
+***********************************************************************
+*                               2 4 0 0                               *
+*        THIS SECTION HANDLES ICC AND CCC FOR 2400 DEVICE TYPE        *
+***********************************************************************
+*                                                                     *
+*        DETERMINE IF RETRY IS POSSIBLE BASED UPON                    *
+*        SEQUENCE CODE AND TERMINATION CODE.                          *
+*                                                                     *
+*        BITS 2, 3 AND 4 OF ERPIB BYTE ARE UNUSED.                    *
+*                                                                     *
+*        THE FOLLOWING COMMANDS ARE CONSIDERED FOR                    *
+*        FURTHER RECOVERY:                                            *
+*              01, 02, 0C, 03, 07, 0F, 17, 1F, 27, 37 AND 3F          *
+***********************************************************************
+F316     EQU   *
+*
+*   SET REPOSITION DIRECTION FOR ALL READ/WRITE ERRORS
+*
+         MVI   IOSMDB,CMDBSR           SET TO BACKSPACE
+         CLI   CCWOP,CMDRDB            IS IT READ BACK?
+         BNE   F316A                   NO - BR AROUND FORWARD SPACE
+         MVI   IOSMDB,CMDFSR           SET TO FORWARD SPACE
+F316A    EQU   *
+         CLI   EWAXCSW2,IB3001         T CODE=00 & R CODE=001?   Y02032
+         BE    F370                    YES - GO SET BUS OUT
+*
+         CLI   EWAXCSW2,IB3002         T CODE=00 & R CODE=010?   Y02032
+         BE    F325                    YES - GO CHECK TYPE OF COMMAND
+*
+         CLI   EWAXCSW2,IB3003         T CODE=00 & R CODE=011?   Y02032
+         BE    F330                    YES - GO CHECK TYPE OF COMMAND
+*
+         CLI   EWAXCSW2,IB3004         T CODE=00 & R CODE=100?   Y02032
+         BE    F370                    YES - GO SET BUS OUT
+*
+         CLI   EWAXCSW2,IB3005         T CODE=00 & R CODE=101?   Y02032
+         BE    F330                    YES - GO CHECK TYPE OF COMMAND
+*
+         CLI   EWAXCSW2,IB3043         T CODE=01 & R CODE=011?   Y02032
+         BE    F330                    YES - GO CHECK TYPE OF COMMAND
+*
+         CLI   EWAXCSW2,IB3045         T CODE=01 & R CODE=101?   Y02032
+         BE    F330                    YES - GO CHECK TYPE OF COMMAND
+*
+         CLI   EWAXCSW2,IB3082         T CODE=10 & R CODE=010?   Y02032
+         BE    F335                    YES - GO CHECK TYPE OF COMMAND
+*
+*   BRANCH TO PERMANENT ERROR.  ALL OTHER TERMINATION CODE
+*   AND RETRY CODE COMBINATIONS ARE NOT RECOVERABLE.
+*
+         B     F390                    BRANCH TO PERMANENT ERROR
+F325     EQU   *
+         CLI   CCWOP,CMDWRT            WRITE COMMAND?
+         BE    F370                    YES - GO SET BUS OUT
+*
+         TM    CCWOP,CMDCTL            CONTROL COMMAND?
+         BNO   F345                    NO - BRANCH TO REPOSITION
+*
+*   IF THIS ONE CHAINED, CONTINUE WITH NEXT
+*
+F327     EQU   *
+         TM    CCWFLS,IOSCCHN          COMMAND CHAINED?
+         BZ    F350                    NO - DONE, NO ERROR, BRANCH
+*
+         LA    CCWREG,C8(CCWREG)       POINT TO NEXT COMMAND
+         CLI   CCWOP,CMDTIC            NEXT COMMAND A TIC?
+         BNE   F328                    NO - USE THIS ADDRESS
+*                                      YES - TRANSLATE 'TIC TO' ADDR
+         MVC   IOSRST,CCWADR           STORE REAL START ADDR     Y02032
+         LR    R4,IOSREG               SAVE IOSB ADDRESS         Y02032
+         L     R1,CCWADR               GET 'TIC TO' ADDRESS      Y02032
+         LA    R1,0(R1)                GET 3-BYTE ADDRESS        Y02032
+         LR    R11,BASREG              SAVE BASE ADDR (R15)      Y02032
+         L     BASREG,LOC16            GET ADDRESS OF CVT        Y02032
+         L     BASREG,C288(BASREG)     GET ADDR OF TRANSLATE RTN Y02032
+         BALR  LNKREG,BASREG           LINK TO TRANSLATE RTN     Y02032
+         LR    CCWREG,R1               GET CCW ADDRESS (VIRT)    Y02032
+         LR    BASREG,R11              RESTORE BASE REG          Y02032
+         LR    IOSREG,R4               RESTORE IOSB REG          Y02032
+*
+F328     EQU   *
+         ST    CCWREG,IOSVST           SET AS RESTART (NO REPOS)
+         LRA   R13,CCW                 GET REAL RESTART ADDRESS
+         ST    R13,IOSRST              STORE IN IOSB
+         B     F370                    GO SET BUS OUT
+*
+F330     EQU   *
+         TM    CCWOP,CMDCTL            CONTROL COMMAND?
+         BO    F327                    YES - GO CHECK FOR CMD CHAINING
+         B     F345                    NO  - BRANCH TO REPOSITION
+*
+F335     EQU   *
+         CLI   CCWOP,CMDWRT            WRITE COMMAND?
+         BE    F370                    YES - GO SET ICC/CCC
+         B     F390                    NO  - BRANCH TO PERM ERROR
+*
+*   REPOSITIONING REQUIRED
+*
+F345     EQU   *
+         CLI   CCWOP,CMDWRT            WRITE COMMAND?
+         BNE   F348                    NO - GO SET ICC/CCC & REPOSIT.
+*
+         OI    EWACNTR2,WRTIND         SET WRITE INDICATOR       Y02032
+         TM    IOSTSA,CSWUEX           TEST FOR UNIT EXCEPTION
+         BZ    F348                    NO - GO SET BUS OUT & REPOSIT.
+         OI    EWACNTR3,EWTUEX         YES - SET UNIT EXCEPTION  Y02032
+*
+F348     EQU   *
+         OI    EWACNTR1,ICCFLG         SET ICC/CCC FLAG          Y02032
+         OI    IOSFLA,IOSREP           SET REPOSITION
+         OI    IOSOPT,IOSDEP           SET DEVICE END POST BIT   Y02032
+         B     F370                    GO RETRY
+*
+*   OPERATION COMPLETE - NO ERROR - IGNORE ICC OR CCC
+*
+F350     EQU   *
+         NI    EWACNTR2,HEX80          CLEAR ERROR COUNT         Y02032
+         NI    EWACNTR1,ZERO           CLEAR ERROR COUNT         Y02032
+*
+*   TEST FOR END OF TAPE BEFORE BSR
+*
+         TM    EWACNTR3,EWTUEX         HAD UNIT EXCEPTION?       Y02032
+         BZ    F352                    NO - BRANCH AROUND
+         OI    IOSTSA,CSWUEX           YES - SET UNIT EXCEPTION IN CSW
+         NI    EWACNTR3,X'FF'-EWTUEX   RESET UNIT EXCEPTION FLAG Y02032
+*
+F352     EQU   *
+         NI    IOSFLA,X'FF'-IOSERR-IOSEX    SET FLAGS FOR TEMP ERROR
+         NI    EWACNTR3,X'FF'-EWTRST   RESET RESTART FLAG        Y02032
+         XC    EWAERPIB,EWAERPIB       ZERO ERPIB                Y02032
+*
+*   TURN OFF ICC AND CCC
+         NI    IOSTSB,HEXF9            TURN OFF ICC AND CCC
+*
+*   TEST FOR REWIND UNLOAD
+*
+         CLI   CCWOP,CMDRWU            RUN COMMAND?
+         BE    F356                    YES - BR AROUND ERROR FLAGS
+*
+         MVI   EWAFLG3,ZERO            CLEAR ERROR FLAGS         Y02032
+         B     B405                    EXIT VIA SVC 15/3
+*
+F356     EQU   *
+         NI    IOSTSA,X'FF'-CSWUCK     TURN OFF UNIT CHECK
+         MVI   IOSCOD,IOSNRMC          SET NORMAL COMPLETION CODE - 7F
+*
+*   SET UCB NOT READY FLAG
+*
+         LA    R13,EWTIDAL             POINT TO WORK AREA FOR IOSGEN
+         AH    UCBREG,H512             POINT TO UCB PROPER     @ZA05134
+         IOSGEN UCBFLG,UCB=(UCBREG),VAR=ON,TABLE=UCBNRY,REG=UNCOND
+         B     B405                    EXIT VIA SVC 15/3
+         EJECT
+*
+*                         R E T R Y
+*
+F370     EQU   *
+         OI    EWACNTR1,ICCFLG         SET ICC/CCC FLAG          Y02032
+         XC    EWAERPIB,EWAERPIB       ZERO ERPIB
+         B     B405                    GO TO SVC 15/3
+*
+*              P E R M A N E N T   E R R O R
+*
+F380     MVI   IOSCOD,IOSINTC          SET INTERCEPT CODE - X'44'
+*
+F390     XC    EWAERPIB,EWAERPIB       ZERO ERPIB
+         B     D840                    EXIT VIA XCTL TO WTO
+         EJECT
+***********************************************************************
+*                              3 4 0 0                                *
+*        THIS SECTION HANDLES ICC AND CCC FOR NEW DEVICE TYPE         *
+***********************************************************************
+*                                                                     *
+*        DETERMINE IF RETRY IS POSSIBLE BASED UPON                    *
+*        SEQUENCE CODE AND TERMINATION CODE.                          *
+*                                                                     *
+*        BITS 2, 3 AND 4 OF ERPIB BYTE ARE UNUSED.                    *
+*                                                                     *
+*        THE FOLLOWING COMMANDS ARE CONSIDERED FOR                    *
+*        FURTHER RECOVERY:                                            *
+*              01, 02, 0C, 03, 07, 0F, 17, 1F, 27, 37, 3F, 04         *
+*                                                                     *
+***********************************************************************
+*
+*   SENSE COMMAND
+*   THE FOLLOWING COMBINATIONS OF TERMINATION
+*   CODE AND SEQUENCE CODE CAN BE RETRIED:
+*              00-001   00-010   00-011   00-101
+*              01-001   01-010   01-011   01-101
+*
+G000     EQU   *
+         CLI   UCBTBYT4,UCB2400        2400 DEVICE?
+         BE    F390                    YES - BRANCH TO PERM ERROR
+*
+         CLI   EWAXCSW2,IB3001         CODE = 00-001?            Y02032
+         BE    F370                    YES - GO RETRY
+*
+         CLI   EWAXCSW2,IB3002         CODE = 00-010?            Y02032
+         BE    F370                    YES - GO RETRY
+*
+         CLI   EWAXCSW2,IB3003         CODE = 00-011?            Y02032
+         BE    F370                    YES - GO RETRY
+*
+         CLI   EWAXCSW2,IB3005         CODE = 00-101?            Y02032
+         BE    F370                    YES - GO RETRY
+*
+         CLI   EWAXCSW2,IB3041         CODE = 01-001?            Y02032
+         BE    F370                    YES - GO RETRY
+*
+         CLI   EWAXCSW2,IB3042         CODE = 01-010?            Y02032
+         BE    F370                    YES - GO RETRY
+*
+         CLI   EWAXCSW2,IB3043         CODE = 01-011?            Y02032
+         BE    F370                    YES - GO RETRY
+*
+         CLI   EWAXCSW2,IB3045         CODE = 01-101?            Y02032
+         BE    F370                    YES - GO RETRY
+         B     F390                    NO - BRANCH TO PERM ERROR
+*
+*   COMMAND - REW, RUN, NOP, TIE, LWR, MODE SETS
+*   THE FOLLOWING COMBINATIONS OF TERMINATION
+*   CODE AND SEQUENCE CODE CAN BE RETRIED:
+*              00-001   00-010
+*              01-001   01-010
+*              10-001   10-010
+*
+G100     EQU   *
+         CLI   UCBTBYT4,UCB2400        2400 DEVICE?
+         BE    F316                    YES - GO CHECK 2400 CODES
+*
+         CLI   EWAXCSW2,IB3002         CODE = 00-010?            Y02032
+         BE    F370                    YES - GO RETRY
+*
+         CLI   EWAXCSW2,IB3042         CODE = 01-010?            Y02032
+         BE    F370                    YES - GO RETRY
+*
+         CLI   EWAXCSW2,IB3082         CODE = 10-010?            Y02032
+         BE    F370                    YES - GO RETRY
+*
+*   COMMAND - RD, RDB, WRT, ERG, WTM, BSR, BSF, FSR, FSF
+*   THE FOLLOWING COMBINATIONS OF TERMINATION
+*   CODE AND SEQUENCE CODE CAN BE RETRIED:
+*              00-001
+*              01-001
+*              10-001
+*
+G200     EQU   *
+         CLI   UCBTBYT4,UCB2400        2400 DEVICE?
+         BE    F316                    YES - GO CHECK 2400 CODES
+*
+         CLI   EWAXCSW2,IB3001         CODE = 00-001?            Y02032
+         BE    F370                    YES - GO RETRY
+*
+         CLI   EWAXCSW2,IB3041         CODE = 01-001?            Y02032
+         BE    F370                    YES - GO RETRY
+*
+         CLI   EWAXCSW2,IB3081         CODE = 10-001?            Y02032
+         BE    F370                    YES - GO RETRY
+         B     F390                    NO - BRANCH TO PERM ERROR
+         EJECT
+***********************************************************************
+*                 WRITE TO OPERATOR MESSAGE                           *
+***********************************************************************
+WTOMSG   DS    0F                      OUTPUT MESSAGE
+LENGTH   DC    AL2(MSGEND-MSGNO)       MESSAGE LENGTH
+         DC    X'8000'                 MCS FLAGS                 A43378
+MSGNO    DC    CL8'IEA000I '           MESSAGE ID
+UNITID   DC    CL4'XXX,'               UNIT ADDRESS
+MSGTEXT  DC    CL13'            ,'     MESSAGE TEXT
+OPCODE   DC    CL3'XX,'                CCW OP CODE
+STATUS   DC    CL5'XXXX,'              CCW STATUS
+SENSE    DC    CL5'XXXX,'              SENSE DATA
+LOC      DC    CL9'XXXXXXXX,'          DCB BLOCK COUNT, INDICATES
+*                                      APPROXIMATE POSITION ON TAPE.
+VOLSER   DC    CL6'XXXXXX'             VOLUME SERIAL NUMBER      A40906
+ROUTE    DC    X'20001040'             DESCRIPTOR AND ROUTING @ZA30415
+MSGEND   EQU   *
+ERRMSG1  DC    CL13'ERROR ON ERG,'     MESSAGE 1                 A40267
+ERRMSG2  DC    CL13'NOISE - USER,'     MESSAGE 2                 A40267
+ERRMSG3  DC    CL13'NOISE - ERP ,'     MESSAGE 3                 A40267
+ERRMSG4  DC    CL13'UNEX INTRPT ,'     MESSAGE 4                 S21048
+ERRMSG5  DC    CL13'DSE FAILED  ,'     MESSAGE 5                 S21048
+ERRMSG6  DC    CL13'CTRL BLK ERR,'     MESSAGE 6                 A29974
+ERRMSG7  DC    CL13'UNEX LOAD PT,'     MESSAGE 7                 A29972
+*
+*   TRANSLATE TABLE
+*
+TRANS    EQU   *-X'ED'                 STARTING ADDR OF TRANS TABLE
+TABLE    DC    C'*, 0123456789ABCDEF'  TRANSLATE TABLE
+NULLOP   DC    X'EDED'                 WILL TRANSLATE TO '**'
+*
+*
+         DS    0H                      ALIGN
+EIGHT    DC    AL2(8)                  HALFWORD OF 8
+ALLF     DC    X'FFFF'                 COMPARE MASK
+F24      DC    F'24'                   FULLWORD OF 24            Y02032
+FZERO    DC    X'00000000'             FULLWORD OF 0
+H512     DC    H'512'                  HALFWORD OF 512           Y02032
+         ORG   ERP2+4067               **
+         DC    C'**   E N D   L O A D   2   **'     **
+         IECDERWA  EWT                                           Y02032
+         EJECT
+         IECDIOSB                                                Y02032
+         EJECT
+         IEFUCBOB  PREFIX=YES                                    Y02032
+         EJECT
+CVT      DSECT
+         CVT
+         EJECT
+         IECDIOCM
+         END

@@ -1,0 +1,1573 @@
+         TITLE    'LINK EDITOR CONTROL CARD SCANNER AND PROCESSOR'
+*
+*STATUS: CHANGE LEVEL 000
+*
+*FUNCTION/OPERATION    SCANS AND PROCESSES THE'PROGRAMMER PUNCHED CARDS
+*    NAMELY:OVERLAY,REPLACE,LIBRARY,INCLUDE,INSERT,ENTRY,CHANGE,ALIAS,
+*     NAME, SETSSI,  HIARCHY                                          *
+*    SINCE THESE CARDS ARE IN THE GENERAL FORM:
+*      OPERATION   OPD01(OPD11,OPD12,OPD13...),OPD02,...,(OPD14),...
+*    THE OPERANDS ARE EITHER OUTSIDE PARENTHESIS OR INSIDE.THEY GO
+*    INTO EITHER OPD0 OR OPD0, RESPECTIVELY. DEPENDING ON THE CARD FOR-
+*    -MAT,AN OPERAND IS PLACED IN OPD0,AN OPERAND IS PLACED IN OPD1,
+*    OR BOTH. THEN, THE SCAN IS INTERRUPTED AND THE CORRESPONDING CARD
+*    PROCESSOR IS 'BALR'"D. WHEN CONTROL RETURNS,SCANNING IS RESUMED.
+*    THE PROCESSING CONSISTS IN ONE OF THE FOLLOWING:
+*    1- ADDING A NEW ITEM IN A CHAIN IN THE CESD (COMPOSITE ESD)
+*    2- FILLING AN INFORMATION INTO THE APT (ALL PURPOSE TABLE),OR
+*       INTO THE PDS DIRECTORY (THE TABLE THAT WILL BE THE PARTITIONED
+*       DATA SET DIRECTORY OF THE OUTPUT MODULE)
+*    3- OPERATING UPON AN EXISTING LINE OF THE CESD
+*
+*ENTRY POINTS - HEWLFSCN  SCAN AND PROCESS THE CONTROL CARD           *
+*
+*                          CALL.SEQ.  LA    1,CARD BEGINNING
+*                                      L    15,=V(HEWLKSCN)
+*                                     BALR  14,15
+*     (DATA IS PASSED BY LOCATION)
+*INPUT:  - 80 BYTES SOMEWHERE IN MAIN STORAGE , REPRESENTING A
+*          CONTROL CARD
+*        - COMPOSITE ESD (CESD)
+*        - ALL PURPOSE TABLE (APT) IN WHICH FLAGS ARE TESTED
+*OUTPUT: - PARTS OF 2 TABLES IN MAIN STORAGE : COMPOSITE ESD (CESD)
+*          AND PARTITIONED DATA SET DIRECTORY   (PDS DY)
+*
+*EXTERNAL ROUTINES:  - HEWLFLOG ERROR ROUTINE WHOSE ADDRESS IS IN THE
+*                      ALL PURPOSE TABLE
+*                    - HEWLCINC   'INCLUDE PROCESSOR'WHICH CHOOSES THE
+*                      ADDITIONAL INPUT TO BE READ, AND PREPARES IT
+*                      (OPEN,BLDL,FIND). GETS CNTRL AFTER AN INCLUDE
+*                      CARD
+*
+*EXITS -NORMAL:   1- RETURN TO THE CARD READER  HEWLEINP AFTER COMPLE-
+*                    TION OF A ONE CARD SCAN (GENERALLY)
+*                 2- CALLS THE INCLUDE PROCESSOR HEWLCINC AFTER COMPLE-
+*                    TION OF THE SCAN OF ONE INCLUDE CARD  (OR SEVERAL
+*                    INCLUDE CARDS IN CASE OF CONTINUATION)
+*      -ERROR:
+***********************************************************************
+*            CONDITIONS                  *DATA PASSED TO RTN HEWLKLOG *
+***********************************************************************
+*INVALID STATEMENT .SCAN TERMINATED      * X'121E' IN R0,CARD AD IN R1*
+*NOT ENOUGH PLACE IN CESD                * X'141G' IN R0,CARD AD IN R1*
+*TOO MANY OVERLAY REGIONS                * X'141F' IN R0,CARD AD IN R1*
+*TOO MANY OVERLAY SEGMENTS               * X'1420' IN R0,CARD AD IN R1*
+*TOO MANY ALIASES                        * X'2221' IN R0,SYMBOL  IN R1*
+*NAME CRD ON LIBR DATA SET. CRD IGNORED  * X'1231' IN R0,CARD AD IN R1*
+***********************************************************************
+*
+*TABLES/WORK AREAS:    CESD , APT
+*
+*ATTRIBUTES:           REUSABLE
+*             (THIS CONTROL SECTION IS IN A SEGMENT OF AN OVERLAY TREE)
+*NOTES:    NONE
+*
+HEWLFSCN CSECT
+*A086000,151000,164000,182000,186000,245000,259000,265000,280000 S21016
+*A303600,815000,826000,858000                                    S21016
+*C115000-116000,184000,243000-244000,248000-249000,254000,260000 S21016
+*C849400                                                         S21016
+*041600-900,054000,063000-800,210220-40,433500-450,435500-700,   Y01048
+*438000,439500,446500,495100-496182,554600-554920                Y01048
+*034800,342600-800,399800-920,530800                             A47001
+*A332100                                                        OX01981
+*A598600-598700                                                 OX03080
+*C184500,C190000-193000                                 OX03126,OY02822
+*D032100-032420,I041500,C141050,C141300-141350          OX04280,OY03413
+*D295580-295900,C331100-331400,C419600-419900           OX04280,OY03413
+*D431010-431460,D525500,I526000,D530700                 OX04280,OY03413
+*D548500-548700                                         OX04280,OY03413
+*I272000                                                OX05439,OY04537
+*I584000                                                        XA05437
+* SEE FIX FOR XA05437                                           YA03750
+* I561500,D584100-584200                                        ZM30869
+*                                                               OZ01403
+* I603960                                                       ZA01400
+*
+* A6099996                                                      ZA01418
+         EXTRN INDDNAME                                          A47001
+***  SUBROUTINE  HEWLKSCN IS THE PROGRAMMER PUNCHED CARD SCANNER.
+***  THE 'CARD READER' PROGRAM  RECOGNIZES THE PROGRAMMER PUNCHED
+***  CARD BY A BLANK IN COLUMN 1 .
+***  CARD READER BRANCHES TO HEWLKSCN BY  BALR 14,15  WHERE  15  IS
+***  LOADED WITH A V TYPE ADCON FOR HEWLKSCN
+***  THE CARD READER PUTS IN  REG. 1  THE ADDRESS OF THE BYTE OF THE
+***  INPUT BUFFER WHICH CONTAINS COLUMN 1
+R0       EQU   0
+R1       EQU   1
+R3       EQU   3
+P2       EQU   13
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+BASE     EQU   12
+R12      EQU   7
+REG9     EQU   9                       GEN REG 9        OX04280,OY03413
+TREG     EQU   4                  PTR TO TRANS TABLE             Y01048
+BASE2    EQU   5                  SECOND BASE REGISTER           Y01048
+SSINFO   EQU   6                  SSI INFORMATION                Y01048
+SAVR7    EQU   7                  USED WITH SSINFO               Y01048
+ERR1LTL  EQU   X'121E'        WRONG LINKEDIT CNTRL CARD .CARD IGNORED
+ERR2LTL  EQU   X'1419'        NOT ENOUGH PLACE IN CESD
+ERR3LTL  EQU   X'141F'        ERROR   TOO MANY OVERLAY REGIONS
+ERR4LTL  EQU   X'1420'        ERROR   TOO MANY OVERLAY SEGMENTS
+ERR6LTL  EQU   X'2221'    TOO MANY ALIASES
+ERR8LTL  EQU   X'2248'                                           A37667
+ERR10LTL EQU   X'1231'  NAME CRD ON LIBR DATA SET .CRD IGNORED
+SPSTROPT EQU   X'02'                   SPECIAL STRING OPTION BIT S21016
+SPSTRFLG EQU   X'80'                   SPECIAL STRING FLAG       S21016
+NOTSPSTR EQU   X'FD'                   BIT CONFIGURATION TO      S21016
+*                                      TURN OFF SPECIAL STRING   S21016
+*                                      OPTION BIT                S21016
+LEVEL1   EQU   X'40'                   LEVEL 1 OPERAND FLAG      S21016
+*                                      IN STAT                   S21016
+NOLEV0   EQU   X'20'                   FLAG IN OPTION INDICATING S21016
+*                                      LEVEL 0 OPERAND WAS       S21016
+*                                      ABSENT                    S21016
+COMMA    EQU   C','                    COMMA -- FOR COMPARISON   S21016
+QUOTE    EQU   C''''                   QUOTE -- FOR COMPARISON   S21016
+SPECMAX  EQU   41                      MAX. COUNTER VALUE FOR    S21016
+*                                      NO. OF CHARS. IN A        S21016
+*                                      SPECIAL STRING            S21016
+NORMAX   EQU   9                       MAX. COUNTER VALUE FOR    S21016
+*                                      NO. OF CHARS. IN A        S21016
+*                                      NORMAL STRING             S21016
+TABSIZE  EQU   16                      NO. OF ENTRIES IN  Y01031,Y01048
+*                                      PROC. ENTRY TABLE  Y01031,S21016
+CURCHAR  EQU   0                       OFFSET IN STRING FOR      S21016
+*                                      CURRENT CHARACTER         S21016
+NEXTCHAR EQU   1                       OFFSET IN STRING FOR      S21016
+*                                      NEXT CHAR.                S21016
+ONECHAR  EQU   1                       A SINGLE CHARACTER IN     S21016
+*                                      STRING                    S21016
+CHAR7    EQU   7                       THE 7TH CHARACTER IN A    S21016
+*                                      FIELD                     S21016
+CHAR8    EQU   8                       THE 8TH CHARACTER IN A    S21016
+*                                      FIELD                     S21016
+LEN32    EQU   32                      LENGTH OF 32 BYTES        S21016
+SAPTR    EQU   13                      POINTER TO LOCAL SAVEAREA S21016
+         ST    BASE,8(15)
+         BC    15,12(15)
+         DS    CL4
+         BALR  BASE,0
+         USING *,BASE,BASE2                                      Y01048
+         USING APTDSECT,2
+         LR    BASE2,BASE         SET UP SECOND BASE REG         Y01048
+         LA    BASE2,4095(BASE2)  TO ADDRESS THE NEXT            Y01048
+         LA    BASE2,1(BASE2)     4K BYTES                       Y01048
+         BC    15,MODID+6
+MODID   DC     C'00MSCN'
+         STM   00,15,SAVR
+         TM    APT0,X'08'    IS LOG OPTION ON
+         BC    8,SCN900    BR. IF NOT
+         XR    0,0
+         L     15,ERDIG
+         BALR  14,15   TO ERR.LOG. SUBROUTINE TO LOG THE CARD
+SCN900   MVC   COL72(1),71(R1)   SAVE  COLUMN 72 'S CONTENT
+         LA    R0,71(0,R1)
+         ST    R0,SAVACOL              SAVE ADDRESS OF COLUMN 72
+          TM    APT2,X'01'  IS THIS CARD A CONTINUATION OF PR5V CRD.
+         BC    1,SCN10240        BRANCH IF YES
+SCN1000  NI    STAT,X'00'        INITIATES STATUS BYTE FOR NEW CARD
+***   P2  POINTS TO THE CURRENT BYTE IN AREA WHERE OPERAND IS BUILT
+***                                                 (OPD0 OR OPD1)
+         LA    P2,OPD1           SET P2 AT OPD1 TO READ OPERATION
+         MVI   OPTION,X'80'         SIGNAL THAT OPTION1 REQUIRED IN RD8
+*                           **DEBUG LE NOTINOV**  RESET OPTION  ATL1
+         BAL  R14,SCN11RD8          BRANCH TO READ  A   SYMBOL.
+*                                   RETURN FROM  RD8(1)
+         TM    STAT,X'01'           TEST IF  ENDED BY BLANK
+         BC    14,SCN10230          BRANCH IF NOT, TO ERROR (MEANS -
+*                         - OPERATION NOT FOLLOWED BY BLANK )
+         LA    R14,TABSIZE             INIT SEARCH ON PROCESSOR  S21016
+*                                      ENTRIES TABLE (12 ENTRIES S21016
+*                                      IN TABLE)                 S21016
+         LA    R15,PROCTABL
+SCN10100 CLC   0(8,R15),OPD1    OPERATION SYMBOL IS IN OPD1
+         BC    8,SCN10120          BRANCH TO SCN10120 WHEN MATCH FOUND
+SCN10105 LA    R15,12(R15)
+         BCT   R14,SCN10100
+         BC    15,SCN10230         BRANCH TO ERROR WHEN MATCH NOT FOUND
+***                                ERROR IN THE CARD
+SCN10120 MVC   PROCENTY(4),8(R15)      SAVE  THE PROCESSOR ENTRY POINT
+         LA    P2,OPD0                SET  P2 ON OPD0 TO READ 1ST OPRD
+         MVI   STAT,X'80'     SET OPD0 NEW' & RESET 'ENDD BY BLANK'
+         OI    OPTION,X'80'           SIGNAL OPTION'1' TO SUBPROGR RD8
+         BAL   R14,SCN11RD8           BRANCH TO  SUBPROG. RD8
+*                                     RETURN FROM RD8
+SCN10130 TM    OPTION,X'40'    IS AT LEAST ONE CHAR. FOUND ?    ATL1
+         BC    8,SCN10220      BRANCH IF NO
+         NI    OPTION,X'DF'      RESET TO 0 THE BIT 'OPD0 ABSENT'
+*                                  (OPD0 IS PRESENT)
+         OI    STAT,X'80'     SET 'OPD0 NEW' ON
+         TM    STAT,X'04'     ENDED BY LEFT PARENTHESIS ?
+         BC    1,SCN10180     BRANCH IF YES
+SCN10140 L     R15,PROCENTY
+         NI    APT2,X'FE'  RESET TO 0 THE CONTINUATION BIT
+**THE PROCESSOR ENTRY POINT IS IN REGISTER R15
+         BALR  R14,R15
+*
+*
+*
+**                         RETURN FROM THE PROCESSOR
+*
+         TM    STAT,X'40'       TEST IF LEVEL =1 OR 0
+         BC    1,SCN10150       BRANCH IF  LEVEL=1
+         TM    STAT,X'02'       TEST  IF ENDED BY COMMA
+         BC    8,SCN10145     BR IF NOT
+         CLC   PROCTABL+8(4),PROCENTY     IS IT OVERLAY
+         BC    8,SCN10230     IF YES,BR TO ERROR
+         CLC   PROCENTY,IDENTADD       IS IDENTIFY CARD BEING    S21016
+*                                      SCANNED?                  S21016
+         BE    SCN10230                IF SO, IT IS AN ERROR     S21016
+         BC    15,SCN10170
+SCN10145 TM    STAT,X'01'   TEST IF ENDED BY BLANK
+         BC    8,SCN10230       BRANCH TO ERROR  IF NOT
+** AT THIS POINT THE CARD IS TERMINATED EXCEPT IF A COMMENT CONTINUES
+SCN10147 CLI   COL72,C' '
+         BC    8,SCN10210     RETURN TO THE CARD READER PROG.(NO CONT.)
+         OI    STAT,X'10'     SET COMMENT=1
+         OI    APT2,X'01'     SET CONTIN=1
+         BC    15,SCN10210    RETURN TO THE CARD READER PROG.
+SCN10150 TM    STAT,X'08'          TEST IF ENDED BY RIGHT PARENTHESIS
+         BC    1,SCN10160          BRANCH IF YES
+         TM    STAT,X'02'          TEST IF ENDED BY COMMA
+         BC    8,SCN10230      BRANCH TO ERROR IF NOT
+         CLC   PROCENTY,IDENTADD       IS IDENTIFY CARD BEING    S21016
+*                                      SCANNED?                  S21016
+         BE    SCN10230                IF SO, IT IS AN ERROR     S21016
+         NI    STAT,X'7F'    RESET  'OPD0 NEW' TO ZERO
+         BC    15,SCN10190    GO TO READ ONE MORE LEVEL 1 ITEM
+SCN10160 NI    STAT,X'BF'       SET  LEVEL TO ZERO
+         LA    R1,1(R1)          UPDATE POINTER OF CARD COLUMN
+         C     R1,SAVACOL       COMPARE R1 AND ADDR OF COL 72
+*   RIGHT PARENT. IN COL. 71 IMPLIES NO CONTINUATION POSSIBLE
+*   (CONTIN. OF OPERAND REQUIRES A COMMA , CONTIN. OFCOMMENT ..
+*    ..REQUIRES THAT COMMENT ALREADY BEGUN )
+         BC    8,SCN10210       BRANCH TO THE RETURN TO CARD READER
+         CLI   0(R1),C','       IS CHAR. UNDER P1  A COMMA
+         BC    7,SCN10147              GO CHECK FOR CONTINUATION
+         OI    STAT,X'02'       SET  'ENDED BY COMMA'
+SCN10170 LA    P2,OPD0        SET POINTER P2 ON OPD0
+         NI    OPTION,X'7F'       SIGNAL  OPTION=0 TO THE SUBPR.    RD8
+         BAL   R14,SCN11RD8       BRANCH TO SUBPROG. RD8
+*                                 RETURN FROM RD8
+         BC    15,SCN10130
+SCN10180 OI    STAT,X'40'         SET LEVEL TO 1
+         CLC   PROCENTY,IDENTADD       IS IDENTIFY CARD BEING    S21016
+*                                      SCANNED?                  S21016
+         BNE   SCN10190                IF NOT, CONTINUE          S21016
+         LA    P2,IDRSTRNG             IF YES, SET P2 TO POINT   S21016
+*                                      TO SPECIAL STRING FOR     S21016
+*                                      IDR DATA                  S21016
+         OI    OPTION,SPSTROPT         TURN ON SPECIAL STRING    S21016
+*                                      OPTION                    S21016
+         B     SCN10193                CONTINUE                  S21016
+SCN10190 LA    P2,OPD1            SET P2 ON OPD1
+SCN10193 NI    OPTION,X'7F'            SIGNAL OPTION=0 TO        S21016
+*                                      SUBPROGRAM READ8          S21016
+         BAL   R14,SCN11RD8       BRANCH  TO SUBPR.
+*                                 RETURN FROM RD8
+         NI    OPTION,NOTSPSTR         TURN OFF SPECIAL STRING   S21016
+*                                      OPTION                    S21016
+         TM    OPTION,X'40'         TEST BIT 'AT LEAST ONE'  ATL1
+         BC    1,SCN10140         TOWARD PROCESSOR
+SCN10200 TM    STAT,X'01'        TEST IF  ENDED BY BLANK
+         BC    8,SCN10230         BRANCH TO ERROR IF NOT
+SCN10205 TM    OLDSTAT,X'02'      TEST IF OLD STATUS IS ENDED BY COMMA
+         BC    8,SCN10230         BRANCH TO ERROR IF NOT (BLANK INSIDE
+*                                 PARENTHESIS IS NOT ALLOWED,EXCEPT FOR
+*                 THE  COMMA-BLANK CONTINUATION CONVENTION)
+*   REGISTER  7  CONTAINS THE ADDRESS OF THE LIBRARY DCB
+         CLI   COL72,C' '        TEST IF BLANK IN COL. 72
+         BC    8,SCN10230         BRANCH TO ERROR IF YES
+         OI    APT2,X'01'   SET CONTIN=1
+***          RETURN TO 'READ NEXT CARD'
+SCN10210 TM    OPTION,X'10'  WAS IT AN INCLUDE CARD
+         BC    8,SCN10215
+         TM    APT2,X'01'      IS CONTIN. EXPECTED
+         BC    1,SCN10215      YES
+         L     15,INCLBRAD    BRANCH ADDR TO INCL PROC(ENTAB ENTRY)
+         LM    00,14,SAVR
+         BCR   15,15    GO TO INCL PROC
+SCN10215 LM   00,15,SAVR
+         L    BASE,8(15)
+         BCR   15,R14             RETURN TO THE CALLER (CARD READER)
+SCN10220 TM     STAT,X'04'    TEST IF ENDED BY LEFT PARENTH.
+         BC      8,SCN10225       NO
+         OI     OPTION,X'20'       SET 'OPD0 ABSENT' IN OPTION
+         BC    15,SCN10180
+SCN10225 TM    APT2,X'01'    TEST IF CONTIN=1
+         BC    8,SCN10200         BRANCH IF NOT
+*                     BRANCH TO ERROR SUBPROG.
+SCN10230 L     R1,SAVR+4     SLOT ADDR. OF 1ST COL OF CARD INTO R1
+SCN10232 LH    0,ERR1         WRONG LK.EDIT CNTRL CRD. CRD.IGNORED
+SCN10235 L     R15,ERDIG
+         NI    APT2,X'FE'  RESET TO 0 THE CONTINUATION BIT
+         BALR  R14,R15
+*
+*
+*
+*                              RETURN FROM ERROR ROUTINE
+         BC    15,SCN10210     GO TO READ NEXT CARD
+SCN10238 ST    R1,SAVRG1               SAV REG 1 A37667,OX04280,OY03413
+         LA    R1,OPD0                 INVALID ALIAS NAME        A37667
+         LH    R0,ERR8                                           A37667
+         L     R15,ERDIG                                         A37667
+         BALR  R14,R15                 LOG ERROR MESSAGE         A37667
+         L     R14,SAVRG14             RES R14   A37667,OX04280,OY03413
+         L     R1,SAVRG1               RES R1    A37667,OX04280,OY03413
+         BR    14                                                A37667
+SCN10240 TM    STAT,X'10'      TEST IF  COMMENT=1
+         BC    8,SCN10250      BRANCH IF NOT
+         CLI   COL72,C' '           TEST IF BLANK IN COL. 72
+         BC    7,SCN10210           BRANCH IF NOT
+         NI    STAT,X'EF'    SET COMMENT=0
+         NI    APT2,X'FE'     SET CONTIN=0
+         BC    15,SCN10210
+SCN10250 LA    R1,14(R1)            SET P1 ON COL. 15
+         TM    STAT,X'40'         TEST IF LEVEL =1
+         BC    1,SCN10190       YES
+         BC    15,SCN10170
+***    SUBROUTINE  SCN11RD8  READS 8 CHAR. OR LESS TO BUILD A SYMBOL
+***    IN THE AREA POINTED TO BY P2
+SCN11RD8 MVC   OLDSTAT(1),STAT    SAVE STATUS BYTE IN OLD STATUS
+         MVI   0(P2),C' '
+         MVC   1(7,P2),0(P2)    PAD BLANKS IN OPERAND AREA
+         TM    OPTION,SPSTROPT         'SPECIAL STRING' OPTION   S21016
+*                                      ON?                       S21016
+         BZ    NOTSPEC                 BRANCH IF NOT             S21016
+         LA    R15,SPECMAX             INITIALIZE CHAR. COUNT    S21016
+*                                      FOR UP TO 40 CHARACTERS   S21016
+*                                      IN OPERAND STRING         S21016
+         MVC   CHAR8(LEN32,P2),CHAR7(P2)  PAD REMAINDER OF       S21016
+*                                      OPERAND FIELD WITH BLANKS S21016
+         B     CONTINUE                BRANCH AROUND NORMAL      S21016
+*                                      CHAR COUNT                S21016
+NOTSPEC  LA    R15,NORMAX              INITIALIZE CHAR. COUNT    S21016
+*                                      (MAXIMUM 8 CHARACTERS)    S21016
+CONTINUE NI    STAT,X'F0'              RESET TO 0 THE ENDED BY   S21016
+*                                      '(' , ')' , ',' OR ' '    S21016
+*                                      BIT                       S21016
+           NI    OPTION,X'BF'   RESET TO 0 THE BIT 'AT LEAST ONE'
+         XC    SPECSTR(2),SPECSTR      RESET TO 0 SPEC. STRING   S21016
+*                                      INDICATOR AND LENGTH      S21016
+SCN11000 LA    R1,1(R1)           UPDATE POINTER R1
+         CLI   0(R1),C' '         TEST IF THIS CHARACTER IS BLANK
+         BE    SCN11006                BRANCH IF YES             S21016
+SCN11001 C     R1,SAVACOL              IS THIS COLUMN 72?        S21016
+         BC    7,SCN11002         OK IF NO
+         TM    OPTION,X'40'       WAS AT LEAST ONE CHARACTER RECEIVED
+         BC    1,SCN10230         ERROR IF YES
+         BC    15,SCN10205        GO CHECK IF VALID CONITNUATION
+SCN11002 TM    SPECSTR,SPSTRFLG        SCANNING A SPEC. STRING?  S21016
+         BO    SCN11003                BRANCH IF YES             S21016
+         CLI   CURCHAR(R1),COMMA       TEST IF THIS CHAR. IS     S21016
+*                                      A COMMA                   S21016
+         BC    8,SCN11010        BRANCH IF YES
+         CLI   0(R1),C'('        TEST IF THIS CHAR. IS LEFT PARENT.
+         BC    8,SCN11020        BRANCH IF YES
+         CLI   0(R1),C')'        TEST IF THIS CHAR. IS RIGHT PARENT.
+         BC    8,SCN11030        BRANCH IF YES
+SCN11003 CLI   CURCHAR(R1),QUOTE       TEST IF THIS CHAR. IS     S21016
+*                                      A QUOTE                   S21016
+         BE    SCN11060                BRANCH IF YES             S21016
+SCN11004 BCT   R15,SCN11005            UPDATE COUNT & GO TO      S21016
+*                                      MOVE THE CHARACTER        S21016
+         BC    15,SCN10230   BRANCH TO ERROR IF MORE THAN 8 CHARACTERS
+SCN11005 MVC   0(1,P2),0(R1)     MOVE THE CHAR. AT ADD POINTED TO BY P2
+         OI    OPTION,X'40'      SET 'AT LEAST ONE'    ATL1=1
+         LA    P2,1(P2)          UPDATE P2
+         BC    15,SCN11000
+SCN11006 TM    SPECSTR,SPSTRFLG        SCANNING A SPECIAL        S21016
+*                                      STRING?                   S21016
+         BNO   SCN11040                BRANCH IF NO              S21016
+         B     SCN11001                CONTINUE IF YES           S21016
+SCN11010 OI    STAT,X'02'        SET  'ENDED BY COMMA'
+         BCR   15,R14            RETURN
+SCN11020 OI    STAT,X'04'        SET  'ENDED BY LEFT PARENT.'
+         BCR   15,R14            RETURN
+SCN11030 OI    STAT,X'08'        SET  'ENDED BY RIGHT PARENT.'
+         BCR   15,R14            RETURN
+SCN11040 TM    OPTION,X'80'      TEST  IF OPTION=1
+         BC    8,SCN11050        BRANCH IF NOT
+         TM    OPTION,X'40'      TEST IF  'AT LEAST ONE'  ATL1=1
+         BC    1,SCN11050    BR. IF YES
+         C    R1,SAVACOL
+         BC    8,SCN10230     GO TO ERROR
+         BC    15,SCN11000    GO & TRY NEXT COLUMN
+SCN11050 OI    STAT,X'01'        SET  'ENDED BY A BLANK'
+         BCR   15,R14            RETURN
+SCN11060 TM    SPECSTR,SPSTRFLG        SCANNING A SPECIAL        S21016
+*                                      STRING?                   S21016
+         BO    SCN11070                BRANCH IF YES             S21016
+         TM    OPTION,SPSTROPT         SPECIAL STRING OPTION ON? S21016
+         BNO   SCN11004                IF NOT, CONTINUE          S21016
+         CH    R15,SPSTRLEN            1ST CHAR IN STRING?       S21016
+         BNE   SCN10230                NOT, ERR  S21016,OX03126,OY02822
+         OI    SPECSTR,SPSTRFLG        IF YES, TURN ON SPECIAL   S21016
+*                                      STRING FLAG               S21016
+         B     SCN11000                PROCESS NEXT CHAR.        S21016
+SCN11070 CLI   NEXTCHAR(R1),QUOTE      IS NEXT CHAR. ALSO A      S21016
+*                                      QUOTE?                    S21016
+         BNE   SCN11080                IF NOT, BRANCH            S21016
+         LA    R1,NEXTCHAR(R1)         IF IT IS, IGNORE 1ST      S21016
+*                                      QUOTE                     S21016
+         B     SCN11004                CONTINUE TO PROCESS THIS  S21016
+*                                      CHAR.                     S21016
+SCN11080 CLI   NEXTCHAR(R1),C')'       TEST END PAREN   OX03126,OY02822
+         BNE   SCN10230                ERR IF NOT THERE OX03126,OY02822
+         SH    R15,SPSTRLEN            CALC TRUE LENGTH OX03126,OY02822
+         LCR   R15,R15                 OF SPECIAL STRNG OX03126,OY02822
+         STH   R15,SPECSTR             STORE NO. OF CHARS. IN    S21016
+*                                      STRING                    S21016
+         LA    R15,ONECHAR             NO MORE CHARS. ALLOWED IN S21016
+*                                      THIS STRING EVEN IF COUNT S21016
+*                                      NOT EXHAUSTED (FINAL      S21016
+*                                      QUOTE FOUND)              S21016
+         B     SCN11000                GO TO CONTINUE SCAN       S21016
+***   PROCESSORS VECTOR TABLE .
+***   GIVES  THE ENTRY POINT OF EACH PROGRAMMER-PUNCHED-CARD PROCESSOR
+         DS    0F
+PROCTABL DC    CL8'OVERLAY '
+         DC    A(SCNOVERL)      4 BYTES ADCON
+         DC    CL8'REPLACE '
+         DC    A(SCNREPLA)
+         DC    CL8'LIBRARY '
+         DC    A(SCNLIBRA)
+         DC    CL8'INCLUDE '
+         DC    A(SCNINCLU)
+         DC    CL8'INSERT  '
+         DC    A(SCNINSER)
+         DC    CL8'ENTRY   '
+         DC    A(SCNENTRY)
+         DC    CL8'CHANGE  '
+         DC    A(SCNCHANG)
+         DC    CL8'ALIAS   '
+         DC    A(SCNALIAS)
+         DC    CL8'NAME    '
+         DC    A(SCNNAME)
+         DC    CL8'SETSSI'
+         DC    A(SCNSETSI)
+         DC    CL8'HIARCHY '
+         DC    A(SCNHIARC)
+IDENTOP  DC    CL8'IDENTIFY'                                     S21016
+IDENTADD DC    A(SCNIDENT)                                       S21016
+         DC    CL8'ORDER'                                       AOSCD
+         DC    A(SCNORDR)                                       AOSCD
+         DC    CL8'PAGE'                                        AOSCD
+         DC    A(SCNPAGE)                                       AOSCD
+         DC    CL8'SETCODE'       SETCODE OPERAND                Y01048
+         DC    A(SCNSTCOD)        ADDRESS OF SETCODE RTN         Y01048
+         DC    CL8'EXPAND '       EXPAND OPERAND                 Y01031
+         DC    A(SCNEXPND)        ADDRESS OF EXPAND RTN          Y01031
+PROCEND  EQU   *
+RF       EQU   13
+RE       EQU   15
+*  SCNHOL SELECTS A FREE LINE IN THE CESD.  ADDRESS OF THIS LINE
+*  RETURNED TO CALLER BY REG. RE  ,  ID BY REG. RF  . THIS LINE COMES
+*  FROM THE HOLES' CHAIN , OR IS A NEW LINE IN THE CESD
+*
+*
+*
+SCNHOL   L     RE,FLCD             ADDR. OF THE HOLES CHAIN BEG.
+         LTR   RE,RE         TEST IF ZERO
+         BC    8,HOL010      YES
+*                            ADDR.OF HOLE IS IN RE
+         MVC   FLCD(4),12(RE)      UPDATE FLCD
+         LR    RF,RE                  HOLE ADDR. IN REG. RF
+         S     RF,CHESD
+         SRL   RF,4              DIVIDE OFFSET BY 16 TO GET ID
+         BCR   15,14             RETURN
+HOL010   LH    RE,ENCDC       HIGHEST  ID USED IN CESD
+HOL010A  CH    RE,ENCDX       COMPARE TO MAX ID AVAILABLE IN CESD
+         BL    HOL010B                 THERE IS STILL ROOM      AOSCD
+         TM    APT4,REALOCTE           CAN REALLOC BE DONE?     AOSCD
+         BO    HOL020                  NO/NO MORE PLACE IN ESD  AOSCD
+         STM   R0,R15,BRNCHSV          SAVE REGISTERS           AOSCD
+         L     R15,ERDIGA              ADDR OF REALLOC RTN      AOSCD
+         BALR  R14,R15                 GO TO REALLOC RTN        AOSCD
+         LM    R0,R15,BRNCHSV          RESTORE REGISTERS        AOSCD
+         B     HOL010A                 CHECK IF REALLOC SUFFICIENT
+         BC     8,HOL020   BRCH IF NO MORE PLACE IN CESD
+HOL010B  LA    RE,1(RE)
+         LR    RF,RE                FREE LINE ID IN RF
+         STH   RE,ENCDC       UPDATE HIGHEST ID USED
+         SLL   RE,4
+         A     RE,CHESD       ADDRESS OF FREE LINE IN RE
+         BCR   15,14                  RETURN
+*                                    NO MORE PLACE IN THE CESD
+HOL020   LH    0,ERR2         NOT ENOUGH PLACE IN CESD  IRRECOVERABLE
+         L     15,ERDIG
+         BALR  14,15
+         BC    15,*         DEBUG.PURPOSE.ERROR ROUT.SHOULD NOT RETURN
+*HEWLEHOL GIVES ADDR. OF A FREE CESD LINE (MAY BE A HOLE) IN RE
+* AND ITS ID IN RF
+* THE CALLER PUTS  THE RETURN ADDRESS IN  14
+*   OVERLAY PROCESSOR
+RX       EQU   11
+RY       EQU   10
+RZ       EQU   09
+*
+*  SCNOVERL  ,GIVEN AN OVERLAY SYMBOL, UPDATES   1- THE OVERLAY CHAIN
+*  2- THE CURRENT NO. OF SEGMENTS  AND THE TABLE SEGTA1
+*  3- THE CURRENT NO. OF REGIONS  AND THE TABLE  LSTS , IF  (REGION) IS
+*     SPECIFIED
+SCNOVERL TM    PDSE7,X'20'    IS OVERLAY OPTION 'ON'
+         BC    8,SCN10230   BR. TO ERROR IF NOT
+         ST    14,SAV14L1   SAVE R14 BECAUSE OF THE CALL TO SCNHOL
+         LH    RY,CSNO        GET CURRENT SEGMENT NUMBER
+         STC  RY,PREVSEG
+         TM    STAT,X'40'   TEST STATUS BYTE OF THE SCANNER
+*                                 IS IT LEVEL=1
+          BC    8,OVR090
+*                                 LEVEL=I ANNOUNCES 'REGION'
+         CLC   OPD1(8),REGION
+         BC    7,SCN10230     TOWARD ERRORLOG
+         BC    15,OVR100
+OVR090   L     RX,OVCMBGAD
+         LTR   RX,RX
+         BC    8,OVR115
+         BC    15,OVR120
+OVR100   LH    RX,CRNO
+         CH    RX,MXNOREG
+         BC    11,OVR105     TOOMANY REGIONS COMING
+         LA    RX,1(RX)
+         STH   RX,CRNO        UPDATE CURRENT REGION
+         XC    PREVSEG(1),PREVSEG    SET PREVSEG TO 0
+         BC    15,OVR110
+OVR105   LH    0,ERR3         ERROR  TOO MANY REGIONS
+         L     15,ERDIG
+         BALR  14,15       BRANCH TO ERROR ROUTINE
+OVR110   L     RZ,OVCMBGAD        ADDRESS OF OVERLAY CHAIN BEGINNING
+         LTR  RZ,RZ
+         BC   8,OVR115      BRANCH IF NO CHAIN EXISTS
+         XC    OVCMBGAD(1),OVCMBGAD    NULLIFY OVCMBGAD
+         LA   14,OVR115     FIX EXIT OF SMALL SUBROUTINE
+         BC   15,OVR165    GO TO NULLIFICATION OF OVRL.CHAIN
+OVR115   BAL   14,SCNHOL   GO & GET FREE LINE IN THE CESD
+         ST    15,OVCMBGAD        INIT OVCMBGAD TO 1ST LINE OF CHAIN
+         BC    15,OVR135
+*                            HERE THE CHAIN EXISTS
+OVR120   CLC   OPD0(8),0(RX)      COMPARE  SYMBOLS
+         BC    8,OVR138         EQUAL
+         L     RZ,8(RX)
+         LA    RZ,0(RZ)           WIPE THE TYPE
+         LTR   RZ,RZ    IS THE CHAIN ADDRESS =0
+         BC    8,OVR130           YES
+         LR    RX,RZ
+         BC    7,OVR120       NO
+OVR130   BAL   14,SCNHOL      GO $ GET A FREE LINE IN THE CESD
+*                               LINE ADDR.IS IN R15 , ID IN R13
+         ST   R15,8(RX)           PUT ADDR. OF NXT LINE IN CURR.LINE
+         MVI   8(RX),X'02'        RESTORE CRUSHED TYPE
+OVR135   LR    RX,R15
+         MVC   0(8,RX),OPD0           PUT SYMBOL INTO  OVERLAY LINE
+         MVC   12(1,RX),PREVSEG     PUT PREVSEG INTO OVERLAY LINE
+*                                     (CSEG IS HERE 'PREVIOUS SEGT.' )
+         XC    9(3,RX),9(RX)           ZEROE   THE CHAIN ADDRESS
+         MVI   8(RX),X'02'             SET TYPE ER
+         MVI   13(RX),X'90'            SET SUBTYPE 'CONTROL  OVRLAY'
+         L     8,SAV14L1      PREPARE RETURN TO CARD SCANNER
+         BC    15,OVR140
+OVR138   MVC   PREVSEG(1),12(RX)    PREV. SEG. TAKEN FROM MATCHED LINE
+         LA    8,OVR160
+OVR140   LA    RY,1(RY)             ADD 1  IN CURRENT SEGM. NO.
+         STH   RY,CSNO        UPDATE CSEG
+         CH    RY,ENS1X       COMPARE CSEG TO MAX PERMISSABLE
+         BC    12,OVR150         OK
+         LH    0,ERR4         ERROR  TOO MANY SEGMENTS IN THIS TREE
+         L     15,ERDIG
+         BALR  14,15
+          BC    15,*        .STOP. THIS ERROR WAS IRRECOVERABLE
+*                            ERROR ROUTINE SHOULD NOT  RETURN
+OVR150   L     R15,SGT1       ADDR OF SEGTA1 MINUS 1 IN R15
+         AR    R15,RY      ADD CURRENT SEGT. NO.
+         MVC   0(1,R15),PREVSEG     FILL ONE SEGTA1 ITEM
+         LH    15,CRNO
+         STC   RY,LSTS(15)       STORE LAST SEG.FOR  THE CURRENT REGION
+         BCR  15,8       RETURN OR GO TO NEXT INSTRUCTION
+**              NULLIFICATION OF THE TAIL OF THE OVERLAY CONTROL CHAIN
+OVR160   L     RZ,8(RX)
+         LA    RZ,0(RZ)
+         LTR   RZ,RZ              TEST IF CHAIN ADDR.IS ZERO(CHAIN END)
+         BCR   8,14
+         XC    9(3,RX),9(RX)     SET ZERO AS CHAIN ADDRESS
+OVR165  MVI   8(RZ),X'07'    NULLIFY TYPE OF NEXT LINE
+         XC    0(8,RZ),0(RZ)  AND CLEAR NAME FIELD      OX05439,OY04537
+         LR    RX,RZ             TAKE NEXT LINE AS NEW CURRENT LINE
+         MVC   12(4,RZ),FLCD  CHAIN THIS FREE LINE TO LAST FREE LINE
+         ST    RZ,FLCD        UPDATE BEGINNING OF HOLES' CHAIN
+         BC   15,OVR160           CHAIN CONTINUES
+SCNORDR  TM    OPTION,X'20'            IS OPD0 ABSENT           AOSCD
+         BO    SCN10230                YES,ERROR                AOSCD
+         TM    STAT,X'40'              IS LEVEL 1 PRESENT       AOSCD
+         BZ    SCNORDR1                NO,BRANCH OUT            AOSCD
+         CLC   OPD1(8),ORDRP           IS OPD1 VALID CHAR       AOSCD
+         BNE   SCN10230                NO,ERROR                 AOSCD
+         OI    SWITCH1,PAGE            SET PAGE ALIGN SWITCH    AOSCD
+         OI    APT4,PAGEE              FLAG PAGE IN APT         AOSCD
+SCNORDR1 OI    SWITCH1,ORDER           SET ORDER SWITCH         AOSCD
+         OI    APT4,ORDERR             FLAG ORDERING IN APT     AOSCD
+         B     INS001                                           AOSCD
+SCNPAGE  OI    SWITCH1,PAGE            SET PAGE SWITCH          AOSCD
+         OI    APT4,PAGEE              FLAG PAGE IN APT         AOSCD
+*
+*  SCNINSER   IS THE  INSERT CARD PROCESSOR.
+SCNINSER TM    STAT,X'40'     IS IT LEVEL 1
+         BZ    INS001          NO,BRANCH OUT                    AOSCD
+         NI    SWITCH1,X'FF'-X'31'     RESET FLAG FOR ORDER & PAGE
+         B     SCN10230            ERROR CONDITION-NO LEVEL 1 FOR INS
+INS001   STM   R13,R3,TEMPRGSV         TEMPORARY SAVE           AOSCD
+         LA    0,16           SET  INCREMENT  FOR THE BXLE
+         L     15,CHESD       SET STARTING ADDR
+         LH    1,ENCDC
+         SLL   1,4
+         AR    1,15           HIGH LIMIT OF BXLE
+         LA    15,16(15)
+INS100   CLC   OPD0(8),00(15)     COMPARE OPRD 0 WITH CESD SYMBOL
+         BC    8,INS158           BRANCH  IF  MATCHING SYMBOL  FOUND
+INS105   BXLE  15,0,INS100
+*               SYMBOL NOT FOUND IN CESD
+         ST    14,SAV14L1
+         BAL   14,SCNHOL      GO AND GET FREE LINE IN THE CESD
+         L     14,SAV14L1
+*              FREE LINE ADDR  IN R15  FREE LINE ID  IN R13
+         MVC   0(8,R15),OPD0     SET  SYMBOL EQUAL TO OPD0
+         XC    8(8,R15),8(R15)                                  AOSCD
+         TM    SWITCH1,PAGE+ORDER      PAGE OR ORDER REQD       AOSCD
+         BC    5,INS150                YES,BRANCH OUT           AOSCD
+         MVI   8(R15),X'02'      SET  TYPE  ER
+         MVI   13(R15),X'00'     SET  SUBTYPE  PURE ER
+         BC    15,INS130
+INS110   MVN   TEMP1(1),8(15)    INSULATE TYPE
+         CLI   TEMP1,X'02'   IS TYPE X'X2'
+         BC    7,INS130   BR. IF NOT
+         CLI   13(15),X'02'   IS IT AN UNMATCHED LIBRARY MEMBER
+         BC    7,INS120    BR IF NOT
+         OI    13(15),X'01'   SET TYPE 'MATCHED LIBR MEMBER'
+INS120   CLI   8(15),X'02'   CAN THE MATCHED LINE BE A CNTRL CARD
+         BC    7,INS130         NO
+         CLI   13(15),X'0F'    IS IT A CNTRL CARD BY ITS SUBTYPE
+         BC    2,INS105          YES  CONTINUE THE SEARCH
+INS130   OI    8(15),X'20'      SET  INSERT BIT IN TYPE
+         MVC   12(1,15),CSNO+1    INSERT THE CURRENT SEG.NO. AS 1 BYTE
+INS140   LM    R13,R3,TEMPRGSV         RESTORE REGISTERS        AOSCD
+         NI    SWITCH1,X'FF'-X'31'     RESET SWITCH             AOSCD
+         BCR   15,14                   RETURN                   AOSCD
+INS150   MVI   8(R15),X'0A'            FLAG A WX                AOSCD
+INS151   STH   R13,IDSAV               SAVE CESD ID             AOSCD
+         L     R13,ORDRADR             PICK UP ADD OF ORDER TABLE
+         LH    R1,ORDRCUR              CURR NO OF BYTES USED    AOSCD
+         LTR   R1,R1                   ARE THERE ANY IN USE?    AOSCD
+         LA    R0,3                    3 BYTES PER ENTRY IN ORDER TBL
+         BZ    INS152A                 NONE USED-BRANCH OUT     AOSCD
+         AR    R1,R13                                           AOSCD
+         SR    R1,R0                                            AOSCD
+INS152   CLC   1(2,R13),IDSAV          MATCH IN THE ORDER TBL   AOSCD
+         BE    INS155                  YES,BRANCH OUT           AOSCD
+         BXLE  R13,R0,INS152           NO,CONTINUE SCANNING     AOSCD
+INS152B  CLC   ORDRCUR(2),ORDRMAX      ORDER TABLE OVFLOW?      AOSCD
+         BL    INS152A                 NO,BRANCH OUT            AOSCD
+         TM    APT4,REALOCTE           CN WE REALLOCATE?        AOSCD
+         BO    HOL020                  ALREADY DONE,BRANCH OUT  AOSCD
+         STM   R0,R15,BRNCHSV          SAVE REGISTERS           AOSCD
+         L     R15,ERDIGA              ADDR OF REALLOC RTN      AOSCD
+         BALR  R14,R15                 GO TO REALLOC RTN        AOSCD
+         LM    R0,R15,BRNCHSV          RESTORE REGISTERS        AOSCD
+         L     R13,ORDRADR             NEW ADDR OF ORDER TBL    AOSCD
+         AH    R13,ORDRCUR             PT TO AVAIL ENTRY        AOSCD
+         B     INS152B                                          AOSCD
+INS152A  MVC   1(2,R13),IDSAV          MOVE ID                  AOSCD
+         AH    R0,ORDRCUR              INCREMENT CNT OF CURR BYTES
+         STH   R0,ORDRCUR              USED IN ORDER TABLE      AOSCD
+         TM    SWITCH1,ORDER           IS THIS AN ORDER STATEMENT
+         BZ    INS153                  NO,BRANCH OUT            AOSCD
+INS153A  LA    R13,0(R13)                                       AOSCD
+         ST    R13,LASTORDR                                     AOSCD
+         OI    0(R13),X'20'            FLAG FOR ORDER           AOSCD
+INS153   TM    SWITCH1,PAGE            IS PAGE ALIGN REQUESTED  AOSCD
+         BZ    INS154                  NO,BRANCH OUT            AOSCD
+         OI    0(R13),X'10'            YES,MARK ENTRY SO        AOSCD
+INS154   TM    SWITCH1,MATCH           WAS THERE A MATCH CESD   AOSCD
+         BZ    INS140                  NO,RETURN                AOSCD
+         OI    0(R13),X'80'            YES,MARK MATCH IN ENTRY  AOSCD
+         B     INS140                  PROCEED                  AOSCD
+INS155   TM    SWITCH1,ORDER           IS ORDER REQUESTED?      AOSCD
+         BZ    INS153                  NO,BRANCH OUT            AOSCD
+         LA    R13,0(R13)                                       AOSCD
+         C     R13,LASTORDR                                     AOSCD
+         BNL   INS153A                                          AOSCD
+         TM    0(R13),X'20'            IS MATCHED ENTRY FOR ORDER
+         BO    INS156                  YES,BRANCH OUT           AOSCD
+         XC    0(3,R13),0(R13)         CLEAR ORDER ENTRY        AOSCD
+         LA    R13,3(R1)                                        AOSCD
+         OI    0(R13),X'10'            FLAG PAGE                AOSCD
+         B     INS152B                 PROCEED                  AOSCD
+INS156   LM    R13,R3,TEMPRGSV         RESTORE REGISTERS        AOSCD
+         NI    SWITCH1,X'FF'-X'31'     RESET PAGE & ORDER FLAGS AOSCD
+         LH    R0,ERR7                 LOAD ERROR CODE          AOSCD
+         LA    R1,OPD0                 POINT TO OPD0            AOSCD
+         B     SCN10235                                         AOSCD
+INS158   TM    SWITCH1,PAGE+ORDER      PAGE OR ORDER REQUESTED  AOSCD
+         BZ    INS110                  NO,BRANCH OUT            AOSCD
+         OI    SWITCH1,MATCH           INDICATE MATCHED ENTRY   AOSCD
+         LR    R13,R15                 CALCULATE CESD ID        AOSCD
+         S     R13,CHESD                                        AOSCD
+         SRL   R13,4                                            AOSCD
+         MVN   TEMP1(1),8(R15)         MOVE TYPE                AOSCD
+         CLI   TEMP1,0                 TYPE SD?                 AOSCD
+         BE    INS151                  YES,BRANCH OUT           AOSCD
+         CLI   TEMP1,X'05'             TYPE COMMON              AOSCD
+         BE    INS151                  YES,BRANCH OUT           AOSCD
+         CLI   TEMP1,X'02'             TYPE ER?                 AOSCD
+         BNE   INS151                  NO,BRANCH OUT            AOSCD
+         TM    13(R15),X'80'           CONTROL CARD ITEM?       AOSCD
+         BZ    INS151                  NO,BRANCH OUT            AOSCD
+         NI    SWITCH1,X'7F'                                    AOSCD
+         B     INS105
+TEMPRGSV DC    7F'0'                   TEMPORARY SAVE AREA      AOSCD
+ORDRP    DC    CL8'P'                  OPD1 CHAR FOR PAGE       AOSCD
+LASTORDR DC    F'0'                                             AOSCD
+IDSAV    DC    H'0'                    SAVEAREA FOR CESD ID     AOSCD
+ERR7     DC    X'2241'                 ERROR CODE               AOSCD
+SWITCH1  DC    X'00'                   SWITCH                   AOSCD
+PAGE     EQU   X'10'                   FLAG FOR PAGE            AOSCD
+ORDER    EQU   X'20'                   FLAG  FOR ORDERING       AOSCD
+MATCH    EQU   X'01'                   FLAG FOR MATCH ENTRY     AOSCD
+RG       EQU   0
+RJ       EQU   13
+RH       EQU   14
+RI       EQU   15
+RM       EQU   3
+SCNREPLA TM    OPTION,X'20'   IS OPD0 ABSENT
+         BC    1,SCN10230     BR TO ERR IF YES
+         OI    STATREPL,X'80'  SET BIT 'ENTERED BY REPLACE'
+         TM    STAT,X'40'      WHAT LEVEL ?  (ZERO OR ONE)
+         BC    1,REP115        BR. IF LEVEL 1  (2 OPERANDS)
+         ST    14,SAV14L1
+         BAL   14,SCNHOL   BR. AND GET A FREE LINE IN THE CESD
+         L     14,SAV14L1
+*  HEWLEHOL  HAS PUT  ADDR. OF FREE LINE IN  RI AND ID  IN RJ
+         LA    RM,REP110      SET  EXIT  ADDRESS FOR THE SUBR. REP100
+REP100   L     RJ,RCCE
+         LTR   RJ,RJ           DOES THE CHAIN ALREADY EXIST.
+         BC    7,REP105        YES
+         ST    RI,RCCB        GIVE  ITS FIRST VALUE TO RCCB
+         BC    15,REP107
+REP105   ST    RI,8(RJ)      PUT THIS NEW LINE ADDR.INTO PREV.LINE  ...
+*                         ...TO FORM THE CHAIN
+         MVI   8(RJ),X'02'    RESTORE CRUSHED TYPE
+REP107   ST    RI,RCCE        UPDATE THE END ADDRESS OF THE  CHAIN
+         MVC   0(8,RI),OPD0     OPERAND ZERO PUT IN LINE
+         MVI   8(RI),X'02'      SET TYPE ER  IN THE LINE
+         XC    9(3,RI),9(RI)   ZEROE   THE CHAINING ADDR.OF THIS NEWLIN
+         BCR   15,RM
+REP110   MVI   13(RI),X'E8'       SET  SUBTYPE'CONTROL-DELETE'
+         BCR   15,RH              RETURN
+SCNCHANG TM    STAT,X'40'     IS IT LEVEL1
+         BC    8,SCN10230     BR TO ERR IF NOT
+         TM    OPTION,X'20'   IS OPD0 ABSENT
+         BC    1,SCN10230     BR TO ERR IF YES
+         NI    STATREPL,X'7F'
+*                          ENTERING  BY 'CHANGE'
+*                  TAKE 2 CONSECUTIVE FREE LINES IN THE CESD
+REP115   LH    RJ,ENCDC
+         LA    RI,1(RJ)          ADD 1 TO HIGHEST ID USED
+         SLL   RI,4              MULTIPLY BY 16
+         A     RI,CHESD       ADD ADDRESS OF CESD MINUS 16
+*                 ADDR. OF FIRST FREE LINE OF A COUPLE IS IN RI
+*                 CHECK IF TWO LINES WERE AVAILABLE IN THE CESD
+         LA    RJ,2(RJ)
+REP117   EQU   *                                                OZ01403
+         CH    RJ,ENCDX
+         BC    2,REP140              TO ERROR
+         STH   RJ,ENCDC       UPDATE ENCDC
+         LA    RM,REP120      SET EXIT ADDR. FOR THE SUBR. REP100
+         BC    15,REP100      BR. TO SMALL INTERNAL SUBR.
+REP120   MVC   16(8,RI),OPD1  PUT SYMBOL OPD1 IN   THE SECOND LINE
+         MVI   24(RI),X'02'   PUT TYPE ER  IN THE SCD. LINE
+         TM    STATREPL,X'80'
+         BC    1,REP130       BR. IF REPLACE
+         MVI   13(RI),X'F0'    SUBTYPE CONTROL CHANGE IN FIRST LINE
+         MVI   29(RI),X'F0'    SUBTYPE CONTROL CHANGE IN SECOND LINE
+         BCR   15,RH            RETURN
+REP130   MVI   13(RI),X'E0'       SET SUBTYPE  CNTRL REPLACE IN 1ST LIN
+         MVI   29(RI),X'E0'       SET SUBTYPE  CNTRL REPLACE IN 2ND LIN
+         BCR   15,RH             RETURN
+REP140   EQU   *                                                OZ01403
+         TM    APT4,REALOCTE     REALLOC. POSSIBLE?             OZ01403
+         BO    REP142            BRANCH IF NOT                  OZ01403
+         STM   R0,R15,BRNCHSV    SAVE REGS BEFORE REALLOC       OZ01403
+         L     R15,ERDIGA        ADDR. OF REALLOC. RTN.         OZ01403
+         BALR  R14,R15           GO TO REALLOC RTN.             OZ01403
+         LM    R0,R15,BRNCHSV    RESTORE REGISTERS              OZ01403
+         B     REP117            GO CHECK CESD AGAIN            OZ01403
+REP142   LH    0,ERR2         NOT ENOUGH PLACE IN CESD  IRRECOVERABLE
+         L     RI,ERDIG
+         BALR  14,15
+         BC    15,*       DEBUGGING PURPOSE. AS THE ERR.WAS IRRECOVE-
+*                        -RABLE,THE ERROR ROUTINE SHOULD NOT RETURN
+*                         HERE
+SCNNAME  TM    OPTION,X'20'   IS OPD0 ABSENT
+         BC    1,SCN10230     BR TO ERR IF YES
+         L     15,HEWLCLAC    ADDRESS OF CURRENT READ BLOCK
+         LA    0,0(0,15)               CLEAR HI ORDER BYTE
+         LA    15,HEWLCRBN    ADDRESS OF SYSLIN READ BLOCK
+         CR    0,15   IS PTER ,POINTOING TO SYSLIN READ BLOCK
+         BC    8,NAM010    BR IF YES
+         L     1,SAVR+4      ADDR OF FIRST COLUMN OF CARD INTO R1
+         LH    0,ERR10  NAME CARD MUST BE IN MAIN STREAM
+         BC    15,SCN10235  BR TO ERROR
+NAM010   TM    APT3,X'40'   TEST IF NAMECRD ALREADY BEEN READ
+         BCR   1,14
+         ST    R14,SAVRG14             SAV RETRN ADDR   OX04280,OY03413
+         LA    REG9,OPD0               POINT TO NAME    OX04280,OY03413
+         L     R15,ADRVLDCK            GET ADDR OF RTN  OX04280,OY03413
+         BALR  R14,R15                 GO VALIDATE NAME OX04280,OY03413
+         L     R14,SAVRG14             RES RETRN ADDR   OX04280,OY03413
+         LTR   REG9,REG9               TEST VALID NAME  OX04280,OY03413
+         BNZ   SCN10230                BRANCH IF INVAL  OX04280,OY03413
+         OI    APT3,X'40'   SET BIT 'NAME CARD RECEIVED' 'ON'
+         MVC   PDSE1(8),OPD0  PUT MEMBER NAME INTO PDS DIRY.
+         NI    APT3,X'EF'              RESET REPLACE INDICATION OX01981
+         TM    STAT,X'40'     TEST IF LEVEL 1
+         BCR   8,14       RETURN IF NOT (LEVEL 0 MEANS SINGLE OPRND)
+         CLI   OPD1,C'R'     TEST IF CHAR.='R'
+         BC    7,SCN10230     BR. TO ERROR IF NOT
+         OI    APT3,X'10'    PUT BIT 'STOW AS AREPLACEMENT'
+         BCR   15,14          RETURN
+SCNENTRY TM    STAT,X'40'     IS IT LEVEL 1
+         BC    1,SCN10230     BR TO ERR IF YES
+         TM    APT1,X'02'     TEST IF ENTRY CARD PREVIOUSLY RECEIVED
+         BCR   1,14           YES,RETURN
+         MVC   EPSM(8),OPD0   LAY ENTRY POINT SYMBOL INTO APT
+         OI    APT1,X'0E'     SET B6=1=ENTRY NAME BY ENTRY CARD
+*                             &  B5=1=ENTRY POINT IN SYMBOLIC
+*    B4=1=ENTRY POINT RECEIVED
+         BCR   15,14             RETURN
+SCNLIBRA TM    STAT,X'40'     IS IT LEVEL 1
+         BC    8,SCN10230     BR TO ERR IF NOT
+         TM    OPTION,X'20'   IS OPD0 ABSENT
+         BC    1,LIB110   BR IF YES
+         CLI   OPD0,C'*'   IS OPD0 *
+         BC    8,LIB080   YES
+         L     R6,INDDNMAD     GET SYSLIN DDNAME                 A47001
+         CLC   0(8,R6),OPD0    COMPARE LIBRARY DDNAME            A47001
+         BE    SCN10230        IF SAME, ERROR                    A47001
+         TM    APT0,X'80'   TEST IF NCAL(NO AUT LIB CALL) IS ON
+         BC    1,SCN10230  TO ERROR IF YES
+         OI    APT0,X'01'  SET SOME LIBRARY CARD HAS BEEN READ,'ON'
+LIB080  ST    14,SAV14L1
+         BAL  14,SCNLIBSB  TO SCN LIBR. SUBROUTINE
+         L    14,SAV14L1     RESTORE 14
+         BC   15,LIB110
+**********
+*  THE SUBROUTINE SCNLIBSB
+* LOOKS IF THE LIBRARY DDNAME IS ALREADY IN THE CESD . IF YES,USES IT.
+* IF NOT,CREATES ONE NEW LINE FOR IT
+SCNLIBSB TM    STAT,X'80'     IS OPD0 NEW
+         BCR   8,14           BR. IF NOT
+**                       MATCH OPD0 AGAINST THE CESD
+*
+         XR    13,13
+         L     15,CHESD
+LIB090   LA    13,1(13)             UPDATE LINE ID
+         LA    15,16(15)            UPDATE LINE ADDRESS
+         CLC   0(8,15),OPD0         COMPARE LINE SYMBOL TO OPD0
+         BC    8,LIB100             BR. IF EQ
+         CH    13,ENCDC       COMPARE LINE ID TO HIGHEST ID USED
+         BC    4,LIB090             TRY NXT LINE
+*                                  MATCH NOT FOUND
+**                                 GO AND GET A FREE LINE IN CESD
+LIB095   ST    14,SAV14L2
+         BAL   14,SCNHOL
+         L     14,SAV14L2
+*  FREE LINE ADDR. IS IN 15 , FREE LINE ID IS IN 13
+         MVC   0(8,15),OPD0       LAY SYMBOL OPD0 INTO THIS LINE
+         XC    14(2,15),14(15)
+         MVI   8(15),X'02'    SET TYPE ER
+          MVI   13(15),X'B0'    SET SUBTYPE DDNAME
+LIB100   CLI   8(15),X'02'    IS THE CESD MATCH A DDNAME TYPE
+         BC    7,LIB095       BR. IF NOT
+         CLI   13(15),X'B0'   IS THE CESD MATCH A DDNAME SUBTYPE
+         BC    7,LIB095       BR. IF NOT
+         STH   13,DDLINID       SAVE  DDLINE ID
+         ST    15,DDLINAD       SAVE DD LINE ADDRESS
+         BCR   15,14          RETURN OF  SCNLIBSB
+*
+*
+*
+**       MATCH  OPD1 AGAINST CESD ITEMS
+*
+LIB110  XR   13,13
+         L     15,CHESD
+LIB120   LA    13,1(13)            UPDATE LINE ID
+         LA    15,16(15)           UPDATE LINE ADDRESS
+         CLC   0(8,15),OPD1        COMPARE LINE SYMBOL TO OPD1
+         BC    8,LIB130            BR. IF EQ
+         CH    13,ENCDC       COMPARE LINE ID TO HIGHEST ID USED
+         BC    4,LIB120            TRY NXT LINE
+*                                  MATCH NOT FOUND
+         BC    15,LIB150           GO AND CREATE A LINE FOR OPD1
+LIB130   MVC   TEMP1(1),8(15)      MOVE MATCHED TYPE
+         NI    TEMP1,X'07'         MASK OUT MATCHED TYPE
+         CLI   TEMP1,X'02'         IS MATCHED TYPE AN ER
+         BC    7,LIB140            BR. IF NOT
+         CLI   13(15),X'00'      IS MATCHED SUBTYPE AN ER
+         BC    8,LIB160          BR IFYES
+         CLI   13(15),X'07'      IS MATCHED SUBTYPE A 'NEVER CALL' OR
+*                                'NO CALL' OR 'LIBRARY MEMBER (MATCHED
+*                                 OR UNMATCHED)'
+*                        (I.E.: IS SUBTYPE SMALLER THAN 7 . AT THIS
+*                         POINT WE KNOW THAT SUBTYPE GREATER THAN 1 )
+         BC    10,LIB150         BR. IF NOT
+*                   HERE,BECAUSE OF ITS MATCHING,THE CARD HAS TO BE
+*                   IGNORED
+LIB140   NI    IND1,X'7F'        RESET IND1(B0) TO 0
+         BCR   15,14             RETURN TO SCANNER
+**                            CREATE A LINE FOR OPD1
+*
+LIB150   ST    14,SAV14L1
+         BAL   14,SCNHOL      GO AND GET A FREE LINE IN THE  CESD
+         L     14,SAV14L1
+         OI    IND1,X'80'     SET IND1(B0=1) INDICATING NW LIN FOR OPD1
+         MVC   0(8,15),OPD1       PUT OPD1 IN THE NEW LINE
+         MVI   8(15),X'02'        SET ITS TYPE = ER
+LIB160   TM    OPTION,X'20'        TEST IF OPD0 ABSENT
+         BC    8,LIB180            BR. IF NOT
+         TM    IND1,X'80'         TEST IF NEW LINE WAS CREATED FOR OPD1
+         BC    1,LIB170
+         MVI   13(15),X'05'       MARK SUBTYPE 'NO CALL,MATCHED'
+         BC    15,LIB140          TOWARD RETURN
+LIB170   MVI   13(15),X'04'       MARK SUBTYPE 'NO CALL,UNMATCHED'
+         BC    15,LIB140          TOWARD RETURN
+LIB180   CLI   OPD0,C'*'          TEST IF OPD0 IS *
+         BC    8,LIB200           BR.IF YES
+         MVI   9(15),X'00'  ZEROE OUT BYTE FOR LATER BLDL INDIC.
+         TM    IND1,X'80'         TEST IF NEW LIN WAS CREATED FOR OPD1
+         BC    1,LIB190           BR. IF YES
+         MVI   13(15),X'03'       MARK SUBTYPE'MATCHED LIBRARY MBR.'
+         BC    15,LIB205
+LIB190   MVI   13(15),X'02'       MARK SUBTYPE'UNMATCHED LIBR.MBR.'
+         BC    15,LIB205
+LIB200   MVI   13(15),X'06'       MARK SUBTYPE'NEVER CALL'
+         BC    15,LIB140          TOWARD RETURN
+**             THE LINE OF OPD1 WILL BE JOINED TO THIS LIBR. CHAIN
+LIB205   LH    3,DDLINID   INITIATE THE CRRT. LINE ID OF THE CHAIN
+         L     4,DDLINAD      INITIATE THE CURRT.LIN.ADDR. OF THE CHAIN
+LIB210   OC    14(2,04),14(04)   NXT ID OF THE CHAIN =00 ?
+         BC    8,LIB220       BR. IF YES
+         LH    3,14(04)       UPDATE CURRENT LINE ID
+         LR    04,03
+         SLL   04,4           MULTIPLY ID BY 16
+         A     4,CHESD        ADD CHESD.  CURRENT LINE ADDRESS IN REG4
+         BC    15,LIB210
+LIB220   STH   13,14(04)      PUT MBR.ID IN'NEXT ID' FIELD OF CRRT.LIN.
+         XC    14(2,15),14(15)    ZERO AS NXT ID AT MEMBER LINE
+         STH   3,10(15)           PUT CRRT.ID AS PREV.ID AT MBR.ADDR.
+         BC    15,LIB140          TOWARD  RETURN
+SCNINCLU TM    OPTION,X'20'   IS OPD0 ABSENT
+         BC    1,SCN10230     BR TO ERR IF YES
+         L     R6,INDDNMAD     GET SYSLIN DDNAME                 A47001
+         CLC   0(8,R6),OPD0    COMPARE LIBRARY DDNAME            A47001
+         BE    SCN10230        IF SAME, ERROR                    A47001
+         ST    14,SAV14L1
+         OI    OPTION,X'10'  SET 'INCLUDE CARD ITEM IN PROCESS'
+         TM    STAT,X'40'       IS IT LEVEL=1
+         BC    8,INC050         BR. IF NOT
+*           SCNLIBSB LOOKS IN CESD IF DDNAME ALREADY ENTERED
+         BAL   14,SCNLIBSB      DEFINE A LINE IN CESD AS DDLIN FOR OPD0
+INC040   LA    08,INC150       PREPARE EXIT OF SUBROUTINE INC100
+         BC    15,INC100
+INC050   LA    08,INC120
+*  INC100 IS SUBROUTINE THAT ENCHAINS A NEW ITEM INTO THE INCLUDE CHAIN
+INC100   BAL   14,SCNHOL        TAKE FREE LINE IN CESD
+         L     07,INCBRKPT
+         LTR   07,07            IS 'INCLUDE BREAK POINT ADDRESS' ZERO
+          BC    7,INC110       NO
+         XC    9(3,15),9(15)    NULLIFY CHAIN ADDR. OF NEW LINE
+         BC    15,INC115
+INC110   MVC   9(3,15),9(07)    PUT THE CHAIN ADDRESS FOUND AT LINE
+*               POINTED TO BY INCBRKPT, AS CHAIN ADDR. OF THE NEW LINE
+* THIS CHAIN ADDR. CAN BE POSITIVE OR NULL(HEAD OF CHAIN)
+         ST    15,8(07)   PUT NEW LINE'S ADDR.AS CHN.ADDR.OF LINE
+         MVI   8(07),X'02'        RESTORE CRUSHED TYPE
+*                                             POINTED TO BY INCBRKPT
+INC115   ST    15,INCBRKPT        UPDATE INCBRKPT BY ADDR. OF NEW LINE
+         OC    CRRTINCL+1(3),CRRTINCL+1    IS CRRTINCL NULL
+         BC    7,INC117    BR. IF NOT
+         ST    15,CRRTINCL      INITIATE CRRTINCL
+INC117   BCR   15,08      RETURN
+INC120   MVC   0(8,15),OPD0    LAY LIBR.SYMBOL OPD0 IN THE NEW CESD LIN
+         MVI   8(15),X'02'     SET TYPE ER
+         MVI   13(15),X'C0'    SET SUBTYPE 'CONTROL INCLUDE WITHOUT
+*                              POINTER'
+         BC    15,INC160
+INC150   MVC   0(8,15),OPD1   LAY MBR.SYMBOL OPD1 IN THE NEW CESD LINE
+         MVI   8(15),X'02'    SET TYPE ER
+         MVI   13(15),X'D0'   SET SUBTYPE 'CONTROL INCL. WITH POINTER'
+         MVC   14(2,15),DDLINID   DDLINID AS THE CHAINED ID
+INC160   L     14,SAV14L1
+         BCR   15,14            RETURN TO THE SCANNER
+SCNALIAS TM    STAT,X'40'     IS IT LEVEL 1
+         BC    1,SCN10230     BR TO ERR IF YES
+         ST    R14,SAVRG14             SAV RETRN ADDR   OX04280,OY03413
+         LA    REG9,OPD0               POINT TO NAME    OX04280,OY03413
+         L     R15,ADRVLDCK            GET ADDR OF RTN  OX04280,OY03413
+         BALR  R14,R15                 GO VALIDATE NAME OX04280,OY03413
+         L     R14,SAVRG14             RES RETRN ADDR   OX04280,OY03413
+         LTR   REG9,REG9               TEST VALID NAME  OX04280,OY03413
+         BNZ   SCN10238                BRANCH IF INVAL  OX04280,OY03413
+         LH    15,ENASC       LOAD CRRT NO OF ENTRIES IN ALIAS TABLE
+         LA    15,1(15)       UPDATE IT
+         CH    15,ENASX       COMPARE IT TO MAX.NO.OF ALIASES
+         BC    12,ALI090      BR.IF 'LE'
+         LA    1,OPD0    ADDR OF ALIAS SYMBOL INTO REG 1
+         LH    0,ERR6         TOO MANY ALIASES
+         BC    15,SCN10235
+ALI090   STH   15,ENASC   STORE NEW NO. OF ALIASES
+         ST    14,SAV14L1
+         BAL   14,SCNHOL      GO AND GET A FREE LINE IN THE CESD
+         L     14,SAV14L1
+*       FREE LINE ADDR. IN 15 , FREE LINE ID IN 13
+         XC     9(3,15),9(15)   SET ZERO IN THE CHAIN ADDR OF THIS LINE
+         L     11,ALCB        TEST THE ALIAS CHAIN BEGINNING
+         LTR   11,11
+         BC    8,ALI100       BR. IF 0 .(ALIAS CHAIN DOESNT EXIST)
+         ST    11,8(15)    SLOT PREV. CHN ADDR INTO NEW ALIAS LINE
+         MVI   8(15),X'02'    RESTORE CRUSHED TYPE
+ALI100   ST    15,ALCB        SLOT FREEADDR AS ALIAS CHAIN BEG.
+         MVC   0(8,15),OPD0   LAY ALIAS SYMBOL (OPD0)INTO THE LINE
+         MVI   8(15),X'02'    SET TYPE ER
+         MVI   13(15),X'A0'   SET SUBTYPE 'CONTROL ALIAS'
+         BCR   15,14          RETURN
+SCNSETSI EQU   *
+         TM    STAT,X'40'     IS IT LEVEL 1
+         BC    1,SCN10230     BR TO ERR IF YES
+         LA    3,8    INIT CHAR SELECTION
+SETSI010 IC    SSINFO,OPD0-1(3)    TAKE CURRENT DIGIT FROM OPD0  Y01048
+         STC   SSINFO,TEST         SAVE DIGIT IN TEST            Y01048
+         LA    TREG,TRANS          INIT SCAN OF TRANS TABLE      Y01048
+         LA    15,16    COUNT FOR TRANS
+SETSI015 CLC   TEST(1),0(TREG)     CHECK CURR DIGIT VS TRANS TAB Y01048
+         BNE   SETSI050                                          Y01048
+         IC    SSINFO,1(TREG)      OBTAIN BINARY EQUIVALENT      Y01048
+         SRDL  SSINFO,4            SHIFT USEFUL INFO INTO SAVR7  Y01048
+         BCT   3,SETSI010    NEXT DIGIT
+         ST    SAVR7,SSI           STORE SSI INTO THE APT        Y01048
+         OI    APT2,X'10'   SET 'STATUS INDICATOR RECEIVED'
+         BCR   15,14    RETURN
+SETSI050 LA    TREG,2(TREG)        POINT TO NEXT ENTRY IN TABLE  Y01048
+         BCT   15,SETSI015
+         BC    15,SCN10230   TO ERROR (CHAR NOT 0-9   A-F  )
+*         *         *         *         *         *         *         *
+*                                                                     *
+*    SUBROUTINE SCNHIARC CHECKS FOR AND SAVES VALID LHN (HIERARCHY    *
+*   NUMBER).  IT THEN LOOKS IF A NAME IS ALREADY IN CESD.             *
+*          IF YES,  IT PUTS THE SAVED HN IN THE CORRESPONDING         *
+*   HIAR TABLE ENTRY                                                  *
+*           IF NO,  A LINE IS CREATED IN THE CESD--AND THIS ENTRY     *
+*    NUMBER IS USED TO PLACE THE HN.                                  *
+*                                                                     *
+*         *         *         *         *         *         *         *
+R6       EQU   6
+PTR      EQU   7                                                 Y01048
+SCNHIARC TM    NEWSW,X'04'          IS HIAR OPTION BIT ON
+         BC    8,SCN10230     NO- ERROR- CARD IGNORED
+         TM    STAT,X'40'     IS IT LEVEL 1  (NO PARENS FOR OPERANDS)
+         BC    1,SCN10230     YES- ERROR-CARD IGNORED
+         TM    OPTION,X'04'   HAS HN BEEN FOUND
+         BC    1,HIAR100      YES
+* FIND HN (HIARCHY NUMBER)
+         TM    STAT,X'02'     DID SYMBOL END WITH COMMA
+         BC    8,SCN10230     NO- ERROR- CARD IGNORED
+* IS  HN VALID
+*   NOTE -- CHECKS HAVE BEEN DONE IN A MANNER WHICH SHOULD ALLOW      *
+*            FOR CHANGE IN THE RANGE OF A VALID HN                    *
+*    ARE ALL CHARACTERS DIGITS 0-9
+         LA    PTR,OPD0       ADDRESS OF SYMBOL
+*              P2,WILL HAVE ADDR OF 1 PAST LAST BYTE OF SYMBOL
+         SR    P2,PTR         P2 = NUMBER CHARACTERS IN SYMBOL
+         LA    R6,3
+         CR    P2,R6                    IS SYMBOL MORE THAN 3 CHARACS
+         BH    SCN10230                 YES-ERROR
+         LR    R6,P2
+HIAR050  CLI   0(PTR),C'0'              IS CHARACTER BETWEEN 0 AND 9
+         BL    SCN10230                 NO- ERROR
+         CLI   0(PTR),C'9'
+         BH    SCN10230                 NO- ERROR
+         LA    PTR,1(PTR)               UPDATE ADDRESS
+         BCT   R6,HIAR050
+*  CHARACTERS ARE ALL NUMBERS-- IS THE SYMBOL EITHER 0 OR 1
+*        CONVERT TO BINARY                                            *
+         BCTR  P2,0                DECREMENT 1 FOR ESECUTE PACK
+         EX    P2,PACK
+         CVB   R6,OPD0
+         STH   R6,HN                    SAVE HIERARCHY NUMBER
+         SR    PTR,PTR
+         CR    R6,PTR                   IS HN = OR LESS THAN 0
+         BL    SCN10230                YES -- ERROR
+         BE    HIAR075
+         BCT   R6,SCN10230             IF GREATER THAN ONE -- ERROR
+HIAR075  OI    OPTION,X'04'            SET HN FOUND BIT
+         BR    14
+HIAR100  CLC   OPD0(7),COMMON    IS SYMBOL '*COMMON '
+         BNE   HIAR150
+         MVI   OPD0,C' '           YES- REPLACE SYMBOL WITH BLANKS
+         MVC   OPD0+1(7),OPD0
+         OI    OPTION,X'08'        INDICATE '*COMMON ' FOUND
+*
+* SEARCH CESD FOR IDENTICAL NAME                                      *
+*
+HIAR150  ST    R1,SAV01L1          SAVE CONTENTS REG 1
+         LA    R0,16               SET INCREMENT FOR BXLE
+         L     R15,CHESD           START OF CESD
+         LH    R1,ENCDC            NUMBER ENTRIES IN CESD
+         SLL   R1,4                NUMBER BYTES IN CESD
+         AR    R1,R15              END ADDRESS CESD (HIGH LIMIT OF BXLE
+         LA    R15,16(R15)         ADDRESS CESD ENTRY
+HIAR200  CLC   OPD0(8),0(R15)      IS SYMBOL IDENT. WITH THAT IN CESD
+          BNE   HIAR220            NO--CHECK NEXT ENTRY
+         CLI   8(R15),X'04'        YES--IS TYPE PRIVATE CODE (PC)
+         BNE   HIAR350             IF NOT PC THEN FIND CESD ID
+HIAR220  BXLE  R15,R0,HIAR200      INCREMENT CESD ADDR  END OF TABLE
+*   END OF CESD--SYMBOL NOT FOUND IN  CESD                            *
+         ST    14,SAV14L1          SAVE CONTENTS REG 14
+         BAL   14,SCNHOL           FIND FREE LINE IN CESD
+         L     14,SAV14L1          RESTORE  R14
+* FREE LINE ADDRESS IN R15, FREE LINE ID IN R13
+         MVC   0(8,R15),OPD0       PUT SYMBOL IN CESD
+         TM    OPTION,X'08'        WAS SYMBOL FOR '*COMMON '
+         BC    1,HIAR300           YES - SET TYPE TO 'CM'
+         MVI   8(R15),X'02'        MARK NEW CESD ENTRY  'ER'
+         XC    9(7,R15),9(R15)         CLEAR REMAINING BYTES     A35957
+*                                                                     *
+*  SET CORRESPONDING ENTRY IN HIAR TABLE TO HN   (USE CESD ID IN R13) *
+*                                                                     *
+HIAR250  L     PTR,HIARADD         GET ADDRESS OF HIARCHY TABLE
+         AR    PTR,R13             GET ADDRESS OF HIARCHY ENTRY
+         MVC   0(1,PTR),HN+1       PUT HN IN APPROPRIATE ENTRY IN TABLE
+         TM    STAT,X'02'          DID SYMBOL END WITH A COMMA
+         BC    1,HIAR290            YES--CONTINUE CHECKING CARD
+* IS NEXT CARD A CONTINUATION CARD- NON-BLANK IN COL72 INDICATES THIS
+         CLI   COL72,C' '          IS COL72 BLANK
+         BNE   HIAR290             NO- CONTINUATION EXPECTED
+         NI    OPTION,X'FB'        SET HN FOUND BIT = 0
+*                                  GET NEXT SYMBOL (RETURN TO SCN)
+HIAR290  L     R1,SAV01L1          RESTORE REG1
+* RETURN TO MAIN SCN RTN
+         BR    14                  RETURN
+*                                                                     *
+HIAR300  MVI   8(R15),X'05'        MARK CESD ENTRY 'CM'
+         MVC   12(1,R15),CSNO+1    ENTER SEGMENT NUMBER
+         NI    OPTION,X'F7'        TURN OFF COMMON SWITCH
+         B     HIAR250
+*  FIND CESD ID
+HIAR350  S     R15,CHESD           REL. ADDRESS OF CESD ENTRY
+         SRL   R15,4               CESD ID  (DIVIDE BY 16)
+         LR    R13,R15             PUT ID IN R13
+         B     HIAR250
+*
+*    SCNSTCOD--SCANS SETCODE STATEMENT AND IF IT IS VALID THE    Y01048
+*              AUTHORIZATION CODE IS PLACED IN THE APT IN THE    Y01048
+*              FIELD WHICH WILL EVENTUALLY BE PLACED IN THE PDS  Y01048
+*                                                                Y01048
+*              WORK REGISTERS ARE RX AND RY                      Y01048
+*                                                                Y01048
+SCNSTCOD DS    0H                                                Y01048
+         TM    OPTION,X'20'       OPD0 PRESENT                   Y01048
+         BO    SCN10230           NO - ERROR                     Y01048
+         TM    STAT,X'C0'         TWO OPERANDS?                  Y01048
+         BNO   SCN10230           NO - ERROR                     Y01048
+         CLC   AC,OPD0            DOES OPD0='AC'?                Y01048
+         BNE   SCN10230           NO - ERROR                     Y01048
+         LA    RX,OPD1            CHECK FOR VALID DIGITS         Y01048
+         LA    RY,8                                              Y01048
+SCNSTC20 EQU   *                                                 Y01048
+         CLI   0(RX),BLANK        IS THIS END OF FIELD?          Y01048
+         BE    SCNSTC50           YES, BRANCH                    Y01048
+         TM    0(RX),NUMBER       IS THIS A DIGIT?               Y01048
+         BNO   SCN10230           NO - ERROR                     Y01048
+         LA    RX,1(RX)           BUMP TO NEXT DIGIT             Y01048
+         BCT   RY,SCNSTC20        SCAN TILL MAX OF 8 DIGITS      Y01048
+SCNSTC50 EQU   *                                                 Y01048
+         BCTR  RX,0               SUBTRACT 1 FROM END ADDR       Y01048
+         LA    RY,OPD1            GET START ADDR                 Y01048
+         SR    RX,RY              RX HAS MACHINE LGTH OF NUM     Y01048
+         XC    OPD0(8),OPD0       USE OPD0 AS WORK SPACE         Y01048
+         EX    RX,PACK1           PACK DIGIT                     Y01048
+         CVB   RX,OPD0            CONVERT TO BINARY              Y01048
+         LA    RY,K255            GET MAX VALUE                  Y01048
+         CR    RX,RY              COMPARE REAL TO MAX            Y01048
+         BH    SCN10230           IF TOO BIG - ERROR             Y01048
+         STC   RX,PDSAPFAC        SAVE LATEST CODE FOR NOW       Y01048
+         BR    R14                RETURN                         Y01048
+*
+TRANS   DC    CL1'0'
+         DC    XL1'00'
+        DC    CL1'1'
+         DC    XL1'01'
+        DC    CL1'2'
+         DC    XL1'02'
+        DC    CL1'3'
+         DC    XL1'03'
+        DC    CL1'4'
+         DC    XL1'04'
+        DC    CL1'5'
+         DC    XL1'05'
+        DC    CL1'6'
+         DC    XL1'06'
+        DC    CL1'7'
+         DC    XL1'07'
+        DC    CL1'8'
+         DC    XL1'08'
+        DC    CL1'9'
+         DC    XL1'09'
+        DC    CL1'A'
+         DC    XL1'0A'
+        DC    CL1'B'
+         DC    XL1'0B'
+        DC    CL1'C'
+         DC    XL1'0C'
+        DC    CL1'D'
+         DC    XL1'0D'
+        DC    CL1'E'
+         DC    XL1'0E'
+        DC    CL1'F'
+         DC    XL1'0F'
+         DS    0F
+SAVR     DS    CL64
+SAV14L1  DS    1F
+SAV14L2  DS    1F
+OPD0     DS    1D
+OPD1     DS    1D
+PROCENTY DS    1F             SAVE AREA FOR THE PROCESSOR ENTRY POINT
+SAVACOL  DS    1F           SAVE AREA FOR ADDR. OF COL72
+DDLINAD  DS    1F
+SAV01L1  DS    1F
+         DS    0F
+SPECSTR  DS    H                       FLAG AND COUNT FOR SPEC.  S21016
+*                                      STRINGS (LEV.1 OPERANDS   S21016
+*                                      OF IDENTIFY CONTROL       S21016
+*                                      STATEMENT) FLAG IS IN     S21016
+*                                      HI ORDER BIT OF HALFWORD  S21016
+IDRSTRNG DS    CL40                    STRING OF IDR DATA        S21016
+*                                      SPECIFIED ON AN IDENTIFY  S21016
+*                                      CONTROL STATEMENT         S21016
+*                                      (LEVEL 1 OPERAND)         S21016
+SAVRG1   DS    F                       SAVE REG.1 WHILE          S21016
+*                                      PROCESSING IDENTIFY CARD  S21016
+SAVRG13  DS    F                       SAVE REG.13 WHILE         S21016
+*                                      PROCESSING IDENTIFY CARD  S21016
+SAVRG14  DS    F                       SAVE REG.14 WHILE         S21016
+*                                      PROCESSING IDENTIFY CARD  S21016
+LCLSAVE  DS    18F                     LOCAL SAVE AREA           S21016
+INCLBRAD DC    V(HEWLFINC)
+ADRVLDCK DC    V(HEWVLDCK)             ADR VLD CK RTN   OX04280,OY03413
+REGION   DC    C'REGION  '
+        DS     0F
+MXNOREG  DC    X'0003'   4 REGIONS ALLOWED.FIRST REGION IS REGION 0
+ERR1     DC    AL2(ERR1LTL)
+ERR2     DC    AL2(ERR2LTL)
+ERR3     DC    AL2(ERR3LTL)
+ERR4     DC    AL2(ERR4LTL)
+ERR6     DC    AL2(ERR6LTL)
+ERR8     DC    AL2(ERR8LTL)                                      A37667
+ERR10    DC    AL2(ERR10LTL)
+INDDNMAD DC    A(INDDNAME)                                       A47001
+CIDRADD  DC    V(HEWLCIDR)             IDR PROCESSOR -- ENTRY    S21016
+*                                      POINT FOR PROCESSING      S21016
+*                                      DATA FROM AN IDENTIFY     S21016
+*                                      CONTROL STATEMENT         S21016
+SPSTRLEN DC    AL2(SPECMAX)            COUNTER VALUE FOR MAX.    S21016
+*                                      LENGTH OF SPEC. STRINGS   S21016
+ENASX    DC    H'16'    MAX. NO. OF ENTRIES IN ALIAS TABLE (HAS...
+*    TO BE SMALLER THAN OR EQUAL TO THE MAX. NO. OF ENTRIES IN ...
+*   THE ALIAS TABLE CREATED BY ADDRESS ASSIGNMENT )
+CONS    DC   X'00B7'
+DDLINID   DS    1H       ID OF DD LINE FOR LIBRARY OR INCLUDE
+STAT     DC    X'00'     STATUS BYTE FOR THE SCANNER
+***  MEANING OF THE BITS IN STAT  IS :
+***  B0     'OPD0 NEW'   THE OPERAND OF LEVEL 0 IS NEW (WHEN B0=1)
+***  B1     'LEVEL 1 '   THE LEVEL OF THE LAST OPERAND IS 1 (WHEN B1=1)
+***  B2     'CONTIN'   CONTINUATION BIT SET WHEN A CARD HAS THE CONTI-
+**                    -NUATION CONDITION . USED AT THE FOLLOWING CARD
+***  B3     'COMMENT'   THE CONTINUATION CONDITION OF THE PRESENT CARD
+***                     APPLIES TO A COMMENT. NEXT CARD WILL BE A
+***                     COMMENT CARD
+***  B4     'END BY )'  THE LAST ALPHANUMERIC STRING IS FOLLOWED BY )
+***  B5     'END BY ('  THE LAST ALPHANUMERIC STRING IS FOLLOWED BY (
+***  B6     'END BY ,'      LAST ALPHAMERIC STRING IS FOLLOWED BY COMMA
+***  B7     'END BY BLANK'  LAST ALPHAMERIC STRING IS FOLLOWED BY BLANK
+OPTION   DC    X'00'      BYTE OF INDICATORE
+*                                                                     *
+*  VALUE = 1   BIT 0    STRING EXPECTED TO BEGIN WITH BLANKS
+*  VALUE = 1   BIT 1    INDICATES AT LEAST ONE VALID CHARACTER FOUND  *
+*  VALUE = 1   BIT 2    MEANS OPD0 ABSENT                             *
+*  VALUE = 1   BIT 3    PROCESSED AN INCLUDE CARD                     *
+*  VALUE = 1   BIT 4    SYMBOL IS '*COMMON '                          *
+*  VALUE = 1   BIT 5    THE HN (HIARCHY NUMBER) HAS BEEN FOUND        *
+*  VALUE = 1   BIT 6    STRING MAY CONTAIN BLANKS AND SPECIAL  S21016 *
+*                       CHARACTERS BETWEEN APOSTROPHES AND/OR  S21016 *
+*                       MAY BE UP TO 40 CHARACTERS IN LENGTH   S21016 *
+OLDSTAT  DC    X'00' OLD STATUS BYTE FOR THE SCANNER
+STATREPL DC    XL1'00'
+*                         B0=0='ENTERED BY CHANGE'
+COL72    DC    X'00' SAVE AREA FOR CHARACTER OF COLUMN 72
+TEMP1    DC    X'00'
+         DS    50F
+HN       DC    H'00'              HIERARCHY NUMBER
+COMMON   DC    C'*COMMON '
+PACK     PACK  OPD0(8),OPD0(0)
+TEST     EQU   TEMP1
+IND1     DC    X'00'
+PREVSEG  DC    X'00'
+BLANK    EQU   C' '               BLANK                          Y01048
+NUMBER   EQU   X'F0'              ZONE FOR DIGITS                Y01048
+K255     EQU   255                MAX AUTH CODE                  Y01048
+PACK1    PACK  OPD0(8),OPD1(0)    PACK AUTH CODE                 Y01048
+AC       DC    CL8'AC      '      KEY WORD FOR AUTH CODE         Y01048
+         EJECT
+***********************************************************************
+*                                                                     *
+*                  SUB-PROGRAM SCNIDENT PROCESSES                     *
+*                  USER-SUPPLIED IDR DATA FROM THE                    *
+*                  IDENTIFY CONTROL STATEMENT                         *
+*                                                              S21016 *
+***********************************************************************
+         SPACE 2                                                 S21016
+SCNIDENT TM    STAT,LEVEL1             TEST IF LEV.1 OPRND FOUND S21016
+         BNO   SCN10230                IF NOT, BRANCH TO ERROR   S21016
+         TM    OPTION,NOLEV0           TEST IF PREVIOUS OPERAND  S21016
+*                                      WAS LEVEL 0               S21016
+         BO    SCN10230                IF NOT, BRANCH TO ERROR   S21016
+         NC    SPECSTR(2),SPECSTR      ANY VALID REC'D  XA05437,ZM30869
+         BZ    SCN10230                BR IF NOT TO ERR XA05437,ZM30869
+         ST    R1,SAVRG1               SAVE REG.1 CONTENTS       S21016
+         LA    R1,PARMLIST             POINT REG.1 TO PARAMETER  S21016
+*                                      LIST TO BE PASSED TO      S21016
+*                                      IDR PROCESSOR             S21016
+         STM   SAPTR,R14,SAVRG13       SAVE REG.13 CONTENTS      S21016
+*                                      AND RETURN ADDR.          S21016
+         LA    SAPTR,LCLSAVE           POINT TO LOCAL SAVE AREA  S21016
+         L     R15,CIDRADD             GET ADDRESS OF IDR        S21016
+*                                      PROCESSOR                 S21016
+         BALR  R14,R15                 GO TO IDR PROCESSOR       S21016
+*                                                                S21016
+*                                      RETURN FROM IDR PROCESSOR S21016
+         LM    SAPTR,R14,SAVRG13       RESTORE REG.13 CONTENTS   S21016
+*                                      AND RETURN ADDR.          S21016
+         L     R1,SAVRG1               RESTORE REG.1 CONTENTS    S21016
+         BR    R14                     RETURN TO CONTINUE        S21016
+*                                      SCANNING                  S21016
+PARMLIST DS    0F                      PARAMETER LIST FOR IDR    S21016
+*                                      MODULE                    S21016
+IDNTSECT DC    A(OPD0)                 ADDR. OF CSECT NAME (LEV. S21016
+*                                      0 OPRND OF IDENTIFY CARD) S21016
+IDNTLEN  DC    A(SPECSTR)              ADDR. OF LENGTH OF IDR    S21016
+*                                      DATA FROM IDENTIFY CARD   S21016
+IDNTSTR  DC    A(IDRSTRNG)             ADDR. OF IDR DATA FROM    S21016
+*                                      IDENTIFY CARD (LEVEL 1    S21016
+*                                      OPERAND)                  S21016
+         EJECT
+**********************************************************************
+*                                                                    *
+*        SUB-PROGRAM SCNEXPND CALLS HEWLFRAT TO ADD PATCH TEXT       *
+*        TO THE END OF CONTROL SECTIONS SPECIFIED ON EXPAND          *
+*        CONTROL STATEMENTS.  IF A NAMED COMMON SECTION IS           *
+*        SPECIFIED ON AN EXPAND CARD, ITS LENGTH IS INCREASED        *
+*        IN THE CESD.                                                *
+*                                                                    *
+*              RX AND RY ARE USED AS WORK REGISTERS.                 *
+*                                                                    *
+*                                                             Y01031 *
+**********************************************************************
+         SPACE 2                                                 Y01031
+SCNEXPND TM    STAT,LEVEL1             TEST IF LEV.1 OPRND FOUND Y01031
+         BNO   SCN10230                IF NOT, BRANCH TO ERROR   Y01031
+         TM    OPTION,NOLEV0           TEST IF PREVIOUS OPERAND  Y01031
+*                                      WAS LEVEL 0               Y01031
+         BO    SCN10230                IF NOT, BRANCH TO ERROR   Y01031
+         LA    RX,OPD1                 CHECK FOR VALID DIGITS    Y01031
+         LA    RY,8                    IN THE LEVEL 1 OPERAND    Y01031
+SCNXPD10 EQU   *                                                 Y01031
+         CLI   0(RX),BLANK             IS THIS END OF FIELD?     Y01031
+         BE    SCNXPD20                YES, BRANCH               Y01031
+         TM    0(RX),NUMBER            IS THIS A DIGIT?          Y01031
+         BNO   SCN10230                NO - ERROR                Y01031
+         LA    RX,1(RX)                BUMP TO NEXT DIGIT        Y01031
+         BCT   RY,SCNXPD10             SCAN TILL MAX OF 8 DIGITS Y01031
+SCNXPD20 EQU   *                                                 Y01031
+         BCTR  RX,0                    SUBTRACT 1 FROM END ADDR  Y01031
+         LA    RY,OPD1                 GET START ADDR            Y01031
+         SR    RX,RY                   RX HAS MACH. LGTH OF NUM  Y01031
+         MVC   XPDSECT,OPD0            MOVE SECTION NAME         Y01031
+         XC    OPD0(8),OPD0            USE OPD0 AS WORK SPACE    Y01031
+         EX    RX,PACK1                PACK DIGIT                Y01031
+         CVB   RX,OPD0                 CONVERT TO BINARY         Y01031
+         LA    RY,K4095                GET MAX VALUE             Y01031
+         CR    RX,RY                   COMPARE REAL TO MAX       Y01031
+         BNH   SCNXPD30                IF < OR =, BRANCH         Y01031
+         LR    RX,RY                   IF TOO BIG, TAKE MAX      Y01031
+SCNXPD30 EQU   *                                                 Y01031
+         STH   RX,XPDLEN               STORE LENGTH OF EXPANSION Y01031
+*
+*              SEARCH CESD FOR CSECT NAME TO BE EXPANDED         Y01031
+*
+         L     RX,CHESD                GET ADDR. OF CESD-16      Y01031
+         LA    RX,CESDWTH(RX)          GET ADDR. OF 1ST LINE     Y01031
+         LH    RY,ENCDC                GET NO. LINES IN CESD     Y01031
+         LTR   RY,RY                   IS CESD SIZE ZERO?       OX03080
+         BZ    SCN10230                ERROR IF NO CESD ENTRIES OX03080
+         SLL   RY,FOUR                 MULTIPLY BY 16            Y01031
+         AR    RY,RX                   GET ADDR. OF END OF CESD  Y01031
+SCNXPD40 CLC   XPDSECT(LEN8),DISP0(RX) IS THIS THE CSECT?        Y01031
+         BNE   SCNXPD50                IF NOT, BRANCH            Y01031
+         TM    CESDTYPE(RX),SECTION    IS IT SD, PC OR CM?       Y01031
+         BZ    SCNXPD60                IF SO,BRANCH              Y01031
+SCNXPD50 LA    RX,CESDWTH(RX)          UPDATE TO NEXT LINE       Y01031
+         CR    RX,RY                   END OF THE CESD?          Y01031
+         BE    SCN10230                IF SO, IT IS AN ERROR     Y01031
+         B     SCNXPD40                IF NOT, TEST NEXT LINE    Y01031
+SCNXPD60 TM    CESDTYPE(RX),DELETE     IS IT MARKED DELETE?      Y01031
+         BO    SCNXPD50                IF SO, CONTINUE SEARCH    Y01031
+         L     RY,LENGTH(RX)           GET LENGTH OF SECTION     Y01031
+         LA    RY,DISP0(RY)            CLEAR HIGH-ORDER BYTE     Y01031
+         ST    RY,SAVELEN              SAVE UNEXPANDED LENGTH    Y01031
+         AH    RY,XPDLEN               ADD EXPAND LENGTH         Y01031
+         LA    RY,RNDUP(RY)            ADD 7 TO LENGTH           Y01031
+         N     RY,DBLWD                ROUND TO DOUBLE WORD      Y01031
+         ST    RY,TMPLEN               SAVE EXPANDED LENGTH      Y01031
+         S     RY,SAVELEN              CALC TRUE EXPAND LENGTH  ZA01400
+         STH   RY,XPDLEN               SAVE TRUE EXPAND LENGTH  ZA01400
+         A     RY,SAVELEN              RESTORE EXPANDED LENGTH  ZA01400
+         MVC   LENGTH+1(LEN3,RX),TMPLEN+1  UPDATE CESD LENGTH    Y01031
+         TM    CESDTYPE(RX),COMSCT     IS IT A COMMON SECTION?   Y01031
+         BNO   SCNXPD70                IF NOT, PROCESS AS AN SD  Y01031
+         MVC   CMNAME,XPDSECT          MOVE CM NAME TO MESSAGE   Y01031
+         UNPK  CMLEN(LEN5),XPDLEN(LEN3)  GET EXPAND LENGTH       Y01031
+         NC    CMLEN(LEN4),ZONE        TURN OFF ZONE BITS        Y01031
+         TR    CMLEN(LEN4),TRTAB       MAKE IT PRINTABLE         Y01031
+         MVI   CMLEN+4,BLANK           CLEAR SIGN BYTE           Y01031
+         ST    R1,SAVEONE              SAVE REGISTER ONE         Y01031
+         LA    R1,XCMMSG               POINT TO THE MESSAGE      Y01031
+         B     SCNXPD80                GO TO PRINT IT            Y01031
+SCNXPD70 S     RX,CHESD                GET OFFSET TO CESD LINE   Y01031
+         SRL   RX,FOUR                 DIVIDE BY 16 TO GET ESDID Y01031
+         STH   RX,XPDID                SAVE CESDID               Y01031
+         STM   R0,R15,SAVERGS          SAVE REGS. 0 THRU 15      Y01031
+         L     R3,SAVELEN              ADDR. OF TEXT FOR RAT     Y01031
+         L     R4,TMPLEN               GET EXPANDED CSECT LENGTH Y01031
+         SR    R4,R3                   SUBTRACT OLD LNGTH TO GET Y01031
+*                                      LENGTH OF TEXT FOR RAT    Y01031
+         SR    R6,R6                   NO ID-LEN LIST PASSED     Y01031
+         OI    APTSW3,XPDIND           INDICATE EXPAND ACTIVE    Y01031
+         OI    APT0,TXTIND             INDICATE TEXT PROCESSING  Y01031
+         OI    APT1,LMIND              INDICATE LOAD MODULE      Y01031
+         L     R15,XPDTXTAD            GET EPA OF HEWLFRAT       Y01031
+         LA    R13,REGSA               POINT TO SAVE AREA        Y01031
+         ST    BASE,TMPBASE1           SAVE 1ST BASE REGISTER    Y01031
+         ST    BASE2,TMPBASE2          SAVE 2ND BASE REGISTER    Y01031
+         LR    R5,RX                   CESDID OF TEXT FOR RAT    Y01031
+         CNOP  2,4                     INSURE FULLWORD ALIGNMENT Y01031
+*                                      FOR RETURN ADDR FROM BALR Y01031
+         BALR  R14,R15                 LINK TO TXT EXPAND RTN    Y01031
+         B     DISP12(R15)             BRANCH AROUND SAVE AREA   Y01031
+TMPBASE1 DS    1F                      SAVE AREA FOR 1ST BASEREG Y01031
+TMPBASE2 DS    1F                      SAVE AREA FOR 2ND BASEREG Y01031
+         L     BASE,DISP4(R15)         RESTORE 1ST BASE REGISTER Y01031
+         L     BASE2,DISP8(R15)        RESTORE 2ND BASE REGISTER Y01031
+         NI    APTSW3,XPDOFF           TURN OFF EXPAND ACTIVE    Y01031
+         NI    APT0,TXTOFF             TURN OFF TEXT PROCESSING  Y01031
+         NI    APT1,LMOFF              TURN OFF LOAD MODULE      Y01031
+         LM    R0,R15,SAVERGS          RESTORE REGS. 0 THRU 15   Y01031
+         MVC   SDNAME,XPDSECT          MOVE CSECT NAME TO MSG    Y01031
+         UNPK  SDLEN(LEN5),XPDLEN(LEN3)  GET EXPAND LENGTH       Y01031
+         NC    SDLEN(LEN4),ZONE        TURN OFF ZONE BITS        Y01031
+         TR    SDLEN(LEN4),TRTAB       MAKE IT PRINTABLE         Y01031
+         MVI   SDLEN+4,BLANK           CLEAR SIGN BYTE           Y01031
+         UNPK  SDLOC(LEN7),SAVELEN+1(LEN4)  GET EXPAND OFFSET    Y01031
+         NC    SDLOC(LEN6),ZONE        TURN OFF ZONE BITS        Y01031
+         TR    SDLOC(LEN6),TRTAB       MAKE IT PRINTABLE         Y01031
+         MVI   SDLOC+6,PERIOD          CLEAR SIGN BYTE           Y01031
+         ST    R1,SAVEONE              SAVE REGISTER ONE         Y01031
+         LA    R1,XSDMSG               POINT TO THE MESSAGE      Y01031
+SCNXPD80 STM   R13,R15,SAVDEF          SAVE REGS. 13,14 & 15     Y01031
+         L     R15,ERDIG               GET EPA OF LOG ROUTINE    Y01031
+         ST    R0,SAVEZERO             SAVE REGISTER ZERO        Y01031
+         LH    R0,XPDMSG               LOAD MESSAGE CODE         Y01031
+         OI    IDRSWS,IDRMSG           INDICATE R1 -> MSG LINE   Y01031
+         BALR  R14,R15                 LINK TO MESSAGE LOG RTN   Y01031
+         LM    R13,R15,SAVDEF          RESTORE REGS. 13,14 & 15  Y01031
+         LM    R0,R1,SAVEZERO          RESTORE REGISTERS 0 & 1   Y01031
+         NI    IDRSWS,MSGOFF           TURN OFF SPECIAL MSG IND. Y01031
+         BR    R14                     RETURN TO MAIN LINE       Y01031
+XPDSECT  DS    CL8                     CSECT NAME FOR EXPAND     Y01031
+XPDTXTAD DC    V(HEWLFRAT)             EP ADDR. OF FRAT FOR      Y01031
+*                                      TEXT EXPANSION            Y01031
+SAVERGS  DS    16F                     SAVE REGS. 0 THRU 15      Y01031
+SAVDEF   EQU   SAVERGS+52              SAVE REGS. 13 THRU 15     Y01031
+SAVEZERO DS    2F                      SAVE REGISTER ZERO        Y01031
+SAVEONE  EQU   SAVEZERO+4              SAVE REGISTER ONE         Y01031
+SAVELEN  DC    F'0'                    SAVE UNEXPANDED SD LENGTH Y01031
+TMPLEN   DC    F'0'                    SAVE EXPANDED CM LENGTH   Y01031
+XCMMSG   DS    0F                      MSG LINE FOR A COMMON     Y01031
+CMLEN    DS    CL5                     NO. OF BYTES ADDED        Y01031
+         DC    C'BYTES HAVE BEEN ADDED TO COMMON SECT.'     MSG  Y01031
+CMNAME   DS    CL8                     COMMON NAME               Y01031
+         DC    C'.'                    MSG TEXT                  Y01031
+         DC    26C' '                  MSG TEXT                  Y01031
+XSDMSG   DS    0F                      MSG LINE FOR A CSECT      Y01031
+SDLEN    DS    CL5                     NO. OF BYTES ADDED        Y01031
+         DC    C'BYTES HAVE BEEN ADDED TO CONTROL SECT.'  MSG    Z01418
+SDNAME   DS    CL8                     CSECT NAME                Y01031
+         DC    C' AT OFFSET '          MSG TEXT                  Y01031
+SDLOC    DS    CL7                     CSECT OFFSET FOR EXPAND   Y01031
+         DC    8C' '                   MSG TEXT                  Y01031
+PERIOD   EQU   C'.'                    MSG TEXT                  Y01031
+         DS    0H                      HALF-WORD ALIGNMENT       Y01031
+XPDMSG   DC    X'104A'                 EXPAND SUCCESS MESSAGE    Y01031
+XPDLEN   DC    H'0'                    LENGTH FOR AN EXPAND      Y01031
+XPDID    DC    H'0'                    CESDID FOR AN EXPAND      Y01031
+ZONE     DC    X'0F0F0F0F0F0F'         MASK TO TURN OFF ZONE     Y01031
+*                                      BITS AFTER UNPACK         Y01031
+TRTAB    DC    C'0123456789ABCDEF'     TRANSLATION TABLE         Y01031
+DBLWD    DS    0F                      MASK TO ROUND LENGTH      Y01031
+         DC    X'FFFFFFF8'             TO A DOUBLE WORD          Y01031
+RNDUP    EQU   7                       ADD-ON TO INSURE ROUNDING Y01031
+*                                      UP AND NOT DOWN           Y01031
+K4095    EQU   4095                    MAX.LENGTH FOR EXPAND     Y01031
+FOUR     EQU   4                       SHIFT LENGTH OF 4 BITS    Y01031
+CESDWTH  EQU   8                       WIDTH OF A  CESD LINE     Y01031
+LEN3     EQU   3                       LENGTH OF 3 BYTES         Y01031
+LEN4     EQU   4                       LENGTH OF 4 BYTES         Y01031
+LEN5     EQU   5                       LENGTH OF 5 BYTES         Y01031
+LEN6     EQU   6                       LENGTH OF 6 BYTES         Y01031
+LEN7     EQU   7                       LENGTH OF 7 BYTES         Y01031
+LEN8     EQU   8                       LENGTH OF 8 BYTES         Y01031
+DISP0    EQU   0                       DISPLACEMENT OF ZERO      Y01031
+DISP4    EQU   4                       DISPLACEMENT OF 4 BYTES   Y01031
+DISP8    EQU   8                       DISPLACEMENT OF 8 BYTES   Y01031
+DISP12   EQU   12                      DISPLACEMENT OF 12 BYTES  Y01031
+R4       EQU   4                       REGISTER 4                Y01031
+R5       EQU   5                       REGISTER 5                Y01031
+CESDTYPE EQU   8                       DISPLACEMENT TO TYPE      Y01031
+*                                      FIELD IN A CESD LINE      Y01031
+LENGTH   EQU   12                      DISPLACEMENT TO LENGTH    Y01031
+*                                      FIELD IN A CESD LINE      Y01031
+SECTION  EQU   X'02'                   MASK TO TEST FOR ALL      Y01031
+*                                      CESD TYPES OTHER THAN     Y01031
+*                                      SD, PC OR CM              Y01031
+COMSCT   EQU   X'05'                   MASK TO TEST FOR A CM     Y01031
+DELETE   EQU   X'10'                   MASK FOR CESD DELETE BIT  Y01031
+IDRMSG   EQU   X'20'                   MASK TO LOG XPD MSG       Y01031
+MSGOFF   EQU   X'DF'                   MASK TO RESET MSG SWITCH  Y01031
+XPDIND   EQU   X'80'                   MASK TO SET XPAND SWITCH  Y01031
+TXTIND   EQU   X'02'                   MASK TO SET TEXT SWITCH   Y01031
+LMIND    EQU   X'20'                   MASK TO SET LOAD MOD SWCH Y01031
+XPDOFF   EQU   X'7F'                   TO RESET XPAND SWITCH     Y01031
+TXTOFF   EQU   X'FD'                   TO RESET TEXT SWITCH      Y01031
+LMOFF    EQU   X'DF'                   TO RESET LOAD MOD SWCH    Y01031
+         HEWAPT
+         END

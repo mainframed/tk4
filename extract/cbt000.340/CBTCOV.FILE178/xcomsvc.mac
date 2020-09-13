@@ -1,0 +1,744 @@
+*          DATA SET SR301000   AT LEVEL 010 AS OF 03/14/78
+SVC206   TITLE 'IGC0020F -- CROSS-MEMORY COMMUNICATION SVC'
+*
+*              PGM-ID. SR301000 ALIAS IGC0020F.
+*              AUTHOR. FRED D. BRISARD.
+*              DATE.   02/24/78.
+*              REMARKS.CROSS MEMORY COMMUNICATIONS SVC.
+*              NOTES.
+*                1.  SEE AM013700 ALIAS XCOM FOR MACRO INTERFACE.
+*                2.  SEE SR302000 FOR CALL INTERFACE.
+*                3.  SEE SR303000 FOR CALL SUPPORT ROUTINE.
+*                4.  SEE SR304000 FOR BATCH ECHO TESTER.
+*                5.  SEE SR305000 ALIAS XCOM FOR TSO DRIVER.
+*              MAINTENANCE.
+*
+*              REV1 03/08/78 DSH - FIXES AND CHANGES AS FOLOWS.
+*
+*                1.  FIX BUG IN TRM WHICH CAUSED LAST PCB TO BE
+*                    CHAINED TO ITSELF.
+*                2.  CHANGE LENGTH OF MESSAGE TO 2012.
+*                3.  FIX BUG IN ENQ/DEQ WHICH DISTROYED COMMON
+*                    REGISTER SAVE AREA IN XCVT.  WAITING TASK
+*                    RELOADS OWNER TASK REGISTERS (0C4, ETC.)
+*                4.  DON'T ISSUE DEQ IF CRITICAL STORAGE OCCURS.
+*
+*              REV2 03/09/78 DSH - FIXES AND CHANGES AS FOLLOWS.
+*
+*                1.  FIX BUG DUE TO NOT SAVING R15 ACROSS DEQ.
+*                2.  ADD XCVT FIELDS TO CONTROL MAXIMUM
+*                    RECORDS TO BE QUEUED IN CSA.
+*                    A.  VTRCUR - CURRENT RECORDS IN CSA
+*                    B.  VTRMAX - MAXIMUM RECORDS ALLOWED
+*                    C.  VTRTOT - TOTAL RECORDS PUT IN CSA SINCE IPL
+*                3.  ADD SVC COMMAND OPTION TO RESET VTRMAX
+*
+*              REV3 03/13/78 DSH - FIX BUG IN XMPOST PCB DELETE
+*
+         SPACE 5
+         MACRO
+&L       PM    &RTN
+&L       BAL   $LINK,&RTN
+         MEND
+         MACRO
+&L       PENTRY
+&L       DS    0H
+         MEND
+         MACRO
+&L       PEXIT
+&L       BR    $LINK
+         MEND
+         EJECT
+         SPACE 5
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+*
+*                         I G C 0 0 2 0 F
+*
+*  THIS SVC IS USED TO MAINTAIN A SET OF CONTROL BLOCKS IN CSA
+*  FOR INTER-ADDRESS SPACE COMMUNICATION.  THE FACILITY IS
+*  A GENERALIZED LOGICAL ONE WHICH ALLOWS FOR MULTIPLE GROUPS
+*  OF MESSAGES TO BE STORED IN CSA TEMPORARILY FOR MANY
+*  ADDRESS SPACES.  THE INFORMATION STORED MUST BE STORED
+*  IN MESSAGE BLOCKS WHICH ARE &TEXTLTH LONG; THERE IS NO
+*  RESTRICTION ON WHAT CAN BE PLACED IN THEM.
+*
+*  COMPLETE DOCUMENTATION ON THE USE OF THIS FACILITY MAY BE
+*  FOUND IN THE DOCUMENT ON THE CROSS-MEMORY COMMUNICATION
+*  FACILITY.
+*
+*  BY    FRED D BRISARD
+*        FLORIDA POWER CORPORATION
+*        ST PETERSBURG, FLORIDA
+*        13 FEBRUARY 1978
+*
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+         EJECT
+*
+*        MAIN ENTRY POINT
+*              SET UP ADDRESSIBILITY, LOCATE THE XCVT OR BUILD ONE IF
+*              THIS IS THE FIRST TIME, BRANCH TO THE CORRECT PROCESSING
+*              ROUTINE.
+*              THIS ROUTINE ALSO ACQUIRES AN ENQ ON MAJOR NAME OF XCOM
+*              AND A MINOR OF CTL.BLOCKS.  BEWARE OF THE POSSIBILITY
+*              OF AN ENQ LOCK IF THE SVC FAILS WHILE ENQUED.
+*
+         SPACE 2
+IGC0020F CSECT
+*
+*   GLOBAL DEFINITIONS
+*
+         GBLA  &TEXTLTH,&MGBSZ,&XCVTSZ,&RMAX
+         SPACE 1
+&TEXTLTH SETA  2012               MESSAGE TEXT LENGTH  (MUST BE < 4096)
+&MGBSZ   SETA  16                 MESSAGE GROUP BLOCK SIZE (K-CORE)
+&XCVTSZ  SETA  8                  XCVT SIZE (K-CORE) (CONTAINS MHB/PCB)
+&RMAX    SETA  500                DEFAULT MAX RECORDS QUEUED IN CSA
+         SPACE 2
+*
+*   RETURN CODE VALUES
+*
+OK       EQU   0
+LOGERR   EQU   4                  LOGICAL ERROR WITHIN A ROUTINE
+PRMERR   EQU   8                  INPUT PARAMETER ERROR
+CRITSTOR EQU   12                 CRITICAL STORAGE ERROR
+CRITUCVT EQU   16                 UCVT NOT ALREADY BUILT
+CRITPOST EQU   20                 ERROR DURING POST PROCESSING
+*
+*   HOUSEKEEPING
+*
+         USING IGC0020F,$BASE     SVC ADDRESSIBILITY
+         USING ASCB,$ASCB         ASCB ADDRESSIBILITY
+         USING CVTMAP,$CVT        CVT ADDRESSIBILITY
+         USING PCBDSECT,$PCB      PCB ADDRESSIBILITY
+         USING MGBDSECT,$MGB      MGB ADDRESSIBILITY
+         USING MHBDSECT,$MHB      MHB ADDRESSIBILITY
+         USING MEDSECT,$ME        ME ADDRESSIBILITY
+         SPACE 2
+         LR    $PARM,R1           SET INPUT PARAMETER
+         USING XCOMPARM,$PARM       ADDRESSIBILITY
+*
+*   PARAMETER VALIDATION ROUTINE....0C4 HERE IF BAD PARMS
+*
+         L     R0,PARMPID         FIRST WORD OF PARM
+         L     R0,PARMRPLY        LAST WORD OF PARM
+         IF    (TM,PARMFUNC,FUNCGET+FUNCPUT+FUNCDEF,NZ)
+               L     R1,PARMECB         ECB/MSG ADDRESS
+               L     R0,0(,R1)          ECB OR FIRST 4 BYTES OF MSG
+         FI
+         IF    (TM,PARMFUNC,FUNCGET+FUNCPUT,NZ)   IF GET OR PUT
+               IC    R0,&TEXTLTH-1(,R1)  CHECK LAST BYTE OF THE MESSAGE
+         FI
+         SPACE 2
+*
+*   CHECK FOR USER CVT AND EXIT IMMEDIATELY IF NONE
+*
+         IF    (ICM,R1,15,CVTUSER,Z) IF THE UCVT DOES NOT EXIST
+               LA    $RC,CRITUCVT   INDICATE A CRITICAL ERROR AND
+               SVC   3              RETURN DIRECTLY TO THE CALLER
+         FI
+*
+*   SET THE ENQ AGAINST THE COMMON CONTROL BLOCKS
+*
+         ENQ   (QNAME,RNAME,E,,SYSTEM)  ENQUE CONTROL BLOCKS
+*
+*   LOCATE THE CROSS-MEMORY COMMUNICATION VECTOR TABLE  XCVT
+*   IF NOT THERE BUILD ONE.....INITIAL ENTRY
+*
+         L     R1,CVTUSER
+         IF    (ICM,$VT,15,UCVTXCVT-UCVTMAP(R1),Z)  IF NO XCVT EXISTS
+               B     VTBLD        BUILD ONE
+VTBLDRET DS    0H
+         FI
+         USING VTDSECT,$VT        SET XCVT ADDRESSIBILITY
+*
+*   CHECK FUNCTION CODE AND GO TO THE APPROPRIATE PROCESSING
+*   ROUTINE.  EXIT WITH RETURN CODE 28 IF NOT VALID.
+*
+         IF     (TM,PARMFUNC,FUNCPUT,O)  IF A PUT REQUEST
+               B     PUT
+         ELSEIF (TM,PARMFUNC,FUNCGET,O)  IF A GET REQUEST
+               B     GET
+         ELSEIF (TM,PARMFUNC,FUNCDEF,O)  IF A DEFINE PATH REQUEST
+               B     DEF
+         ELSEIF (TM,PARMFUNC,FUNCTRM,O)  IF A TERMINATE PATH REQUEST
+               B     TRM
+         ELSEIF (TM,PARMFUNC,FUNCSET,O)  IF A SET MAX REC REQ.
+               B     SET
+         ELSE ,                   IF NOT ANY OF THE ABOVE
+               LA    $RC,PRMERR   INDICATE AN ERROR
+         FI
+*
+*   COMMON EXIT ROUTINE.  RETURN CODE SHOULD BE IN $RC ON ENTRY
+*
+EXIT     DS    0H
+         LR    R2,R15
+         DEQ   (QNAME,RNAME,,SYSTEM) RELEASE CONTROL BLOCKS
+         LR    R15,R2
+         SVC   3                  RETURN TO THE CALLER
+         EJECT
+*
+*        PUT
+*
+*              THIS ROUTINE IS USED TO PUT THE MESSAGE INTO THE CSA
+*              FOR LATER ACCESS.  ALL LOGIC FOR THE PUT IS CONTAINED
+*              WITHIN STRAIGHT-LINE CODE EXCEPT REQUESTS FOR
+*              CSA STORAGE BLOCKS.
+         SPACE 2
+PUT      DS    0H
+*
+*  CHECK IF MAX CSA QUEUE EXCEEDED
+*
+         L     R0,VTRCUR
+         IF    (CL,R0,VTRMAX,NL)      IS QUEUE LIMIT EXCEEDED
+               LA   $RC,CRITSTOR      YES, EXIT WITH ERROR CODE
+               B    EXIT
+         FI
+         AH    R0,=H'1'               NO, INCR QUEUE BY ONE
+         ST    R0,VTRCUR
+         L     R0,VTRTOT
+         AH    R0,=H'1'               INCR PUT COUNT
+         ST    R0,VTRTOT
+*
+*  SCAN FOR A MATCHING MESSAGE HEADER BLOCK.
+*  IF THERE IS NONE...CREATE AND INITIALIZE ONE.
+*
+         L     $MHB,VTMHBH        HEAD OF MESSAGE HEADER CHAIN
+         DO    WHILE,(LTR,$MHB,$MHB,NZ),AND,(CLC,PARMPID(8),MHBPID,NE)
+               L    $MHB,MHBNEXT  NEXT MESSAGE HEADER
+         OD
+         IF    (LTR,$MHB,$MHB,Z)  IF THE END OF CHAIN
+*                                 BUILD A NEW MESSAGE HEADER BLOCK
+               IF    (ICM,$MHB,15,VTFBH,Z)  IF NO FREE ELEMENTS
+                     LA    $RC,CRITSTOR      CRITICAL STORAGE ERROR
+                     B     EXIT
+               FI
+               MVC   VTFBH,MHBNEXT  RESET FREE BLOCK CHAIN
+               L     R1,VTMHBH    MESSAGE HEADER BLOCK HEAD
+               ST    R1,MHBNEXT   SET INTO NEXT
+               ST    $MHB,VTMHBH  SET NEW HEAD
+               MVC   MHBPID(8),PARMPID  SET ROUTE INFO FROM PARM
+               SR    R0,R0        WORK REG
+               STH   R0,MHBME#    NUMBER OF MESSAGES
+               ST    R0,MHBMEH    MESSAGE ELEMENT HEAD
+               LA    R0,MHBMEH    MESSAGE ELEMENT HEAD ADDRESS
+               ST    R0,MHBMET    SET IN TAIL FOR EASY MAINT
+         FI
+*
+*  SEARCH FOR AN AVAILABLE SLOT IN A MESSAGE GROUP BLOCK
+*  IF THERE ARE NONE...CREATE A NEW ONE AND INITIALIZE.
+*
+         L     $MGB,VTMGBH        MESSAGE GROUP BLOCK HEAD OF CHAIN
+         DO    WHILE,(LTR,$MGB,$MGB,NZ),AND,(ICM,$ME,15,MGBMEFC,Z)
+               L     $MGB,MGBNEXT
+         OD
+         IF    (LTR,$MGB,$MGB,Z)  IF NO AVAILABLE SPACE
+               PM    GETBLOK      GET AND FORMAT ANOTHER MGB
+               LR    $MGB,R1
+               MVC   MGBID,=C'MGB '
+               L     R1,VTMGBH    CHAIN IT ON THE MGB Q
+               ST    R1,MGBNEXT
+               ST    $MGB,VTMGBH
+               SR    R0,R0        SET NUMBER OF ALLOCATED ME'S
+               STH   R0,MGBME#
+               LR    R0,$MGB            INITIALIZE THE ME AREA
+               A     R0,MGBGTMN
+               SH    R0,=Y(MEL)
+               LA    R1,MGBMES
+               ST    R1,MGBMEFC
+               DO    WHILE,(CR,R1,R0,NH)
+                     LR    $ME,R1
+                     LA    R1,MEL(,$ME)
+                     ST    R1,MENEXT
+               OD
+               SR    R0,R0
+               ST    R0,MENEXT
+               L     $ME,MGBMEFC   GET TOP ME ADDRESS
+         FI
+*
+*   DECHAIN THE TOP ME ON THE MGB Q AND INITIALIZE WITH
+*   THE TEXT.  RECHAIN ON THE APPROPRIATE MHB.
+*
+         MVC   MGBMEFC,MENEXT     DECHAIN IT
+         LH    R1,MGBME#          INCREMENT USE COUNT
+         LA    R1,1(,R1)
+         STH   R1,MGBME#
+         ST    $MGB,MEMGB         SAVE MGB ADDRESS
+         MVC   MERPLY,PARMRPLY    SET REPLY VALUE
+         LA    R0,METEXT          SETUP FOR MVCL OF MESSAGE
+         LA    R1,&TEXTLTH
+         LR    R15,R1
+         L     R14,PARMMSGA
+         MVCL  R0,R14
+         L     R1,MHBMET          CHAIN MESSAGE ONTO RESPECTIVE MHB
+         ST    $ME,MHBMET
+         ST    $ME,MENEXT-MEDSECT(,R1)
+         SR    R0,R0
+         ST    R0,MENEXT
+         LH    R1,MHBME#          ADJUST MESSAGE COUNT FOR THIS MHB
+         LA    R1,1(,R1)
+         STH   R1,MHBME#
+*
+*  SCAN FOR RELATED PCB AND POST IF REQUIRED
+*
+         IF    (TM,PARMFUNC,FUNCPOST,O)
+               L    $PCB,VTPCBH   LOCATE RESPECTIVE PCB
+               DO   WHILE,(LTR,$PCB,$PCB,NZ),AND,(CLC,PCBPID,MHBPID,NE)
+                    L     $PCB,PCBNEXT
+               OD
+               IF   (LTR,$PCB,$PCB,NZ),AND,(ICM,R1,15,PCBECB,NZ),      X
+               AND,(TM,PCBFLAGS,PCBPOST,Z)
+*        DO THE POST IF THE PCB EXISTS, THE ECB FIELD IS NON-ZERO,
+*        AND THE POST FLAGS THAT A PREVIOUS POST WAS NOT DONE.
+                    PM    XMPOST
+                    B     EXIT     USE POST RET CODE DIRECTLY
+               FI
+         FI
+         SR    $RC,$RC            SET RETURN CODE
+         B     EXIT
+         EJECT
+*
+*        GET
+*
+*              THIS ROUTINE IS RESPONSIBLE FOR LOCATING APPROPRIATE
+*              MESSAGES FOR THIS CALLER.  AFTER MOVING THE MESSAGE
+*              TO THE CALLERS WORK AREA, CLEANUP IS PERFORMED.
+*
+         SPACE 2
+GET      DS    0H
+*
+*   RESET THE POST INDICATOR IN THE PCB FOR THIS PATH IF IT EXISTS.
+*
+         L     $PCB,VTPCBH
+         DO    WHILE,(LTR,$PCB,$PCB,NZ),AND,(CLC,PCBPID,PARMPID,NE)
+               L     $PCB,PCBNEXT
+         OD
+         IF    (LTR,$PCB,$PCB,NZ)
+               NI    PCBFLAGS,255-PCBPOST
+         FI
+*
+*   LOCATE AN APPROPRIATE MHB.  IF NONE FOUND RETURN WITH A
+*   CODE OF 4.
+*
+         IF    (ICM,$MHB,15,VTMHBH,Z)  MESSAGE HEADER HEAD
+               LA    $RC,LOGERR        SET LOGICAL ERROR
+               B     EXIT              AND EXIT IMMEDIATELY
+         FI
+         IF    (ICM,R0,15,PARMTID,Z)   IF NO TERM ID GIVEN
+               DO    UNTIL,(CLC,MHBPID,PARMPID,EQ),OR,                 X
+               (ICM,$MHB,15,MHBNEXT,Z) USE THE FIRST MHB WITH PATH EQ
+               OD
+         ELSE ,                   SCAN FOR MATCHING PATH AND TERM IDS
+               DO    UNTIL,(CLC,MHBPID(8),PARMPID,EQ),OR,              X
+               (ICM,$MHB,15,MHBNEXT,Z)
+               OD
+         FI
+         IF    (LTR,$MHB,$MHB,Z)  IF NO HEADER FOUND
+               LA    $RC,LOGERR   SET RETURN CODE AND
+               B     EXIT         RETURN TO CALLER
+         FI
+         MVC   PARMTID,MHBTID  SET TERM ID OF RESPECTIVE MHB
+*
+*   MOVE INFO TO REPLY AREA FOR FIRST MESSAGE ON MHB Q
+*
+         L     $ME,MHBMEH
+         MVC   PARMRPLY,MERPLY    SET ASSOCIATED REPLY TERMINAL ID
+         LA    R0,METEXT          SETUP FOR MVCL OF MESSAGE
+         LA    R1,&TEXTLTH
+         LR    R15,R1
+         L     R14,PARMMSGA
+         MVCL  R14,R0
+*
+*  DECREMENT CSA QUEUE COUNT
+*
+         L     R0,VTRCUR
+         SH    R0,=H'1'
+         ST    R0,VTRCUR
+*
+*   CHECK FOR ANY MORE MESSAGES AND CHAIN THEM TO MHB.
+*   IF NO MESSAGES DELETE THE MHB.
+*   Q THE EMPTY ME TO THE MGB FREE Q
+*   IF THE MGB IS EMPTY FREE IT ALSO.
+*
+         IF    (ICM,R1,15,MENEXT,NZ) IF THERE ARE MORE MESSAGES
+               ST    R1,MHBMEH    CHAIN THEM TO THE MHB
+               LH    R1,MHBME#    DECREMENT MESSAGE COUNT
+               SH    R1,=H'1'
+               STH   R1,MHBME#
+         ELSE ,                   IF NO MESSAGES THEN DELETE THE MHB
+               LA    R1,VTMHBH    SCAN THE MHB CHAIN
+               DO    WHILE,(C,$MHB,MHBNEXT-MHBDSECT(,R1),NE)  FOR THE
+                     L     R1,MHBNEXT-MHBDSECT(,R1)    PREVIOUS MHB
+               OD
+               MVC   MHBNEXT-MHBDSECT(,R1),MHBNEXT   DECHAIN CURNT MHB
+               MVC   MHBNEXT,VTFBH    AND CHAIN ONTO THE
+               ST    $MHB,VTFBH       FREE MHB/PCB Q
+         FI
+         L     $MGB,MEMGB         RESTORE MGB ADDRESS
+         MVC   MENEXT,MGBMEFC     CHAIN ME TO MGB ME FREE CHAIN
+         ST    $ME,MGBMEFC
+         LH    R1,MGBME#          DECREMENT ME COUNT
+         IF    (SH,R1,=H'1',P)    IF COUNT POSITIVE
+               STH   R1,MGBME#    STORE IN MGB
+         ELSE ,         OTHERWISE COUNT IS ZERO SO FREE THE MGB
+               LA    R1,VTMGBH-(MGBNEXT-MGBDSECT)  GET PREVIOUS MGB
+               DO    WHILE,(CL,$MGB,MGBNEXT-MGBDSECT(,R1),NE)
+                     L     R1,MGBNEXT-MGBDSECT(,R1)
+               OD
+               MVC   MGBNEXT-MGBDSECT(,R1),MGBNEXT  DECHAIN CURRENT MGB
+               LR    R1,$MGB      AND RETURN TO FREE CSA
+               PM    FREEBLOK
+         FI
+         SR    $RC,$RC            SET ZERO RETURN CODE
+         B     EXIT               RETURN TO CALLER
+         EJECT
+*
+*        DEF
+*
+*              THIS ROUTINE IS USED TO DEFINE THE PATH FOR SUBSEQUENT
+*              GETS AND PUTS.  THE PURPOSE IS ACTUALLY TO DEFINE A PATH
+*              NAME AND RELATE AN ADDRESS SPACE AND AN ECB WITHIN
+*              THAT ADDRESS SPACE TO BE POSTED WHEN A MESSAGE IS
+*              PLACED IN THE COMMON AREA FOR LATER RECEIPT BY THAT
+*              TASK.
+*
+         SPACE 2
+DEF      DS    0H
+*
+*   SCAN FOR DUPLICATE PCB AND SET RETURN CODE OF 4 IF FOUND.
+*   IF NOT FOUND CREATE A PCB.  IF NO FREE SPACE IS AVAILABLE
+*   RETURN WITH A CODE OF 28 (DISASTER).
+*
+*   MANY JOB RELATED VALUES ARE SAVED IN THE PCB SO THAT A
+*   VALIDATION CAN BE PERFORMED PRIOR TO POST.  IF ANY OF THESE
+*   VALUES SAVED DO NOT MATCH UP, THE POST IS SKIPPED AND
+*   THE PCB IS DELETED.
+*
+         L     $PCB,VTPCBH        PCB HEAD
+         DO    WHILE,(LTR,$PCB,$PCB,NZ),AND,(CLC,PCBPID,PARMPID,NE)
+               L     $PCB,PCBNEXT
+         OD
+         IF    (LTR,$PCB,$PCB,Z)           IF PCB NOT FOUND
+               IF    (ICM,$PCB,15,VTFBH,Z) AND FREE PCB SPACE NOT AVAIL
+                     LA    $RC,CRITSTOR    SET CRITICAL ERROR CODE
+               ELSE ,            OTHERWISE CREATE A NEW PCB
+                     MVC   VTFBH,PCBNEXT   DECHAIN A FREE MBH
+                     ST    $ASCB,PCBASCB   SET ASCB ADDRESS
+                     MVC   PCBASID,ASCBASID  SET ASID
+                     IF    (ICM,R1,15,ASCBJBNI,Z)  GET JOBNAME ADDRESS
+                           ICM   R1,15,ASCBJBNS
+                     FI
+                     MVC   PCBJOBN,0(R1)   AND SET IN THE PCB
+                     ST    R1,PCBJOBNA     SET JOBNAME FIELD ADDRESS
+                     MVC   PCBPID,PARMPID  SET PATH ID
+                     MVC   PCBECB,PARMECB  SET ECB ADDRESS
+                     MVI   PCBECB,0        CLEAR HIGH ORDER BYTE
+                     MVI   PCBFLAGS,0      CLEAR FLAG FIELD
+                     L     R1,VTPCBH       CHAIN PCB ONTO THE ACTIVE Q
+                     ST    R1,PCBNEXT
+                     ST    $PCB,VTPCBH
+                     SR    $RC,$RC          SET RETURN CODE
+               FI
+         ELSE ,                   SET DUPLICATE PCB RETURN CODE
+               LA    $RC,LOGERR
+         FI
+         B     EXIT               RETURN TO CALLER
+         EJECT
+*
+*        TRM
+*
+*              THIS ROUTINE TERMINATES A PATH.  IF THE PATH CANNOT
+*              BE LOCATED, A RETURN CODE OF 4 IS SET.
+*
+         SPACE 2
+TRM      DS    0H
+*
+*   SCAN FOR MATCHING PATH ID'S
+*
+         LA    R1,VTPCBH          PREVIOUS POINTER    DSH FIX 1 OF 2
+         L     $PCB,VTPCBH        PCB HEAD            DSH FIX 2 OF 2
+         DO    WHILE,(LTR,$PCB,$PCB,NZ),AND,(CLC,PCBPID,PARMPID,NE)
+               LR    R1,$PCB
+               L     $PCB,PCBNEXT
+         OD
+         IF    (LTR,$PCB,$PCB,Z)  IF PATH ID NOT FOUND
+               LA    $RC,LOGERR   SET ERROR CODE
+         ELSE ,                   OTHERWISE DECHAIN THE PCB
+               MVC   PCBNEXT-PCBDSECT(,R1),PCBNEXT
+               MVC   PCBNEXT,VTFBH   AND RETURN IT TO THE FREE Q
+               ST    $PCB,VTFBH
+               SR    $RC,$RC      SET ZERO RETURN CODE
+         FI
+         B     EXIT
+*
+*        SET
+*
+*                THIS ROUTINE SETS MAXIMUM RECORDS ALLOWED TO BE
+*                QUEUED IN CSA AT ANY ONE TIME.
+*
+SET      MVC   VTRMAX,PARMRMAX
+         SR    $RC,$RC
+         B     EXIT
+         EJECT
+*
+*   VTBUILD
+*
+*   THIS ROUTINE IS USED TO BUILD THE VECTOR TABLE INITIALLY
+*   IT SHOULD ONLY BE CALLED ONCE PER IPL.
+*
+         SPACE 2
+VTBLD    PENTRY
+         L     R0,=A(XCVTL)       XCVT LENGTH
+         GETMAIN RC,LV=(0),SP=241 GET STORAGE FOR XCVT
+         IF    (LTR,$RC,$RC,NZ)   TEST RETURN CODE AND
+               LA    $RC,CRITSTOR INDICATE CRITICAL ERROR AND
+               SVC   3            EXIT IF NOT ZERO - SKIP DEQ
+         FI
+         LR    $VT,R1             XCVT ADDRESSIBILITY
+         MVC   VTID,=C'XCVT'      INITIALIZE XCVT BASE SEGMENT
+         MVC   VTGTMN,=A(XCVTL)
+         MVC   VTRMAX,=A(&RMAX)
+         SR    R0,R0
+         ST    R0,VTRCUR
+         ST    R0,VTRTOT
+         ST    R0,VTPCBH
+         ST    R0,VTMHBH
+         ST    R0,VTMGBH
+         LA    R1,VTFBS           START OF FREE BLOCK AREA
+         ST    R1,VTFBH
+         LR    R0,$VT
+         A     R0,VTGTMN
+         SH    R0,=Y(MHBL)
+         DO    WHILE,(CR,R1,R0,NH)
+               LR    $MHB,R1
+               LA    R1,MHBL(,R1)
+               ST    R1,MHBNEXT
+         OD
+         SR    R0,R0
+         ST    R0,MHBNEXT
+         L     R8,CVTUSER         UCVT
+         IF    (ICM,R9,15,UCVTXCVT-UCVTMAP(R8),Z)  IF XCVT STILL ZERO
+               ST    $VT,UCVTXCVT-UCVTMAP(,R8)   SET NEW ADDRESS
+         ELSE ,   IF ANOTHER TASK HAS OVERLAPED
+               LA    R0,=A(XCVTL)     FREE THIS XCVT AND USE THE NEW
+               FREEMAIN RC,LV=(0),A=($VT),SP=241
+               LR    $VT,R9
+         FI
+         SPACE 2
+         B     VTBLDRET
+         EJECT
+*
+*   GETBLOK
+*
+*   THIS ROUTINE GETS MESSAGE BLOCKS FROM CSA
+*
+GETBLOK  PENTRY
+         STM   R14,R5,VTSAVE
+         L     R0,=A(MGBL)        MGB LENGTH
+         GETMAIN RC,LV=(0),SP=241
+         IF    (LTR,$RC,$RC,NZ)   IF ERROR IN GETMAIN
+               LA    $RC,CRITSTOR SET CRITICAL ERROR
+               SVC   3    EXIT WITHOUT DEQ
+         FI
+         MVC   4(4,R1),=A(MGBL)   SET GETMAIN LENGTH
+         L     R14,VTSAVE
+         LM    R2,R5,VTSAVE+16
+         PEXIT                    RETURN TO CALLER
+         EJECT
+*
+*   FREEBLOK
+*
+*   THIS ROUTINE IS USED TO FREE MGB'S NO LONGER NEEDED.
+*
+FREEBLOK PENTRY
+         STM   R14,R5,VTSAVE
+         L     R0,4(,R1)          GET FREE BLOCK SIZE
+         FREEMAIN RC,A=(1),LV=(0),SP=241
+         IF    (LTR,$RC,$RC,NZ)   IF AN ERROR EXISTS
+               LA    $RC,CRITSTOR SET CRITICAL RETURN CODE
+               SVC   3    EXIT WITHOUT DEQ
+         FI
+         LM    R14,R5,VTSAVE
+         PEXIT
+         EJECT
+*
+*   POST
+*
+*   THIS ROUTINE POSTS THE ECB FOR THE PCB IN $PCB.
+*
+XMPOST   PENTRY
+         STM   R14,R5,VTSAVE      SAVE WORK REGS
+         OI    PCBFLAGS,PCBPOST   SET POST INDICATOR FOR THIS PCB
+         NI    VTFLAGS,255-POSTFAIL RESET POST FAIL INDICATOR
+         L     R2,PCBASCB         VALIDATE ASCB TO BE POSTED
+         IF    (ICM,R1,15,ASCBJBNI-ASCB(R2),Z)
+               L     R1,ASCBJBNS-ASCB(,R2)
+         FI
+         IF    (CLC,PCBASID,ASCBASID-ASCB(R2),EQ),AND,                 X
+               (CLC,PCBJOBN,0(R1),EQ),AND,                             X
+               (CL,R1,PCBJOBNA,EQ)
+               SR    R0,R0        ECB COMPLETION CODE
+               L     R4,PCBECB    ECB ADDRESS
+               L     R5,PCBASCB   ASCB ADDRESS OF POSTEE
+               POST  (R4),(0),ASCB=(R5),ERRET=POSTERR,MF=(E,POSTMFL)
+         ELSE ,                   IF NOT VALID SET ERROR
+               OI    VTFLAGS,POSTFAIL
+         FI
+         SPACE 2
+         IF    (TM,VTFLAGS,POSTFAIL,O)  IF THE POST FAILED
+               LA    R1,VTPCBH-(PCBNEXT-PCBDSECT)  DELETE THE BAD PCB
+               DO    WHILE,(CL,$PCB,PCBNEXT-PCBDSECT(,R1),NE)
+                     L     R1,PCBNEXT-PCBDSECT(,R1)
+               OD
+               MVC   PCBNEXT-PCBDSECT(,R1),PCBNEXT
+               MVC   PCBNEXT,VTFBH
+               ST    $PCB,VTFBH
+         SPACE 2
+               WTO   'POST ERROR IN XCOM...NOTIFY TECH SUPPORT'
+         SPACE 2
+               LA    $RC,CRITPOST SET CRITICAL POST ERROR
+         ELSE
+               SR    $RC,$RC      SET NORMAL COMPLETION
+         FI
+         SPACE 2
+         L     R14,VTSAVE
+         LM    R0,R5,VTSAVE+8
+         SPACE 5
+         PEXIT
+         SPACE 5
+*
+*   POST ERROR ROUTINE
+*
+*   THIS ROUTINE IS INVOKED IF AN ERROR OCCURS DURING A CROSS-
+*   MEMORY POST.  THE ROUTINE DOES NOTHING.....THERE WAS A GREAT
+*   DEAL OF IGNORANCE ABOUT XMPOSTING AT THIS TIME.
+*
+POSTERR  BR    R14                RETURN -- AT ONCE
+         EJECT
+*
+*        REGISTER EQUATES AND LITERALS
+*
+$PARM    EQU   2
+$CVT     EQU   3
+$BASE    EQU   6
+$ASCB    EQU   7
+$MHB     EQU   8
+$MGB     EQU   9
+$PCB     EQU   10
+$ME      EQU   11
+$VT      EQU   12
+$LINK    EQU   14
+$RC      EQU   15
+         EQUAL
+         SPACE 3
+QNAME    DC    CL8'XCOM'
+RNAME    DC    C'CTL.BLOCKS'
+         EJECT
+*
+*        CROSS-MEMORY COMMUNICATION CONTROL BLOCK DSECTS
+*
+         SPACE 5
+*
+*        XCVT -- VECTOR TABLE
+VTDSECT  DSECT
+VTID     DC    CL4'XCVT'          CONTROL BLOCK ID
+VTGTMN   DS    F                  GETMAIN AREA SIZE
+         SPACE 1
+VTFLAGS  DS    X                  MISC FLAGS
+POSTFAIL EQU   X'80'                POST FAIL INDICATOR
+         SPACE 1
+VTPCBH   DS    A                  PCB CHAIN HEAD
+VTMHBH   DS    A                  MHB CHAIN HEAD
+VTFBH    DS    A                  PCB/MHB FREE CHAIN HEAD
+VTMGBH   DS    A                  MGB CHAIN HEAD
+         SPACE 1
+VTSAVE   DS    4D                 REGISTER SAVE AREA
+VTRCUR   DS    F                  CURRENT RECORDS IN CSA QUEUE
+VTRMAX   DS    F                  MAXIMUM RECORDS ALLOWED IN CSA
+VTRTOT   DS    F                  TOTAL   RECORDS PUT SINCE IPL
+         SPACE 2
+POSTMFL  POST  0,ASCB=0,ERRET=0,MF=L
+         SPACE 2
+VTFBS    DS    0X                 FREE BLOCK AREA START
+VTBASEL  EQU   *-VTDSECT          BASE SEGMENT LENGTH
+XCVTL    EQU   (&XCVTSZ)*1024     XCVT LENGTH
+         SPACE 5
+*
+*        PCB -- PATH CONTROL BLOCK
+*
+PCBDSECT DSECT
+PCBNEXT  DS    A                  CHAIN TO NEXT PCB
+PCBPID   DS    CL4                PATH ID
+PCBFLAGS DS    X                  FLAGS
+PCBPOST  EQU   X'80'              POST DONE INDICATOR
+         DS    X                  UNUSED
+PCBASID  DS    H                  ADDRESS SPACE ID
+PCBASCB  DS    A                  ADDRESS SPACE ADDRESS
+PCBJOBNA DS    A                  JOBNAME FIELD ADDRESS
+PCBJOBN  DS    CL8                ADDRESS SPACE JOBNAME
+PCBECB   DS    A                  ECB ADDRESS
+PCBL     EQU   *-PCBDSECT         PCB LENGTH
+         SPACE 5
+*
+*        MHB -- MESSAGE HEADER BLOCK
+*
+MHBDSECT DSECT
+MHBNEXT  DS    A                  CHAIN TO NEXT MHB
+MHBPID   DS    CL4                ASSOCIATED PATH ID
+MHBTID   DS    CL4                ASSOCIATED TERM ID
+         DS    H                  UNUSED
+MHBME#   DS    H                  COUNT OF CHND MESSAGES FOR THIS MHB
+MHBMEH   DS    A                  HEAD OF MESSAGE CHAIN
+MHBMET   DS    A                  TAIL OF MESSAGE CHAIN
+         DS    2F                 RESERVED -- MAINTAIN MHB/PCB SIZE
+MHBL     EQU   *-MHBDSECT         MHB LENGTH
+         SPACE 5
+*
+*        ME -- MESSAGE ELEMENT
+*
+MEDSECT  DSECT
+MENEXT   DS    A                  CHAIN TO NEXT ME
+MEMGB    DS    A                  OWNER MGB ADDRESS
+MERPLY   DS    CL4                TERM ID OF REPLY TERM OR ZERO
+METEXT   DS    (&TEXTLTH)X        MESSAGE TEXT
+MEL      EQU   *-MEDSECT          MESSAGE ELEMENT LENGTH
+         SPACE 5
+*
+*        MGB -- MESSAGE GROUP BLOCK
+*
+MGBDSECT DSECT
+MGBID    DC    CL4'MGB'           BLOCK ID
+MGBGTMN  DS    F                  GETMAIN LENGTH
+MGBNEXT  DS    A                  NEXT MGB ON ACTIVE CHAIN
+         DS    H                  UNUSED
+MGBME#   DS    H                  NUMBER OF ACTIVE ME'S IN THIS MGB
+MGBMEFC  DS    A                  FREE ME HEAD
+MGBMES   DS    0X                 START OF ME AREA
+MGBL     EQU   (&MGBSZ)*1024      MGB LENGTH
+         SPACE 5
+*
+*        XCOMPARM -- INPUT PARM DSECT
+*
+XCOMPARM DSECT
+PARMRMAX DS    0F                 MAXIMUM RECORDS ALLOWED IN CSA QUEUE
+PARMPID  DS    F                  PATH ID
+PARMTID  DS    F                  TERM ID
+PARMFUNC DS    0X                 FUNCTION INDICATOR
+FUNCDEF  EQU   X'80'              DEFINE PATH FUNCTION
+FUNCTRM  EQU   X'40'              TERMINATE PATH FUNCTION
+FUNCGET  EQU   X'20'              GET A RECORD FUNCTION
+FUNCPUT  EQU   X'10'              PUT A RECORD FUNCTION
+FUNCSET  EQU   X'04'              SET MAXIMUM RECORDS IN CSA
+FUNCPOST EQU   X'01'              POST ON PUT INDICATOR
+PARMECB  DS    0A                 ECB ADDRESS - DEF PATH ONLY
+PARMMSGA DS    A                  MESSAGE ADDRESS - GET/PUT ONLY
+PARMRPLY DS    F                  REPLY TERM ID
+XCOML    EQU   *-XCOMPARM         XCOMPARM LENGTH
+         EJECT
+UCVTDSCT DSECT
+         UCVT
+         SPACE 5
+IGC0020F CSECT
+         EJECT
+         CVT   DSECT=YES
+         IHAASCB
+         END

@@ -1,0 +1,570 @@
+TOP20    TITLE 'DISPLAY HIGH CPU USAGE ADDRESS SPACES'
+*
+* DWIGHT HARM
+* 5/22/79
+* SYSTEM DEVELOPMENT CORP.
+*
+* THIS PROGRAM RUNS AS A COMMAND PROCESSOR UNDER TSO.  IT WILL COMPUTE
+* THE PERCENTAGE OF CPU USAGE OF BATCH AND TSO JOBS EXECUTING, BASED ON
+* THE ELAPSED TIME THE COMMAND HAS BEEN RUNNING.  THEREFORE, THE
+* COMMAND ALWAYS TAKES 5 SECONDS TO INITIALIZE THE FIRST SCREEN.
+*
+*
+*  UPDATES:
+*    05/02/83 U015 LDW  DISPLAY MORE DIGITS OF IOREQ
+*    01/19/83 U014 LDW  FIX TURKEY BUG IN PREVIOUS UPDATE, WHICH
+*                          CAUSED CPU TIMES TO BE DISPLAYED *256
+*    12/10/82 U013 EMS  MAJOR LOGIC CHANGES TO SUPPORT TOP20 USERS
+*                          OR FIRST 20  USERS MEETING SELECTION
+*                          CRITERIA.
+*    10/25/82 U012 EMS  ATTEMPT TO FIX LOGIC FOR 20 DISPLAY LINES
+*    10/25/82 U011 LDW  DO I HEAR EMS SAYING "GOBBLE, GOBBLE"???
+*    10/18/82 U010 EMS  FIX U008 UPDATE
+*                          AND GET RID  OF 0C9'S (HOPEFULLY)
+*                       CHANGE LOGIC TO SCAN ALL ASCBS IN SYSTEM,
+*                          INSTEAD OF FIRST 20 ONLY
+*                       UPDATE TO CALCULATE NUMBER OF ASCB'S IN SYSTEM
+*    08/09/82 U009 LDW  FIX U008 UPDATE
+*    07/27/82 U008 LDW  DISPLAY "---" INSTEAD OF 0.00% IF CPU, SRB, OR
+*                          I/O UTILIZATION FOR INTERVAL IS TRULY ZERO
+*    07/20/82 U007 LDW  ALSO SELECT JOB FOR DISPLAY IF IORATE > 25/SEC
+*                          OR SRB% > .5
+*                       INCREASE SIZE OF "CPUTABLE"
+*             U006      FIX TYPO IN SRMLINE BUILD
+*    07/08/82 U005 LDW  ADD MORE STUPID EQUATES FOR SP1 "IRARMCT" MACRO
+*    02/18/82 U004 LDW  ADD 'SRMLINE' CODE FROM CHIMP
+*    08/26/81 U003 LDW  CHANGE DEFAULT TO NO AUTO UPDATE
+*                       CHANGE HEADERS TO LOWER CASE USING 'LC' MACRO
+*    08/20/81 U002 LDW  RE-ARRANGE SCREEN LINE LAYOUT
+*                       CHANGE ASID DISPLAY TO HEX
+*                       DISPLAY I/O COUNT AND RATE
+*                       CHANGE CONCEPT SO THAT RATE IS JUST SINCE LAST
+*                          SCREEN UPDATE, RATHER THAN SINCE THE JOB
+*                          WAS FIRST FOUND.
+*                       FIX ALIGNMENT ERRORS (BY USING "ICM")
+*    08/18/81 U001 LDW  CHANGE PFKEY DEFINITION TO DCMS(SPF) STANDARD
+*                       MAKE MAIN DISPLAY LOW INTENSITY
+*                       MISC MINOR CLEANUP
+*
+         EJECT
+TOP20    DCMSTART R,LV=DCMSWRKL                                    U010
+         TITLE 'PREPARE FOR NEW SCREEN GENERATION'
+         MVC   IOCBWAIT,=F'500'         SET DEFAULT WAIT TO 5 SECONDS
+*U003    MVI   FLAG,FAUTO+FSTART        SET FLAG BYTE
+         MVI   FLAG,FSTART              SET FLAG BYTE              U003
+         L     R9,CVTPTR                -> CVT                     U010
+         L     R9,CVTASVT-CVT(,R9)      -> ASVT                    U011
+         L     R0,ASVTMAXU-ASVT(,R9)    MAX NO OF ASCBS IN SYSTEM  U011
+         MH    R0,=Y(ENTRYLEN)          * ENTRY LEN                U010
+         ICM   R0,B'1000',=AL1(1)       BUY OUT OF SP 1            U010
+         ST    R0,TABLELEN              SAVE LEN OF ASCB TABLE     U010
+         GETMAIN  R,LV=(0)              BUY THE TABLE              U010
+         ST    R1,CPUTABLE              SAVE ADDR FOR LATER        U010
+*
+TOP20RST L     R14,CPUTABLE             -> CPU TABLE               U010
+         L     R15,TABLELEN             LEN TO CLEAR               U010
+         N     R15,=A(X'00FFFFFF')      JUST LEN PLEASE            U010
+         SR    R0,R0                    CLEAR FROM ADDR            U010
+         XR    R1,R1                    CLEAR FROM LEN (PAD=X'00') U010
+         MVCL  R14,R0                   CLEAR TABLE FOR RE-INIT    U010
+         MVI   FLAG,FSTART              SET FLAG BYTE              U010
+         MVC   IOCBWAIT,=F'500'         SET DEFAULT WAIT TO 5 SEC  U010
+         MVC   THRSHCPU(12),=Y(100,50,2500,1,2,1)  INIT THRESHOLDS U013
+         B     NEWSCR                   AND INIT TABLE             U010
+*                                                                  U010
+NEWAUTO  OI    FLAG,FAUTO               SET AUTO UPDATE MODE DEFAULT
+         B     NEWSCR                   GET STARTED                U013
+*
+NEWMODE  XI    FLAG,FMODE               FLIP MODE SWITCH           U013
+*
+NEWSCR   STCK  CLOCK                    GET CURRENT TIME
+         BAL   R14,CLEAR                CLEAR SCREEN IMAGE AREA
+         XC    BRNYCNT(256),BRNYCNT     CLEAR BROWNIE PT COUNTERS  U013
+         XC    BRNYCNT+256(256),BRNYCNT+256  CLEAR ALL COUNTERS    U013
+         L     R9,CVTPTR
+*
+         L     R9,CVTASCBH-CVT(,R9)     R9->ASCB'S
+         USING ASCB,R9
+*
+         MVC   HEADASCB,ASCBASID        SAVE TOP ASID              U013
+         LH    R11,ASCBASID             GET ASCBID                 U013
+         BCTR  R11,0                    -1 TABLE ORIGIN 0          U013
+         MH    R11,=Y(ENTRYLEN)         OFFSET INTO TABLE          U013
+         A     R11,CPUTABLE             -> CORRECT ENTRY           U013
+         USNGX CPUENTRY,R11                                        U013
+         B     FRSTASCB                 GET FIRST ASCB DATA        U013
+         TITLE 'MAIN LINE CODE - LOOP THRU ASCB QUEUE'
+*  SCAN THROUGH ASCB'S ON DISPATCHING QUEUE AND
+*  CALCULATE CPU (TCB+SRB) UTILIZATION.  THIS IS
+*  BASED ON ELAPSED TIME SINCE I FIRST SAW THEM VERSUS
+*  CPU TIME USED SINCE I FIRST SAW THEM.
+*
+NEXTASCB MVC   NXTASCBD,ASCBASID        CHAIN ASCB'S TOGETHER      U013
+         DROPX R11                                                 U013
+         XR    R8,R8                    CLEAR BROWNIE PT CTR       U013
+         LH    R11,ASCBASID             GET ASID                   U010
+         BCTR  R11,0                    TABLE IS ORIGIN 0          U012
+*
+         MH    R11,=Y(ENTRYLEN)         ASID * LENGTH OF TABLE ENT U010
+         A     R11,CPUTABLE             ...IS OFFSET INTO JOB TAB  U010
+         USING CPUENTRY,R11
+*
+FRSTASCB L     R5,ASCBJBNI              GET BATCH JOBNAME
+         LTR   R5,R5                    IF ZERO,
+         BNZ   *+8
+         L     R5,ASCBJBNS              ...GET TSO ID/STARTED TASK NAME
+*
+         CLC   JOBNAME,0(R5)            SAME JOBNAME?
+         BE    SAMEJOB                  ...YES, CONTINUE
+*
+         MVC   JOBNAME,0(R5)            NEW JOB...SET JOBNAME
+         MVC   PERCPU,=H'-1'            TRUE ZERO                  U013
+         MVC   PERSRB,=H'-1'            DITTO                      U013
+         MVC   PERIO,=H'-1'             HERE TOO.                  U013
+         B     SAVEINFO                 THEN SKIP TO NEXT ASCB.
+*
+SAMEJOB  EQU   *           * COMPUTE CPU PERCENTAGE USAGE *
+         ICM   R14,B'1111',CLKTIME+1    START OF INTERVAL          U002
+         ICM   R2,B'1111',CLOCK+1       LOAD CLOCK TIME            U002
+         SR    R2,R14                   ELAPSED TIME FOR JOB       U002
+         BZ    SAVEINFO                 LESS THAN 1.048/256 SEC?   U010
+*
+         L     R1,ASCBEJST              CPU TIME (TCB+SRB) IN 1.048 SEC
+*
+         ICM   R1,B'1111',ASCBEJST+1    LOAD BYTES 1-4             U002
+         SL    R1,CPUTIME               CPU SINCE LAST PASS        U013
+         BZ    TCBCPUZ                  NONE, SKIP CALC            U010
+         M     R0,=F'10000'             CONVERT TO UNITS*10,000
+*
+         DR    R0,R2                    XXX.XX% CPU UTILIZATION (TCB)
+*
+** NOTE THAT RATIO OF .01 (1%) RESULTS IN VALUE OF 100,
+*  DUE TO FACTOR OF 10,000 INTRODUCED ABOVE.
+*
+         STH   R1,PERCPU                SAVE %CPU UTIL.            U013
+         MH    R1,FACTCPU               * CPU FACTOR FOR DISPLAY   U013
+         AR    R8,R1                    ADD TO BROWNIE PT CTR.     U013
+*
+         B     *+10                     GO FOR SRB TIME            U012
+TCBCPUZ  MVC   PERCPU,=H'-1'            YES - SHOW TRUE ZERO       U013
+*
+         L     R1,ASCBSRBT              CALCULATE % FOR SRB TIME
+*
+         ICM   R1,B'1111',ASCBSRBT+1    LOAD BYTES 1-4             U002
+         SL    R1,SRBTIME               SRB SINCE LAST PASS        U013
+         BZ    SRBCPUZ                  IF NONE, SKIP CALC         U010
+         M     R0,=F'10000'             IN UNITS*10,000
+         DR    R0,R2
+         STH   R1,PERSRB                SAVE SRB%                  U013
+         MH    R1,FACTSRB               * SRB FACTOR FOR DISP      U013
+         AR    R8,R1                    ADD TO TOTAL               U013
+         B     *+10                     GO FOR I/O COUNT           U012
+SRBCPUZ  MVC   PERSRB,=H'-1'            INDICATE TRUE ZERO         U013
+*
+         MVC   JOBDPRTY,ASCBDP          SAVE DISPATCHING PRIORITY  U013
+*
+         L     R1,ASCBOUCB              -> OUCB                    U002
+         USING OUCB,R1                                             U002
+         L     R5,OUCBIOSM              GET SMF I/O COUNT          U002
+         DROP  R1                                                  U002
+*
+         S     R5,IOCOUNT               GET I/O SINCE LAST PASS    U002
+         BZ    IOCNTZ                   NONE, SKIP CALC            U010
+         LM    R14,R15,CLOCK            GET CURRENT TOD CLOCK VAL  U002
+         SRDL  R14,12                   CONVERT IT TO MICROSEC     U002
+         LM    R0,R1,CLKTIME            GET PREVIOUS TOD CLOCK VAL U002
+         SRDL  R0,12                    CONVERT IT TO MICROSEC     U002
+         SR    R15,R1                   GET INTERVAL IN MICROSEC   U002
+         SR    R14,R14                  CLEAR FOR DIVIDE           U002
+         D     R14,=F'1000'             CONVERT TO MILLISEC        U002
+         M     R4,=F'100000'            SCALE FOR DIVIDE           U002
+         DR    R4,R15                   GET I/O RATE *100 PER SEC  U002
+         STH   R5,PERIO                 SAVE I/O RATE              U013
+         MH    R5,FACTIO                * I/O FACTOR               U013
+         XR    R4,R4                    CLEAR FOR DIVIDE           U013
+         D     R4,=F'100'               JUST I/O PER SEC FOR FACT. U013
+         AR    R8,R5                    TOTAL BROWNIE PTS          U013
+         B     *+10                     FINISH UP FOR DISPLAY      U012
+IOCNTZ   MVC   PERIO,=H'-1'             YES - SHOW TRUE ZERO       U013
+         SPACE 2
+SAVEINFO MVC   CPUTIME,ASCBEJST+1       ...CURRENT CPU TIME
+         MVC   SRBTIME,ASCBSRBT+1       ...CURRENT SRB TIME
+         MVC   CLKTIME,CLOCK            ...AND CLOCK TIME          U002
+         L     R1,ASCBOUCB              -> OUCB                    U002
+         USING OUCB,R1                                             U002
+         MVC   IOCOUNT,OUCBIOSM         SAVE I/O COUNTER           U002
+         DROP  R1                                                  U002
+         LR    R1,R8                    COPY TO 2N+1               U013
+         XR    R0,R0                    CLEAR FOR DIVIDE           U013
+         D     R0,=F'100'               CORRECT SCALING FACTOR     U013
+         STH   R1,BROWNIE               SAVE BROWNIE PTS           U013
+         LTR   R1,R1                    WHAT SIGN                  U013
+         BP    *+6                      POSITIVE?                  U013
+         XR    R1,R1                    CLEAR FOR INDEXING         U013
+         CH    R1,=H'255'               OVER MAX?                  U013
+         BNH   *+8                      NO, CONTINUE               U013
+         LA    R1,255                   YES, SET TO MAX            U013
+         SLL   R1,1                     *2 FOR TABLE SIZE          U013
+         LA    R1,BRNYCNT(R1)           -> CORRECT SLOT            U013
+         LA    R0,1                     INCR                       U013
+         AH    R0,0(,R1)                INCR COUNTER               U013
+         STH   R0,0(,R1)                SAVE NEW VALUE             U013
+         SPACE 1
+NEXTPLS  L     R9,ASCBFWDP              NEXT ASCB ON QUEUE         U010
+         LTR   R9,R9
+         BNZ   NEXTASCB                 GO GET CHECK NEXT ASCB     U010
+         STH   R9,NXTASCBD              GROUND THE CHAIN           U013
+         SPACE 3
+         TM    FLAG,FSTART              FIRST TIME THROUGH?        U013
+         BO    DISPLAY                  YES, JUST DISP INIT SCR    U013
+         TM    FLAG,FMODE               TOP 20 USERS?              U013
+         BZ    DISPFRMT                 NO, GO FORMAT DISPLAY      U013
+         LA    R14,255                  MAX OFFSET                 U013
+         XR    R0,R0                    TOTAL NUMBER AVAIL TO DISP U013
+BRNYLOOP LR    R1,R14                   INDEX OF CURRENT ENT       U013
+         SLL   R1,1                     *2 FOR OFFSET              U013
+         AH    R0,BRNYCNT(R1)           ADD TO TOTAL               U013
+         CH    R0,=H'20'                IS SCREEN FULL YET?        U013
+         BH    *+8                      YES, STOP NOW              U013
+         BCT   R14,BRNYLOOP             NO, TRY NEXT GROUP         U013
+         EJECT ,
+DISPFRMT LH    R11,HEADASCB             TOP ASID                   U013
+         LA    R8,20                    NUMBER OF LINES TO DISP    U013
+         LA    R10,L3                   -> STARTING LINE           U013
+DISPLOOP MVC   OUTAREA,CPULINE          MOVE IN DISPLAY MASK       U013
+         STH   R11,DOUBLE               SAVE CURRENT ASID          U013
+         LTR   R11,R11                  ANY LEFT?                  U013
+         BZ    DISPLAY                  IF ZERO, NONE LEFT         U013
+         BCTR  R11,0                    TABLE ORIGIN 0             U013
+         MH    R11,=Y(ENTRYLEN)         OFFSET INTO TABLE          U013
+         A     R11,CPUTABLE             -> CORRECT ENTRY           U013
+         USNGX CPUENTRY,R11                                        U013
+         SPACE 1                                                   U013
+         TM    FLAG,FMODE               TOP20 USERS MODE?          U013
+         BZ    *+12                     NO, CHECK FOR DISP LATER   U013
+         CH    R14,BROWNIE              OVER THRESHOLD FOR DISP?   U013
+         BH    DISPNXT                  NO, SKIP IT                U013
+         SPACE 1
+         MVC   OL@JOBNM,JOBNAME         MOVE IN JOBNAME            U013
+         HEX   OL@ASID,DOUBLE+1,LEN=1   CONVERT ASID               U013
+         L     R1,CPUTIME               GET CURRENT CPU TIME       U013
+         SRL   R1,8                     ADJUST IT                  U014
+         CVD   R1,DOUBLE                PRINT CPU TIME
+         MVC   OL@TCBR,=X'40202020206B202120'
+         ED    OL@TCBR,DOUBLE+4
+         SPACE 1
+         LH    R1,PERCPU                GET CPU%                   U013
+         CVD   R1,DOUBLE                CONVERT CPU PERCENT
+         MVC   OL@TCBP,=X'402020214B2020'
+         ED    OL@TCBP,DOUBLE+5
+         CH    R1,=H'-1'                TRUE ZERO?                 U013
+         BNE   *+16                     NO, CONTINUE               U013
+         MVC   OL@TCBP(8),=C'   ---  '  YES, CLEAR FIELD           U013
+         XC    PERCPU,PERCPU            CLEAR CPU COUNTER FOR TEST U013
+         SPACE 1
+         L     R1,SRBTIME               LOAD TOTAL SRB TIME        U013
+         SRL   R1,8                     ADJUST IT                  U014
+         CVD   R1,DOUBLE
+         MVC   OL@SRBR,=X'40202020206B202120'
+         ED    OL@SRBR,DOUBLE+4         PRINTABLE
+         SPACE 1
+         LH    R1,PERSRB                GET SRB%                   U013
+         CVD   R1,DOUBLE                R1 = % (*100) SRB USAGE
+         MVC   OL@SRBP,=X'402020214B2020'
+         ED    OL@SRBP,DOUBLE+5         MAKE PRINTABLE.
+         CH    R1,=H'-1'                TRUE ZERO?                 U013
+         BNE   *+16                     NO, CONTINUE               U013
+         MVC   OL@SRBP(8),=C'   ---  '  YES, CLEAR FIELD           U013
+         XC    PERSRB,PERSRB            CLEAR CPU COUNTER FOR TEST U013
+         SPACE 1
+         HEX   OL@DPRTY,JOBDPRTY,LEN=1  CONVERT DISP PRTY          U013
+         SPACE 1
+         L     R1,IOCOUNT               TOTAL I/O                  U013
+         SPACE 1
+         CVD   R1,DOUBLE                CONVERT                    U013
+         MVC   OL@IOREQ,=X'402020202020206B202120'                 U015
+         ED    OL@IOREQ,DOUBLE+3        PRINTABLE                  U015
+         SPACE 1
+         LH    R1,PERIO                 I/O PER SECOND             U013
+         CVD   R1,DOUBLE                R1 = I/O RATE * 100        U013
+         MVC   OL@IORAT,=X'402020214B2020'                         U002
+         ED    OL@IORAT,DOUBLE+5        MAKE PRINTABLE             U002
+         CH    R1,=H'-1'                TRUE ZERO?                 U013
+         BNE   *+16                     NO, CONTINUE               U013
+         MVC   OL@IORAT(8),=C'   ---  ' YES, CLEAR FIELD           U013
+         XC    PERIO,PERIO              CLEAR FOR DISP TEST        U013
+         SPACE 3
+         TM    FLAG,FMODE               TOP 20 USERS MODE?         U013
+         BO    DISPADD                  YES, ADD LINE TO DISP      U013
+         CLC   PERCPU,THRSHCPU          OVER CPU THRESHOLD?        U013
+         BNL   DISPADD                  YES, ADD TO DISP           U013
+         CLC   PERSRB,THRSHSRB          OVER SRB THRESHOLD?        U013
+         BNL   DISPADD                  YES, ADD TO DISP           U013
+         CLC   PERIO,THRSHIO            OVER I/O THRESHOLD?        U013
+         BNL   DISPADD                  YES, ADD TO DISP           U013
+         SPACE 1
+DISPNXT  LH    R11,NXTASCBD             # OF NEXT ASID             U013
+         B     DISPLOOP                 GO INSPECT IT              U013
+         SPACE 1
+DISPADD  MVC   0(OUTAREAL,R10),OUTAREA  MOVE LINE TO DISPLAY AREA  U013
+         LA    R10,OUTAREAL(,R10)       -> NEXT LINE               U013
+         LH    R11,NXTASCBD             # OF NEXT ASID             U013
+         BCT   R8,DISPLOOP              DO IT UNTIL SCREEN IS FULL U013
+         EJECT ,
+DISPLAY  TM    FLAG,FSTART              FIRST TIME THRU?
+         BZ    SETTITLE                 ...NO, PROCEED
+*
+         NI    FLAG,255-FSTART          RESET FLAG                 U003
+         MVC   L6+L'INITMSG/2(L'INITMSG),INITMSG    MOVE MESSAGE   U002
+*
+SETTITLE MVC   SCREEN(79),HEADER1
+         MVC   L2(79),HEADER2
+         EJECT ,
+         MVC SRMLINE,=C'CPU=XXX   UIC=XXX   AFC=XXXX   ASMQ=XXX  ' U004
+         L     R15,CVTPTR               -> CVT                     U004
+         USING CVT,R15                                             U004
+         L     R14,CVTPVTP              -> PVT                     U004
+         LH    R0,PVTAFC-PVT(,R14)      AVAILABLE FRAME COUNT      U004
+         CVD   R0,WORK                                             U004
+         MVC   EDITWORK(10),=X'40202020212040404040'               U004
+         LA    R1,EDITWORK+5            INIT SIGNIFICANCE POINTER  U004
+         EDMK  EDITWORK(6),WORK+5                                  U004
+         MVC   SRMLINE+24(5),0(R1)      MOVE AFC TO DISPLAY        U004
+         SPACE 1
+         L     R14,CVTOPCTP             -> SRM CONTROL TABLE       U004
+         DROP  R15                      CVT                        U004
+         USING RMCT,R14                                            U004
+         L     R15,RMCTMCT              -> SRM STORAGE MGT CTL TBL U004
+         LH    R0,MCVSTCRI-MCT(,R15)    SYSTEM HIGHEST UIC         U004
+         CVD   R0,WORK                                             U004
+         MVC   EDITWORK(10),=X'40202020212040404040'               U004
+         LA    R1,EDITWORK+5            INIT SIGNIFICANCE POINTER  U004
+         EDMK  EDITWORK(6),WORK+5                                  U004
+         MVC   SRMLINE+14(5),0(R1)      MOVE UIC TO DISPLAY        U004
+         SPACE 1
+         L     R1,RMCTCCT               -> SRM CPU MGT CONTROL TBL U004
+         DROP  R14                                                 U004
+         LH    R0,CCVUTILP-CCT(,R1)     SYSTEM CPU UTILIZATION     U004
+         CVD   R0,WORK                                             U004
+         MVC   EDITWORK(10),=X'40202020212040404040'               U004
+         LA    R1,EDITWORK+5            INIT SIGNIFICANCE POINTER  U004
+         EDMK  EDITWORK(6),WORK+5                                  U004
+         MVC   SRMLINE+04(5),0(R1)      MOVE CPU TO DISPLAY        U004
+         SPACE 1
+         LA    R1,MCTLEN(,R15)          -> SRM RESOURCE MGT CTL TB U006
+         LH    R0,RCVASMQA-RCT(,R1)     ASMQ LENGTH AVERAGE        U004
+         CVD   R0,WORK                                             U004
+         MVC   EDITWORK(10),=X'40202020212040404040'               U004
+         LA    R1,EDITWORK+5            INIT SIGNIFICANCE POINTER  U004
+         EDMK  EDITWORK(6),WORK+5                                  U004
+         MVC   SRMLINE+36(5),0(R1)      MOVE ASMQ TO DISPLAY       U004
+         EJECT ,
+         TM    FLAG,FAUTO               AUTO UPDATE MODE?
+         BZ    WRITE2                   ...NO.
+*
+         OI    IOCBFLGD,IOCBDYON+IOCBDFRC
+         SPACE 2                                                   U002
+         TRMIO IOCB,WRITE,FORMAT=FORMAT,IMAGE=SCREEN
+         SPACE 2                                                   U002
+*U003    TM    FLAG,FSTART              FIRST TIME THRU?           U002
+*U003    BZ    *+8                      NO - SKIP                  U002
+*U003    NI    FLAG,255-FSTART-FAUTO    RESET BOTH FLAGS           U002
+         SPACE 2                                                   U002
+         PFKEY DEF=NEWSCR,ATTN=NOAUTO
+NOAUTO   NI    FLAG,255-FAUTO           TURN OFF AUTO UPDATE
+         NI    IOCBFLGD,255-IOCBDYON-IOCBDFRC
+         SPACE 2                                                   U002
+WRITE2   TRMIO IOCB,FORMAT=FORMAT,IMAGE=SCREEN
+         SPACE 2
+         PFKEY DEF=NEWSCR,K2=NEWAUTO,K9=TOP20RST,K5=NEWMODE,       U013$
+               K3=TOP20XIT,K12=TOP20XIT,ATTN=TOP20XIT              U010
+CLEAR    LH    R3,FORMAT                GET IMAGE LENGTH
+         LA    R2,SCREEN                GET IMAGE ADDRESS
+         L     R5,=X'40000000'          PAD BYTE, AND ZERO LENGTH
+         MVCL  R2,R4                    CLEAR AREA TO BLANKS
+         BR    R14
+         TITLE 'CONSTANT DEFINITIONS'
+INITMSG  LC    '****  /I N I T I A L I Z I N G  ****'              U003
+*
+HEADER1  LC    '/JOBNAME  /A/S/I/D    /T/C/B /C/P/U /USAGE      /S/R/B *
+               /C/P/U /USAGE   /DISP        /I///O /USAGE',L=79,   U003
+HEADER2  LC    '               /SECONDS            /SECONDS           /*
+               PRIO   /REQUESTS  /RATE///SEC',L=79                 U003
+CPULINE  DS    0CL79
+         DC    CL8' ',CL2' '            JOBNAME                    U002
+         DC    CL2' ',CL1' '            ASID                       U002
+         DC    CL9' '                   TCBR                       U002
+         DC    CL7' ',CL3'%'            TCB                        U002
+         DC    CL9' '                   SRBR                       U002
+         DC    CL7' ',CL5'%'            SRB                        U002
+         DC    CL2' ',CL3' '            DPRTY                      U002
+         DC    CL9' ',CL2' '            IOREQ                      U002
+         DC    CL7' ',CL2' '            IORATE                     U002
+         DC    CL1' '
+         SPACE 2
+HEXTAB   EQU   *-C'0'                                              U002
+         DC    C'0123456789ABCDEF'
+         SPACE 2
+         TITLE 'TERMINATION PROCESSING + DYNAMIC WORK AREAS'
+FORMAT   DCMSFMT                                                   U001
+SCREEN   DCMSFLD  79                                               U001
+L2       DCMSFLD  79                                               U001
+L3       DCMSFLD  79,INTEN=LO                                      U001
+L4       DCMSFLD  79,INTEN=LO                                      U001
+L5       DCMSFLD  79,INTEN=LO                                      U001
+L6       DCMSFLD  79,INTEN=LO                                      U001
+L7       DCMSFLD  79,INTEN=LO                                      U001
+L8       DCMSFLD  79,INTEN=LO                                      U001
+L9       DCMSFLD  79,INTEN=LO                                      U001
+L10      DCMSFLD  79,INTEN=LO                                      U001
+L11      DCMSFLD  79,INTEN=LO                                      U001
+L12      DCMSFLD  79,INTEN=LO                                      U001
+L13      DCMSFLD  79,INTEN=LO                                      U001
+L14      DCMSFLD  79,INTEN=LO                                      U001
+L15      DCMSFLD  79,INTEN=LO                                      U001
+L16      DCMSFLD  79,INTEN=LO                                      U001
+L17      DCMSFLD  79,INTEN=LO                                      U001
+L18      DCMSFLD  79,INTEN=LO                                      U001
+L19      DCMSFLD  79,INTEN=LO                                      U001
+L20      DCMSFLD  79,INTEN=LO                                      U001
+L21      DCMSFLD  79,INTEN=LO                                      U001
+L22      DCMSFLD  79,INTEN=LO                                      U001
+INPLINE  DCMSFLD  37,ALPHA,CURSOR=YES                              U004
+SRMLINE  DCMSFLD 41                                                U004
+         DCMSFEND                                                  U001
+         EJECT ,
+TOP20XIT L     R0,TABLELEN              LEN TO FREE                U010
+         L     R1,CPUTABLE              ADDR TO FREE               U010
+         FREEMAIN  R,LV=(0),A=(1)       FREE TABLE STORAGE         U010
+         SPACE 2                                                   U010
+         DCMSTOP                                                   U001
+         SPACE 2
+WORK     DS    D                        FOR CVD                    U004
+EDITWORK DS    CL10                     FOR EDIT                   U004
+CLOCK    DS    D                        FOR STORE-CLOCK
+TABLELEN DS    F                        GETMAIN DESC FOR CPUTABLE  U010
+*U010CPUTABLE DS    150XL28             ROOM FOR 150 ASID'S        U007
+CPUTABLE DS    A(*-*)                   -> ASCB SAVE TABLE         U010
+         SPACE 1
+HEADASCB DS    H                        # OF HIGHEST PRIOR ASCB    U013
+THRSHCPU DS    H                        THRESHOLD FOR CPU %        U013
+THRSHSRB DS    H                        THRESHOLD FOR SRB %        U013
+THRSHIO  DS    H                        THRESHOLD FOR I/O RATE     U013
+FACTCPU  DS    H                        FACTOR FOR CPU WIEGHTING   U013
+FACTSRB  DS    H                        FACTOR FOR SRB WIEGHTING   U013
+FACTIO   DS    H                        FACTOR FOR I/O WIEGHTING   U013
+         SPACE 1
+BRNYCNT  DS    256H                     SPACE FOR 256 BROWNIE CTRS U013
+         SPACE 3
+OUTAREA  DS    0CL79
+OL@JOBNM DC    CL8' ',CL2' '                                       U002
+OL@ASID  DC    CL2' ',CL1' '                                       U002
+OL@TCBR  DC    CL9' '                                              U002
+OL@TCBP  DC    CL7' ',CL3'%'                                       U002
+OL@SRBR  DC    CL9' '                                              U002
+OL@SRBP  DC    CL7' ',CL5'%'                                       U002
+OL@DPRTY DC    CL2' ',CL1' '                                       U015
+OL@IOREQ DC    CL11' ',CL2' '                                      U015
+OL@IORAT DC    CL7' ',CL2' '                                       U002
+         DC    C' '                                                U013
+OUTAREAL EQU   *-OUTAREA                                           U002
+         SPACE 1
+FLAG     DS    X                        FLAG BYTE - VALUES ARE:
+FAUTO    EQU   X'80'                    AUTO UPDATE MODE
+FSTART   EQU   X'40'                    FIRST TIME THRU.
+FMODE    EQU   X'20'                    TOP 20 CPU USERS           U013
+*
+         DSGEN FORMAT                                              U012
+DCMSWRKL EQU   *-DCMSWORK               LEN OF DSECT               U010
+         TITLE 'JOB TABLE DSECT'
+CPUENTRY DSECT ,                        DSECT FOR SINGLE TABLE ENTRY
+JOBNAME  DS    CL8                      JOBNAME/USERID
+CLKTIME  DS    D                        CLOCK TIME (MS)
+CPUTIME  DS    F                        CPU TIME   (MS)
+SRBTIME  DS    F                        SRB TIME
+IOCOUNT  DS    F                        I/O COUNT                  U002
+PERCPU   DS    H                        % CPU TIME * 100           U013
+PERSRB   DS    H                        % SRB TIME * 100           U013
+PERIO    DS    H                        I/O PER SEC * 100          U013
+BROWNIE  DS    H                        BROWNIE PT COUNT           U013
+NXTASCBD DS    H                        # OF NEXT ASCBID           U013
+JOBDPRTY DS    X                        DISPATCHING PRTY           U013
+         DS    X                        RESERVED                   U013
+ENTRYLEN EQU   *-CPUENTRY               LENGTH OF ONE ENTRY
+         TITLE 'ASCB DSECT'
+         IHAASCB
+         TITLE 'OUCB DSECT'                                        U002
+         IRAOUCB                                                   U002
+         TITLE 'PVT DSECT'                                         U004
+         IHAPVT  ,                                                 U004
+         TITLE 'RMCT DSECT'                                        U004
+*  THE RMCT DSECT IS ON PVTMACS, IF YOU DON'T HAVE IT, COMMENT     U004
+*  OUT THE IRARMCT AND UNCOMMENT OUT THE FOLLOWING.                U004
+         SPACE 1
+*RMCT    DSECT                                                     U004
+*        DS    C'RMCT'                                             U004
+*RMCTCCT DS    A(CCT)                                              U004
+*        DS    A(ICT)                                              U004
+*RMCTMCT DS    A(MCT)                                              U004
+         SPACE 1
+         IRARMCT  ,                                                U004
+*  EQU'S TO PREVENT ASSEMBLY ERRORS                                U004
+ICT      EQU   *                                                   U004
+RMPT     EQU   *                                                   U004
+RMCA     EQU   *                                                   U004
+RMEX     EQU   *                                                   U004
+RMSB     EQU   *                                                   U004
+IRAEPPA  EQU   *                                                   U004
+EPDTSCN  EQU   *                                                   U004
+EPATSCN  EQU   *                                                   U004
+EPAT     EQU   *                                                   U004
+IRAFLTM  EQU   *                                                   U004
+IRAEPPR  EQU   *                                                   U004
+IRACTMQE EQU   *                                                   U004
+IRAOUCB  EQU   *                                                   U004
+IRAWTQE  EQU   *                                                   U004
+IRAOTQE  EQU   *                                                   U004
+IRAINQE  EQU   *                                                   U004
+RQSV     EQU   *                                                   U004
+IRAOUXB  EQU   *                                                   U004
+IRASRBT  EQU   *                                                   U004
+         SPACE 1
+*  ADDED FOR SP1                                                   U005
+LSCT     EQU   *                                                   U004
+ICSP     EQU   *                                                   U004
+RSPL     EQU   *                                                   U004
+ENFPM    EQU   *                                                   U004
+         TITLE 'CCT DSECT'                                         U004
+*  THE CCT DSECT IS ON PVTMACS, IF YOU DON'T HAVE IT, COMMENT      U004
+*  OUT THE IRACCT AND UNCOMMENT OUT THE FOLLOWING.                 U004
+         SPACE 1
+*CCT     DSECT                                                     U004
+*        ORG   CCT+X'6E'                                           U004
+*CCVUTILP DS   H                                                   U004
+         SPACE 1
+         IRACCT  ,                                                 U004
+         TITLE 'MCT DSECT'                                         U004
+*  THE MCT DSECT IS ON PVTMACS, IF YOU DON'T HAVE IT, COMMENT      U004
+*  OUT THE IRAMCT AND UNCOMMENT OUT THE FOLLOWING.                 U004
+         SPACE 1
+*MCT     DSECT                                                     U004
+*        ORG   MCT+X'38'                                           U004
+*MCVSTCRI DS   H                                                   U004
+*MCTLEN  EQU   X'96'                                               U004
+         SPACE 1
+         IRAMCT  ,                                                 U004
+         TITLE 'RCT DSECT'                                         U004
+*  THE RCT DSECT IS ON PVTMACS, IF YOU DON'T HAVE IT, COMMENT      U004
+*  OUT THE IRARCT AND UNCOMMENT OUT THE FOLLOWING.                 U004
+         SPACE 1
+*RCT     DSECT                                                     U004
+*        ORG   RCT+X'2C'                                           U004
+*RCVASMQA DS   H                                                   U004
+         SPACE 1
+         IRARCT  ,                                                 U004
+         TITLE 'CVT DSECT'
+         CVT   LIST=NO,DSECT=YES
+         TITLE 'ASVT DSECT'                                        U010
+         IHAASVT  ,                                                U010
+         SPACE 2
+         END

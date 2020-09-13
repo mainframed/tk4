@@ -1,0 +1,255 @@
+ TITLE 'IGG019BT--C.E.A. FOR BSAM CREATION OF VS-BDAM DATA SET'
+*
+IGG019BT CSECT
+*                                                                     *
+*MODULE NAME - IGG019BT                                               *
+*                                                                     *
+*DESCRIPTIVE NAME - BDAM CREATE CHANNEL END APPENDAGE, VS FORMAT      *
+*                                                                     *
+*COPYRIGHT - NONE                                                     *
+*                                                                     *
+*CHANGE ACTIVITY                                                      *
+*                                                                     *
+*          RELEASE 20 DELETIONS
+*3631334000                                                      20201
+*          RELEASE 21 DELETIONS
+*
+*          RELEASE VS2-2 DELETIONS
+*002500,140000,142800-143600,144400-145600,150000-151000,152400-153600,
+*192500-194080,194120-208600,218000-225000,296000-298000,380000,
+*390000-392000,484000,540000-798000,846200-847200                Y02072
+*                                                                YM3849
+*
+*STATUS CHANGE LEVEL 003
+*
+*FUNCTIONS - THIS ROUTINE IS LOADED TOGETHER WITH IGGO19BR,IGGO19BS
+*            WHEN DCB SPECIFIES MACRF=(WL),RECFM=VS,BUFTEK=R,DSORG=PS
+*            AND DD STATEMENT SPECIFIES DSORG=DA
+*
+*            THE ROUTINE OPERATES AS FOLLOWS
+*            WHEN THE WRITE-SZ WAS ISSUED,IT RETURNS CONTROL BACK TO
+*            IOS
+*
+*            WHEN THE WRITE-SF WAS ISSUED,IT DETERMINES WHETHER THE
+*            BLOCK IS SPANNED RECORD.IF NOT SPANNED,IT RETURNS CONTROL
+*            BACK TO IOS
+*
+*            WHEN A SPANNED RECORD IS BEING PROCESSED,IT DETERMINES
+*            IF THE ENTIRE RECORD HAS BEEN WRITTEN.IF THE RECORD HAS
+*            BEEN WRITTEN,THE ROUTINE RETURNS CONTROL TO IOS.WHEN THE
+*            ENTIRE RECORD HAS NOT BEEN WRITTEN,THE ROUTINE SCHEDULES
+*            THE ASYNCHRONOUS EXIT ROUTINE SO THAT THE ASYNCHRONOUS
+*            EXIT ROUTINE WILL SCHEDULE EXCP TO WRITE A MIDDLE OR THE
+*            LAST SEGMENT OF THE RECORD.
+*
+*
+*ENTRY - THIS ROUTINE IS ENTERED WHEN A CHANNEL END,CHANNEL END WITH
+*        UNIT EXCEPTION,OR CHANNEL END WITH WRONG LENGTH RECORD OCCUR
+*        WITHOUT ANY OTHER ABNORMAL END CONDITIONS
+*
+*INPUT - ENTRY PARAMETERS
+*        R1 - ADDRESS OF RQE (MUST NEVER BE TOUCHED)
+*        R2 - ADDRESS OF IOB
+*        R3 - ADDRESS OF DEB
+*        R4 - ADDRESS OF DCB
+*        R7 - ADDRESS OF UCB
+*        R13- ADDRESS OF IOS SAVEAREA                            Y02072
+*        R14- RETURN ADDRESS
+*
+*
+*OUTPUT - REGISTERS
+*        ALL REGISTER CONTENTS ARE RESTORED BEFORE RETURNING TO IOS
+*
+*EXIT - TO IOS
+*        +0(R14) - I/O COMPLETE AND RB IS MADE AVAILABLE
+*      'ASYOUT' TO EXIT EFFECTOR TO SCHEDULE ASYNCHRONOUS ROUTINE
+*
+*EXTERNAL ROUTINES -
+*
+*MACROS - MODESET
+*
+*ATTRIBUTES - THIS ROUTINE IS RE-ENTRANT, ENABLED, AND PRIVILEGED.
+*         ENTRY IS IN KEY ZERO, BUT MOST PROCESSING IS IN USER KEY.
+*         THE APPENDAGE RUNS WITH THE LOCAL LOCK HELD.
+*NOTES -
+*
+***********************************************************************
+*   REGISTER CONVENTIONS
+***********************************************************************
+R0       EQU   0                   PARAMETER REGISTER
+RQER     EQU   1                   ADDR OF RQE (NEVER USE)
+RIOB     EQU   2                   ADDR OF IOB
+RDEB     EQU   3                   ADDR OF DEB (ALSO MODESET WORKREG)
+RDCB     EQU   4                   ADDR OF DCB
+R5       EQU   5
+R6       EQU   6                   WORKREG FOR MODESET           Y02072
+RUCB     EQU   7                   ADDR OF UCB
+RDECB    EQU   8                   ADDR OF DECB                  Y02072
+SGWKR    EQU   9                   SEGMENT WORK REG.(MUST BE SET TO 0)
+RWKR9    EQU   9                   WORK REGISTER
+WKR10    EQU   10                  WORK REGISTER
+WKR11    EQU   11                  WORK REGISTER
+RBASE    EQU   12                  BASE REGISTER
+RSAVE    EQU   13                  WORK REGISTER                 Y02072
+RTNR     EQU   14                  RETURN REGISTER
+R15      EQU   15                  WORK REGISTER                 Y02072
+*
+***********************************************************************
+*   EQUATES AND MASKS
+***********************************************************************
+SETSECT  EQU   X'23'                    SET SECTOR CC MASK       20201
+WRITESZ  EQU   X'04'               TYPE OF WRITE = 'SZ'
+SPANNED  EQU   X'04'               RECORD IS A SPANNED RECORD
+NOT      EQU   X'FF'               CONSTANT 'FF'
+TWELVE   EQU   12                  CONSTANT '12'
+NULL     EQU   0                   CONSTANT '0'
+ONE      EQU   1                   CONSTANT '1'
+FOUR     EQU   4                   CONSTANT '4
+ADDRLG   EQU   3                        3 BYTE LENGTH OF ADDR    YM3849
+UNITCHK  EQU   X'02'                    UNIT CHECK BIT
+STATBITS EQU   3                        OFFSET IN CSW TO STATUS  Y02072
+IOSEXIT  EQU   12                       RETURN TO IOS AT 12 OFF  Y02072
+*                                       R14 FOR NO POST,SAVE RQE Y02072
+***********************************************************************
+*                       ESTABLISH REGISTERS
+***********************************************************************
+START    EQU   *                                                 Y02072
+         STM   R0,R15,0(RSAVE)          SAVE IOS REGISTERS       Y02072
+         USING IHADCB,RDCB
+         USING RQE,RQER                 ESTABLISH RQE BASE       Y02072
+         BALR  RBASE,NULL               ESTABLISH
+         USING *,RBASE                  BASE FOR C.E.A.          Y02072
+*
+         MODESET  KEYADDR=RQEPRT,WORKREG=6   CHANGE TO USER KEY  Y02072
+*
+         SH    RIOB,KIOBPREF            BACK UP TO VS IOB PREFIX
+         USING IOBBSAMN,RIOB            SET UP IOB BASE REG
+***********************************************************************
+*  THE FOLLOWING ROUTINE RESTORES THE USER'S ECB IN THE IOB.  IF
+*  MULTIPLE SEGMENTS WERE REQUIRED, THE USER'S DECB ADDRESS WILL
+*  HAVE BEEN SAVED IN THE IOBIOBA FIELD IN THE IOB(-4) BEFORE THE
+*  SECOND AND SUBSEQUENT EXCPS WERE ISSUED BY THE ASI ROUTINE.
+*  THIS WAS NECESSARY TO PREVENT EXCP PROCESSING OF SECONDARY EXCPS
+*  FROM OVERLAYING ANY CHANGE IN THE STATUS OF THE ECB.
+***********************************************************************
+ECBCHK   EQU   *                        CHECK DECB ADDR          YM3849
+         L     WKR10,IOBECBPT           GET ADDR IN IOB FOR DECB YM3849
+         LA    WKR10,0(WKR10)           CLEAR OUT TOP BYTE       YM3849
+         LA    WKR11,IOBCSW-1           GET ADDR OF IOBCSW WORD  YM3849
+         CR    WKR11,WKR10              DOES IOBECBPT PT TO CSW  YM3849
+         BNE   TESTCSW                  IF NOT, DECB PTR OK      YM3849
+         MVC   IOBECBPB(ADDRLG),IOBNECB+1  MV REAL DECB PTR BACK YM3849
+         XC    IOBNECB+1(ADDRLG),IOBNECB+1   CLEAR IOB FIELD     YM3849
+*******
+TESTCSW  EQU   *                        TEST CSW FOR ERROR       YM3849
+         TM    IOBCSW+STATBITS,UNITCHK  TEST UNIT CHECK          Y02072
+         BO    NORMAL                   BRANCH IF ON
+*
+         L     RDECB,IOBECBPT           LOAD ADDR OF DECB
+         USING DECB,RDECB               ESTABLISH DECB BASE      Y02072
+***********************************************************************
+*   DETERMINE THE TYPE OF I/O REQUEST AND ITS HANDLING
+*     1. WRITE/SZ - RETURN TO +0(IOS)
+*     2. NON-SPANNED RECORD - RETURN TO +0(IOS)
+*     3. SPANNED RECORD - FURTHER ANALYSIS
+***********************************************************************
+         TM    DECTYPE2,DECWRSZ         TEST IF WRITE/SZ REQUEST Y02072
+         BO    NORMAL                   YES,GO TO IOS IMMEDIATELY
+*
+         TM    IOBNFLG1,IOBSPAN         TEST IF SPANNED RECORD   Y02072
+         BO    CHKSPAN                  YES, GO TO CHECK SPANNED RECORD
+***********************************************************************
+*   NORMAL RETURN TO IOS  - +0(IOS)
+***********************************************************************
+NORMAL   EQU   *
+*
+         MODESET  KEYADDR=IOSKEY,WORKREG=3   RETURN TO IOS KEY   Y02072
+*
+         LM    R0,R15,0(RSAVE)          RESTORE IOS REGS         Y02072
+         BR    RTNR                     GO BACK TO IOS
+***********************************************************************
+*   DETERMINE WHETHER ANY MORE I/O IS REQUIRED
+*        YES - SCHEDULE ASYNCHRONOUS EXIT ROUTINE
+*        NO  - RESET SPAN BIT AND GO BACK TO IOS
+***********************************************************************
+CHKSPAN  EQU   *
+         SR    SGWKR,SGWKR              ZERO OUT REG 9           20201
+         IC    SGWKR,DCBOFFSW           GET OFFSET TO WRT CCW    20201
+         L     SGWKR,NULL(SGWKR,RIOB)   GET SEG WRK AREA ADDR    20201
+         SH    SGWKR,SWACBLG            MINUS SWA CONTROL FIELD  Y02072
+         USING SWA,SGWKR           ESTABLISH BASE FOR SEG.WKAREA Y02072
+         TM    SWAFLAG,SWALAST     TEST IF PREVIOUS I/O WAS LAST Y02072
+         BNO   ASYOUT              NO,GOTO EXIT TO ASYNCHRONOUS EXIT
+*
+         NI    IOBNFLG1,NOT-SPANNED RESET SPANNED BIT IN IOB
+         B     NORMAL              GO BACK TO +0(IOS)
+***********************************************************************
+***********************************************************************
+*   EXIT TO EXIT EFFECTOR TO SCHEDULE ASYNCHRONOUS EXIT ROUTINE.
+*   THE ROUTINE WILL ISSUE EXCP TO WRITE NEXT SEGMENT OF THE RECORD.
+***********************************************************************
+ASYOUT   EQU   *
+         L     R15,CVTPTR           GET CVTPTR                   Y02072
+         USING CVT,R15              LOCATE EXIT EFFECTOR ADDR    Y02072
+         L     R15,CVT0EF00             FROM CVT                 Y02072
+*
+         MODESET  KEYADDR=IOSKEY,WORKREG=3   RETURN TO IOS KEY   Y02072
+*
+         BALR  RTNR,R15                 GO TO EXIT EFFECTOR      Y02072
+         LM    R0,R15,0(RSAVE)          RESTORE IOS REGS         Y02072
+         B     IOSEXIT(RTNR)            RETURN TO IOS            Y02072
+***********************************************************************
+*   CONSTANTS
+***********************************************************************
+KIOBPREF DC    H'8'                     LENGTH OF IOBPREFIX
+SWACBLG  DC    H'10'                    LENGTH OF SWA CNTRL BLK  Y02072
+IOSKEY   DC    X'00'                    KEY FOR IOS              Y02072
+MODID    DC    CL8'IGG019BT'            MODULE ID                Y02072
+*
+PATCH    DC    XL50'0'                  PATCH AREA               Y02072
+         LTORG
+         EJECT
+***********************************************************************
+*
+*    CONTROL BLOCK DEFINITIONS FOLLOW
+*
+***********************************************************************
+         IECDRQE                                                 Y02072
+         EJECT
+         IEZDEB                                                  Y02072
+         EJECT
+         IEZIOB                                                  Y02072
+         EJECT
+         IHADECB                                                 Y02072
+         EJECT
+         CVT  DSECT=YES
+**********************************************************************
+*
+         DCBD  DSORG=(PS),DEVD=(DA)
+*
+***********************************************************************
+*
+         IGGSWA                                                  Y02072
+*
+***********************************************************************
+*
+*   DSECT FOR DASD DEVICE CHARACTERISTIC TABLE
+*
+***********************************************************************
+*
+DASDTBL  DSECT
+*
+DASDCYL  DS    H                   NO. OF CYLINDERS
+DASDTRK  DS    H                   NO. OF TRACKS/CYLINDER
+DASDLNGH DS    H                   TRACK LENGTH
+DASDINTR DS    AL1                 OVERHEAD FOR INTERMEDIATE RECORD
+DASDLAST DS    AL1                 OVERHEAD FOR LAST RECORD
+DASDKEY  DS    AL1                 OVERHEAD FOR KEY
+DASDFLAG DS    AL1                 FLAGS
+*
+BYTEMODE EQU   X'02'               MBBCCHHR IS BY BYTE (2321)
+TOLERANC EQU   X'01'               TOLERANCE FACTOR MUST BE ADDED
+*
+DASDTOL  DS    AL2                 TOLERANCE FACTOR
+*
+         END

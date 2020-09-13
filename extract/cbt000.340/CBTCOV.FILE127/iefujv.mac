@@ -1,0 +1,589 @@
+TEC016   TITLE 'IEFUJV - SMF JOB VALIDATION EXIT ROUTINE'
+***********************************************************************
+*                          COPYRIGHT: 1979 RAINIER NATIONAL BANK      *
+*                                     SEATTLE WASHINGTON              *
+*                                     (206) 433-7467                  *
+* MEMBER: TEC016                                                      *
+* SMP USERMOD: PZ00038                                                *
+* LOAD LIB: SYS1.LPALIB                                               *
+* MACRO LIBS NEEDED: SYS1.AMODGEN                                     *
+*                    SYS1.HASPSRC                                     *
+*                    TEC.RACF.MACLIB                                  *
+*                    SYS1.MACLIB                                      *
+*                                                                     *
+* LINKAGE EDITOR PARMS: LET,NCAL,RENT                                 *
+*                                                                     *
+* PURPOSE:                                                            *
+*        IEFUJV IS AN SMF JOB VALIDATION EXIT. AT RNB IT PERFORMS     *
+*        THE FOLLOWING FUNCTIONS:                                     *
+*        (1) SAVE RACF USER AND GROUP INFORMATION FROM THE            *
+*            JOBCARD FOR BATCH JOBS;                                  *
+*        (2) WHEN ALL OF THE JOBCARD HAS BEEN PROCESSED, PERFORM A    *
+*            RACINIT USING THE SAVED USER AND GROUP VALUES, AND THE   *
+*            PASSWORD VALUES CONTAINED IN THE JES2 JCT FOR THE JOB;   *
+*        (3) IF THE RACINIT IS OK, LET THE JOB RUN;                   *
+*        (4) IF THE RACINIT FAILS AND THE USERID IS NOT A PRODUCTION  *
+*            USERID, FAIL THE JOB, AND ISSUE AN ERROR MESSAGE FOR     *
+*            THOSE CASES WHERE RACINIT DOESN'T ISSUE ONE;             *
+*        (5) IF THE RACINIT FAILS FOR A PRODUCTION USER, AND THE      *
+*            FAILURE IS DUE TO PASSWORD EXPIRATION, ALLOW THE JOB TO  *
+*            RUN BUT LOG A MESSAGE TO SMF VIA RACF SO DATA SECURITY   *
+*            WILL KNOW THEY NEED TO REDEFINE THE PASSWORD             *
+*                                                                     *
+* CHANGE LOG:                                                         *
+*   001  12/16/80 - (1) HANDLE PRODUCTION PASSWORD EXPIRATION         *
+*                   (2) ISSUE WTO FOR SOME RACINIT FAILURES           *
+*                   (3) ISSUE WTO IF JES2 JCT APPEARS TO HAVE BAD     *
+*                       FORMAT - INDICATES POSSIBLE ERROR OR CHANGED  *
+*                       CONTROL BLOCK CHAINING                        *
+*                                                                     *
+* NOTES:                                                              *
+*                                                                     *
+*                 (1) THIS MODULE USES THE FIRST 4 BYTES OF JMRUSEID, *
+*                     WHICH IS AN 8-BYTE AREA IN THE SMF-PROVIDED     *
+*                     COMMON EXIT PARAMETER AREA. AFTER EXECUTION OF  *
+*                     IEFUJV, JMRUSEID IS RESTORED TO BLANKS.         *
+*                                                                     *
+*                 REGISTER CONVENTIONS = STANDARD CONVENTIONS.        *
+*                    REGISTER  0       = UNUSED                       *
+*                    REGISTER  1       = ADDRESS OF INPUT PARAMETERS, *
+*                                        THEN WORK                    *
+*                    REGISTER  2       = ADDRESS OF COMMON EXIT       *
+*                                        PARAMETER AREA               *
+*                    REGISTER  3       = ADDRESS 80 BYTE JCL TEXT     *
+*                    REGISTER  4       = ADDRESS ENTRY CODE BYTE      *
+*                    REGISTERS 5 TO 9  = WORK                         *
+*                    REGISTER  10      = ADDRESSABILITY TO JES2 JCT   *
+*                                        FOR THIS JOB                 *
+*                    REGISTER  11      = WORK                         *
+*                    REGISTER  12      = ADDRESSABILITY TO IEFUJV     *
+*                                        CSECT                        *
+*                    REGISTER  13      = SAVE AREA AND ADDRESSABILITY *
+*                                        TO WORK AREA                 *
+*                    REGISTER  14      = WORK REGISTER                *
+*                    REGISTER  15      = WORK REGISTER                *
+*                                                                     *
+*                PATCH LABEL = PATCH (UNUSED AND INTIALIZED TO        *
+*                   BINARY ZEROES)                                    *
+*                                                                     *
+*                                                                     *
+*                ATTRIBUTES = KEY 1, REENTRANT,                       *
+*                   SUPERVISOR STATE, ENABLED, NO LOCKS HELD          *
+*                                                                     *
+*             ENTRY POINTS = IEFUJV (ONLY ENTRY POINT)                *
+*                                                                     *
+*             INPUT = REG1 POINTS TO A LIST OF FOUR-BYTE ADRESSES AS  *
+*                     FOLLOWS:                                        *
+*                     1. ADDRESS OF COMMON EXIT PARAMETER AREA        *
+*                     2. ADDRESS OF 80-BYTE JCL TEXT AREA             *
+*                     3. ADDRESS OF 1-BYTE AREA THAT INDICATES        *
+*                        THE TYPE OF JCL STATEMENT AS FOLLOWS:        *
+*                        0 NULL STATEMENT                             *
+*                        1 JOB  STATEMENT                             *
+*                        2 EXEC STATEMENT                             *
+*                        4 DD   STATEMENT                             *
+*                        8 PROC STATEMENT                             *
+*                       16 ALL JCL HAS BEEN CONVERTED                 *
+*                       32 ALL JCL HAS BEEN INTERPRETED               *
+*                                                                     *
+*             OUTPUT = NONE                                           *
+*                                                                     *
+*             EXIT - NORMAL = AT PROGRAM END VIA BRANCH REGISTER 14   *
+*                                                                     *
+*                OUTPUT = NONE                                        *
+*                                                                     *
+*                RETURN CODE = ZERO                                   *
+*                                                                     *
+*             EXIT - ERROR = AT PROGRAM END VIA BRANCH REGISTER 14    *
+*                                                                     *
+*                OUTPUT = NONE                                        *
+*                                                                     *
+*                RETURN CODE = FOUR, TO CANCEL THE JOB                *
+*                                                                     *
+*             EXTERNAL REFERENCES =                                   *
+*                                                                     *
+*                ROUTINES = NONE                                      *
+*                                                                     *
+*                DATA AREAS = CVT,TCB,JES2 JCT                        *
+*                                                                     *
+*             TABLES = NONE                                           *
+*                                                                     *
+*             MACROS = SAVE, RETURN, RACINIT, REGEQU, GETMAIN,        *
+*                      FREEMAIN, CVT, IKJTCB, $JCT                    *
+*                                                                     *
+*             MESSAGES =                                              *
+*                SEVERAL, IF THE RACINIT FAILS. ALSO, RACINIT MAY     *
+*                ISSUE SEVERAL MESSAGES                               *
+*                                                                     *
+*             ABEND CODES = NONE                                      *
+***********************************************************************
+         EJECT
+         MACRO                                                      001
+&L       MSG   &TEXT,&FLAGS=0,&ROUTCDE=(2,9,11),&DESC=(6)           001
+         DS    0F                                                   001
+&L       DC    AL1(&FLAGS),AL3(&L.WTO)                              001
+&L.WTO   WTO   &TEXT,ROUTCDE=&ROUTCDE,DESC=&DESC,MF=L               001
+         MEND                                                       001
+         EJECT
+IEFUJV   CSECT ,                       CSECT NAME DECLARED
+         SAVE  (14,12),,IEFUJV_&SYSDATE_&SYSTIME
+         LR    R12,R15                 LOAD BASE REG WITH ENTRY POINT
+         USING IEFUJV,R12              #####
+         LM    R2,R5,0(R1)             LOAD INPUT PARM LIST ADDRESSES
+*
+*    R2  = ADDRESS OF COMMON EXIT PARAMETER AREA
+*    R3  = ADDRESS OF 80 BYTE JCL TEXT AREA
+*    R4  = ADDRESS OF ENTRY CODE BYTE
+*
+* CHECK THAT THIS IS FOR A BATCH JOB
+*
+         TM    K29(R2),X'01'           IS THIS A BATCH JOB?
+         BO    RET0                    NO, THEN NO PROCESSING AND EXIT
+*
+* CHECK THAT WE AREN'T DONE WITH THE JOB ALREADY
+*
+         CLI   K0(R4),CONVERTD         ALL JCL CONVERTED?
+         BE    JOBDONE                 /YES - GO DO RACINIT
+         CLI   K0(R4),JOBCODE          PROCESSING JOB CARD?
+         BNE   RET0                    /NO  - EXIT
+*
+* OBTAIN WORK AREA IF NECESSARY
+*
+         L     R11,K20(,R2)            GET ADDRESS OF AREA (IF ANY)
+         CLI   K20(R2),C' '            DO WE HAVE A WORKAREA?
+         BNE   INITDONE                IF NOT A BLANK, YES WE DO
+         GETMAIN R,LV=WORKLEN          AND GET THE WORKAREA
+         ST    R1,K20(,R2)             SAVE ADDR OF WORKAREA
+         MVI   K20(R2),C'*'            SET FLAG TO SHOW WE HAVE AN AREA
+         LR    R11,R1                  GET ADDR OF AREA
+         USING WORK,R11                #####
+         MVI   WFLAGS,0                INIT THE WORK AREA
+         MVI   WUIDL,0
+         MVI   WGRPL,0
+         MVI   WPSWD1L,0
+         MVI   WPSWD2L,0
+         MVC   WUID,BLANKS
+         MVC   WGRP,BLANKS
+         MVC   WPSWD1,BLANKS
+         MVC   WPSWD2,BLANKS
+         MVC   WCARDP,BLANKS
+         MVC   WCARDS,BLANKS
+INITDONE ST    R13,WORK+4              LINK THE SAVE AREAS
+         ST    R11,8(,R13)
+         LR    R13,R11
+         DROP  R11                     #####
+         USING WORK,R13                #####
+         EJECT
+***********************************************************************
+*                                                                     *
+* SCAN A JOBCARD, LOOKING FOR PARAMETERS                              *
+*                                                                     *
+***********************************************************************
+*
+JOBSCAN  DS    0H
+         TM    WFLAGS,WQUIT
+         BO    EXIT
+         MVC   WCARD(71),K0(R3)        MOVE CARD(1:71) TO WORK AREA
+         LA    R5,WCARD                POINT TO AREA TO SCAN
+         LA    R6,K71                  SET LENGTH TO SCAN
+EQLOOP   CLI   0(R5),C'='              FIND AN EQUAL SIGN (END OF
+         BE    EQFOUND                 KEYWORD)
+EQBUMP   LA    R5,1(,R5)
+         BCT   R6,EQLOOP
+         B     EXIT                    NO MORE KEYWORDS ON THIS CARD
+EQFOUND  LR    R14,R5                  KEYWORD FOUND, SEE WHICH ONE
+         SH    R14,=Y(L'CUSER)
+         CLC   CUSER,0(R14)            USER=?
+         BE    USERFND                 /YES - GO PROCESS IT
+         LR    R14,R5                  /NO
+         SH    R14,=Y(L'CGROUP)
+         CLC   CGROUP,0(R14)           GROUP=?
+         BE    GROUPFND                /YES - GO PROCESS IT
+         B     EQBUMP                  /NO  - KEEP SCANNING
+*
+*  PROCESS USER= KEYWORD
+*
+USERFND  CLI   WUIDL,K0                HAVE WE PROCESSED UID ALREADY?
+         BNE   QUIT1                   /YES - QUIT
+         LA    R0,K7                   MAX LENGTH OF UID IS 8
+         LA    R1,WUIDL                POINT TO OUTPUT AREA
+         BAL   R14,MOVEPARM            MOVE THE USERID
+         LTR   R6,R6                   ANYTHING LEFT ON CARD?
+         BP    EQBUMP                  /YES - KEEP SCANNING
+         B     EXIT                    /NO  - DONE FOR NOW
+*
+*  PROCESS GROUP= KEYWORD
+*
+GROUPFND CLI   WGRPL,K0                HAVE WE PROCESSED GROUP ALREADY?
+         BNE   QUIT1                   /YES - QUIT
+         LA    R0,K8                   MAX LENGTH OF GROUP IS 8
+         LA    R1,WGRPL                POINT TO OUTPUT AREA
+         BAL   R14,MOVEPARM            MOVE THE USERID
+         LTR   R6,R6                   ANYTHING LEFT ON CARD?
+         BP    EQBUMP                  /YES - KEEP SCANNING
+         B     EXIT                    /NO  - DONE FOR NOW
+*
+*  MOVE A PARAMETER TO THE WORK AREA
+*
+MOVEPARM LR    R15,R1                  SAVE ADDR OF OUTPUT AREA
+         STC   R0,0(,R1)               SAVE MAX LENGTH
+         LA    R1,1(,R1)               BYPASS LENGTH BYTE
+         LA    R5,1(,R5)               POINT TO FIRST CHAR
+         BCT   R6,MOVECHKP
+         BR    R14                     GET OUT IF NO CHAR AVAIL
+MOVECHKP CLI   0(R5),CLPAREN           IS PARM IN PARENS?
+         BNE   MOVELOOP                /NO
+         LA    R5,1(,R5)               BUMP TO NEXT CHAR
+         BCT   R6,MOVELOOP
+         BR    R14                     GET OUT IF NO CHAR AVAIL
+MOVELOOP LTR   R0,R0                   ROOM LEFT IN OUTPUT AREA?
+         BNP   MOVEDONE                /NO
+         CLI   0(R5),CBLANK            END OF PARM?
+         BE    MOVEDONE                /YES
+         CLI   0(R5),CCOMMA
+         BE    MOVEDONE                /YES
+         CLI   0(R5),CRPAREN
+         BE    MOVEDONE                /YES
+         MVC   0(1,R1),0(R5)           /NO  - MOVE A CHARACTER
+         BCTR  R0,0                    DECREMENT OUTPUT LENGTH LEFT
+         LA    R1,1(,R1)               BUMP OUTPUT POINTER
+         LA    R5,1(,R5)               BUMP TO NEXT CHAR
+         BCT   R6,MOVELOOP             CHECK NEXT CHAR
+MOVEDONE SR    R1,R1                   COMPUTE LENGTH OF DATA
+         IC    R1,0(,R15)              AS MAX LENGTH
+         SR    R1,R0                   - LENGTH LEFT
+         STC   R1,0(,R15)              SET LENGTH BYTE
+         BR    R14                     RETURN TO CALLER
+*
+* MULTIPLE USERID'S OR GROUPS ON JOB CARD, ERROR
+*
+QUIT1    OI    WFLAGS,WQUIT            SET FLAG TO QUIT SCANNING    001
+         LA    R1,MSG1                 ISSUE MESSAGE                001
+         BAL   R14,PUTMSG                                           001
+         B     EXIT
+         EJECT
+***********************************************************************
+*                                                                     *
+* DONE SCANNING JOB CARDS - DO RACINIT                                *
+*                                                                     *
+***********************************************************************
+JOBDONE  DS    0H
+         L     R11,K20(,R2)            GET ADDRESS OF WORK AREA
+         ST    R13,4(,R11)             LINK THE SAVE AREAS
+         ST    R11,8(,R13)
+         LR    R13,R11
+         USING WORK,R13                #####
+         TM    WFLAGS,WQUIT            ERROR FOUND ALREADY?         001
+         BO    FREEWORK                /YES - DONE                  001
+*                                      /NO                          001
+         CLI   WUIDL,K0                USERID ENTERED?
+         BE    FREEWORK                /NO  - DON'T DO RACINIT
+         L     R10,CVTPTR              GET JCT POINTER FROM
+         USING CVT,R10                 #####CVT        HOSCNVT'S
+         L     R10,CVTTCBP                             SAVE AREA
+         L     R10,4(,R10)                             (SAVED BY
+         USING TCB,R10                 #####TCB        CONVERTER)
+         L     R10,TCBFSA              1ST SAVE AREA
+         L     R10,60(,R10)            R10 FROM SAVE AREA
+         USING JCTDSECT,R10            #####(JES2) JCT
+         CLC   =CL4'JCT',JCTID         IS IT REALLY A JCT?
+         BE    @JCTOK1                 /YES - CONTINUE CHECKING     001
+         LA    R1,MSG2                 /NO  - ISSUE ERROR MSG       001
+         BAL   R14,PUTMSG                                           001
+         B     FREEWORK                                             001
+@JCTOK1  CLC   JCTJNAME(8),K0(R2)      DOES JCT HAVE RIGHT JOBNAME? 001
+         BE    @JCTOK2                 /YES - CONTINUE              001
+         LA    R2,MSG3                 /NO  - ISSUE ERROR MSG       001
+         BAL   R14,PUTMSG                                           001
+         B     FREEWORK                                             001
+@JCTOK2  CLI   JCTPASS,X'00'           IS THERE A PASSWORD IN JCT?  001
+         BE    FREEWORK                /NO  - GET OUT
+         CLI   JCTPASS,C' '
+         BE    FREEWORK
+         MVC   WPSWD1,JCTPASS          COPY PASSWORD TO OUR AREA
+         SR    R1,R1                   GET PASSWORD LENGTH
+         LA    R0,8
+         LA    R14,WPSWD1
+P1LOOP   CLI   0(R14),C' '             LOOK FOR BLANK (END OF PSWD)
+         BE    P1DONE
+         LA    R14,1(,R14)
+         LA    R1,1(,R1)
+         BCT   R0,P1LOOP
+P1DONE   STC   R1,WPSWD1L              SAVE THE LENGTH
+         CLI   JCTNUPAS,X'00'          IS THERE A NEW PASSWORD?
+         BE    RACSETUP                /NO  - CONTINUE
+         CLI   JCTNUPAS,C' '
+         BE    RACSETUP
+         MVC   WPSWD2,JCTNUPAS         COPY NEW PASSWORD TO OUR AREA
+         SR    R1,R1                   GET PASSWORD LENGTH
+         LA    R0,8
+         LA    R14,WPSWD2
+P2LOOP   CLI   0(R14),C' '             LOOK FOR BLANK (END OF PSWD)
+         BE    P2DONE
+         LA    R14,1(,R14)
+         LA    R1,1(,R1)
+         BCT   R0,P2LOOP
+P2DONE   STC   R1,WPSWD2L              SAVE THE LENGTH
+RACSETUP MVC   WRACINIT(RACINITL),RACINIT  SETUP L-FORM RACINIT AND
+         LA    R1,WUIDL                FILL IN ITS PARAMETERS
+         ST    R1,WRACINIT+4           USERID
+         LA    R1,WPSWD1L
+         ST    R1,WRACINIT+8           PASSWORD
+         CLI   WGRPL,K0                GROUP ENTERED?
+         BE    @3                      /NO
+         LA    R1,WGRPL                /YES - FILL IT IN
+         ST    R1,WRACINIT+20
+@3       CLI   WPSWD2L,K0              2ND PASSWORD ENTERED?
+         BE    @4                      /NO
+         LA    R1,WPSWD2L              /YES - FILL IT IN
+         ST    R1,WRACINIT+24
+@4       RACINIT MF=(E,WRACINIT),      CHECK THE PARMS                 X
+               ENVIR=CREATE,                                           X
+               ACEE=WACEE,                                             X
+               SUBPOOL=0,                                              X
+               SMC=NO
+         LTR   R15,R15                 SUCCESSFUL RACINIT?
+         BZ    RACDEL                  /YES - GO DO RACINIT DELETE
+         LA    R14,FREEWORK            /NO  - PREPARE FOR ERROR MSG 001
+*                                                                   001
+         LA    R1,MSG4                 EXPIRED PASSWORD?            001
+         C     R15,=XL4'0C'                                         001
+         BNE   CHEKRC10                /NO  - CHECK NEXT RC         001
+*                                      /YES                         001
+         CLC   WUID+3(4),=C'PROD'      IS IT A PROD USER?           001
+         BNE   PUTMSG                  /NO  - ISSUE MESSAGE         001
+         BAL   R14,LOGIT               /YES - LOG IT TO RACF        001
+         B     FREEWORK                AND GO CLEAN UP              001
+*                                                                   001
+CHEKRC10 LA    R1,MSG5                 INVALID NEW PASSWORD?        001
+         C     R15,=XL4'10'                                         001
+         BE    PUTMSG                  /YES - ISSUE MESSAGE         001
+*                                      /NO                          001
+         LA    R1,MSG6                 FAILED BY RACINIT EXIT?      001
+         C     R15,=XL4'18'                                         001
+         BE    PUTMSG                  /YES - ISSUE MESSAGE         001
+*                                      /NO                          001
+         LA    R1,MSG7                 USER REVOKED?                001
+         C     R15,=XL4'1C'                                         001
+         BE    PUTMSG                  /YES - ISSUE MESSAGE         001
+*                                      /NO                          001
+         LA    R1,MSG8                 USER REVOKED IN GROUP?       001
+         C     R15,=XL4'24'                                         001
+         BE    PUTMSG                  /YES - ISSUE MESSAGE         001
+*                                      /NO  - ISSUE GENERAL MSG     001
+         LA    R1,MSG9                 TELLING USER TO SEE PREVIOUS 001
+         B     PUTMSG                  RACF MESSAGE                 001
+         EJECT
+*
+* DELETE RACF ENVIRONMENT AFTER SUCCESSFUL RACINIT
+*
+RACDEL   MVC   WRACINIT(RACINITL),RACINIT  /YES - SETUP FOR AND
+         RACINIT MF=(E,WRACINIT),      ISSUE RACINIT DELETE            X
+               ENVIR=DELETE,                                           X
+               ACEE=WACEE,                                             X
+               SUBPOOL=0,                                              X
+               SMC=NO
+         B     FREEWORK
+         EJECT
+*
+* FREE THE WORK AREA
+*
+FREEWORK DS    0H
+         LR    R1,R13                  GET ADDR OF AREA TO FREE
+         MVC   K20(4,R2),BLANKS        RESET JMRUSEID
+         SR    R5,R5                   SET RC=0
+         TM    WFLAGS,WCANCEL          SHOULD JOB BE CANCELLED?
+         BZ    FREE1                   /NO
+         LA    R5,4                    /YES - SET RC=4
+FREE1    L     R13,4(,R13)             GET ADDR OF CALLER'S SAVEAREA
+         FREEMAIN R,A=(1),LV=WORKLEN   FREE THE STORAGE
+         LR    R15,R5                  GET THE RETURN CODE FROM R5
+         B     RETURN
+         EJECT
+*
+* RETURN TO CALLER
+*
+EXIT     DS    0H
+         L     R13,4(,R13)             GET CALLER'S SAVE AREA
+RET0     SR    R15,R15
+RETURN   RETURN (14,12),RC=(15)        RETURN TO CALLER
+         EJECT
+*                                                                   001
+* ISSUE ERROR MESSAGE                                               001
+*                                                                   001
+PUTMSG   LR    R11,R14                 SAVE RETURN ADDRESS          001
+         OC    WFLAGS(1),0(R1)         SET FLAGS FROM MESSAGE       001
+         L     R1,0(,R1)               GET ADDRESS OF MSG WTO       001
+         WTO   MF=(E,(1))              ISSUE THE MESSAGE            001
+         LR    R14,R11                 RESTORE RETURN ADDRESS       001
+         BR    R14                     AND RETURN TO CALLER         001
+         EJECT
+*                                                                   001
+* LOG EXPIRED PRODUCTION PASSWORD TO SMF FOR DATA SECURITY          001
+*                                                                   001
+LOGIT    LA    R1,WLOGC            GET ADDRESS OF COMMON LOG PARMS  001
+         USING LOGC,R1             #####                            001
+         MVI   LOGCODE,DSACCESS         RESOURCE ACCESS             001
+         MVI   LOGCVIOL,0               NO ERROR                    001
+         MVI   LOGCAUTH,LOGCNORM        NORMAL ACCESS AUTHORITY     001
+         MVI   LOGCREAS,LOGCENT         ENTITY AUDIT                001
+         MVI   LOGCREAS+1,0             *RESERVED*                  001
+         MVI   LOGCERR,0                NO ERROR FLAGS              001
+         DROP  R1                  #####                            001
+*                                  SET UP ICHRAU00 PARM LIST        001
+         LA    R1,FFOUR             POINTER TO # OF CODE/DATA PAIRS 001
+         ST    R1,WPRMCTP                                           001
+         LA    R1,LOGCODES              POINTER TO CODES            001
+         ST    R1,WPRMCDP                                           001
+         LA    R1,WPRMDAT               POINTER TO DATA SECTION     001
+         ST    R1,WPRMDTP                                           001
+         LA    R1,WPRMCTP               STRANGE BUT TRUE            001
+         ST    R1,WPRMCTPP                 .                        001
+         LA    R1,WPRMCDP                  .                        001
+         ST    R1,WPRMCDPP                 .                        001
+         LA    R1,WPRMDTP                  .                        001
+         ST    R1,WPRMDTPP                 .                        001
+         LA    R1,FZERO                 NO ACEE POINTER             001
+         ST    R1,WPRMACEP                                          001
+*                                  SET UP ICHRAU00 DATA POINTERS    001
+         LA    R1,WLOGC                 COMMON SECTION              001
+         ST    R1,WPRMDAT                                           001
+         LA    R1,WUIDL                 RESOURCE NAME (USERID)      001
+         ST    R1,WPRMDAT+4                                         001
+         LA    R1,LOGCLASS              RESOURCE CLASS (#EXPIRE#)   001
+         ST    R1,WPRMDAT+8                                         001
+         LA    R1,LOGAPPL               APPLICATION (TEC016)        001
+         ST    R1,WPRMDAT+12                                        001
+         LR    R11,R14             SAVE RETURN ADDRESS              001
+         NOPR  R11      *** ZAP TO UNCOND BRANCH TO FORCE NO LOG ***001
+         L     R1,CVTPTR           CVT ADDRESS                      001
+         USING CVT,R1              #####                            001
+         L     R1,CVTRAC           RCVT ADDRESS                     001
+         USING RCVT,R1             #####                            001
+         ICM   R15,7,RCVTRAU0+1    ADDRESS OF ICHRAU00              001
+         DROP  R1                  #####                            001
+         BZR   R11                 DON'T LOG IF NO LOGGING MODULE   001
+         LA    R1,WPRMCTPP         POINT TO PARM LIST POINTER       001
+         BALR  R14,R15             GO TO ICHRAU00                   001
+         BR    R11                 RETURN TO CALLER                 001
+         EJECT
+*
+* CONSTANTS
+*
+FZERO    DC    F'0'                                                 001
+FFOUR    DC    F'4'                                                 001
+BLANKS   DC    CL8' '
+CUSER    DC    C'USER'
+CGROUP   DC    C'GROUP'
+CIEFUJV  DC    C'IEFUJV'
+LOGCODES DC    AL1(CMMNDATA,OLDDSNM,CLASSNM,APPLNAME)               001
+LOGCLASS DC    AL1(8),C'#EXPIRE#'                                   001
+LOGAPPL  DC    AL1(6),C'TEC016'                                     001
+         DS    0F
+RACINIT  RACINIT MF=L,INSTLN=CIEFUJV
+RACINITL EQU   *-RACINIT
+*
+MSG1     MSG   'TEC01601 JOB CANCELLED. MULTIPLE USERIDS OR GROUPNAMES *
+               FOUND ON JOBCARD.',FLAGS=WCANCEL                     001
+*
+MSG2     MSG   'TEC01602 BAD JCTID - NOTIFY TEC SUPPORT',DESC=11    001
+*
+MSG3     MSG   'TEC01603 BAD JCTJNAME - NOTIFY TEC SUPPORT',DESC=11 001
+*
+MSG4     MSG   'TEC01604 JOB CANCELLED. PASSWORD HAS EXPIRED AND NEW PA*
+               SSWORD WAS NOT SPECIFIED.',FLAGS=WCANCEL             001
+*
+MSG5     MSG   'TEC01605 JOB CANCELLED. INVALID NEW PASSWORD SPECIFIED *
+               ON JOBCARD.',FLAGS=WCANCEL                           001
+*
+MSG6     MSG   'TEC01606 JOB CANCELLED BY RACINIT EXIT',            001*
+               FLAGS=WCANCEL
+*
+MSG7     MSG   'TEC01607 JOB CANCELLED. SUBMITTER''S ACCESS TO SYSTEM H*
+               AS BEEN REVOKED.',FLAGS=WCANCEL                      001
+*
+MSG8     MSG   'TEC01608 JOB CANCELLED. SUBMITTER''S ACCESS TO GROUP HA*
+               S BEEN REVOKED.',FLAGS=WCANCEL                       001
+*
+MSG9     MSG   'TEC01609 JOB CANCELLED. SEE PRECEDING RACF ERROR MESSAG*
+               E.',FLAGS=WCANCEL                                    001
+         EJECT
+         LTORG ,                                                    001
+         EJECT
+*
+*  CONSTANT EQUATES
+*
+K0       EQU   0                       CONSTANT 0
+K7       EQU   7                       CONSTANT 7
+K8       EQU   8                       CONSTANT 8
+K20      EQU   20                      CONSTANT 20
+K29      EQU   29                      CONSTANT 29
+K71      EQU   71                      CONSTANT 71
+XFF      EQU   X'FF'                   CONSTANT 255
+CLPAREN  EQU   C'('                    CONSTANT '('
+CCOMMA   EQU   C','                    CONSTANT ','
+CBLANK   EQU   C' '                    CONSTANT ' '
+CRPAREN  EQU   C')'                    CONSTANT ')'
+*
+JOBCODE  EQU   1                       JCL TYPE INDICATOR FOR DD STMTS
+CONVERTD EQU   16                      INDICATOR FOR END OF CONVERSION
+*
+* REGISTER EQUATES
+*
+         REGEQU
+JCT      EQU   R10
+*
+* PATCH AREA
+*
+         DS    0F
+MODLEN   EQU   *-IEFUJV           EQUATE FOR MODULE LENGTH(- PATCH)
+PTCHLEN  EQU   ((MODLEN+7)/8+7)/8*8 PATCH AREA LENGTH EQUATE
+PTCHLNTH DC    Y(PTCHLEN)          LENGTH OF PATCH AREA
+PTCHBASE DC    S(PATCH)            BASE DISPLACED ADDRESS OF PATCH
+PATCH    DC    XL(PTCHLEN)'00'     PATCH AREA
+         EJECT
+         COPY  ICHPLOGC         RACF COMMON LOG (ICHRAU00) PARMS    001
+         EJECT
+WORK     DSECT
+         DS    18F              SAVE AREA - MUST BE FIRST IN WORK
+WACEE    DS    A                PLACE FOR RACINIT TO PUT ACEE ADDRESS
+WRACINIT DS    XL(RACINITL)     AREA FOR L-FORM RACINIT
+WFLAGS   DS    X                FLAGS:
+WQUIT    EQU   X'80'              STOP SCANNING - ERROR ENCOUNTERED
+WCANCEL  EQU   X'40'              CANCEL THE JOB
+WUIDL    DS    X                AREA FOR USERID
+WUID     DS    CL7
+WGRPL    DS    X                AREA FOR GROUP NAME
+WGRP     DS    CL8
+WPSWD1L  DS    X                AREA FOR CURRENT PASSWORD
+WPSWD1   DS    CL8
+WPSWD2L  DS    X                AREA FOR NEW PASSWORD
+WPSWD2   DS    CL8
+WCARDP   DS    CL8               CARD PREFIX - ALLOWS FOR SCANNING
+*                                  OFF FRONT OF CARD
+WCARD    DS    CL71              DATA PART OF CARD
+WCARDS   DS    CL8               CARD SUFFIX - ALLOWS FOR SCANNING
+*                                  OFF END OF CARD
+         DS    0F                FULLWORD ALIGNED AREA FOR RACF:    001
+WLOGC    DS    XL(LOGCLEN)         COMMON LOG PARMS                 001
+WPRMCTP  DS    A                 ICHRAU00 ARRAY POINTERS            001
+WPRMCDP  DS    A                   "                                001
+WPRMDTP  DS    A                   "                                001
+WPRMCTPP DS    A                 ICHRAU00 PARM LIST                 001
+WPRMCDPP DS    A                   "                                001
+WPRMDTPP DS    A                   "                                001
+WPRMACEP DS    A                   "                                001
+WPRMDAT  DS    6A                DATA POINTERS FOR ICHRAU00         001
+WORKLEN  EQU   *-WORK
+         EJECT
+*
+* IBM DSECTS
+*
+         PRINT NOGEN
+         CVT   DSECT=YES
+         ICHPRCVT                                                   001
+         IKJTCB
+IEFUJV   CSECT
+         $BUFFER
+         $JCT
+         END   IEFUJV

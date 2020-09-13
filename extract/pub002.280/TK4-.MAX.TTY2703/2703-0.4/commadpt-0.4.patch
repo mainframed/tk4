@@ -1,0 +1,557 @@
+--- repo/hercules-svn/commadpt.c	2012-01-29 09:10:02.193330225 -0500
++++ herc-svn/commadpt.c	2012-02-15 20:43:50.119970017 -0500
+@@ -84,8 +84,32 @@
+    Also, 2740 OS consoles should work.  It may be necessary to modify the
+    driver to end READ CCWs even when no data has been received (see comment)
+ 
++   *****************************************************************
++
++   Some TTY Fixes - 2012-01-30 MHP <ikj1234i at yahoo dot com>
++
++   This async/2703 driver release contains several bug fixes and minor 
++   enhancements (primarily to fix windows telnet clients).  In addition
++   there are three new configuration parameters (iskip=, bs=dumb, break=dumb)
++
++   When using windows telnet, it's recommended to set bs=dumb and break=dumb .
++
++   The new iskip= option is analogous to the skip= option, except that 
++   it chooses input ASCII characters to suppress (the skip= option is used
++   to suppress characters in output processing).  Note that while both options
++   are entered as hex bytes, the skip= option uses S/370 mainframe code
++   points (either byte-reversed ASCII for TTY or correspondence code/EBCD for
++   2741), whereas the iskip= option requires ASCII code points.  Here's an
++   example:
++   0045 2703 lport=32003 dial=IN lnctl=tele2 uctrans=yes term=tty skip=88C9DF iskip=0A
++   Here's an example, for windows telnet clients
++   0046 2703 lport=32003 dial=IN lnctl=tele2 uctrans=yes term=tty skip=88C9DF iskip=0A bs=dumb break=dumb
++
++
+ ******************************************************************** */
+ 
++#define TTYLINE_SZ 512
++
+ #include "hstdinc.h"
+ #include "hercules.h"
+ #include "devtype.h"
+@@ -150,6 +174,9 @@
+     { "code",     PARSER_STR_TYPE },
+     { "uctrans",  PARSER_STR_TYPE },
+     { "skip",     PARSER_STR_TYPE },
++    { "iskip",    PARSER_STR_TYPE },
++    { "bs",       PARSER_STR_TYPE },
++    { "break",    PARSER_STR_TYPE },
+     {NULL,NULL}  /* (end of table) */
+ };
+ 
+@@ -168,7 +195,10 @@
+     COMMADPT_KW_TERM,
+     COMMADPT_KW_CODE,
+     COMMADPT_KW_UCTRANS,
+-    COMMADPT_KW_SKIP
++    COMMADPT_KW_SKIP,
++    COMMADPT_KW_ISKIP,
++    COMMADPT_KW_BS,
++    COMMADPT_KW_BREAK,
+ } commadpt_kw;
+ 
+ static BYTE byte_reverse_table[256] = {
+@@ -456,6 +486,7 @@
+         commadpt_ring_terminate(&dev->commadpt->outbfr,dev->ccwtrace);
+         commadpt_ring_terminate(&dev->commadpt->rdwrk,dev->ccwtrace);
+         commadpt_ring_terminate(&dev->commadpt->pollbfr,dev->ccwtrace);
++        commadpt_ring_terminate(&dev->commadpt->ttybuf,dev->ccwtrace);
+         /* release the CA lock */
+         release_lock(&dev->commadpt->lock);
+         free(dev->commadpt);
+@@ -497,6 +528,7 @@
+     commadpt_ring_init(&dev->commadpt->outbfr,4096,dev->ccwtrace);
+     commadpt_ring_init(&dev->commadpt->pollbfr,4096,dev->ccwtrace);
+     commadpt_ring_init(&dev->commadpt->rdwrk,65536,dev->ccwtrace);
++    commadpt_ring_init(&dev->commadpt->ttybuf,TTYLINE_SZ,dev->ccwtrace);
+     dev->commadpt->dev=dev;
+     return 0;
+ }
+@@ -752,109 +784,135 @@
+ 
+ static void commadpt_read_tty(COMMADPT *ca, BYTE * bfr, int len)
+ {
+-    BYTE        bfr2[256];
+     BYTE        bfr3[3];
+     BYTE        c;
++    BYTE        dump_buf[TTYLINE_SZ];
++    int         dump_bp=0;
++    BYTE        tty_buf[TTYLINE_SZ];
++    int         tty_bp=0;
+     int i1;
+-    int o1;
+-        for (i1 = 0, o1 = 0; i1 < len; i1++) 
++    int crflag = 0;
++    for (i1 = 0; i1 < len; i1++) 
++    {
++        c = (unsigned char) bfr[i1];
++        if (ca->telnet_opt) 
+         {
+-            c = (unsigned char) bfr[i1];
+-            if (ca->telnet_opt) 
+-            {
+-                ca->telnet_opt = 0;
+-                if(ca->dev->ccwtrace)
+-                    WRMSG(HHC01053,"D",
+-                            SSID_TO_LCSS(ca->dev->ssid),
+-                            ca->dev->devnum,
+-                            ca->telnet_cmd, c);
+-                bfr3[0] = 0xff;  /* IAC */
+-            /* set won't/don't for all received commands */
+-                bfr3[1] = (ca->telnet_cmd == 0xfd) ? 0xfc : 0xfe;
+-                bfr3[2] = c;
+-                if(ca->dev->ccwtrace)
+-                    WRMSG(HHC01054,"D",
+-                            SSID_TO_LCSS(ca->dev->ssid),
+-                            ca->dev->devnum,
+-                            bfr3[1], bfr3[2]);
+-                commadpt_ring_pushbfr(&ca->outbfr,bfr3,3);
+-                continue;
++            ca->telnet_opt = 0;
++            if(ca->dev->ccwtrace)
++                WRMSG(HHC01053,"D",
++                        SSID_TO_LCSS(ca->dev->ssid),
++                        ca->dev->devnum,
++                        ca->telnet_cmd, c);
++            bfr3[0] = 0xff;  /* IAC */
++        /* set won't/don't for all received commands */
++            bfr3[1] = (ca->telnet_cmd == 0xfd) ? 0xfc : 0xfe;
++            bfr3[2] = c;
++            if(ca->dev->ccwtrace)
++                WRMSG(HHC01054,"D",
++                        SSID_TO_LCSS(ca->dev->ssid),
++                        ca->dev->devnum,
++                        bfr3[1], bfr3[2]);
++            commadpt_ring_pushbfr(&ca->outbfr,bfr3,3);
++            continue;
++        }
++        if (ca->telnet_iac) 
++        {
++            ca->telnet_iac = 0;
++            if(ca->dev->ccwtrace)
++                WRMSG(HHC01055,"D",
++                        SSID_TO_LCSS(ca->dev->ssid),
++                        ca->dev->devnum,
++                        c);
++            switch (c) 
++            {
++                case 0xFB:  /* TELNET WILL option cmd */
++                case 0xFD:  /* TELNET DO option cmd */
++                    ca->telnet_opt = 1;
++                    ca->telnet_cmd = c;
++                    break;
++                case 0xF4:  /* TELNET interrupt */
++                    if (!ca->telnet_int) 
++                    {
++                        ca->telnet_int = 1;
++                        commadpt_ring_flush(&ca->ttybuf);
++                        commadpt_ring_flush(&ca->inbfr);
++                        commadpt_ring_flush(&ca->rdwrk);
++                        commadpt_ring_flush(&ca->outbfr);
++                    }
++                    break;
+             }
+-            if (ca->telnet_iac) 
++            continue;
++        }
++        if (c == 0xFF) 
++        {  /* TELNET IAC */
++            ca->telnet_iac = 1;
++            continue;
++        } 
++        else
++        {
++            ca->telnet_iac = 0;
++        }
++        if (c == 0x0d) { // char was CR ?
++            crflag = 1;
++        }
++        if (c == 0x03 && ca->dumb_break)
++        {  /* Ctrl-C */
++            ca->telnet_int = 1;
++            commadpt_ring_flush(&ca->ttybuf);
++            commadpt_ring_flush(&ca->inbfr);
++            commadpt_ring_flush(&ca->rdwrk);
++            commadpt_ring_flush(&ca->outbfr);
++            continue;
++        }
++        commadpt_ring_push(&ca->ttybuf,c);
++    }
++    if (crflag) 
++    {   /* process complete line, perform editing and translation, etc. */
++        while (ca->ttybuf.havedata) 
++        {
++            c = commadpt_ring_pop(&ca->ttybuf);
++            if ((c & 0x7f) == 0x08 && ca->dumb_bs)   // backspace editing
+             {
+-                ca->telnet_iac = 0;
+-                if(ca->dev->ccwtrace)
+-                    WRMSG(HHC01055,"D",
+-                            SSID_TO_LCSS(ca->dev->ssid),
+-                            ca->dev->devnum,
+-                            c);
+-                switch (c) 
+-                {
+-                    case 0xFB:  /* TELNET WILL option cmd */
+-                    case 0xFD:  /* TELNET DO option cmd */
+-                        ca->telnet_opt = 1;
+-                        ca->telnet_cmd = c;
+-                        break;
+-                    case 0xF4:  /* TELNET interrupt */
+-                        if (!ca->telnet_int) 
+-                        {
+-                            ca->telnet_int = 1;
+-                            commadpt_ring_flush(&ca->inbfr);
+-                            commadpt_ring_flush(&ca->rdwrk);
+-                            commadpt_ring_flush(&ca->outbfr);
+-                        }
+-                        break;
+-                }
++                if (tty_bp > 0)
++                    tty_bp --;
+                 continue;
+             }
+-            if (c == 0xFF) 
+-            {  /* TELNET IAC */
+-                ca->telnet_iac = 1;
+-                continue;
+-            } 
+-            else 
+-            {
+-                ca->telnet_iac = 0;
+-            }
+-            if (c == 0x0a)
+-                continue;
+-            c &= 0x7f;
++            if (ca->input_byte_skip_table[c])
++                continue;	// skip this byte per cfg
++            c &= 0x7f;		// make 7 bit ASCII 
+             if  (ca->uctrans && c >= 'a' && c <= 'z') 
+             {
+                 c = toupper( c );     /* make uppercase */
+             }
++            /* now map the character from ASCII into proper S/370 byte format */
+             if (ca->term == COMMADPT_TERM_TTY) 
+             {
+-#if 0
+-                if (c == 0x0d)  // char was CR ?
+-#endif
+-                    ca->eol_flag = 1;
+                 if (byte_parity_table[(unsigned int)(c & 0x7f)])
+                     c |= 0x80;     // make even parity
+-                bfr2[o1++] = byte_reverse_table[(unsigned int)(c & 0xff)];
++                c = byte_reverse_table[(unsigned int)(c & 0xff)];
+             } 
+             else 
+             {   /* 2741 */
+-                if (c == 0x0d) 
+-                {   // char was CR ?
+-                    ca->eol_flag = 1;
+-#if 0
+-                    continue;   // ignore
+-#endif
+-                }
+                 if (ca->code_table_fromebcdic) 
+                 {  // do only if code != none
+                     c = host_to_guest(c & 0x7f);  // first translate to EBCDIC
+-                    bfr2[o1++] = ca->code_table_fromebcdic[ c ];   // then to 2741 code
++                    c = ca->code_table_fromebcdic[ c ];   // then to 2741 code
+                 }
+             }
++            tty_buf[tty_bp++] = c;
++            if (tty_bp >= TTYLINE_SZ)
++                tty_bp = TTYLINE_SZ - 1;   // prevent buf overflow
+         }
+-        if (o1) 
+-        {
+-            commadpt_ring_pushbfr(&ca->inbfr,bfr2,(size_t)o1);
+-            logdump("RCV2",ca->dev,bfr2,o1);
+-        ca->readcomp = 1;
++        if (tty_bp > 0) {
++            for (i1 = 0; i1 < tty_bp; i1++) {
++                commadpt_ring_push(&ca->rdwrk, tty_buf[i1]);
++                dump_buf[dump_bp++] = tty_buf[i1];
++                if (dump_bp >= TTYLINE_SZ) dump_bp = TTYLINE_SZ - 1;
++            }
+         }
++        logdump("RCV2",ca->dev,dump_buf,dump_bp);
++        ca->eol_flag = 1; // set end of line flag
++    } /* end of if(crflag) */
+ }
+ 
+ /*-------------------------------------------------------------------*/
+@@ -869,20 +927,22 @@
+     gotdata=0;
+     for (;;) 
+     {
+-        if (IS_BSC_LNCTL(ca)) 
++     /* if (IS_BSC_LNCTL(ca)) 
+         {
+             rc=read_socket(ca->sfd,bfr,256);
+         } 
+         else 
+-        {
++        { */
+             /* read_socket has changed from 3.04 to 3.06 - async needs old way */
+             /* is BSC similarly broken? */
++            /* --> Yes, it is! I propose to fully remove the if/else construct     */
++            /*                 i.e. to handle BSC and async identically here (JW)  */
+ #ifdef _MSVC_
+             rc=recv(ca->sfd,bfr,256,0);
+ #else
+             rc=read(ca->sfd,bfr,256);
+ #endif
+-        }
++     /* } */
+         if (rc <= 0)
+             break;
+         logdump("RECV",ca->dev,bfr,rc);
+@@ -957,8 +1017,6 @@
+     int init_signaled;          /* Thread initialisation signaled    */
+     int pollact;                /* A Poll Command is in progress     */
+     int i;                      /* Ye Old Loop Counter               */
+-    int eintrcount=0;           /* Number of times EINTR occured in  */
+-                                /* a row.. Over 100 : Bail out !     */
+     char threadname[40];
+ 
+     /*---------------------END OF DECLARES---------------------------*/
+@@ -1149,7 +1207,7 @@
+                     signal_condition(&ca->ipc);
+                     break;
+                 }
+-                if(ca->inbfr.havedata)
++                if(ca->inbfr.havedata || ca->eol_flag)
+                 {
+                     ca->curpending=COMMADPT_PEND_IDLE;
+                     signal_condition(&ca->ipc);
+@@ -1426,18 +1484,10 @@
+         if(rc==-1)
+         {
+             if(errno==EINTR)
+-            {
+-                eintrcount++;
+-                if(eintrcount>100)
+-                {
+-                    break;
+-                }
+-                continue;
+-            }
++                continue;  /* thanks Fish! */
+             WRMSG(HHC01000, "E",SSID_TO_LCSS(ca->dev->ssid),devnum,"select()",strerror(HSO_errno));
+             break;
+         }
+-        eintrcount=0;
+ 
+         /* Select timed out */
+         if(rc==0)
+@@ -1533,8 +1583,13 @@
+                 if(IS_ASYNC_LNCTL(ca) || !dopoll)
+                 {
+                     commadpt_read(ca);
+-                    ca->curpending=COMMADPT_PEND_IDLE;
+-                    signal_condition(&ca->ipc);
++                    if(IS_ASYNC_LNCTL(ca) && ca->ttybuf.havedata) {
++                        /* async: EOL char not yet received, partial line is still in ttybuf */
++                        /* ... just remain in COMMADPT_PEND_READ state ... */
++                    } else {
++                        ca->curpending=COMMADPT_PEND_IDLE;
++                        signal_condition(&ca->ipc);
++                    }
+                     continue;
+                 }
+             }
+@@ -1723,7 +1778,7 @@
+ static int commadpt_init_handler (DEVBLK *dev, int argc, char *argv[])
+ {
+     char    thread_name[33];
+-    int     i;
++    int     i,j;
+     int     ix;
+     int     rc;
+     int     pc;             /* Parse code */
+@@ -1773,6 +1828,9 @@
+         dev->commadpt->code_table_toebcdic   = xlate_table_ebcd_toebcdic;
+         dev->commadpt->code_table_fromebcdic = xlate_table_ebcd_fromebcdic;
+         memset(dev->commadpt->byte_skip_table, 0, sizeof(dev->commadpt->byte_skip_table) );
++        memset(dev->commadpt->input_byte_skip_table, 0, sizeof(dev->commadpt->input_byte_skip_table) );
++        dev->commadpt->dumb_bs=0;
++        dev->commadpt->dumb_break=0;
+         etospec=0;
+ 
+         for(i=0;i<argc;i++)
+@@ -1856,7 +1914,7 @@
+                         dev->commadpt->rto=28000;        /* Read Time-Out in milis */
+                     } 
+                     else 
+-                        if(strcasecmp(res.text,"bsc")) 
++                        if(strcasecmp(res.text,"bsc")==0)
+                         {
+                             dev->commadpt->lnctl = COMMADPT_LNCTL_BSC;
+                         } 
+@@ -1921,15 +1979,36 @@
+                 case COMMADPT_KW_SKIP:
+                     if  (strlen(res.text) < 2)
+                         break;
+-                    for (i=0; i < (int)strlen(res.text); i+= 2) 
++                    for (j=0; j < (int)strlen(res.text); j+= 2) 
+                     {
+-                        bf[0] = res.text[i+0];
+-                        bf[1] = res.text[i+1];
++                        bf[0] = res.text[j+0];
++                        bf[1] = res.text[j+1];
+                         bf[2] = 0;
+                         sscanf(bf, "%x", &ix);
+                         dev->commadpt->byte_skip_table[ix] = 1;
+                     }
+                     break;
++                case COMMADPT_KW_ISKIP:
++                    if  (strlen(res.text) < 2)
++                        break;
++                    for (j=0; j < (int)strlen(res.text); j+= 2) 
++                    {
++                        bf[0] = res.text[j+0];
++                        bf[1] = res.text[j+1];
++                        bf[2] = 0;
++                        sscanf(bf, "%x", &ix);
++                        dev->commadpt->input_byte_skip_table[ix] = 1;
++                    }
++                    break;
++                case COMMADPT_KW_BS:
++                    if(strcasecmp(res.text,"dumb")==0) {
++                        dev->commadpt->dumb_bs = 1;
++                    }
++                    break;
++                case COMMADPT_KW_BREAK:
++                    if(strcasecmp(res.text,"dumb")==0)
++                        dev->commadpt->dumb_break = 1;
++                    break;
+                 case COMMADPT_KW_SWITCHED:
+                 case COMMADPT_KW_DIAL:
+                     if(strcasecmp(res.text,"yes")==0 || strcmp(res.text,"1")==0 || strcasecmp(res.text,"inout")==0)
+@@ -2352,6 +2431,7 @@
+             dev->commadpt->xparwwait=0;
+             commadpt_ring_flush(&dev->commadpt->inbfr);      /* Flush buffers */
+             commadpt_ring_flush(&dev->commadpt->outbfr);      /* Flush buffers */
++            commadpt_ring_flush(&dev->commadpt->ttybuf);      /* Flush buffers */
+ 
+             if((!dev->commadpt->dialin && !dev->commadpt->dialout) || !dev->commadpt->connect)
+             {
+@@ -2511,20 +2591,10 @@
+                 break;
+             }
+             /* Check for any remaining data in read work buffer */
+-            if(dev->commadpt->readcomp)
++            if(dev->commadpt->readcomp || dev->commadpt->eol_flag)
+             {
+-                if (IS_ASYNC_LNCTL(dev->commadpt)) 
+-                {
+-                    while (dev->commadpt->inbfr.havedata) 
+-                    {
+-                        commadpt_ring_push(&dev->commadpt->rdwrk, commadpt_ring_pop(&dev->commadpt->inbfr));
+-                    }
+-                }
+-                if (( IS_BSC_LNCTL(dev->commadpt) && dev->commadpt->rdwrk.havedata)
+-                    || (IS_ASYNC_LNCTL(dev->commadpt) && dev->commadpt->rdwrk.havedata && dev->commadpt->eol_flag))
++                if (dev->commadpt->rdwrk.havedata || dev->commadpt->eol_flag)
+                 {
+-                    if(IS_ASYNC_LNCTL(dev->commadpt) && dev->commadpt->term == COMMADPT_TERM_2741)
+-                        dev->commadpt->eol_flag = 0;
+                     num=(U32)commadpt_ring_popbfr(&dev->commadpt->rdwrk,iobuf,count);
+                     if(dev->commadpt->rdwrk.havedata)
+                     {
+@@ -2532,8 +2602,8 @@
+                     }
+                     *residual=count-num;
+                     *unitstat=CSW_CE|CSW_DE;
+-                    if(IS_ASYNC_LNCTL(dev->commadpt) && dev->commadpt->term == COMMADPT_TERM_2741)
+-                        *unitstat|=CSW_UX;   // 2741 EOT
++                    if(IS_ASYNC_LNCTL(dev->commadpt) && !dev->commadpt->rdwrk.havedata && *residual > 0)
++                        dev->commadpt->eol_flag = 0;
+                     break;
+                 }
+             }
+@@ -2545,6 +2615,17 @@
+                 dev->sense[0]=SENSE_IR;
+                 break;
+             }
++            /* Catch a race condition.                                                           */
++            /* TCAM likes to issue halt I/O as a matter of routine, and it expects to get back a */
++            /* unit exception along with the normal channel end + device end.                    */
++            /* Sometimes the halt I/O loses the race (with the write CCW) and we catch up here.  */
++            if(IS_ASYNC_LNCTL(dev->commadpt) && dev->commadpt->haltpending)
++            {
++                dev->commadpt->haltpending = 0;
++                *residual=0;
++                *unitstat=CSW_CE|CSW_DE|CSW_UX;
++                break;
++            }
+ #if 0
+         // MHP TEST 2740
+             *residual=count;
+@@ -2619,7 +2700,8 @@
+                 /* receiving data (or a SYNC)                            */
+                 /* (28 seconds for LNCTL_ASYNC)                          */
+                 /* INHIBIT command does not time out                     */
+-                if(!dev->commadpt->inbfr.havedata && code != 0x0a)
++                /* eol_flag set means data is present */
++                if(!dev->commadpt->inbfr.havedata && code != 0x0a && !dev->commadpt->eol_flag)
+                 {
+                     *unitstat=CSW_DE|CSW_CE|CSW_UC;
+                     dev->sense[0]=0x01;
+@@ -2821,17 +2903,9 @@
+                     } /* END WHILE - READ FROM DATA BUFFER */
+                 } /* end of if (bsc) */
+                 /* If readcomp is set, then we may exit the read loop */
+-                if(dev->commadpt->readcomp)
++                if(dev->commadpt->readcomp || dev->commadpt->eol_flag)
+                 {
+-                    if (IS_ASYNC_LNCTL(dev->commadpt)) 
+-                    {
+-                        while (dev->commadpt->inbfr.havedata) 
+-                        {
+-                            commadpt_ring_push(&dev->commadpt->rdwrk, commadpt_ring_pop(&dev->commadpt->inbfr));
+-                        }
+-                    }  /* end of if(async) */
+-                    if (( IS_BSC_LNCTL(dev->commadpt) && dev->commadpt->rdwrk.havedata)
+-                        || (IS_ASYNC_LNCTL(dev->commadpt) && dev->commadpt->rdwrk.havedata && dev->commadpt->eol_flag))
++                    if (dev->commadpt->rdwrk.havedata || dev->commadpt->eol_flag)
+                     {
+                         num=(U32)commadpt_ring_popbfr(&dev->commadpt->rdwrk,iobuf,count);
+                         if(dev->commadpt->rdwrk.havedata)
+@@ -2841,8 +2915,8 @@
+                         *residual=count-num;
+                         *unitstat=CSW_CE|CSW_DE|(setux?CSW_UX:0);
+                         logdump("Read",dev,iobuf,num);
+-                        if(IS_ASYNC_LNCTL(dev->commadpt) && dev->commadpt->term == COMMADPT_TERM_2741)
+-                                dev->commadpt->eol_flag = 0;
++                        if(IS_ASYNC_LNCTL(dev->commadpt)&& !dev->commadpt->rdwrk.havedata && *residual > 0)
++                            dev->commadpt->eol_flag = 0;
+                         break;
+                     }
+                 }
+--- repo/hercules-svn/commadpt.h	2012-01-29 09:10:02.197329827 -0500
++++ herc-svn/commadpt.h	2012-01-30 18:30:55.378115327 -0500
+@@ -48,6 +48,7 @@
+     COMMADPT_RING outbfr;       /* Output buffer ring                       */
+     COMMADPT_RING pollbfr;      /* Ring used for POLL data                  */
+     COMMADPT_RING rdwrk;        /* Inbound data flow work ring              */
++    COMMADPT_RING ttybuf;       /* async: partial TTY input line            */
+     U16  devnum;                /* devnum copy from DEVBLK                  */
+     BYTE dialdata[32];          /* Dial data information                    */
+     U16  dialcount;             /* data count for dial                      */
+@@ -86,8 +87,11 @@
+     u_int telnet_int:1;         /* telnet interrupt received                */
+     u_int eol_flag:1;           /* carriage return received flag            */
+     u_int uctrans:1;            /* Uppercase translate flag                 */
++    u_int dumb_bs:1;            /* perform backspace editing in driver      */
++    u_int dumb_break:1;         /* map ASCII ETX (Ctrl-C) to interrupt/attn */
+     BYTE telnet_cmd;            /* telnet command received                  */
+     BYTE byte_skip_table[256];  /* async: characters to suppress in output  */
++    BYTE input_byte_skip_table[256];  /* async: characters to suppress in input  */
+ };
+ 
+ enum commadpt_lnctl {

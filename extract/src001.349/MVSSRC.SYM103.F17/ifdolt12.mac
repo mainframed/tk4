@@ -1,0 +1,975 @@
+         TITLE 'IFDOLT12 - OLTEP LOADER'
+IFDOLT12 CSECT
+         ENTRY OLTDCB                   OLTCDSDD DCB             Y02008
+***********************************************************************
+*                                                                     *
+* MODULE NAME= IFDOLT12                                               *
+*                                                                     *
+* DESCRIPTIVE NAME= OLTEP LOADER                                      *
+*                                                                     *
+* COPYRIGHT= NONE                                                     *
+*                                                                     *
+* STATUS: CHANGE LEVEL 000     SUPPORT CODE: X02008                   *
+*                                                                     *
+* FUNCTION:                                                           *
+*           1. CALCULATES THE SIZE OF THE MODULE (OLT AND PLINK).     *
+*              IF IT IS NOT A CDS LOAD, IT WILL PASS THE SIZE BACK    *
+*              TO THE CALLER. IF IT IS A CDS LOAD, IT WILL LOAD THE   *
+*              REQUESTED NUMBER OF BYTES INTO CORE.                   *
+*                                                                     *
+*           2. LOADS THE REQUESTED OLT, PLINK OR CDS INFORMATION      *
+*              AND RETURNS THE STARTING ADDRESS OF THE LOADED MODULE  *
+*              TO THE CALLER.                                         *
+*                                                                     *
+* ENTRY POINTS: IFDOLT12                                              *
+*                                                                     *
+* INPUT: UPON ENTRY TO THIS MODULE REGISTER 1 POINTS TO A LIST WITH   *
+*        THE FOLLOWING PARAMETERS:                                    *
+*                   DS    C  INDICATORS FOR TRANSIENT MANAGER         *
+*                   DS    C  MACRO LEVEL                              *
+*                   DS    2C IDENTITY OF MACRO EXPANSION              *
+*                   DS    F  POINTER TO PARAMETER LIST                *
+*        THIS PARAMETER LIST HAS THE FOLLOWING FORMAT:                *
+*                   DS    8C MODULE NAME                              *
+*                   DS    F  POINTER TO WHERE MODULE SHOULD BE LOADED *
+*                   DS    C  FLAGS                                    *
+*                   DS    C  RESERVED FOR FUTURE USE                  *
+*                   DS    H  CDS MODULE COUNT                         *
+*                                                                     *
+* OUTPUT:  REGISTER 0 WILL CONTAIN MODULE SIZE(FOR COMPUTE REQUEST)   *
+*          REGISTER 1 WILL CONTAIN STARTING ADDRESS OF LOADED MODULE. *
+*          REGISTER 15 WILL CONTAIN RETURN CODES:                     *
+*                   X'00'   LOAD SUCCESSFUL/COMPUTE SUCCESSFUL        *
+*                   X'04'   NO END CARD                               *
+*                   X'08'   READ ERROR                                *
+*                   X'0C'   MODULE NOT FOUND                          *
+*                   X'10'   REP CARD ERROR                            *
+*                   X'14'   LOAD CALLED BEFORE COMPUTE                *
+*                   X'18'   ORDER ERROR                               *
+*                                                                     *
+*          THE FOLLOWING MESSAGES ARE OUTPUTTED:                      *
+*                                                                     *
+*                 1. IFD202I  -  THIS MESSAGE WILL INFORM THE USER    *
+*                                THAT AN INVALID REP CARD EXISTS FOR  *
+*                                THE SPECIFIED TEST SECTION.          *
+*                 2. IFD203I  -  THIS MESSAGE TELLS THE USER THAT AN  *
+*                                END OF FILE INDICATION OCCURED       *
+*                                UNEXPECTANTLY. DATASET MAY HAVE BEEN *
+*                                CREATED INCORRECTLY.                 *
+*                 3. IFD205I  -  THIS MESSAGE TELLS THE USER THAT AN  *
+*                                I/O ERROR OCCURED DURING THE LOADING *
+*                                OF THE TEST SECTION.                 *
+*                 4. IFD901I  -  THIS MESSAGE TELLS THE USER THAT THE *
+*                                DD CARD NAMED XXXXXXXX COULD NOT BE  *
+*                                OPENED, THEREFORE THE DATASET IS NOT *
+*                                ACCESSIBLE.                          *
+*                 5. IFD911I  -  THIS MESSAGE TELLS THE USER THAT AN  *
+*                                INVALID OR UNRECOGNIZEABLE CONTROL   *
+*                                CARD HAS BEEN DETECTED. DATASET MAY  *
+*                                HAVE BEEN CREATED INCORRECTLY.       *
+*                                                                     *
+* EXTERNAL ROUTINES:                                                  *
+*                                                                     *
+*          THIS MODULE WILL ISSUE THE FOLLOWING SYSTEM MACROS:        *
+*                                                                     *
+*                 1. OPEN   TO INITIATE PROCESSING OF REQUIRED DATASET*
+*                 2. CLOSE  TO COMPLETE PROCESSING OF DATA SETS       *
+*                 3. FIND   TO DETERMINE IF A MODULE EXISTS           *
+*                 4. POINT  TO FIND THE RECORD THAT MUST BE READ      *
+*                 5. READ   TO GET THE CONTROL CARDS & MODULE TEXT    *
+*                            INTO CORE                                *
+*                 6. CHECK  TO WAIT FOR COMPLETION OF READ REQUEST    *
+*                 7. NOTE   TO KEEP TRACK OF THE LAST RECORD READ     *
+*                 8. DCB    TO DEFINE THE OLT LIB DCB                 *
+*                 9. SAVE   TO SAVE REGISTERS                         *
+*                 10.SYNADAFF  TO PERFORM SYNAD ANALYSIS       @ZA14111
+*                 11.SYNADRLS  TO RELEASE SAVE AREA OBTAINED   @ZA14111
+*                              BY SYNADAD                      @ZA14111
+*                                                                     *
+* NORMAL EXITS:                                                       *
+*          TO CALLER WITH RETURN CODE EQUAL TO ZERO.                  *
+*                                                                     *
+* ERROR EXITS:                                                        *
+*          TO CALLER WITH RETURN CODE NOT EQUAL TO ZERO               *
+*                                                                     *
+* TABLES/WORKAREAS:                                                   *
+*          PATCH12 - PATCH AREA                                       *
+*          SAVEAREA- SAVE AREA                                        *
+*          BUFFER  - READ IN BUFFER FOR CONTROL RECORDS(IE ESD, ETC)  *
+*          RLCOREAD- REAL CORE ADDRESS OF MODULE                      *
+*          ASSEMAD - ASSEMBLED ADDRESS OF MODULE(RELATIVE TO ZERO)    *
+*          B28WORK - WORK AREA                                        *
+*          WORK    - WORK AREA                                        *
+*          RELFT   - RELOCATION FACTOR FOR RLD DATA ITEMS             *
+*          RDBUFAD - ADDRESS/POINTER TO READ IN AREA                  *
+*          RDLNGTH - LENGTH OF READ                                   *
+*          RETCODE - RETURN CODE SAVE AREA (DEBUG AID)                *
+*          TTRZ    - TTRZ FOR READ ROUTINE                            *
+*          SIZEAREA- AREA USED TO STORE MODULE SIZE                   *
+*          OLTDCB  - DCB FOR OLT LIBRARY                              *
+*          CHARTBL - TABLE USED TO VALIDATE REP DATA                  *
+*          LDSWITCH- INTERNAL FLAG BYTE                               *
+*             BIT 0- COMPUTE HAS BEEN DONE FOR REQUESTED MODULE       *
+*             BIT 1- THIS IS A TRUNCATED(CDS) LOAD REQUEST            *
+*             BIT 2- TXTHDR & TXT INFORMATION MUST BE PROCESSED       *
+*             BIT 3- COMPUTE HAS BEEN STARTED                         *
+*             BIT 4- FLAG USED TO INDICATE WHICH BYTE OF REP DATA     *
+*                    BEING CONVERTED                                  *
+*             BIT 5- I/O ERROR OCCURED ON LOAD                        *
+*             BIT 6- UNUSED AT PRESENT TIME                           *
+*             BIT 7- UNUSED AT PRESENT TIME                           *
+*                                                                     *
+* CHANGE ACTIVITY = AS FOLLOWS                                        *
+*    PTM XM0088 ADDITION OF CDS EQUATING SUPPORT               XM0088 *
+*    PTM XM0794 FIX MISSING BASE REG AND CORRECT PARMLIST LBLS XM0794 *
+*    APAR XA29758 PROVIDE SUPPORT FOR SOSPC RELEASE 10         @ZA29758
+***********************************************************************
+*                               EQUATES                               *
+***********************************************************************
+*                              REGISTERS                              *
+***********************************************************************
+R0       EQU   0                       REGISTER 0
+R1       EQU   1                       REGISTER 1
+R2       EQU   2                       REGISTER 2
+R3       EQU   3                       REGISTER 3
+R4       EQU   4                       REGISTER 4
+R5       EQU   5                       REGISTER 5
+R6       EQU   6                       REGISTER 6
+R7       EQU   7                       REGISTER 7
+R8       EQU   8                       REGISTER 8
+R9       EQU   9                       REGISTER 9
+R10      EQU   10                      REGISTER 10
+R11      EQU   11                      BASE REGISTER
+R12      EQU   12                      REGISTER 12
+R13      EQU   13                      REGISTER 13
+R14      EQU   14                      REGISTER 14
+R15      EQU   15                      REGISTER 15
+REPPTR   EQU   1                       POINTER TO WHERE REP STARTS
+DEBREG   EQU   1                       POINTER TO NEEDED DEB     Y02008
+PLISTREG EQU   3                       PARAMETER LIST POINTER
+FROMADDR EQU   5                       FROM ADDRESS FOR CONVERT
+TOADDR   EQU   6                       TO ADDRESS FOR CONVERT
+LNGTHREG EQU   6                       LENGTH OF READ
+COUNT    EQU   7                       COUNT FOR CONVERSION ROUTINE
+DATAPTR  EQU   8                       POINTER TO RLD DATA FIELD
+CHAR     EQU   8                       CHARACTER TO BE MATCHED
+NAMEPTR  EQU   8                       POINTER TO MODULE NAME
+RLDBTCNT EQU   9                       NO OF 4 BYTE AREAS IN RLD CARD
+DCBPTR   EQU   9                       POINTER TO NEEDED DCB
+REPBYTE  EQU   9                       CHARACTER TO BE CONVERTED
+TXTBTCNT EQU   9                       TXT BYTE COUNT
+ESDBTCNT EQU   9                       ESD BYTE COUNT
+AREAPTR  EQU   10                      POINTER TO READ BUFFER
+TTRZPTR  EQU   10                      POINTER TO TTRZ FOR READ
+INDEX    EQU   10                      INDEX REGISTER
+***********************************************************************
+*                       INTERNAL FLAG EQUATES                         *
+***********************************************************************
+CPTSW    EQU   X'80'                   COMPUTE DONE
+TRNCL    EQU   X'40'                   TRUNCATED LOAD
+TWOREADS EQU   X'20'                   TWO READS REQUESTED
+CMPTSTRT EQU   X'10'                   COMPUTE HAS BEEN STARTED
+IOERROR  EQU   X'04'                   I/O ERROR FLAG
+***********************************************************************
+*                       PARAMETER LIST EQUATES                        *
+***********************************************************************
+PLNK     EQU   X'80'                   PLINK REQUESTED
+CMPTE    EQU   X'40'                   COMPUTE REQUESTED
+CDS      EQU   X'20'                   CDS LOAD
+SYMBOLIC EQU   X'08'                   SYMBOLIC CDS
+NAME     EQU   0                       MODULE NAME DISPLACEMENT
+AD       EQU   8                       REAL CORE ADDRESS DISPLACEMENT
+FLAG     EQU   12                      FLAG FIELD DISPLACEMENT
+TCNT     EQU   14                      TRUNCATED COUNT DISPLACEMENT
+***********************************************************************
+*                       MISCELLANEOUS EQUATES                         *
+***********************************************************************
+TWICE    EQU   2                       MULTIPLY BY FOUR
+D0       EQU   0                       DISPLACEMENT ZERO
+SAMEPTR  EQU   1                       SAME ESD ID
+D1       EQU   1                       DISPLACEMENT ONE
+D4       EQU   4                       DISPLACEMENT FOUR
+L3       EQU   3                       LENGTH THREE
+TMFLG    EQU   X'01'                   TRANSIENT MANAGER FLAG
+OFLGS    EQU   X'10'                   OPEN FLAG
+ZEROONE  EQU   X'01'                   HEX 01
+HIHALF   EQU   240                     HIGH HALF OF A BYTE
+ALL      EQU   255                     WHOLE BYTE
+NEW      EQU   X'10'                   NEW OLT
+OLD      EQU   X'20'                   OLD OLT
+TYTST    EQU   X'04'                   ESD TYPE
+FIRST    EQU   X'F7'                   FIRST BYTE OF DATA FLAG
+SECOND   EQU   X'08'                   SECOND BYTE OF DATA FLAG
+RLDFLG   EQU   X'02'                   POS OR NEG RELOCATION
+VIRTREAL EQU   X'01'                   OLT-VIRTUAL OR REAL       X03008
+VIRTUAL  EQU   X'20'                   OLT CAN RUN IN VIRTUAL    X03008
+REAL     EQU   X'DF'                   OLT MUST RUN IN REAL      X03008
+ROOTID   EQU   C'T'                    FIRST LETTER OF A ROOT MOD NAME C
+                                       USED IN V=V V=R INIT      X03008
+D44      EQU   44                      DISPLACEMENT 44           Y02008
+D66      EQU   66                      DISPLACEMENT 66           Y02008
+MSG202   EQU   100                      DISPLACEMENT TO MSG IFD202I
+MSG203   EQU   104                      DISPLACEMENT TO MSG IFD203I
+MSG205   EQU   108                      DISPLACEMENT TO MSG IFD205I
+MSG911   EQU   112                     DISPLACEMENT TO MSG IFD911I
+MSG901   EQU   116                      DISPLACEMENT TO MSG IFD901I
+MSG899   EQU   128                     DISP TO MSG IFD899I       Y02008
+         EJECT
+         SAVE  (14,12),,IFDOLT12&SYSDATE
+         BALR  R11,0                   ESTABLISH ADDRESSABILITY
+         USING *,R11
+         ST    R13,SAVEAREA+4          SAVE CALLERS SAVE AREA POINTER  C
+                                       IN MY SAVE AREA
+         LA    R15,SAVEAREA            GET ADDRESS OF THE SAVE AREA
+         ST    R15,8(0,R13)            STORE ADDRESS OF MY SAVE AREA   C
+                                       IN CALLERS SAVE AREA
+         LR    R13,R15                 PLACE MY SAVE AREA ADDRESS IN   C
+                                       REGISTER 13
+         USING CHASCT,R2
+***********************************************************************
+*                             INITIALIZE                              *
+***********************************************************************
+         L     PLISTREG,4(R1)          PUT POINTER TO PARAMETER LIST   C
+                                       IN REG 3
+         MVC   RLCOREAD(4),AD(PLISTREG) GET REAL CORE ADDRESS OF WHERE C
+                                       MODULE SHOULD BE LOADED
+         NI    LDSWITCH,CPTSW          TURN OFF ALL INTERNAL FLAGS     C
+                                       EXCEPT FOR COMPUTE
+         MVI   CDSIND,X'00'             ZERO INDICATOR         XM0088
+         TM    TABLNGTH+2,X'40'         TEST CDS EQUATE BIT    XM0088
+         BZ    LDINIT08                 NO CDS EQUATE ENTRY    XM0088
+         TM    FLAG(PLISTREG),CDS       TEST PARAMETER FLAG    XM0088
+         BZ    LDINIT08                 NO CDS REQUEST         XM0088
+         CLC   NAME+1(3,PLISTREG),=C'000' CHECK CDS NAME       XM0794
+         BNE   LDINIT08                 NOT CREATED FROM DEVICEXM0088
+         MVC   SREALDEV(4),NAME+4(PLISTREG) SAVE REAL DEVICE   XM0088
+         LA    R1,EHLIST                CONVERT PARAMETER LIST XM0088
+         L     R15,TAB28                TRANSIENT MANAGER      XM0088
+         BALR  R14,R15                  GO TO ENTRY POINT      XM0088
+         LA    R4,16                    MAXIMUM CDS ENTRIES    XM0088
+         L     R5,MCT+128               ROOT MODULE ADDRESS    XM0088
+         LA    R5,32(R5)                RESIDENT CDS TABLE     XM0088
+LDINIT02 DS    0H                                              XM0088
+         CLC   0(2,R5),SREALHEX         CHECK CDS DEVICE       XM0088
+         BE    LDINIT03                 DEVICE IN TABLE        XM0088
+         LA    R5,4(R5)                 NEXT DEVICE            XM0088
+         BCT   R4,LDINIT02              CHECK NEXT ITEM        XM0088
+         B     LDINIT08                 NORMAL CDS REQUEST     XM0088
+LDINIT03 DS    0H                                              XM0088
+         MVC   SCDSHEX(2),2(R5)         CDS EQUATE DEVICE      XM0088
+         LA    R1,HELIST                CONVERT PARAMETER LIST XM0088
+         L     R15,TAB28                TRANSIENT MANAGER      XM0088
+         BALR  R14,R15                  GO TO ENTRY POINT      XM0088
+         MVI   CDSIND,X'80'             EQUATED CDS NAME USED  XM0088
+         MVC   NAME+4(4,PLISTREG),SCDSDEV NEW NAME TO USE      XM0088
+LDINIT08 DS    0H                                              XM0088
+         TM    FLAG(PLISTREG),CMPTE    IS THIS A COMPUTE REQUEST
+         BNO   LDTXT006                NO, GO TO CODE THAT WILL LOAD   C
+                                       AND RELOCATE THE MODULE
+         NI    LDSWITCH,0              TURN OFF INTERNAL COMPUTE SWITCHC
+                                       THIS IS A NEW REQUEST
+         XC    BUFFER(80),BUFFER       CLEAR READ BUFFER
+         SPACE 1
+***********************************************************************
+*                         ESD CARD HANDLING                           *
+***********************************************************************
+LDESD001 EQU   *
+         BAL   R4,LDIOSUB              GO TO IO SUBROUTINE TO READ     C
+                                       FIRST ESD CARD
+         CLC   BUFFER+1(L3),=C'ESD'    IS THIS AN ESD CARD
+         BNE   LDESD001                NO, FIND FIRST ESD
+         CLC   BUFFER+14(2),ONE1       IS THIS THE FIRST ESD CARD
+         BNE   LDESD001                NO, FIND FIRST ESD
+         SPACE 1
+LDESD006 EQU   *
+         CLC   BUFFER+16(8),NAME(PLISTREG) DOES THIS ESD CARD HAVE NAMEC
+                                       OF REQUESTED UNIT TEST MODULE
+         BE    LDESD011                YES, GO TO ROUTINE THAT WILL    C
+                                       CONTINUE ESD PROCESSING
+         CLC   BUFFER+32(8),NAME(PLISTREG) DOES THIS ESD CARD HAVE NAMEC
+                                       OF REQUESTED UNIT TEST MODULE
+         BNE   LDESD001                NO, GO TO ROUTINE THAT WILL GET C
+                                       NEXT CARD
+         SPACE 1
+LDESD011 EQU   *
+         OI    LDSWITCH,CPTSW          TURN ON INTERNAL COMPUTE FLAG
+         TM    FLAG(PLISTREG),CDS+PLNK IS THIS REQUEST FOR A CDS OR    C
+                                       PLINK MODULE
+         BM    LDESD021                YES, BYPASS DETERMINING IF THIS C
+                                       IS A NEW OLT
+         NI    CESWT,ALL-OLD-NEW       CLEAR OLD AND NEW TEST FLAGS
+         CLC   BUFFER+32(3),=CL3'#OL'  IS THIS A NEW OLT       @ZA29758
+         BNE   LDESD016                NO, GO TO ROUTINE THAT WILL SET C
+                                       OLD UNIT TEST FLAG
+         OI    CESWT,NEW               SET NEW UNIT TEST FLAG
+         CLI   NAME(PLISTREG),ROOTID   IS THIS A PLINK           X03008
+         BC    2,LDESD021              YES,NO SET UP FOR V=V V=R X03008C
+                                       CAPABILITY                X03008
+         TM    BUFFER+38,VIRTREAL      CAN OLT RUN VIRTUAL       X03008
+         BNO   LDESD013                NO, GO ZERO FLAG IN COMMONX03008C
+                                       AREA, TELLING SCHED THAT  X03008C
+                                       OLT MUST RUN REAL         X03008
+         OI    TABLNGTH+2,VIRTUAL      YES, SET FLAG IN COMMON   X03008C
+                                       AREA TO 1 TELLING SCHED   X03008C
+                                       OLT CAN RUN VIRTUAL       X03008
+         B     LDESD021                CONTINUE                  X03008
+LDESD013 EQU   *                                                 X03008
+         NI    TABLNGTH+2,REAL         ZERO FLAG IN COMMON AREA  X03008C
+                                       TELLING SCHED THAT OLT    X03008C
+                                       MUST RUN REAL             X03008
+         B     LDESD021
+         SPACE 1
+LDESD016 EQU   *
+         OI    CESWT,OLD               SET OLD UNIT TEST FLAG
+         NI    TABLNGTH+2,REAL         ZERO FLAG IN COMMON AREA  X03008C
+                                       TELLING SCHED THAT OLT    X03008C
+                                       MUST RUN REAL             X03008
+         SPACE 1
+LDESD021 EQU   *
+         MVC   B28WORK+1(L3),BUFFER+25 GET THE ADDR OF WHERE THIS      C
+                                       MODULE WAS ASSEMBLED AT INTO    C
+                                       WORK AREA
+         SR    R7,R7                   CLEAR ESD LENGTH REG
+         L     R6,B28WORK              PUT ASSEMBLE ADDRESS INTO REG 6
+         ST    R6,ASSEMAD              SAVE THE ASSEMBLED ADDRESS FOR  C
+                                       LATTER USE
+         SPACE 1
+LDESD026 EQU   *
+         SR    ESDBTCNT,ESDBTCNT       CLEAR ESD BYTE COUNT REG
+         IC    ESDBTCNT,BUFFER+11      GET NUMBER OF BYTES OF ESD DATA C
+                                       ON THIS CARD
+         SR    R8,R8                   CLEAR REG 8
+         LA    R5,16                   SET REG 5 TO CONTAIN LENGTH OF  C
+                                       ESD DATA FIELD
+         DR    R8,R5                   DIVIDE NO. OF BYTES OF ESD DATA C
+                                       BY LNGTH OF ESD DATA FLD TO FINDC
+                                       NUMBER OF FLDS IN ESD CARD
+         LA    R5,BUFFER+8             PRIME REG 5 WITH ADDRESS OF ESD C
+                                       CARD TO SIMPLIFY LOOPING ON     C
+                                       ESD DATA FIELDS ON ONE CARD
+         SPACE 1
+LDESD031 EQU   *
+         LA    R5,16(R5)               BUMP POINTER TO ESD CARD TO     C
+                                       POINT TO MIDDLE OF ESD DATA     C
+                                       FIELD
+         TM    0(R5),ALL               IS THIS AN SD TYPE
+         BZ    LDESD036                YES, GO TO ROUTINE WHICH WILL   C
+                                       SUM ESD LENGTH FIELDS
+         TM    0(R5),TYTST             DOES THIS ESD HAVE ANY LENGTH   C
+                                       ATTRIBUTE
+         BZ    LDESD041                NO, GO TO ROUTINE WHICH         C
+                                       DETERMINES IF THERE ARE ANY MOREC
+                                       ESD DATA FIELDS
+         SPACE 1
+LDESD036 EQU   *
+         MVC   B28WORK+1(L3),5(R5)     MOVE LENGTH INTO WORK AREA
+         A     R7,B28WORK              ADD THIS LENGTH TO SUM OF       C
+                                       PREVIOUS LENGTHS
+         SPACE 1
+LDESD041 EQU   *
+         BCT   ESDBTCNT,LDESD031       DECREMENT NUMBER OF ESD DATA    C
+                                       FIELDS BY ONE AND IF THERE ARE  C
+                                       ANY LEFT, PROCESS THIS ONE
+         BAL   R4,LDIOSUB              GO TO IO SUBROUTINE TO READ NEXTC
+                                       CARD
+         CLC   BUFFER+1(L3),=C'ESD'    IS THIS CARD AN ESD
+         BE    LDESD026                YES, GO TO ROUTINE TO SUM LENGTHC
+                                       ON ESD CARDS
+         CLC   BUFFER+1(L3),=C'TXT'    IS THIS CARD A TXT
+         BNE   LDRLD046                NO, ORDER ERROR OR GARBAGE,     C
+                                       GO TO ROUTINE THAT RETURNS 24   C
+                                       IN REG 15
+         EJECT
+***********************************************************************
+*                         TXT CARD HANDLING                           *
+***********************************************************************
+LDTXT001 EQU   *
+         NI    LDSWITCH,ALL-TWOREADS   SET FLAG INDICATING TWO READS   C
+                                       ARE REQUIRED
+         LH    R5,TCNT(PLISTREG)       TAKE TRUNCATED LOAD COUNT AND
+         LTR   R5,R5                   LOOK AT IT
+         BZ    CMPTDONE                IF ZERO, GO TO RETURN TO CALLER C
+                                       EXIT ROUTINE
+         OI    LDSWITCH,TRNCL          SET TRUNCATED LOAD FLAG ON
+         SPACE 1
+LDTXT006 EQU   *
+         LA    R15,20                  PLACE ERROR CODE 20 IN REG 15   C
+                                       FOR FAILURE TO DO COMPUTE
+         TM    LDSWITCH,CPTSW          HAS A COMPUTE BEEN DONE
+         BNO   LDRETERR                NO, GO TO ROUTINE THAT          C
+                                       DETERMINES IF THIS IS OK
+         L     R6,ASSEMAD              GET ASSEMBLED ADDRESS OF MODULE
+         TM    FLAG(PLISTREG),PLNK     IS THIS MODULE A PLINK MODULE
+         BNO   LDTXT011                NO, BYPASS UPDATING REAL CORE AD
+         A     R6,PARTITEM             ADD ADDRESS OF OLT TO ASSEMBLED C
+                                       ADDRESS OF PLINK MODULE
+         ST    R6,RLCOREAD             SAVE NEW REAL CORE ADDRESS
+         SPACE 1
+LDTXT011 EQU   *
+         L     R6,RLCOREAD             GET REAL CORE ADDRESS OF MODULE
+         S     R6,ASSEMAD              SUBTRACT ASSEMBLED ADDRESS FROM C
+                                       TARGET ADDRESS TO GET RELOCATIONC
+                                       FACTOR
+         ST    R6,RELFT                SAVE RELOCATION FACTOR
+         SPACE 1
+LDTXT016 EQU   *
+         LH    TXTBTCNT,BUFFER+22      GET BYTE COUNT OF FOLLOWING DATAC
+                                       RECORD FROM TXTHDR CARD INTO    C
+                                       REG 9
+         TM    LDSWITCH,TRNCL          IS THIS A TRUNCATED LOAD- A CDS C
+                                       LOAD
+         BNO   LDTXT026                NO, GO TO ROUTINE THAT HANDLES  C
+                                       PLACING TXT CARDS INTO CORE
+         LTR   R5,R5                   HAS IT BEEN DONE-LOOK AT        C
+                                       TRUNCATED COUNT IN PARM LIST
+         BZ    LDRLD051                YES, GO TO SUCCESSFUL EXIT      C
+                                       SUBROUTINE
+         CR    R5,TXTBTCNT             CHECK BYTES REQUESTED VS LENGTH C
+                                       OF TXT RECORD
+         BH    LDTXT021                ANOTHER RECORD IS NEEDED, GO TO C
+                                       CODE THAT PREPARES FOR THIS
+         LR    TXTBTCNT,R5             SET LENGTH EQUAL TO BYTES       C
+                                       REQUESTED
+         SPACE 1
+LDTXT021 EQU   *
+         SR    R5,TXTBTCNT             SET BYTES REQUESTED EQUAL TO    C
+                                       DIFFERENCE OF ORIGINAL REQUEST  C
+                                       AND LENGTH
+         SPACE 1
+LDTXT026 EQU   *
+         MVC   B28WORK+1(L3),BUFFER+17 PUT ASSEMBLED ADDR OF FOLLOWING C
+                                       TXT RECORD IN WORK AREA
+         L     R6,B28WORK              GET THIS ASSEMBLED ADDR IN REG 6
+         A     R6,RELFT                ADD RELOCATION FACTOR TO THIS   C
+                                       ASSEMBLED ADDRESS
+         ST    R6,RDBUFAD              STORE THIS ADDR IN READ COMMAND
+         ST    R9,RDLNGTH              STORE LENGTH IN READ COMMAND
+         OI    LDSWITCH,TWOREADS       INDICATE 2 READS ARE NECESSARY
+LDTXT031 EQU   *
+         BAL   R4,LDIOSUB              GO TO IO SUBROUTINE TO READ     C
+                                       TXT DATA CARD INTO CORE AND     C
+                                       READ NEXT TXTHDR CARD
+         CLC   BUFFER+1(L3),=C'TXT'    IS THIS A TXTHDR CARD
+         BNE   LDREP011                NO, GO SEE IF IT IS A REP
+         B     LDTXT016                YES, DECODE AND HANDLE THIS TXT C
+                                       CARD
+         EJECT
+***********************************************************************
+*                         REP CARD HANDLING                           *
+***********************************************************************
+LDREP001 EQU   *
+         LA    COUNT,6                 PUT NUMBER OF CHARACTERS TO BE  C
+                                       CONVERTED INTO COUNT REG
+         LA    FROMADDR,BUFFER+6       PUT STARTING ADDRESS OF THE     C
+                                       CONVERT IN THE FROMADDR REG
+         LA    TOADDR,B28WORK+1        PUT THE TO ADDRESS OF CONVERT   C
+                                       IN TOADDR REG
+         BAL   R4,LDCNV001             GO TO CONVERT ROUTINE AND OBTAINC
+                                       WHERE REP SHOULD OCCUR
+         L     REPPTR,B28WORK          PLACE ADDRESS OF WHERE REP      C
+                                       SHOULD START IN REPPTR
+         A     REPPTR,RELFT            ADD RELOCATION FACTOR TO THIS   C
+                                       AND GET REAL CORE ADDRESS OF    C
+                                       WHERE REP SHOULD START
+         LA    FROMADDR,BUFFER+16      PUT STARTING ADDRESS OF REP ON  C
+                                       THE REP CARD INTO THE FROMADDR  C
+                                       REG SO CONVERSION CAN BE DONE
+         SPACE 1
+LDREP006 EQU   *
+         LA    COUNT,4                 PUT NUMBER OF CHARACTERS TO BE  C
+                                       CONERTED INTO COUNT REG
+         LA    TOADDR,B28WORK+2        PUT TO ADDRESS OF CONVERT INTO  C
+                                       TOADDR REG
+         BAL   R4,LDCNV001             GO TO CONVERT ROUTINE AND       C
+                                       CONVERT TWO BYTES OF THE REP
+         MVC   0(2,REPPTR),B28WORK+2   MOVE THIS TWO BYTES OF REP TO   C
+                                       WHERE IT BELONGS IN CORE
+         CLI   0(FROMADDR),C','        IS A COMMA THE NEXT CHARACTER   C
+                                       ON THE REP CARD
+         BE    LDREP016                YES, GO TO ROUTINE WHICH WILL   C
+                                       SET UP TO CONVERT NEXT TWO BYTESC
+                                       OF REP DATA
+         CLI   0(FROMADDR),C' '        NO, IS THE REP FINISHED OR IS   C
+                                       THERE A BLANK AS NEXT CHARACTER C
+                                       ON THE REP CARD
+         BNE   LDREP021                NO, GO TO REP CARD ERROR EXIT   C
+                                       ROUTINE
+         BAL   R4,LDIOSUB              GO TO IO SUBROUTINE AND READ    C
+                                       NEXT RECORD
+         SPACE 1
+LDREP011 EQU   *
+         CLC   BUFFER+1(L3),=C'REP'    IS THIS NEXT RECORD A REP CARD
+         BE    LDREP001                YES, GO TO REP CARD HANDLING    C
+                                       ROUTINE
+         B     LDRLD041                GO TO RLD CARD HANDLING ROUTINE C
+                                       AND SEE IF IT IS AN RLD RECORD
+         SPACE 1
+LDREP016 EQU   *
+         LA    FROMADDR,1(FROMADDR)    INCREMENT FROMADDR BY ONE TO    C
+                                       POINT TO NEXT TWO BYTES OF REP  C
+                                       DATA
+         LA    REPPTR,2(REPPTR)        INCREMENT REAL CORE ADDR OF REP C
+                                       BY TWO TO POINT TO WHERE NEXT   C
+                                       TWO BYTES OF REP DATA SHOULD GO
+         B     LDREP006                GO TO ROUTINE TO DECODE NEXT    C
+                                       TWO BYTES OF REP DATA
+         SPACE 1
+LDREP021 EQU   *
+         L     R1,MSGMOD                GET POINTER TO MESSAGE MODULE
+         L     R1,MSG202(R1)            GET POINTER TO MESSAGE IFD202I
+         PWTO  REG=(R1)                WRITE MESSAGE IFD202I
+         LA    R15,16                  PUT 16 IN RETURN CODE REGISTER, C
+                                       INDICATING REP CARD ERROR
+         B     LDRETERR                GO TO ERROR EXIT LINKAGE
+         EJECT
+***********************************************************************
+**********  CONVERT SUBROUTINE USED FOR REP CARD HANDLING    **********
+***********************************************************************
+         SPACE 1
+LDCNV001 EQU   *
+         SR    CHAR,CHAR               CLEAR REGISTER WHICH WILL BE    C
+                                       USED FOR SEARCH OF CHARACTER    C
+                                       TABLE
+         SPACE 1
+LDCNV006 EQU   *
+         NI    LDSWITCH,FIRST          ZERO FLAG WHICH TELLS WHICH BYTEC
+                                       OF DATA BEING CONVERTED. ZERO   C
+                                       IMPLIES 1ST BYTE, ONE - 2ND BYTE
+         SR    REPBYTE,REPBYTE         CLEAR REGISTER WHICH WILL       C
+                                       CONTAIN BYTE OF REP DATA BEING  C
+                                       PROCESSED
+         SPACE 1
+LDCNV011 EQU   *
+         IC    REPBYTE,0(FROMADDR)     PUT CHARACTER TO BE CONVERTED   C
+                                       INTO REP DATA BYTE REG
+         LA    INDEX,16                PUT 16 INTO INDEX REGISTER IN   C
+                                       PREPARATION FOR SEARCH OF TABLE
+         SPACE 1
+LDCNV016 EQU   *
+         IC    CHAR,CHARTBL-1(INDEX)   GET A CHARACTER FROM TABLE AND  C
+                                       PUT IT IN REG USED FOR SEARCH
+         CLR   CHAR,REPBYTE            DOES CHAR ON REP CARD EQUAL     C
+                                       THIS CHAR FROM TABLE
+         BE    LDCNV021                YES, GO TO ROUTINE WHICH HANDLESC
+                                       A SUCCESSFUL MATCH
+         BCT   INDEX,LDCNV016          TRY NEXT CHARACTER IN TABLE, IF C
+                                       ANY LEFT
+         B     LDREP021                IF NONE ARE LEFT, GO TO ROUTINE C
+                                       WHICH WILL INDICATE REP CARD    C
+                                       ERROR
+         SPACE 1
+LDCNV021 EQU   *
+         LA    FROMADDR,1(FROMADDR)    ADVANCE FROM ADDR REG BY ONE TO C
+                                       POINT TO NEXT CHARACTER TO BE   C
+                                       CONVERTED
+         BCTR  INDEX,0                 DECREMENT INDEX BY ONE AS THIS  C
+                                       IS THE HEX EQUIVALENT OF EBCDIC C
+                                       CHARACTER ON REP CARD
+         SPACE 1
+LDCNV026 EQU   *
+         TM    LDSWITCH,SECOND         HAVE TWO BYTES OF REP DATA BEEN C
+                                       CONVERTED
+         BO    LDCNV031                YES, GO TO ROUTINE WHICH WILL   C
+                                       PLACE REP DATA IN SPECIFIED AREA
+         LR    R14,INDEX               SAVE FIRST CONVERSION RESULT IN C
+                                       REG 14
+         SR    REPBYTE,REPBYTE         CLEAR REGISTER USED TO CONTAIN  C
+                                       BYTE OF REP DATA BEING PROCESSED
+         OI    LDSWITCH,SECOND         SET FLAG WHICH INDICATES WHICH  C
+                                       BYTE OF DATA IS BEING CONVERTED C
+                                       TO 1, 1 IMPLIES THIS IS 2ND BYTE
+         SLL   R14,4                   LEFT JUSTIFY FIRST CONVERTED    C
+                                       BYTE IN REG 14
+         BCT   COUNT,LDCNV011          GO CONVERT NEXT BYTE OF REP DATAC
+                                       IF THERE IS ANY
+         LA    COUNT,1                 SINCE THERE ARE NONE, SET COUNT C
+                                       TO 1 SO PROCESSING WILL NOT LOOPC
+                                       FOREVER BELOW
+         SPACE 1
+LDCNV031 EQU   *
+         OR    R14,INDEX               COMBINE TWO CONVERSIONS TO BE   C
+                                       ONE BYTE
+         STC   R14,0(TOADDR)           PUT TWO CONVERTED BY INTO AREA  C
+                                       SPECIFIED BY TO ADDR REG
+         LA    TOADDR,1(TOADDR)        BUMP TO ADDR REG BY ONE TO POINTC
+                                       TO NEXT BYTE IN TOADDR FIELD
+         BCT   R7,LDCNV006             GO CONVERT NEXT CHARACTER, IF   C
+                                       THERE IS ONE
+         BR    R4                      NONE LEFT, RETURN TO CALLER
+         SPACE 3
+***********************************************************************
+*                TABLE USED TO VALIDATE REP INFORMATION               *
+***********************************************************************
+CHARTBL  DC    C'0123456789ABCDEF'
+         EJECT
+***********************************************************************
+*                         RLD CARD HANDLING                           *
+***********************************************************************
+         SPACE 1
+LDRLD001 EQU   *
+         SR    RLDBTCNT,RLDBTCNT       CLEAR RLD BYTE COUNT REG
+         IC    RLDBTCNT,BUFFER+11      GET RLD DATA BYTE COUNT
+         SRL   RLDBTCNT,TWICE          DIVIDE COUNT BY FOUR AND GET    C
+                                       NUMBER OF POSSIBLE 4 BYTE RLD   C
+                                       DATA ITEMS
+         LA    DATAPTR,BUFFER+16       GET ADDRESS OF FIRST BYTE OF    C
+                                       RLD DATA
+         BCT   RLDBTCNT,LDRLD016       SINCE THIS IS FIRST DATA FIELD, C
+                                       DECREMENT NO. OF 4 BYTE RLD DATAC
+                                       ITEMS BY 1, GO DECODE RLD DATA
+         SPACE 1
+LDRLD006 EQU   *
+         TM    D0(DATAPTR),SAMEPTR     DOES RLD HAVE SAME R OR P PTR
+         BO    LDRLD016                BRANCH IF YES
+         SPACE 1
+LDRLD011 EQU   *
+         LA    DATAPTR,D4(DATAPTR)     BUMP RLD DATA POINTER BY 4 TO   C
+                                       AVOID THE ESD ID INDICATORS AND C
+                                       TO POINT TO DATA FIELD
+         BCTR  RLDBTCNT,0              DECREMENT NUMBER OF 4 BYTE RLD  C
+                                       DATA ITEMS BY ONE
+         SPACE 1
+LDRLD016 EQU   *
+         LA    DATAPTR,D4(DATAPTR)     BUMP RLD DATA POINTER BY 4
+         MVC   B28WORK+1(L3),D1(DATAPTR) GET ADDRESS THAT MUST BE      C
+                                       UPDATED
+         L     R6,B28WORK              PLACE THIS ADDRESS IN REG 6
+         A     R6,RELFT                ADD RELOCATION FACTOR
+         SPACE 1
+LDRLD021 EQU   *
+         TM    D0(DATAPTR),HIHALF      IS THIS AN ADCON OR CCW
+         BNZ   LDRLD036                NO, BRANCH TO DECODE NEXT RLD   C
+                                       DATA ITEM IF NECESSARY
+         XC    WORK(4),WORK            CLEAR WORK AREA
+         IC    R7,D0(DATAPTR)          GET LENGTH OF DATA ITEM
+         N     R7,FULL15               STRIP INDICATORS FROM LENGTH
+         SRL   R7,TWICE                ADJUST LENGTH
+         EX    R7,MVC01                MOVE DATA REQUIRING UPDATE TO   C
+                                       WORK AREA
+         L     R5,WORK                 PUT DATA REQUIRING UPDATE IN    C
+                                       REG 5
+         LA    R1,3                    PLACE MAX SIZE ADDRESS THAT     C
+                                       COULD BE UPDATED, THREE IMPLIES C
+                                       A FOUR BYTE ADDRESS
+         SR    R1,R7                   SUBTRACT LNGTH OF ITEM FROM MAX C
+                                       LNGTH, REMAINDER IS NO. OF BYTESC
+                                       NOT USED, I.E. 1 EQ. 3 BYTE ADDR
+         SLL   R1,3                    TAKE REMAINDER AND CONVERT IT TOC
+                                       THE BIT SHIFT REQUIRED TO RIGHT C
+                                       JUSTIFY ADDR BEING WORKED ON
+         SRL   R5,D0(R1)               RIGHT JUSTIFY THE ADDRESS IN    C
+                                       REG 5
+         TM    D0(DATAPTR),RLDFLG      TEST RLD FLAG BIT- POS OR NEG
+         BO    LDRLD026                BRANCH IF NEGATIVE
+         A     R5,RELFT                ADD RELOCATION FACTOR
+         B     LDRLD031                GO TO ROUTINE THAT STORES       C
+                                       UPDATED ADDRESS IN THE PROGRAM
+         SPACE 1
+LDRLD026 EQU   *
+         S     R5,RELFT                SUBTRACT RELOCATION FACTOR
+         SPACE 1
+LDRLD031 EQU   *
+         SLL   R5,D0(R1)               LEFT JUSTIFY UPDATED ADDRESS
+         ST    R5,WORK                 STORE UPDATED ADDRESS IN WORK   C
+                                       AREA
+         EX    R7,MVC02                MOVE UPDATED ADDRESS IN WORK    C
+                                       AREA TO ITS HOME IN PROGRAM
+         SPACE 1
+LDRLD036 EQU   *
+         BCT   RLDBTCNT,LDRLD006       DECREMENT NUMBER OF 4 BYTE RLD  C
+                                       DATA ITEMS BY ONE, IF THERE ARE C
+                                       ANY LEFT, GO DECODE THEM
+         SPACE 1
+         BAL   R4,LDIOSUB              GO TO IO SUBROUTINE AND GET     C
+                                       NEXT CARD
+         SPACE 1
+LDRLD041 EQU   *
+         CLC   BUFFER+1(L3),=C'RLD'    IS THIS CARD AN RLD CARD
+         BE    LDRLD001                YES, GO TO RLD CARD HANDLER
+         CLC   BUFFER+1(L3),=C'END'    IS THIS CARD AN END CARD
+         BE    LDRLD051                YES, END LOADER, GO TO FINISH   C
+                                       ROUTINE
+         SPACE 1
+LDRLD046 EQU   *
+         L     R1,MSGMOD                GET POINTER TO MESSAGE MODULE
+         L     R1,MSG911(R1)           GET POINTER TO MESSAGE IFD911I
+         MVC   31(8,R1),NAME(PLISTREG) PLACE MODULE NAME IN MESSAGE
+         PWTO  REG=(R1)                WRITE MESSAGE IFD911I
+         LA    R15,24                  PUT 24 IN RETURN CODE REGISTER, C
+                                       INDICATING ORDER ERROR OR       C
+                                       GARBAGE
+         B     LDRETERR                GO TO ERROR EXIT LINKAGE
+         SPACE 1
+LDRLD051 EQU   *
+         L     R1,RLCOREAD             PLACE ADDRESS OF WHERE MODULE   C
+                                       WAS LOADED IN REGISTER ONE
+         B     LDRET00                 GO TO SUCCESSFUL EXIT LINKAGE
+MVC01    MVC   WORK(0),D0(R6)          MOVE ADDRESS TO WORK AREA
+MVC02    MVC   D0(0,R6),WORK           MOVE UPDATED ADDRESS TO ITS     C
+                                       PLACE IN PROGRAM
+         EJECT
+***********************************************************************
+*                           IO SUBROUTINE                             *
+***********************************************************************
+LDIOSUB  EQU   *
+         LA    DCBPTR,OLTDCB           GET POINTER TO DCB FOR OLT      C
+                                       LIBRARY IN DCB REG
+         TM    48(DCBPTR),OFLGS        IS OLT LIB OPEN
+         BO    LDIO0010                YES, BYPASS DOING OPEN
+         OPEN  ((DCBPTR),(INPUT))      ATTEMPT TO OPEN OLT DCB
+         TM    48(DCBPTR),OFLGS        DID OLT LIB OPEN
+         BO    LDIO0010                YES, CONTINUE
+         L     R1,MSGMOD                GET POINTER TO MESSAGE MODULE
+         L     R1,MSG901(R1)            GET POINTER TO MESSAGE IFD901I
+         MVC   12(8,R1),=C'OLTCDSDD'   PLACE DD CARD NAME IN MSG901I
+LDIO0005 EQU   *
+         PWTO  REG=(R1)                WRITE MESSAGE IFD901I
+         B     LDIO0030                RETURN ERROR CODE INDICATING    C
+                                       MODULE NOT FOUND
+         SPACE 1
+LDIO0010 EQU   *
+         USING DEBBASIC,DEBREG                                   YM4762
+         L     DEBREG,D44(DCBPTR)      GET ASSOCIATED DEB ADDR   Y02008
+         LA    DEBREG,D0(DEBREG)       CLEAR HIGH ORDER BYTE     Y02008
+         TM    DEBFLGS1,DEBAPFIN       IS LIBRARY AUTHORIZED     Y02008
+         BO    LDIO0015                YES, CONTINUE LOAD REQ    Y02008
+LDIO0013 EQU   *                                                 Y02008
+         L     R1,MSGMOD               GET POINTER TO MSG MODULE Y02008
+         L     R1,MSG899(R1)           GET PTR TO MSG IFD899I    Y02008
+         MVI   D66(R1),X'F4'           PUT 04 CODE IN MSG        Y02008
+         B     LDIO0005                PRINT ERROR MESSAGE       Y02008
+LDIO0015 EQU   *                                                 Y02008
+         TM    FLAG(PLISTREG),SYMBOLIC IS THIS A SYMBOLIC CDS REQUEST
+         BNO   LDIO0020                NO, PERFORM REQUESTED LOAD
+         L     DCBPTR,SYMPTR           GET POINTER TO DCB FOR SYMBOLIC C
+                                       CDS IN DCB REG
+         L     R1,MSGMOD               GET POINTER TO MESSAGE MODULE
+         L     R1,MSG901(R1)           GET POINTER TO MESSAGE IFD901I
+         MVC   12(8,R1),=C'SYMSYM  '   PLACE DD CARD NAME IN MSG901I
+         TM    48(DCBPTR),OFLGS        IS SYMBOLIC DCB OPEN
+         BNO   LDIO0005                NO, INDICATE SYMSYM DD CARD     C
+                                       FAILED TO OPEN
+         L     DEBREG,D44(DCBPTR)      GET ASSOCIATED DEB ADDR   Y02008
+         LA    DEBREG,D0(DEBREG)       CLEAR HIGH ORDER BYTE     Y02008
+         TM    DEBFLGS1,DEBAPFIN       IS LIBRARY AUTHORIZED     Y02008
+         BNO   LDIO0013                NO, PRINT ERROR MESSAGE   Y02008
+         DROP  DEBREG
+         SPACE 1
+LDIO0020 EQU   *
+         TM    FLAG(PLISTREG),CMPTE    IS CALLER ASKING FOR A COMPUTE
+         BNO   LDIO0040                NO, READ NEXT RECORD OF MODULE
+         TM    LDSWITCH,CMPTSTRT       HAS COMPUTE BEEN STARTED
+         BO    LDIO0040                YES, GO TO ROUTINE TO READ NEXT C
+                                       RECORD
+         LA    NAMEPTR,NAME(PLISTREG)  GET POINTER TO REQUESTED DATA   C
+                                       SET MEMBER NAME
+         FIND  (DCBPTR),(NAMEPTR),D    ISSUE FIND FOR REQUESTED MEMBER
+         OI    LDSWITCH,CMPTSTRT       INDICATE COMPUTE HAS STARTED
+         LTR   R15,R15                 WAS FIND SUCCESSFUL
+         BZ    LDIO0050                SUCCESSFUL FIND, GO READ FIRST  C
+                                       CARD IN MODULE
+         SPACE 1
+LDIO0030 EQU   *
+         SR    R0,R0                   CLEAR REGISTER ZERO INDICATING  C
+                                       MODULE NOT FOUND
+         LA    R15,12                  PUT 0C IN REG 15 TO INDICATE    C
+                                       MODULE NOT FOUND
+         B     LDRESET                 RETURN TO CALLER
+         SPACE 1
+LDIO0040 EQU   *
+         LA    TTRZPTR,TTRZ            GET POINTER TO TTRZ FOR POINT
+         POINT (DCBPTR),(TTRZPTR)      POINT TO RECORD THAT MUST BE    C
+                                       READ
+         SPACE 1
+LDIO0050 EQU   *
+         TM    LDSWITCH,TWOREADS       IS THIS REQUEST FOR TWO READS
+         BNO   LDIO0060                NO, SET UP TO PERFORM ONE READ
+         L     AREAPTR,RDBUFAD         GET POINTER TO BUFFER AREA IN   C
+                                       AREA POINTER REG
+         L     LNGTHREG,RDLNGTH        GET LENGTH OF READ IN LENGTH REG
+         B     LDIO0070                GO TO READ ROUTINE
+         SPACE 1
+LDIO0060 EQU   *
+         LA    AREAPTR,BUFFER          GET POINTER TO MY BUFFER AREA   C
+                                       IN  AREA POINTER REG
+         LA    LNGTHREG,80             PUT LENGTH OF 80 IN LENGTH REG
+         SPACE 1
+LDIO0070 EQU   *
+         READ  DECB,SF,(DCBPTR),(AREAPTR),(LNGTHREG) READ A RECORD
+         CHECK DECB                    WAIT UNTIL READ COMPLETES
+         TM    LDSWITCH,IOERROR        WAS THERE AN I/O ERROR
+         BNO   LDIO0075                NO, CONTINUE NORMALLY
+         L     R1,MSGMOD                GET POINTER TO MESSAGE MODULE
+         L     R1,MSG205(R1)            GET POINTER TO MESSAGE IFD205I
+         PWTO  REG=(R1)                WRITE MESSAGE IFD205I INDICATINGC
+                                       AN I/O ERROR HAS OCCURED
+         LA    R1,IOERRMSG         PRINT I/O ERROR REASON      @ZA14111
+         PWTO  REG=(R1)                                        @ZA14111
+         NI    LDSWITCH,ALL-IOERROR    CLEAR I/O ERROR FLAG
+         LA    R15,8                   PLACE 08 RETURN CODE IN REG 15
+         B     LDRETERR                RETURN TO CALLER INDICATING     C
+                                       READ ERROR
+         SPACE 1
+LDIO0075 EQU   *
+         NOTE  (DCBPTR)                FIND OUT WHERE THIS READ WAS
+         ST    R1,TTRZ                 SAVE IT TO PERFORM NEXT READ
+         MVI   TTRZ+3,X'01'            UPDATE TTRZ SO NEXT RECORD MAY  C
+                                       BE READ
+         AIF   ('&SYSPARM' NE 'DEBUG').BYPASS
+         MVC   MESSAGE+8(7),BUFFER
+MESSAGE  WTO   '       '
+.BYPASS  ANOP
+         TM    LDSWITCH,TWOREADS       IS THIS A REQUEST TO DO TWO     C
+                                       READS
+         BNO   LDIO0080                GO TO ROUTINE WHICH RETURNS TO  C
+                                       CALLER
+         NI    LDSWITCH,ALL-TWOREADS   CLEAR TWO READ REQUEST FLAG SO  C
+                                       NEXT READ WILL BE LAST
+         B     LDIO0040                GO TO ROUTINE WHICH WILL POINT  C
+                                       TO NEXT RECORD AND READ IT
+         SPACE 1
+LDIO0080 EQU   *
+         BR    R4                      RETURN TO CALLER
+         EJECT
+***********************************************************************
+*                    RETURN TO CALLER EXIT ROUTINE                    *
+***********************************************************************
+CMPTDONE EQU   *
+         ST    R7,SIZEAREA             PLACE SIZE OF MODULE IN SIZE    C
+                                       AREA
+         TM    FLAG(PLISTREG),PLNK     IS THIS A REQUEST TO LOAD A     C
+                                       PLINK MODULE
+         BNO   LDEXT006                NO, BYPASS ADJUSTING MODULE     C
+                                       SIZE TO COMPENSATE FOR POSSIBLE C
+                                       NON ZERO ORIGIN
+         A     R7,ASSEMAD              ADD ORIGIN TO LENGTH OF PLINK   C
+                                       MODULE AND GET ADJUSTED LENGTH
+         LR    R0,R7                   PLACE SIZE OF MODULE IN REGISTERC
+                                       ZERO
+         B     LDRET00                 INDICATE TO CALLER SUCCESSFUL   C
+                                       COMPUTE
+         SPACE 1
+LDEXT006 EQU   *
+         A     R7,ONE                  ADD ONE TO SIZE OF MODULE
+         ST    R7,SIZEAREA             PLACE SIZE OF MODULE IN SIZE    C
+                                       AREA
+         TM    CESWT,OLD               IS THIS OLT AN OLD ONE
+         BNO   LDEXT011                NO, IT MUST BE A NEW OLT
+         OI    SIZEAREA+3,TMFLG        INDICATE TO TRANS. MGR. THAT    C
+                                       THIS IS AN OLD OLT BY SETTING   C
+                                       LAST BIT IN MOD. SIZE FLD TO 1
+         L     R0,SIZEAREA             PLACE SIZE OF MODULE IN REGISTERC
+                                       ZERO
+         B     LDRET00                 RETURN TO CALLER INDICATING     C
+                                       COMPUTE FINISHED
+         SPACE 1
+LDEXT011 EQU   *
+         NI    SIZEAREA+3,ALL-TMFLG    INDICATE TO TRANS. MGR. THAT    C
+                                       THIS IS A NEW OLT BY SETTING    C
+                                       LAST BIT IN MOD. SIZE FLD TO 0
+         L     R0,SIZEAREA             PLACE SIZE OF MODULE IN REGISTERC
+                                       ZERO
+         SPACE 1
+LDRET00  EQU   *
+         SR    R15,R15                 INDICATE TO CALLER SUCCESSFUL   C
+                                       LOAD
+         SPACE 1
+LDRETERR EQU   *
+         TM    FLAG(PLISTREG),CMPTE    IS THIS A COMPUTE REQUEST
+         BO    LDEXTRET                YES, EVERYTHING OK
+LDRESET  EQU   *
+         NI    LDSWITCH,ALL-CPTSW      CLEAR INTERNAL COMPUTE FLAG
+         SPACE 1
+LDEXTRET EQU   *
+         TM    CDSIND,X'80'             TEST CDS INDICATOR     XM0088
+         BZ    LDEXT04                  NO SUBSTITUTED NAME    XM0088
+         MVC   NAME+4(4,PLISTREG),SREALDEV ORIGINAL NAME       XM0088
+         CLC   TCNT(2,PLISTREG),FOUR    CHECK AREA FOR LOAD    XM0794
+         BL    LDEXT04                  SIZE TOO SMALL         XM0088
+         L     R7,AD(PLISTREG)          CDS ADDRESS            XM0088
+         MVC   2(2,R7),SREALHEX         REAL DEVICE            XM0088
+LDEXT04  DS    0H                                              XM0088
+         ST    R15,RETCODE             SAVE RET CODE FOR DEBUGGING
+         L     R13,SAVEAREA+4          RESTORE POINTER TO CALLERS SAVE C
+                                       AREA
+         L     R14,12(0,R13)           RESTORE RETURN ADDRESS OF CALLER
+         LM    R2,R12,28(R13)          RESTORE CALLERS REGISTERS
+         BR    R14                     RETURN TO CALLER
+         EJECT
+***********************************************************************
+*                           EODAD ROUTINE                             *
+***********************************************************************
+ENDATA   EQU   *
+         CLOSE ((DCBPTR))              CLOSE OLT LIB DCB
+         L     R1,MSGMOD                GET POINTER TO MESSAGE MODULE
+         L     R1,MSG203(R1)            GET POINTER TO MESSAGE IFD203I
+         PWTO  REG=(R1)                WRITE MESSAGE IFD203I
+         LA    R15,24                  PLACE 24 RETURN CODE IN REG 15
+         B     LDRETERR                RETURN TO CALLER INDICATING     C
+                                       ORDER ERROR OR GARBAGE
+***********************************************************************
+*                           SYNAD ROUTINE                             *
+***********************************************************************
+ERROR    EQU   *
+         SYNADAF   ACSMETH=BPAM    GET THE I/O ERROR           @ZA14111
+         MVC   IOERRMSG+9(78),42(1)  MOVE IT TO BE PRINTED     @ZA14111
+         ST    R14,SAVE14            SAVE RETURN ADDRESS       @ZA14111
+         OI    LDSWITCH,IOERROR        INDICATE TO SELF THAT AN I/O    C
+                                       ERROR HAS OCCURRED
+         SYNADRLS                                              @ZA14111
+*                                   RELEASE THE SAVE AREA FROM SYNADAF
+         L     R14,SAVE14          RESORE RETURN ADDR          @ZA14111
+         BR    R14                     RETURN TO CALLER
+         EJECT
+***********************************************************************
+*                              DECLARES                               *
+***********************************************************************
+SAVEAREA DC    18F'0'                  SAVE AREA
+BUFFER   DC    20F'0'                  READ BUFFER
+RLCOREAD DC    F'0'                    REAL CORE ADDRESS OF MODULE
+ASSEMAD  DC    F'0'                    ASSEMBLED ADDRESS OF MODULE
+B28WORK  DC    F'0'                    FULLWORD WORK AREA
+WORK     DC    F'0'                    FULLWORD WORK AREA
+RELFT    DC    F'0'                    RELOCATION FACTOR
+RDBUFAD  DC    F'0'                    BUFFER ADDRESS
+RDLNGTH  DC    F'0'                    LENGTH OF READ
+RETCODE  DC    F'0'                    RETURN CODE AREA
+FULL15   DC    F'15'                   FULLWORD CONSTANT EQUAL 15
+ONE      DC    F'1'                    FULLWORD CONSTANT EQUAL 1
+ONE1     EQU   ONE+2                   HALFWORD CONSTANT EQUAL 1
+TTRZ     DC    F'0'                    TTRZ FOR READ ROUTINE
+SIZEAREA DC    F'0'                    SIZE WORK AREA
+LDSWITCH DC    X'00'                   INTERNAL FLAGS
+EHLIST   DS    0F                       EBCDIC TO HEX CONVERT  XM0794
+         DC    XL2'02'                  MACRO LEVEL            XM0088
+         DC    CL2'41'                  CONVERT MACRO ID       XM0088
+         DC    A(SREALDEV)              FROM EBCDIC AREA       XM0088
+         DC    A(SREALHEX)              TO HEX AREA            XM0088
+         DC    AL2(4)                   COUNT AND TYPE         XM0088
+SREALHEX DC    XL2'00'                  REAL DEVICE IN HEX     XM0088
+SREALDEV DC    CL4' '                   SAVE REAL DEVICE       XM0088
+HELIST   DS    0F                       HEX TO EBCDIC CONVERT  XM0794
+         DC    XL2'02'                  MACRO LEVEL            XM0088
+         DC    CL2'41'                  CONVERT MACRO ID       XM0088
+         DC    A(SCDSHEX)               FROM HEX AREA          XM0088
+         DC    A(SCDSDEV)               TO EBCDIC AREA         XM0088
+         DC    AL2(2+32768)             COUNT AND TYPE         XM0088
+SCDSHEX  DC    XL2'00'                  EQUATED DEVICE IN HEX  XM0088
+FOUR     DC    H'4'                     HALFWORD 4             XM0794
+SCDSDEV  EQU   WORK                     EQUATED DEVICE         XM0088
+CDSIND   EQU   SCDSHEX                  CDS INDICATOR          XM0088
+SAVE14   DC    F'0'                SAVE R14                    @ZA14111
+IOERRMSG WTO   '                                               @ZA14111X
+                                                               @ZA14111X
+                        ',MF=L,ROUTCDE=10,DESC=7               @ZA14111
+***********************************************************************
+*                           OLT LIB DCB                               *
+***********************************************************************
+OLTDCB   DCB   BLKSIZE=3600,LRECL=80,DDNAME=OLTCDSDD,DSORG=PO,         C
+               MACRF=R,RECFM=UT,EODAD=ENDATA,SYNAD=ERROR
+***********************************************************************
+*                         COMMON AREA DSECT                           *
+***********************************************************************
+LOADER   IFDCOM
+         IEZDEB                        DSECT FOR DEB             Y02008
+         END

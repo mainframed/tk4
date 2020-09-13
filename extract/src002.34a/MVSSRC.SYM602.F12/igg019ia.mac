@@ -1,0 +1,1906 @@
+         TITLE 'IGG019IA - PUT, W/O WR CHK, VLR'
+*                                                                     *
+*        RELEASE 0S/VS2-02 DELETIONS
+*D174400                                                        YM03178
+*                                                               YM05395
+*                                                               YM06516
+*      VS2 RELEASE 030 CHANGES
+* A323400-323588                                                ZA03186
+*
+*C132000,162000,510000                                         @ZA07607
+*A167000-167800                                                @ZA07607
+*A167700-167750,C175600                                        @ZA10227
+*A509940                                                       @ZA10226
+*        RELEASE 21 DELETIONS                                         *
+*0281                                                            A46890
+*0281635600-637600                                               M0170
+*D141800                                                        XM6075
+*D281200-281400                                                 SA55487
+*D281730,281800                                                 SA53927
+*
+*FUNCTION/OPERATION- THIS MODULE CONTAINS THE BASIC LOAD MODE PUT     *
+*   ROUTINES. THESE ROUTINES INVOLVE RECORD PROCESSING FOR MOVE MODE  *
+*   AND FOR LOCATE MODE, BUFFER MANAGEMENT, CHANNEL PROGRAM INITIAL-  *
+*   IZATION, AND CHANNEL PROGRAM EXECUTION.                           *
+*                                                                     *
+*ENTRY POINTS - 'IGG019IA' (ISLFX01) IS THE ENTRY FOR A LOAD MODE PUT *
+*   MACRO INSTRUCTION. THE GENERATED CALLING SEQUENCE IS,             *
+*   LA   1,DCB                                                        *
+*   LA   0,RECORD   FOR MOVE MODE                                     *
+*   L    15,48(0,1)                                                   *
+*   BALR 14,15                                                        *
+*                                                                     *
+*INPUT- REGISTER 0  -POINTS TO USERS RECORD IN WORK AREA (MOVE MODE). *
+*       REGISTER 1  -POINTS TO DCB.                                   *
+*       REGISTER 13 -POINTS TO USER SAVE AREA.                        *
+*       REGISTER 14 -POINTS TO RETURN FROM PUT.                       *
+*                                                                     *
+*OUTPUT- REGISTER 1 -POINTS TO NEXT AVAILABLE SPACE IN OUTPUT BUFFER  *
+*                     (LOCATE MODE).                                  *
+*        REGISTER 1 -POINTS TO BAD BUFFER IF WRITE ERROR OCCURRED.    *
+*        REGISTER 0 -POINTS TO IOB IF WRITE ERROR OCCURRED.           *
+*        REGISTER 14-POINTS TO RETURN TO CLOSE IF WRITE ERROR         *
+*                      OCCURRED DURING CLOSE.                         *
+*                                                                     *
+*EXTERNAL ROUTINES- 'IGG019GC'-CHANNEL PROGRAM APPENDAGE ROUTINES     *
+*   USED TO PROCESS I/O RETURNS. ALSO, CHANNEL PROGRAMS AND IOS.      *
+*                                                                     *
+*EXITS-NORMAL- (ISLFX13), USER RECORD HAS BEEN PROCESSED SUCCESSFULLY.*
+*     -ERROR-  (ISLFX05), AN ERROR OCCURRED DURING THE PROCESSING OF  *
+*   THE USER RECORD. THE ERROR CONDITION IS FLAGGED AS FOLLOWS,       *
+*   DCBEXCD1 BIT 5 ON = WRITE ERROR, REG 1 POINTS TO BAD BUFFER.      *
+*                                    REG 0 POINTS TO IOB.             *
+*   DCBEXCD1 BIT 2 ON = SPACE ERROR, NOT ENOUGH SPACE FOR DATA SET.   *
+*   DCBEXCD2 BIT 1 ON = DUPLICATE KEY.                                *
+*   DCBEXCD2 BIT 0 ON = KEY OUT OF SEQUENCE.                          *
+*                                                                     *
+*   DCBEXCD2 BIT 7 ON = LENGTH ERROR                           
+*TABLES/WORK AREAS-                                                   *
+*   DCB      - COMMUNICATION WITH USER.                               *
+*   DEB      - COMMUNICATION WITH IOS.                                *
+*   ISLCOMON - COMMUNICATION WITHIN LOAD MODE.                        *
+*   ISLIOBA  - COMMUNICATION WITH I/O FOR CP18 AND CP20.              *
+*   ISLIOBB  - COMMUNICATION WITH I/O FOR CP21.                       *
+*   ISLIOBC  - COMMUNICATION WITH I/O FOR CP19.                       *
+*   ISLAREAZ - WORK AREA USED FOR PREFORMATTING.                      *
+*   ISLIXLT  - INDEX LOCATION TABLE, LOCATES HI-LEVEL INDICIES.       *
+*   ISLY     - WORK AREA USED WHEN WRITING INDICIES.                  *
+*   ISLVPTRS - VARIABLE POINTERS, REFERENCE VARIABLE LENGTH BLOCKS.   *
+*   IOBBCT   - BUFFER CONTROL TABLE, CONTROLS BUFFER USAGE.           *
+*                                                                     *
+*ATTRIBUTES- READ ONLY, REENTRANT, REUSABLE.                          *
+*                                                                     *
+*NOTES- THIS MODULE, TOGETHER WITH THE APPENDAGE MODULE 'IGG019GC',   *
+*   AND THE CHANNEL PROGRAMS, CREATE THE ISAM DATA SET WHEN NO WRITE- *
+*   CHECKING IS SPECIFIED. ALL OTHER LOAD MODE MODULES MERELY PROVIDE *
+*   THE OPEN AND CLOSE FUNCTIONS.                                     *
+*       SECTIONS OF THE PROCESSING IN THIS MODULE ARE ENTERED         *
+*   DIRECTLY FROM CLOSE PROCESSING. IN SUCH CASES, PROCESSING IS      *
+*   CARRIED ON AS THOUGH IT WAS PART OF CLOSE.                        *
+*        ENTRY POINTS - ISLFX01                                       *
+*                     - ISLFX20                                       *
+*                     - ISLFY01                                       *
+*                     - ISLFZ01                                       *
+*                     - ISLPA01                                       *
+*                                                                     *
+*    ******************************************************************
+*    THE FOLLOWING NOTATION IS FREQUENTLY USED THROUGHOUT COMMENTS -  *
+*              C(FIELD X) = A(FIELD Y)                                *
+*     CONTENTS OF FIELD X = ADDRESS OF FIELD Y                        *
+*    ******************************************************************
+*                                                                     *
+         EJECT
+IGG019IA CSECT                                                      
+*   BASE REGISTERS                                                    *
+*        R1    DCB
+*        R8    DEB
+*        R12   ISLCOMMON
+*        R11   IOBBCT
+*        R9    ISLY
+*        R2    IOB
+*        R7    IXLT
+********************
+* DCB REFERENCE    *
+********************
+*
+         DCBD  DSORG=(IS)
+         USING IHADCB,R1
+         EJECT
+********************
+* DEB REFERENCE    *
+********************
+*
+IHADEB   IGGDEBD
+DEBXTN   DSECT
+DEBXLNGH  DS   H                        LENGTH DEB EXTENSION
+DEBXFLG1  DS   B                        FLAG BYTE
+DEBXTSKC EQU   X'40'                    TASK CLOSE CLOSING DCB
+         USING IHADEB,R8                                         S20201
+         EJECT
+*
+ISLCOMON IGGLOAD
+         USING ISLCOMON,R12
+*
+* IOBBCT REFERENCE         C(ISLVPTRS+8)=A(IOBBCT)
+*
+IOBBCT   DSECT
+         USING IOBBCT,R11
+         DS    0D
+IOBFLAGS DS    0CL1                     FLAGS
+IOBPTRA  DS    A                        PTR A
+IOBB     DS    0CL1                     B
+IOBPTRB  DS    A                        PTR B
+IOBS     DS    0CL1                     S - STATUS FIELD FOR BUF NO 1
+IOBABUF  DS    A                        A(BUF NO 1) - ADR OF BUF NO 1
+*
+*------------------ VARIABLE AREA ------------------------------------
+*
+*        --
+*        --
+*        --
+*        --
+*
+* ISLY REFERENCE           C(ISLVPTRS)=A(ISLY)
+*
+ISLY     DSECT
+         USING ISLY,R9
+         DS    0D
+         DS    CL8                      CYL-MAST IX    COUNT    Y+0
+         DS    CL10                                    DATA     Y+8
+         DS    CL8                      TRK IX NORM    COUNT    Y+18
+         DS    CL10                                    DATA     Y+26
+         DS    CL8                      TRK IX OVFL    COUNT    Y+36
+         DS    CL10                                    DATA     Y+44
+         DS    CL8                      TRK IX DUMM    COUNT    Y+54
+*        DS    CL(IL)                                  KEY 1S   Y+62
+*        DS    CL10                                    DATA     Y+62+IL
+*
+         EJECT
+IHAIOB   DSECT
+         USING IHAIOB,R2
+         DS    0D
+IOBFLG1  DS    CL1                      FLAGS 1
+IOBFLG2  DS    CL1                      FLAGS 2
+         DS    CL1
+IOBSENSE DS    CL1                      SENSE
+IOBECBAD DS    A                        ECB POINTER
+IOBCSW   DS    CL8                      CHANNEL STATUS WORD
+IOBSIOCC DS    0CL1                     SIO CC
+IOBCPSAD DS    A                        CHANNEL PROG START ADR
+IOBWT    DS    0CL1                     WEIGHT
+IOBDCBAD DS    A                        DCB POINTER
+IOBCPRAD DS    A                        CHANNEL PROG RESTART ADR
+IOBBCTI  DS    CL2                      BLK CTR INCR
+IOBECT   DS    CL2                      ERROR CTR
+IOBDADAD DS    CL8                      DIR ACCESS DEV ADR MBBCCHHR
+*
+IXLT     DSECT
+         USING IXLT,R7
+         DS    0D
+IXLTIND  DS    CL1                      INDICATOR
+IXLBEG   DS    CL8                      BEGINING COUNT MBBCCHHR
+IXLSTP   DS    CL8                      STEPPING COUNT MBBCCHHR
+IXLEND   DS    CL8                      ENDING COUNT   NBBCCHHR
+         DS    CL1
+         DS    CL26                                                LEV2
+         DS    CL26                                                LEV3
+         DS    CL26                                                LEV4
+         EJECT
+         IKJRB DSECT=YES                                        YM03178
+         SPACE 4
+         IHAPSA                                                 YM05395
+         EJECT
+CPSX     IGGLDCP RECFM=V                LOAD CP SKELETON         S20201
+         EJECT
+***********************************************************************
+* ISL PUT - BEGIN                                                     *
+***********************************************************************
+*
+*
+IGG019IA CSECT
+ISLF800  SAVE  (14,12)                  SAVE USERS REGS
+         BALR  R15,0
+         USING *,R15              BASE REG 9                        
+         B     ISLFX01
+         B     ISLFX20
+         B     ISLFY01
+         B     ISLFZ01
+         B     ISLPA01
+*
+* EQUATE SYMBOLIC REGISTERS
+*
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   8
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   9
+R16      EQU   15
+CVTPTR   EQU   16
+K0       EQU   0                        CONSTANT                 S20201
+K1       EQU   1                        CONSTANT                 S20201
+K3       EQU   3                        CONSTANT                 S20201
+L3       EQU   3                        LENGTH                   S20201
+L4       EQU   4                        LENGTH                   S20201
+L7       EQU   7                        LENGTH                   S20201
+K7       EQU   7                        CONSTANT                 S20201
+K4       EQU   4                        CONSTANT                 S20201
+*
+IOERR    EQU   X'04'                                             A34959
+LOCATE   EQU   X'08'                                             A34959
+BOBSW    EQU   X'08'                                             A34959
+RESLD    EQU   X'20'                                             A34959
+BOBOFF   EQU   X'F7'                                             A34959
+RLOFF    EQU   X'DF'                                             A34959
+TCOFF    EQU   X'F0'                                             M0651
+ISLKEYVL EQU   X'04'                    KEY SEQUENCE VALID(IXLT) XM6075
+COMPLETE EQU   X'40'                    COMPLETE ECB
+INCLOSE  EQU   X'10'                    ENTERED FROM CLOSE      YM05395
+DMCODE   EQU   119                      INTERNAL PROB DET CODE  YM05395
+*
+* F8 CONSTANTS
+*
+         SPACE
+ISL8     DC    F'8'
+ISL10    DC    F'10'
+ISL24    DC    F'24'
+CONSF8   DC    F'248'
+ISLFRKS  DC    F'0'
+ISL28    DC    F'28'
+ISL44    DC    F'44'
+ISL4     DC    F'4'
+ISL12    DC    F'12'
+ISLZEROF DC    F'0'
+ISLONEF  DC    F'1'
+ISLTWOF  DC    F'2'
+ISLTENF  DC    F'256'
+ISLFX02A CLC   0(1,R4),0(R5)           KEY COMP TO BE EXECUTED (L)
+ISLFX06A MVC   0(1,R5),0(R4)           MOVE KEY TO BE EXECUTED (L)
+ISLFX08A CLC   0(1,R5),0(R4)           KEY COMP TO BE EXECUTED (M)
+*
+*
+ERROR    OI    DCBEXCD2,X'08'    SET FLG   LL GTR THAN STATED MAX   
+         BC    15,ISLFX04A                                     @ZA07607
+*
+         EJECT
+***********************************************************************
+* CHART FX - PUT (MOVE/LOCATE)                                        *
+***********************************************************************
+*
+         USING IHADEB,R8
+*
+* FX HOUSEKEEPING
+*
+ISLFX01  L     R12,DCBWKPT1             C(R12)=A(COMMON)
+         L     R10,DCBWKPT6            C(R10)=A(VPTRS)         
+         L     R11,8(R10)              C(R11)=A(BCT)           
+         TM    IOBFLAGS,X'10'          DID WE COME FROM CLOSE  
+         BO    CONTINUE                YES, BRANCH             
+         ST    R13,ISLVRSAV+4                                  
+CONTINUE EQU   *                                               
+         LA    R2,ISLIOBA               C(R2)=A(IOBA)
+         NI    DCBEXCD2,X'3F'           SET EXCD2 BITS 0 AND 1 = 00
+*
+*   TEST FOR UNCORRECTABLE I/O ERRORS
+*
+         TM    DCBEXCD1,IOERR           UNCORRECTABLE I/O ERRORS A34959
+         BO    ISLFX02                  YES - TAKE SYNAD OR      A34959
+*                                       * ABEND JOB.
+*
+* TEST DCBST BIT 1 FOR LOAD MODE (FIRST TIME SW)
+*
+         TM    DCBST,X'40'              TEST ST BIT 1 (1=NOT FRST TIME)
+         BZ    ISLFX10A           B NOT ON = FIRST TIME             
+*
+*   TEST FOR RESUME LOAD
+*
+         LH    R5,DCBRKP                RKP USED TO FIND KEYS    A34959
+         TM    DCBST,RESLD              TEST FOR RESUME LOAD     A34959
+         BZ    ISLFX022                 NO - TAKE NORMAL PATH    A34959
+*   RESUME LOCATE MODE SKIP SEQUENCE CHECK AS THIS RECORD WAS
+*   PREVIOUSLY ACCEPTED IN THE LAST LOAD STEP.
+         TM    DCBMACRF+1,LOCATE        IS THIS LOCATE MODE      A34959
+         BO    ISLFX07A                 LOCATE - BR              XM6075
+         L     R4,4(R10)                HIGH KEY IS IN THE       A34959
+*                                       * KEYSAVE AREA.
+         B     ISLFY022                 BRANCH TO CHECK SEQUENCE A34959
+*
+*   UNCORRECTABLE I/O ERROR PREPARE FOR ERROR ROUTINE.
+*
+ISLFX02  EQU   *                        *                        A34959
+         L     R13,ISLVRSAV+4           C(R13)=A(USERS SAVE AREA)
+         L     R0,36(R10)               C(R0)=A(BAD BUF) FROM VPTR10
+         MVC   40(4,R10),DCBSYNAD       SET VPTR 11 = A(SYNAD)
+         ST    R0,24(R13)               STORE A(BAD BUF) IN USERS R1
+         LA    R0,ISLIOBA               C(R0)=A(IOBA)
+         ST    R0,20(R13)               STORE A(IOBA) IN USERS R0
+         B     ISLFX05                  B TO TAKE SYNAD
+*
+* SEQUENCE CHECK
+****************
+*
+ISLFX022 EQU   *                        *                        A34959
+         L     R4,ISLCBF                PT TO KEY IN RECORD LAST A34959
+         AR    R4,R5                     LOADED.                 A34959
+ISLFY022 EQU   *                        *                        A34959
+         SR    R3,R3
+         IC    R3,DCBKEYLE              C(R3)=KEYLEN, 000000NN
+         BCTR  R3,0                     C(R3)=KEYLEN-1, FOR EXECUTE
+*
+* TEST FOR MOVE OR LOCATE PUT
+*
+         TM    DCBMACRF+1,X'10'         TEST MACRF BIT 11
+         BC    1,ISLFX08                B IF ON = MOVE PUT
+*
+* LOCATE PUT ***
+*   LENGTH TEST:  STATED LRECL(N-1) VS ACTUAL LENGTH                
+         L     R6,ISLVPTRS+20      A(CP20)                          
+         L     R5,ISLCBF          C(R5) = A(RCD N-1)                
+         CLC   82(2,R6),0(R5)      COMPARE STATED LENGTH VS ACTUAL  
+         BL    ERROR                                                
+*
+         L     R5,4(R10)                C(R5)=A(KEYSAVE)=A(PREV KEY)
+         EX    R3,ISLFX02A              C(CBF+RKP) VS C(KEYSAVE)
+         BH    ISLFX06                  B IF NEW KEY HIGH
+         BL    ISLFX04                  B IF NEW KEY LOW = SEQ ERR
+*
+* LOCATE PUT,KEYS EQUAL- TEST IF 2ND PUT (SEQ CHK ONLY AFTER 2ND PUT)
+*
+         L     R6,DCBNREC               C(R6)=NREC
+         C     R6,ISLONEF               TEST NREC VS 1
+         BE    ISLFX06                  B IF NREC = 1, ONLY 2ND PUT
+*
+* DUPLICATE RECORDS = ERROR
+*
+ISLFX03  OI    DCBEXCD2,X'40'           SET EXCD2 BIT 1 ON = DUPLICATE
+         B     ISLFX04A                                        @ZA07607
+*
+* MOVE PUT ***
+*
+ISLFX08  AR    R5,R0                    C(R5)=C(AREA+RKP)=A(NEW KEY)
+         EX    R3,ISLFX08A              C(NEW KEY) VS C(CBF+RKP)
+         BH    ISLFX07                  BRANCH IF NEW KEY HIGH
+         BE    ISLFX03                  BR IF KEYS EQUAL=DUPLIC ATES
+*
+* SEQUENCE ERROR
+*
+ISLFX04  OI    DCBEXCD2,X'80'           SET EXCD2 BIT 0 ON = SEQ ERR
+*
+* TAKE SYNAD EXIT
+ISLFX04A LA    R0,ISLIOBA               LOAD IOB ADDR          @ZA07607
+         TM    IOBFLAGS,X'10'           IN CLOSE?              @ZA10227
+         BO    ISLFX05                  YES BRANCH             @ZA10227
+         ST    R0,20(R13)               ST IN USER SAVE AREA   @ZA07607
+ISLFX05  LR    R4,R14                   SAVE RETURN IN R4
+         L     R16,DCBSYNAD
+         C     R16,ISLONEF              TEST SYNAD VS 1
+         BE    ISLFX052                 BR IF 1 - NO SYNAD
+         TM    IOBFLAGS,X'10'          TEST FLAG 3 (CLOSE)     
+         BC    1,ISLFX051              BRANCH IF ON            
+         L     R13,ISLVRSAV+4          RESTORE USER 13         
+         L     R14,12(R13)              RESTORE USER 14
+         LM    0,12,20(R13)             RESTORE REGS
+         BR    R16                      TAKE SYNAD EXIT
+ISLFX051 TM    DCBEXCD2,X'20'           TEST EXCD2 BIT 2    ***CLOSE***
+         BC    1,0(R4)                  B IF ON, RETURN TO CLOSE
+         L     R5,DCBDEBAD              DEB ADDRESS             YM06516
+         LA    R5,0(R5)                 CLEAR HIGH ORDER BYTE   YM06516
+         S     R5,ISL8                  PT TO DEB EXTENSION PTR YM06516
+         L     R5,0(R5)                 ADDR DEB EXTENSION      YM06516
+         USING DEBXTN,R5                DEB EXT. ADDRESSABILITY YM06516
+         TM    DEBXFLG1,DEBXTSKC        TASK CLOSE CLOSING DCB  YM06516
+         BO    ISLFTERM                 BR YES - ISSUE MESSAGE  YM06516
+         USING PSA,R0                   LOW CORE ADDRESSABILITY YM05395
+         L     R5,PSATOLD               TCB ADDRESS             YM05395
+         DROP  R0,R5                    END LOW CORE DEB ADDR   YM06516
+         L     R5,0(R5)
+         USING RBBASIC,R5               SYNCH RB ADDRESSABILITY YM03178
+         L     R5,RBLINK                OPEN SVRB ADDRESS       YM03178
+         DROP  R5                       END RB ADDRESSABILITY   YM03178
+         LA    R13,ISLVRSAV             SAVE AREA ADDRESS       YM03178
+         OI    DCBEXCD2,X'20'           SET EXCD2 BIT 2 ON = CLOSE
+         L     1,24(R13)                SET REG 1              @ZA10227
+         LM    2,13,40(R5)              RESTORE USERS REGS 2 - 13
+         BR    R16                      TAKE SYNAD EXIT - WILL   Y02072
+*                                       RETURN TO CLOSE AS REG   Y02072
+*                                       14 HAS ADDR ESTABLISHED  Y02072
+*                                       AS RESULT OF ISSUING     Y02072
+*                                       SYNCH BY CLOSE           Y02072
+*
+ISLFX052 EQU   *                        NO SYNAD = ABEND 31
+         TM    IOBFLAGS,INCLOSE         ENTERED FROM CLOSE      YM05395
+         BZ    ISLFX054                 BR NO - ISSUE ABEND     YM05395
+         L     R5,DCBDEBAD              DEB ADDRESS             YM06516
+         LA    R5,0(R5)                 CLEAR HIGH ORDER BYTE   YM06516
+         S     R5,ISL8                  PT TO DEB EXTENSION PTR YM06516
+         L     R5,0(R5)                 ADDRESS DEB EXTENSION   YM06516
+         USING DEBXTN,R5                DEB EXT. ADDRESSABILITY YM06516
+         TM    DEBXFLG1,DEBXTSKC        TASK CLOSE CLOSING DCB  YM06516
+         BO    ISLFTERM                 BR YES - ISSUE MESSAGE  YM05395
+         DROP  R5                       END DEB EXT.  ADDR      YM06516
+ISLFX054 EQU   *                        ISSUE ABEND             YM05395
+         ABEND X'031',DUMP,,SYSTEM      SYSTEM 031 ABEND         Y02072
+         DS    0F                                                   
+         SPACE 2
+*        ISSUE ERROR MESSAGE AND TERMINATE TASK WITH 031 ABEND -
+*        TASK TERMINATION ISSUED CLOSE FOR USER.
+         SPACE 2
+ISLFTERM EQU   *                        ISSUE MESSAGE-TERM. TSK YM05395
+         DMABCOND DMCODE,SVC=YES,DCB=(R1)                       YM05395
+         SPACE 2
+*
+* LOCATE PUT,SEQUENCE OK- MOVE KEY TO KEYAVE AREA
+*
+ISLFX06  EX    R3,ISLFX06A              MOVE C(CBF+RKP) TO C(KEYSAVE)
+*
+* BUMP CBF
+*
+*   UPDATE: CBF, BLKL, AND SET KEY ADDRESS.                         
+ISLFX07  EQU   *                        *                        A34959
+         OI    ISLIXLT,ISLKEYVL         VALID RECORD ADDED       XM6075
+ISLFX07A EQU   *                        *                        XM6075
+         TM    IOBFLAGS,BOBSW           TEST IF BOB SWITCH ON    A34959
+         BZ    ISLFX09                  BIT SET IF RESUME LOAD   A34959
+*                                       AND OVERFLOW OFF TRACK
+         BAL   R14,ISLPA01              IF ON, GET NEW BUFFER    A34959
+         MVC   IOBPTRA+1(3),IOBPTRB+1   NEW BUFFER WILL BE FIRST A34959
+*                                       TO SCHEDULE
+         NI    IOBFLAGS,BOBOFF          TURN OFF BOB SW          A34959
+         NI    IOBS,TCOFF               TURN OFF TRK-CYL BITS    M0651
+         B     ISLFX10                                           A34959
+ISLFX09  EQU   *                                                 A34959
+         L     R4,ISLVPTRS+20           C(R4) = A(CP20)          A34959
+         L     R5,ISLCBF          C(R5) = C(CBF) = A(RCD N-1)       
+         MVC   40(2,R4),0(R5)      MOVE IN LRECL ACTUAL             
+         L     R3,ISLVPTRS+12     A(CP18)                           
+         LH    R7,40(R4)           C(R7) = LENGTH OF ACTUAL RCD N-1 
+         L     R6,IOBPTRB         C(R6) = A(SLOT N)                 
+         L     R6,0(R6)           C(R6) = A(BUF N)                  
+         AH    R7,8(R6)           LRECL + BLKL                      
+         STH   R7,8(R6)            = BLKL                           
+         AH    R5,DCBRKP          CBF + RKP = A(KEY RCD N-1)        
+         LH    R7,80(R4)          C(R7) = DISP TO CCW SLOT IN CP18  
+         IC    R6,32(R3,R7)       SAVE OP CODE                      
+         ST    R5,32(R3,R7)       STORE KEY LOCATION INTO CL5       
+         STC   R6,32(R3,R7)       RESTORE OP CODE                   
+         L     R5,ISLCBF          C(R5) = A(RCD N-1)                
+         AH    R5,40(R4)           CBF + ACTUAL LRECL OF RCD N-1    
+         ST    R5,ISLCBF           = A(RCD N)                       
+         B     ISLFX10
+*
+* BUMP NREC
+*
+ISLFX10A OI    DCBST,X'40'              SET ST BIT ON
+         CLC   DCBLPDA(1),DCBMSWA      TEST FOR SAME M         
+         BNE   KEEPGOIN                                        
+         CLC   DCBLPDA+3(4),DCBMSWA+3  TEST SAME CCHHR         
+         BH    ISLPA205                                        
+KEEPGOIN EQU   *                                               
+ISLFX10  EQU   *                                                 A29251
+         SR    R6,R6                                                
+         SR    R10,R10                                              
+         IC    R10,DCBKEYLE       KL                                
+         L     R3,DCBLRAN          A(DEV TBLE)                      
+*
+* TEST FOR MOVE OR LOCATE PUT
+*
+ISLFX11  TM    DCBMACRF+1,X'10'         TEST MACRF BIT 11
+         L     R4,ISLVPTRS+20      A(CP20)                          
+         BO    ISLFX11A           MOVE PUT                          
+*
+* LOCATE PUT
+         CLC   32(2,R4),DCBLRECL  LRECL(MAX) GT LRECL(N)            
+         BL    ERROR              NO.                               
+         MVC   82(2,R4),DCBLRECL  SAVE STATED LENGTH                
+         LH    R7,DCBLRECL                                          
+         B     ISLFX11F                                             
+*   MOVE PUT
+ISLFX11A LH    R7,DCBBLKSI              MAXIMUM LOGICAL RECORD   A31383
+         S     R7,ISL4                  *  LENGTH POSSIBLE       A31383
+         STH   R7,32(R4)                SET MAX RECL TO BLKSI-4  A31383
+         CH    R7,DCBLRECL              IS NEW LRECL TO LARGE    A31383
+         BH    ISLNOST                  YES - USE MAXIMUM VALUE  A34959
+         MVC   32(2,R4),DCBLRECL        NO - USE USER SUPPLIED   A31383
+*                                       *  VALUE
+ISLNOST  EQU   *                                                 A31383
+         LR    R7,R0                    C(R7) = A(RCD N)         A31383
+         CLC   32(2,R4),0(R7)          MAX RECL VS STATED LRECL     
+         BL    ERROR              NO                                
+         MVC   82(2,R4),0(R7)          SAVE ACTUAL LENGTH           
+         LH    R7,82(R4)               RECL OF RECORD N             
+*   TEST BLOCK, TRACK, AND CYLINDER CONDITIONS.
+ISLFX11F EQU   *                                                    
+         L     R3,DCBNREC               C(R3)=NREC               A29251
+         A     R3,ISLONEF               C(R3)=NREC+1             A29251
+         ST    R3,DCBNREC               C(NREC)=NREC+1           A29251
+         L     R3,DCBLRAN               A(DEV TBLE)              A29251
+         CLC   DCBNREC(4),ISLONEF IS NREC = 1                       
+         BH    ISLFX11B           NO. NOT FIRST TI,E                
+         LA    R7,4(R7)            INCLUDE INITIAL BLKL OF 4        
+         B     ISLFX11C                                             
+ISLFX11B EQU   *                                                    
+         TM    DCBRECFM,X'10'     ARE RECORDS BLOCKED?              
+         L     R5,IOBPTRB         C(R5) = A(SLOT N)                 
+         L     R5,0(R5)           C(R5) = A(BUFF N)                 
+         BO    ISLFX115                 BR IF RECORDS BLOCKED    M0651
+         TM    DCBST,RESLD              TEST IF RESUME LOAD      M0651
+         BO    ISLFX11C                 IF RESUME LOAD,          M0651
+*                                       UNBLOCKED RECS           M0651
+*                                            WILL RETURN
+         B     ISLFX11D                 OTHERWISE WILL CONTINUE  M0651
+ISLFX115 EQU   *                                                 M0651
+         AH    R7,8(R5)            LRECL + BLKL                     
+         CH    R7,DCBBLKSI         WILL RCD N FIT INTO BUFF N       
+         BH    ISLFX11D           NO. GEBIN NEW BUFFER              
+*   WILL BUFF N, CONTAINING RCD N FIT ONTO TRACK?
+ISLFX11C EQU   *                                                    
+         LH    R6,ISLLGAP               C(R6) = LIDO             S20201
+         AR    R6,R7               LIDO + (LRECL+BLKL)              
+         AR    R6,R10             LIDO + (LRECL+BLKL) + KL          
+         CH    R6,66(R4)          IS C(R6) LE REMAINNING CAPACITY   
+         BNH   ISLFX12            YES. BLOCK WILL FIT ONTO TRACK    
+         B     ISLFX11E           NO. SIGNAL EOT.                   
+*   WILL NEW BLOCK CONTAINING RCD N, & PREV BLK WITH RCD N-1, FIT TR
+ISLFX11D LR    R6,R10             C(R6) = KL                        
+         AH    R6,8(R5)           KL + BLKL                         
+         MH    R6,10(R3)          * TOLERANCE                       
+         SRA   R6,9               / 512                             
+         ST    R6,36(R4)           TOL * (KL + BLKL)                
+         AR    R6,R10              + KL                             
+         AH    R6,82(R4)           + ACTUAL LRECL                   
+         LA    R6,4(R6)            + 4                              
+         AH    R6,ISLIGAP               + NIDO                   S20201
+         AH    R6,ISLLGAP               + LIDO                   S20201
+         CH    R6,66(R4)          IS C(R6) LE REM CAP ON TRACK      
+         BNH   ISLFX24            YES. BOTH BLOCKS WILL FIT.        
+*   MARK END-OF-TRACK
+ISLFX11E L     R6,IOBPTRB         C(R6) = A(SLOT N-1)               
+         OI    0(R6),X'09'        ON - EOT, EOTX                     TR
+         CLC   3(1,R5),DCBLDT+1   IS THIS TRACK THE LAST IN CYL?    
+         BL    ISLFX24            NO. GO TO EOB                     
+         OI    0(R6),X'04'         ON - EOC                         
+         B     ISLFX24                                              
+*                                       NOT EOB
+ISLFX12  TM    IOBFLAGS,X'40'           TEST FLAGS BIT 1
+         BC    1,ISLFX14                B IF ON = WRITE SHOULD BE
+*                                                 ATTEMPTED
+*
+* NOT EOB, FLAGS BIT 1 OFF, RESTORE REGS AND RETURN TO USER
+*
+* EXIT PUT
+*
+ISLFX13  TM    IOBFLAGS,X'10'           TEST FLAGS BIT-3 (CLOSE)
+         BC    1,0(R14)                 B IF ON = CLOSE
+         NI    DCBST,RLOFF              RESET RESUME LOAD BIT    A34959
+         TM    DCBMACRF+1,X'10'         TEST MACRF BIT 11 (MOVE PUT)
+         BO    ISLFX20            MOVE PUT                          
+         L     R1,ISLCBF                C(R1)=CBF, FOR LOCATE PUT
+ISLFX132 L     R13,ISLVRSAV+4
+         L     R14,12(R13)              RESTORE R14
+         RETURN (2,12)                  RESTORE USERS REGS AND EXIT
+*
+*
+*
+* NOT EOB, FLAGS BIT 1 ON, SET FLAGS BIT 1 OFF AND ATTEMPT WRITE
+*
+ISLFX14  NI    IOBFLAGS,X'BF'           SET FLAGS BIT 1 OFF
+         OI    IOBFLAGS,X'20'           SET FLAGS BIT 2 ON (NOT EOB)
+         B     ISLFY02A                                             
+*
+*
+*
+* MOVE PUT
+* MOVE RECORD FROM USER AREA TO CURRENT BUFFER VIA CBF
+*
+ISLFX20  EQU   *                                                    
+         LR    R5,R0              SEND LOCATION                     
+         SR    R4,R4                                                
+         IC    R4,0(R5)                                             
+         SLL   R4,8                                                 
+         IC    R4,1(R5)                                             
+         SRDL  R4,32                   R5=ACTUAL RECL               
+         LA    R6,256             FULL SIZE MOVE                    
+         DR    R4,R6              C(R4)=PARTIAL MOVE. C(R5)=NUM-    
+         BCTR  R4,0                BER OF FULL MOVES.               
+         LR    R6,R0              SEND LOCATION                     
+         L     R3,ISLCBF          RECEIVE LOCATION                  
+         LTR   R5,R5              IS THERE NO FULL MOVES?           
+         BZ    *+24               YES. NO FULL MOVES                
+         LA    R7,255             MACH LENGTH OF FULL MOVE          
+         EX    R7,ISLFX20M        EXECUTE FULL MOVE                 
+         LA    R3,256(R3)         UPDATE RECV LOCATION              
+         LA    R6,256(R6)         UPDATE SEND LOCATION              
+         BCT   R5,*-12                                              
+         LTR   R4,R4              IS PARITIAL MOVE = ZERO           
+         BL    ISLFX132           YES.                              
+         EX    R4,ISLFX20M        EXECUTE PARTIAL MOVE              
+         B     ISLFX132                                             
+ISLFX20M MVC   0(0,R3),0(R6)      MOVE INSTRUCTION                  
+*
+*   END-OF-BLOCK SCHDULING                                          
+* MARK CURRENT BUFFER AND BUMP B IN BCT.
+*
+ISLFX24  L     R3,IOBPTRB               C(R3)=PTR B = A(CURRENT SLOT)
+         NI    0(R3),X'DF'              SET STATUS BIT 2 = 0
+         OI    0(R3),X'40'              SET STATUS BIT 1 = 1
+*                                       STATUS BITS 1 AND 2 = 10
+*                                       =BUF FULL BUT NOT SCHED
+         SR    R4,R4
+         IC    R4,IOBB                  C(R4)=000N  N= NO. BFRS FILLED
+         A     R4,ISLONEF               C(R4)=000000NN+1
+         STC   R4,IOBB                  C(PTRB)=NNAAAAAA, NN = B
+         L     R12,DCBWKPT1       A(COMMON)                         
+         B     ISLFY01                 *
+*
+         EJECT
+***********************************************************************
+* CHART FY - PUT (EOB)                                                *
+***********************************************************************
+*
+* TEST B VS FBW (ARE WE READY TO ATTEMPT TO WRITE)
+*
+*   REG CONTENTS UPON ENTRY
+*        R3    A(DEVICE TABLE)
+*        R4    A(CP20)
+*        R5    A(BUFF N)
+*        R6    A(SLOT N)
+*        R1    A(DCB)
+*        R7    A(CCW SLOT IN CP18)
+*        R10   LIDO
+ISLFY01  EQU   *                  FBW CONTEMPLATIONS                
+         L     R3,DCBLRAN         A(DEV TBL)                        
+         L     R12,DCBWKPT1       A(COMMON)                         
+         L     R11,ISLVPTRS+8     A(BCT)                            
+         L     R4,ISLVPTRS+20     A(CP20)                           
+         L     R6,IOBPTRB         A(SLOT N)                         
+         L     R5,0(R6)           A(BUFF N)                         
+         LR    R7,R14              SAVE REG 14                      
+         SR    R10,R10            CLEAR R10                         
+ISLFY01A EQU   *                                                    
+         LH    R14,66(R4)         CURR TRK CAP                      
+         TM    0(R6),X'08'        IS BUFF N = EOT                   
+         BZ    ISLFY01D           NO.                               
+         SH    R14,ISLLGAP              - LIDO                   S20201
+         IC    R10,DCBKEYLE                                         
+         SR    R14,R10             - KL                             
+         SH    R14,8(R5)           - BLKL                           
+         STH   R14,10(R5)          = REM CAP TO BE INSERTED UNTO R0 
+         MVC   66(2,R4),4(R3)     RESET RUN CAP TO MAX CAP          
+         CLC   4(1,R5),DCBHIRPD   IS R(RECORD ID) GT HIRPD          
+         BNH   *+10               NO.                               
+         MVC   DCBHIRPD(1),4(R5)  YES. SET HIRPD = R                
+         CLI   ISLFBW+3,X'FF'     IS FBW SET?                       
+         BNE   ISLFY02            YES. PREVIOUS PUT WAS QUEUED      
+         IC    R10,4(R5)          C(R10) = R                        
+         SH    R10,64(R4)          - R OF LAST SCHD BUFFER          
+         STH   R10,ISLFBW+2       SET FBW                           
+         LTR   R10,R10     IS IT ZERO OR NEG                        
+         BC    2,ISLFY02           NO                               
+         SR    R10,R10               CLEAR R10                      
+         IC    R10,4(R5)           RESET R10                        
+         STH   R10,ISLFBW+2        RESET FBW                        
+         B     ISLFY02                                              
+ISLFY01D SH    R14,ISLIGAP              CUR TRK CAP - NIDO       S20201
+         S     R14,36(R4)           - TOL*(KL+BLKL)                 
+         STH   R14,66(R4)         STORE REDUCED CAPACITY            
+         CLI   ISLFBW+3,X'FF'     IS FBW SET?                       
+         BNE   ISLFY02            YES.                              
+         CLI   DCBBUFNO,X'01'     NO. DOES BUFNO = 1?               
+         BNE   ISLFY01E           NO.                               
+         MVI   ISLFBW+3,X'01'     SET FBW = 1 = DCBBUFNO            
+         B     ISLFY02                                              
+ISLFY01E SR    R14,R14                                              
+         IC    R14,ISLBUFNO             SET TO NUMBER OF BUFFERS
+         BCTR  R14,R0             C(R14) = NB-1                     
+         IC    R10,IOBB           C(R10) = NUMB OF FULL, UNSCHD BUF 
+         CR    R14,R10            DOES (NB-1) = FUB?                
+         BH    ISLFY41             NO.                              
+         STH   R10,ISLFBW+2        SET FBW = IOBB                   
+         SR    R10,R10            CLEAR R10                         
+         B     ISLFY02                                              
+*
+*                                       B G.E. FBW, ATTEMPT WRITE
+* TEST FLAGS BIT 0 VS 1, (IWR)-IS CP AVAILABLE
+*
+ISLFY02  LR    R14,R7             RESTORE R14                       
+         LH    R7,80(R4)           CP18 DISP SLOT                   
+ISLFY02A TM    ISLECBA,COMPLETE         IS THE IOB AVAILABLE    SA55487
+         BO    ISLFY03                  CP READY TO USE         SA55487
+         LA    R4,ISLFY02A              GET RETURN ADDRESS
+         TM    DCBEXCD1,X'04'           TEST FOR PERM ERROR      M4883
+         BZ    ISLFY99                  WAIT FOR CP             SA53927
+         ST    R14,ISLF9WK1             SAVE RETURN ADDR        SA53927
+         B     ISLPA65                  YES, TAKE SYNAD EXIT    SA53927
+*
+* B GE FBW AND FLAGS BIT 0 = 0 (CP AVAILABLE), SET UP TO WRITE
+*
+ISLFY03  SR    R3,R3
+         IC    R3,IOBB                  C(R3)=000N
+         S     R3,ISLFBW                C(R3)=B-FBW, WE WILL SCHED FBW
+*                                                    BUFFRS
+         STC   R3,IOBB                  C(PTRB)=NNAAAAAA, NN = B
+*
+         NI    IOBFLAGS,X'BF'           SET FLAGS BIT 1 OFF
+*
+*
+*
+* WAIT FOR PREVIOUS I/O TO COMPLETE
+*
+*
+*
+* MAKE SURE CP21 HAS COMPLETED
+*
+         LA    R2,ISLIOBB               SET BASE FOR IOB FOR CP21
+         BAL   R4,ISLFY99               BR TO WAIT SUBROUTINE
+*
+* TEST STATUS BIT-6 (PF BIT) PERTAING TO 1ST BFR.  IF PF BIT ON, THIS
+* IS THE 1ST BUFFER TO BE WRITTEN ON A NEW CYLINDER WITH SHARED TRACKS
+*
+         TM    0(R3),X'02'              TEST STATUS BIT-6
+         BC    8,ISLFY08                B IF PF NOT ON
+*
+* STATUS BIT-6 (PF BIT) IS ON. WE ARE ABOUT TO SCHED THE 1ST WRITE ON
+* A NEW, SHARED-TRACK, CYLINDER. FIRST WE MUST BE SURE CP19 HAS
+* FINISHED PRE-FORMATTING.
+*
+         LA    R2,ISLIOBC               SET BASE FOR IOB FOR CP19
+         BAL   R4,ISLFY99               BR TO WAIT SUBROUTINE
+         NI    0(R3),X'FD'              SET STATUS BIT 6 (PF BIT) OFF
+*
+*
+* SCHED FBW BUFFRS FOR WRITING VIA PTR A (STATUS BITS 1,2 ON)
+* AT THE SAME TIME TEST STATUS BYTES FOR BIT-3 ON = NEW EXTENT
+*
+ISLFY08  L     R4,ISLFBW                C(R4)= NO OF SLOTS TO SCHED
+         LA    R7,IOBABUF          A(SLOT 1)                        
+         LA    R5,0(R3)           CLEAR FIRST BYTE                  
+         SR    R5,R7               DIFFERENCE BWT SLOT 1 & SLOT A   
+         LTR   R5,R5               IF ZERO, SLOT A = SLOT 1         
+         BZ    *+12                YES. ZERO.                       
+         SRL   R5,2                REDUCE DIFF TO NUMB OF SLOTS     
+         MH    R5,ISL24+2          MODIFY BY NUMBER OF CCW SLOT SIZE
+         A     R5,ISLVPTRS+12      ADD IN ADDR(CP18, CL1)           
+         LR    R7,R6               SAVE R6                          
+ISLFY10  OI    0(R3),X'60'              SET STATUS BITS 1,2 = 11
+*   SET BLKL INTO CCW SLOT OF CP18; AND INTO BUFFER DL.
+*
+*                                                                   
+*                                                                   
+         L     R6,0(R3)           C(R7) = PTRA = A(FIRST UNSCH BUF) 
+         MVC   46(2,R5),8(R6)     SET BL INTO CCW SLOT              
+         MVC   6(2,R6),8(R6)      SET DL = BLKL                     
+         TM    0(R3),X'10'              TEST STATUS BIT-3
+         BC    8,ISLFY11                B IF 0, SAME EXTENT
+         SR    R6,R6               BIT-3 = 1, NEW EXTENT            
+         IC    R6,IOBDADAD         M                                
+         LA    R6,1(R6)            M+1                              
+         STC   R6,IOBDADAD         C(IOBA+32) = MBBCCHHR, M=M+1     
+         BAL   R6,ISLFZ21                                      
+         NI    0(R3),X'EF'              SET STATUS BIT-3 = 0
+ISLFY11  A     R3,ISL4                  BUMP R3 TO ADR NEXT SLOT
+         C     R3,ISLBUFN               TEST FOR ADR OF NTH SLOT
+         LA    R5,24(R5)           STEP TO NEXT CCW SLOT            
+         BC    13,ISLFY20A              BR IF NOT HIGH
+ISLFY12  BCT   R4,ISLFY13               WRAPAROUND POSSIBLE
+         B     ISLFY20                  OUT, SLOT N WAS LAST
+ISLFY13  LA    R3,IOBABUF               WRAPAROUND REAL, C(R3)=A(SLOT1)
+         L     R5,ISLVPTRS+12      RESET R5 PTR CP18,CL1            
+         B     ISLFY10                  LOOP AGAIN
+*
+*                                       SAVE ADR OF LAST SLOT IN REG 7
+ISLFY20A BCT   R4,ISLFY10
+*                                                                   
+ISLFY20  LR    R6,R7               RESTORE R6                       
+         LR    R7,R3              C(R7)= A(LAST SLOT SCHED + 4)     
+         S     R7,ISL4                  C(R7)=A(LAST SLOT SCHED)
+*
+* INITIALIZE CP18 AND CP20 IN SUBROUTINE
+*
+*
+         STM   R2,R11,ISLVRSAV+28       SAVE REGS 2-11
+         B     ISLF801
+ISLFY21  LM    R2,R11,ISLVRSAV+28       RESTORE REGS 2-11
+*
+* SAVE CONTENTS OF BCT SLOT WITH STATUS AND POINTER OF LAST BUFF SCHED
+*
+         ST    R7,ISLF9WK1        C(R7) = A(LAST SLOT SCHED)        
+*                                                                   
+*
+* TEST LAST BUFFER FOR END OF CYLINDER (C-BIT ON)
+*
+         TM    0(R7),X'04'              TEST S BIT 5 VS 1 (C-BIT)
+         BC    1,ISLFZ01                B IF ON
+*
+*
+* EXECUTE CP18 (CP20)
+*
+*
+ISLFY30  EQU   *
+         USING CQ1,R10                  ADDRESSABILITY FOR CP20 ZA03186
+         L     R10,DCBWKPT6             R10 = A(ISLVPTRS)       ZA03186
+         L     R10,20(R10)              R10= A(CP20)            ZA03186
+         MVI   CQ3,WD                   RESET WR DATA CODE      ZA03186
+         LH    R3,CQ8                   GET TRK YY              ZA03186
+         LTR   R3,R3                    IS IT MINUS?            ZA03186
+         BNM   NOSKIP                   NO - BR                 ZA03186
+         MVI   CQ3,NOP                  SET NOP CCW CODE        ZA03186
+NOSKIP   EQU   *
+         DROP  R10
+         LA    R13,ISLVRSAV             C(R13)=A(VRSAV)
+         LR    R3,R0                    SAVE R0
+         LR    R4,R1                    SAVE R1
+         LR    R5,R14                   SAVE R14
+*
+*              SET FLAG BIT-0 (IWR BIT) =1   TURN ON BIT 0
+*
+         OI    IOBFLAGS,X'80'          TURN ON BIT 0
+         EXCP  IHAIOB                   EXECUTE CHANNEL PROGRAM
+         LR    R0,R3                    RESTORE R0
+         LR    R1,R4                    RESTORE R1
+         LR    R14,R5                   RESTORE R14
+*
+*
+* SET FBW IN SUBROUTINE
+*
+         L     R7,ISLF9WK1         C(R7)=A(LAST SLOT SCHED FROZEN
+         B     ISLPB01                  GO TO SUBROUTINE
+ISLFY41A OI    IOBFLAGS,X'40'           SET FLAGS BIT 1 ON TO ATTEMPT
+*                                       TO WRITE LATER
+*
+*
+*
+* TEST FLAGS BIT 2 (NOT EOB INDICATOR)
+*
+ISLFY41  TM    IOBFLAGS,X'20'           TEST FLAGS BIT 2
+         BC    8,ISLFY42                B IF NOT ON (EOB)
+         NI    IOBFLAGS,X'DF'           TURN FLAGS BIT 2 OFF
+         B     ISLFX13                  RTRN TO FX (DONT GET LOC BUFF)
+*
+* TEST FOR MOVE OR LOCATE PUT
+*
+ISLFY42  TM    IOBFLAGS,X'10'     CLOSE MODE?                       
+         BO    ISLFX13            YES.                              
+*
+* LOCATE PUT
+*
+         BAL   R14,ISLPA01             *LINK TO BOB ROUTINE
+         B     ISLFX13                  RETURN TO FX
+*
+*
+***WAIT SUBROUTINE***
+* THIS SUBROUTINE DETERMINES IF A CHANNEL PROGRAM IS AVAILABLE, AND
+* IF IT IS NOT, WAITS UNTIL IT IS.  THE ROUTINE EXPECTS THE  FOLLOWING
+* INPUT - R2 = ADDR OF IOB FOR CHANNEL PROGRAM TO BE TESTED
+*         R4 = RETURN ADDRESS
+*
+ISLFY99  EQU   *
+         ST    R4,ISLVRSAV                                        0700
+         LR    R3,R1                    SAVE R1
+         L     R1,IOBECBAD              C(R1)=A(ECB)
+         TM    0(R1),X'40'              TEST ECB BIT 1 (C-BIT)
+         BC    1,ISLFY995               B IF 1, I/O COMPLETE-DON'T WAIT
+         LA    R13,ISLVRSAV             C(R13)=A(VRSAV)
+         LR    R4,R0                    SAVE R0
+         LR    R5,R14                   SAVE R14
+         WAIT  ECB=(1)
+         LR    R0,R4                    RESTORE R0
+         LR    R1,R3                    RESTORE R1
+         LR    R14,R5                   RESTORE R14
+*
+ISLFY995 LA    R2,ISLIOBA               C(R2)=A(IOBA)
+         LR    R1,R3                    RESTORE R1
+         L     R3,IOBPTRA               C(R3)=A(1ST SLOT TO SCHED)
+         LA    R3,0(R3)
+         L     R4,ISLVRSAV                                        0700
+         BCR   15,R4                    RETURN
+*
+         EJECT
+***********************************************************************
+* CHART FZ - CYLINDER INDEX ENTRY SETUP                               *
+***********************************************************************
+*
+*
+* STORE ADDR OF STATUS BYTE WITH C-BIT ON IN CP21 AT CQ41
+* -THIS IS DONE TO PERMIT APPENDAGE TO TURN OFF C-BIT-
+*            * R7 CONTAINS ADDR OF THE STATUS BYTE *
+*
+ISLFZ01  L     R10,DCBWKPT6             C(R10)=A(VPTRS)
+         L     R10,24(R10)              C(R10)=A(CP21-CQ40)
+         ST    R7,12(R10)               C(CQ41+4)=A(LAST SLOT SCHED)
+         NI    ISLIXLT,X'F7'            SET IXLT LEV1 BIT-4 OFF- TRK IX
+*
+*
+* LOCATE LEVEL IN INDEX LOCATION TABLE AT CYLINDER INDEX
+*
+         LA    R7,ISLIXLT               C(R7)=A(IXLT)
+         OI    0(R7),X'20'              IXLTIND BIT-2 ON IN LEV1
+         NI    26(R7),X'DF'                     BIT-2 OFF IN LEV2
+         NI    52(R7),X'DF'                                  LEV3
+         NI    78(R7),X'DF'                                  LEV4
+*
+* CONSTRUCT COUNT FOR CYLINDER INDEX ENTRY IN AREA Y, Y+0
+*
+         L     R10,DCBWKPT6             C(R10)=A(VPTRS)
+         L     R9,0(R10)                C(R9)=A(AREA Y)
+         MVC   0(4,R9),12(R7)           COUNT = CCHH FROM IXLT S0
+         SR    R3,R3
+         IC    R3,16(R7)                C(R3)=R FROM IXLT S0, 000N
+         A     R3,ISLONEF               C(R3)=R+1
+         STC   R3,4(R9)                 COUNT = CCHHR WITH R=R+1
+*
+* CONSTRUCT DATA FOR CYLINDER INDEX ENTRY IN AREA Y, Y+8
+*
+         TM    0(R7),X'40'              TEST IXLTIND BIT 1 (DUMMY SW)
+         BC    1,ISLFZ10                B IF ON
+*
+*                                       DUMMY SW OFF
+*  A. NORMAL DATA
+*
+         MVC   8(7,R9),IOBDADAD         DATA=MBBCCHH FROM IOBA+32
+*
+         MVC   13(2,R9),ISLZEROF        DATA=MBBCCHH HH=00
+*                                       HH OF FIRSH NOT 00
+ISLFZ02  MVI   15(R9),X'00'             DATA = MBBCCHHR WITH R=00
+ISLFZ03  MVI   16(R9),X'01'             DATA = MBBCCHHRF WITH F = 01
+*
+         SR    R6,R6
+         IC    R6,9(R7)                 C(R6) = M FROM IXLT S0
+         BCTR  R6,0                     C(R6)=M-1
+         SLL   R6,4                     C(R6) = M-1 X 16 (USE AS INDX)
+*
+         SR    R5,R5
+         IC    R5,IOBDADAD              C(R5) = M FROM IOBA+32
+         BCTR  R5,0                     C(R5)=M-1
+         SLL   R5,4                     C(R5) = M-1 X 16 (USE AS INDX)
+*
+         L     R8,DCBDEBAD              C(R8)=A(DEB)
+         L     R4,DEBFPEAD              C(R4)=A(1ST PRIM EXTENT ENTRY)
+         LA    R4,0(R6,R4)              C(R4)=A(CURR INDX EXTENT ENTRY)
+         L     R3,DEBFPEAD              C(R3)=A(1ST PRIM EXTENT ENTRY)
+         LA    R3,0(R5,R3)              C(R3)=A(CURR PRIM EXTENT ENTRY)
+         L     R9,0(R10)                C(R9)=A(AREA Y)
+*
+         CLC   1(3,R3),1(R4)            COMP UCB ADDRS, PRIM VS INDX
+         BNE   ISLFZ04                  B IF NOT EQUAL
+*
+*                                       UCBS EQUAL
+ISLFZ04A EQU   *
+         MVI   17(R9),X'0B'             DATA = MBBCCHHRFP WITH P=0B
+         B     ISLFZ05
+*
+*                                       UCBS UNEQUAL
+ISLFZ04  MVI   17(R9),X'07'             DATA = MBBCCHHRFP WITH P=07
+*
+*                                       SET CQ43 (CP21) TO ADDRESS KEY
+*                                       OF LAST RECORD IN LAST BUFFER
+*
+ISLFZ05  L     R4,ISLKEYAD             =A(KEY OF LAST WR CKD)  
+         B     ISLFZ20                                         
+         L     R4,ISLKEYAD              C(R4)=A(KEY OF LAST WR CKD)
+*
+*                                       DUMMY SW ON = END OF CYLINDER
+*  B. DUMMY DATA
+*
+*                                       TEST CC+1 VS DEBENDCC FOR
+*                                       POSSIBLE END OF INDEX EXTENT
+*
+ISLFZ10  EQU   *
+         SR    R6,R6
+         IC    R6,9(R7)                 C(R6)=M FROM IXLT S0, 000M
+         BCTR  R6,0                                            
+         SLL   R6,4                    C(R6)=16(M-1) INDEX USE 
+*                                       TO DEB ENTRY FOR CURR IX EXTNT
+*
+         L     R8,DCBDEBAD              C(R8)=A(DEB)
+         L     R4,DEBFPEAD              C(R4)=A(1ST PRIM EXTENT ENTRY)
+         LA    R4,0(R6,R4)              C(R4)=A(CURR INDX EXTNT ENTRY)
+*
+         L     R9,0(R10)                C(R9)=A(AREA Y)
+         MVC   ISLFXWK1(4),12(R7)      C(WK1)=CCHH OF IXLT SO  
+         L     R3,ISLFXWK1              C(R3)=CCHH
+         MVC   ISLFXWK2(4),10(R4)       C(FXWK2)=CCHH FROM DEBENDCC
+         SRL   R3,16                    C(R3)=00CC
+         LA    R3,1(R3)                 ADD 1 FOR NEXT CYL C(R3)=00CC+1
+         SLL   R3,16                    C(R3)=CC+100
+         ST    R3,ISLFXWK1              C(FXWK1)=CC+100
+         CLC   ISLFXWK1(2),ISLFXWK2     CC+1 VS ENDCC
+         BH    ISLFZ11                  BR IF CC+1 HI - IN NEW EXTENT
+*
+*                                       CC+1    IN CURRENT EXTENT
+ISLFZ11A MVC   8(3,R9),9(R7)            DATA=MBB FROM IXLT S0
+         MVC   11(4,R9),ISLFXWK1        DATA=MBBCCHH  CC=CC+1 HH=00
+         BC    15,ISLFZ12               BR TO PICK UP R, ETC.
+*
+*
+ISLFZ11  EQU   *
+         LA    R6,16(R6)                C(R6)=MX16 INDEX TO NEXT EXTENT
+         MVC   ISLFXWK1(1),3(R4)        C(FXWK1)= H FROM BUFR CNT
+         L     R8,DCBDEBAD             C(R8)=A(DEB)            
+         L     R4,DEBFPEAD              C(R4)=A(1ST PRIM EXTENT ENTRY)
+         LA    R4,0(R6,R4)              C(R4)=A(NEXT INDX EXTENT ENTRY)
+         L     R9,0(R10)               C(R9)=A(AREA Y)         
+         MVC   9(6,R9),4(R4)            DATA = BBCCHH FROM NEW EXTENT
+         SRL   R6,4                     C(R6) = M FOR NEXT EXTENT
+         A     R6,ISLONEF               C(R6) = M+1 (M=1 FOR EXTENT 0)
+         STC   R6,8(R9)                 DATA = MBBCCHH OF NEW EXTENT
+*
+ISLFZ12  MVI   15(R9),X'00'             DATA = MBBCCHHR WITH R=00
+*
+         MVI   16(R9),X'29'             DATA = MBBCCHHRF WITH F=29
+         MVI   17(R9),X'07'             DATA = MBBCCHHRFP WITH P=07
+*
+*                                       SET CQ43(CP21) TO ADDRESS KEY
+*                                       OF ALL ONES AT AREA Y +62
+*
+         LA    R4,62(R9)               C(R4)=A(AREA Y + 62)    
+ISLFZ20  L     R10,24(R10)             C(R10)=A(CP21-CQ40)        
+         IC    R5,24(R10)              SAVE OP                    
+         ST    R4,24(R10)              PTR TO REAL OR DUMMY KEY   
+         STC   R5,24(R10)              RESTORE OP                 
+         LA    R2,ISLIOBB              C(R2)=A(IOBB)              
+         MVC   IOBDADAD(8),9(R7)       C(IOBB+32)=C(IXLT SO)      
+         BAL   R6,ISLFZ21                                         
+*
+*
+*
+* EXECUTE CP21
+*
+         LA    R13,ISLVRSAV             C(R13)=A(VRSAV)
+         LR    R3,R0                    SAVE R0
+         LR    R4,R1                    SAVE R1
+         LR    R5,R14                   SAVE R14
+         EXCP  IHAIOB                   EXECUTE CHANNEL PROGRAM
+         LR    R0,R3                    RESTORE R0
+         LR    R1,R4                    RESTORE R1
+         LR    R14,R5                   RESTORE R14
+*
+         LA    R2,ISLIOBA               C(R2)=A(IOBA)
+         TM    IOBFLAGS,X'12'           TEST FLAGS BITS 3&6 (CLOSE X)
+         BCR   1,R14                    BR IF ON = CLOSE
+         B     ISLFY30                  EXIT
+*
+ISLFZ21  EQU   *                                                  
+         L     R13,DCBDEBAD                                       
+         LA    R13,32(R13)        START MOVE OF DEB BB TO IOB     
+         SR    R8,R8                                              
+         IC    R8,IOBDADAD                                        
+         SLL   R8,4                                               
+         AR    R8,R13                                             
+         MVC   IOBDADAD+2(1),5(R8)                                
+         BR    R6                      RETURN                     
+         EJECT
+***********************************************************************
+* CHART PA - BEGINING OF BUFFER                                       *
+***********************************************************************
+*
+*
+* USING PTR B TO REFERENCE COUNT IN LAST BUFFER FILLED -
+*   SET REG 5 = R               - REG A = 000R
+*   SET REG 6 = CCHH            - REG B = CCHH
+*   SET REG 7 = HI-RCD ON TRACK - REG C = 000R
+*
+ISLPA01  ST    R14,ISLF9WK1             SAVE R14 FOR RETURN TO FX
+         MVC   DCBFTMI3(8),DCBLPDA      SAVE PREVIOUS LPDA FOR CLOSE
+         L     R3,IOBPTRB               C(R3)=C(PTRB)
+         LA    R3,0(R3)                 C(R3)=A(SLOT S)
+         L     R4,0(R3)                 C(R4)=C(SLOT S)=A(BUF B)
+         SR    R5,R5
+         IC    R5,4(R4)                 C(R5)=000R
+         MVC   ISLFXWK2(4),0(R4)        C(FXWK2)=CCHH
+         L     R6,ISLFXWK2              C(R6)=CCHH
+*
+*                                       TEST HH FOR SHARED TRACK
+         SR    R7,R7
+         LR    R14,R3              SAVE ADDRESS OF LAST FILLED SLOT 
+         B     ISLPA02                                              
+*                                                                   
+ISLPA01A NC    ISLFXWK1(1),DCBFIRSH+3   REDUCE TO TRACK
+ISLPA01B CLC   DCBFIRSH+1(1),ISLFXWK1   H OF FIRSH VS H OF BUFR CNT
+*                                                                   
+*                                                                   
+ISLPA02  IC    R7,DCBHIRPD              NOT A SHARED TRACK, C(R7)=HIRPD
+*
+* STEP PTR B TO NEXT SLOT IN BCT (MAY WRAPAROUND)
+*
+ISLPA03  C     R3,ISLBUFN               TEST FOR ADR OF NTH SLOT
+         L     R4,ISLVPTRS+20     A(CP20)                           
+         ST    R7,88(R4)          SAVE REG 7                        
+         LH    R7,80(R4)          GET DISP PRT TO CL6               
+         LA    R7,24(R7)          INCREMENT PTR TO NEXT SLOTS       
+         LA    R3,4(R3)                 STEP TO NEXT SLOT
+         BNE   ISLPA05                  NOT NTH SLOT, GO UPDATE PTR B
+ISLPA04  LA    R3,IOBABUF               C(R3)=0AAA, AAA= ADR 1ST SLOT
+         SR    R7,R7              INITIALIZE CP18 DISPLACEMENT      
+ISLPA05  STH   R7,80(R4)          STORE CP18 DISP - B               
+         L     R7,88(R4)          RESTORE R7                        
+         IC    R4,IOBB            SAVE B                            
+         ST    R3,IOBPTRB               STORE UPDATED PTR B
+         STC   R4,IOBB                  RESTORE B
+*
+* UPDATE CBF AND EOB FOR NEW BUFFER VIA PTR B
+*
+         L     R4,0(R3)                 C(R4)=C(SLOT S)=A(BUFF B)
+         LA    R4,0(R4)
+         LA    R3,12(R4)           A(BUFF B)+12                     
+         ST    R3,ISLCBF                C(CBF)=A(BUFF B)+8
+         L     R3,DCBBUFL               C(R3)=NNXX, NN=BUFL
+         SRL   R3,16                    C(R3)=00NN
+         BCTR  R3,0                     C(R3)=00NN-1
+         AR    R3,R4                    C(R3)=A(BUFF B)+BUFL-1
+         ST    R3,ISLEOB                C(EOB)=A(BUFF B)+BUFL-1
+*
+*
+* ROUTINE TO SET UP NEW COUNT FIELD FOR NEW BUFFER
+* ************************************************
+*
+*
+* TEST IF LAST BUFFR FILLED WAS EOT
+*
+         TM    0(R14),X'08'        WAS LAST FILLED SLOT = EOT       
+         BO    ISLPA20             YES.                             
+        TM    0(R14),X'01'       DOES "EOTX" SHOW END-OF-TRACK?      TR
+         BO    ISLPA20            YES. CE APP MUST HAVE SHUT OFF EOT.TR
+*
+*
+* STEP REG A TO NEXT R ON CURRENT TRACK
+*
+         A     R5,ISLONEF               C(R5)=000R+1
+*
+* TEST IF NEXT BUFFR TO BE FILLED IS AVAILABLE (STATUS BITS)
+*
+ISLPA50  L     R3,IOBPTRB               C(R3)=PTR B = A(NEXT SLOT) OR-
+         LA    R3,0(R3)                 C(R3)=A(STATUS BITS)
+         TM    0(R3),X'60'              TEST BITS 1 AND 2
+         BC    8,ISLPA70                B IF 00 = BUFFR AVAILABLE
+*
+*                                       BITS 1 AND 2 = 11 OR 10
+*
+* WAIT FOR CP18, AND/OR CP20, AND/OR CP21 BEFORE RE-FILLING BUFFER
+*
+ISLPA60  L     R4,IOBECBAD              C(R4)=A(ECB)
+         TM    0(R4),X'40'              TEST ECB BIT 1 (C-BIT)
+         BC    1,ISLPA70                B IF 1, I/O COMPLETE-DONT WAIT
+         LA    R13,ISLVRSAV             C(R13)=A(VRSAV)
+         LR    R3,R1                    SAVE R1
+         LR    R1,R4                    C(R1)=A(ECB)
+         LR    R4,R0                    SAVE R0
+         WAIT  ECB=(1)                  WAIT
+         LR    R0,R4                    RESTORE R0
+         LR    R1,R3                    RESTORE R1
+ISLPA65  L     R3,IOBPTRB               C(R3)=PTR B = A(NEXT     S20201
+*                                       SLOT) OR-                S20201
+         LA    R3,0(R3)                 C(R3)=A(STATUS BITS)
+*
+*
+* TEST DCBEXCD1 BIT 5 FOR PREVIOUS UNCORRECTABLE WRITE ERROR
+*
+ISLPA70  TM    DCBEXCD1,X'04'           TEST EXCD1 BIT 5
+         BC    8,ISLPA72                B IF NOT ON
+         TM    IOBFLAGS,X'10'           TEST FLAGS BIT 3 (CLOSE)
+         BC    1,ISLPA72                B IF ON = CLOSE
+         L     R10,DCBWKPT6             C(R10)=A(VPTRS) FROM VPTR10
+         L     R13,ISLVRSAV+4           C(R13)=A(USERS SAVE AREA)
+         L     R0,36(R10)               C(R0)=A(BAD BUF) FROM VPTR10
+         ST    R0,24(R13)               STORE A(BAD BUF) IN USERS R1
+         LA    R0,ISLIOBA               C(R0)=A(IOBA)
+         ST    R0,20(R13)               STORE A(IOBA) IN USERS R0
+         MVC   40(4,R10),DCBSYNAD       SET VPTR 11 = A(SYNAD)
+         B     ISLFX05                  B TO TAKE SYNAD
+*
+ISLPA72  EQU   *
+         LA    R2,ISLIOBB               C(R2)=A(IOBB)
+         TM    0(R3),X'04'              TEST BIT 5 (C-BIT)
+         BC    7,ISLPA60                BR IF 1 - C-BIT ON
+*
+*                                       C-BIT OFF
+         LA    R2,ISLIOBA               C(R2)=A(IOBA)
+*
+* TEST IF NEXT BUFFER TO BE FILLED WILL BE EOT (AND EOC)
+* IF EOT, TURN ON T-BIT  IF EOC, TURN ON C-BIT
+*
+ISLPA80  EQU   *                                                    
+* ENTER NEW COUNT IN BUFFER USING REG A AND REG B AND UPDATE LPDA
+*
+ISLPA84  L     R3,0(R3)                 C(R3)=C(SLOT S)=A(NEXT BUFFR)
+         LA    R3,0(R3)
+         ST    R6,ISLFXWK2              STORE CCHH FROM REG B
+         MVC   8(2,R3),ISL4+2     SET INITIAL BLKL=4                
+         XC    10(2,R3),10(R3)     CLEAR GARBAGE BYTES              
+         MVC   0(4,R3),ISLFXWK2
+         STC   R5,4(R3)                 STORE R FROM REG A
+         MVC   DCBLPDA+3(5),0(R3)       STORE CCHHR FROM BUF IN LPDA
+         L     R14,ISLF9WK1             RESTORE R14 FOR RETURN TO FX
+         BR    R14                     *EXIT
+*----------------------------------------------------------------------
+*
+*                                       LAST BUFFR FILLED EOT
+* SET REG 7 (REG C) = HIRPD, NEXT TRACK CANT BE SHARED
+*
+ISLPA20  ST    R6,ISLFXWK1        C(FXWK1)=CCHH FROM REG B          
+        NI    0(R14),X'FE'       OFF - EOTX                          TR
+*
+*
+* TEST FOR OUT-OF-SPACE
+*
+         CLC   DCBLPDA(1),DCBMSWA       CURRENT M VS HI M
+         BNE   ISLPA21                  B IF NOT HI PRIME M
+         CLC   ISLFXWK1(4),DCBMSWA+3    CURRENT CCHH VS HI CCHH
+         BL    ISLPA21                  BR LESS THAN HIGH PRIME  A27810
+*                                       CCHH                     A27810
+         TM    IOBFLAGS,X'10'           TEST FOR CLOSE
+         BC    1,ISLPA21                BR TO PICK UP COUNT FOR CLOSE
+*                                      *---------OUT-OF-SPACE---------*
+ISLPA205 EQU   *
+         OI    DCBEXCD1,X'20'           SET EXCD1 BIT 2 ON = SPACE ERR
+*   REDUCE COUNT BECAUSE CURRENT RECORD DOESN'T FIT IN DATA SET.
+         L     R4,DCBNREC               NUMBER OF RECORDS =      A46890
+         S     R4,ISLONEF               COUNT MINUS RECORD THAT  A46890
+         ST    R4,DCBNREC               DID'T FIT.               A46890
+         L     R13,ISLVRSAV+4           RESTORE USER REG 13    @ZA10226
+         B     ISLFX04A                 B TO TAKE SYNAD        @ZA07607
+*
+* TEST IF LAST BUFFER FILLED WAS EOT AND EOC
+*
+ISLPA21  EQU   *
+         NC    ISLFXWK1+3(1),DCBFIRSH+3 EDUCE TO TRACK FROM REG B   
+         CLC   DCBLDT+1(1),ISLFXWK1+3  H OF LDT VS H FROM REG B     
+         BE    ISLPA30                  B IF EOT AND EOC
+*
+*                                       EOT NOT EOC
+* STEP REG B TO NEXT HH AND SET REG A TO R = 1
+*
+         A     R6,ISLONEF               C(R6)=CCHH+1
+         L     R5,ISLONEF               C(R5)=000R, R = 1
+         B     ISLPA50
+*
+*
+*                                       EOT,EOC
+* NEXT BUFFER TO BE FILLED WILL BE THE 1ST BUFFR ON A NEW CYLINDER
+*
+* TEST IF SHARED TRACKS
+*
+* TEST IF LAST BUFFER FILLED WAS EOT, EOC, AND EOE
+*
+ISLPA30  EQU   *                                                    
+ISLPA31  L     R8,DCBDEBAD              C(R8)=A(DEB)
+         L     R3,DEBFPEAD              C(R3)=A(1ST PRIME EXTENT ENTRY)
+         LA    R3,0(R3)
+         L     R4,DCBLPDA               C(R4)=MBBC
+         SRL   R4,24                    C(R4)=000M
+         BCTR  R4,0                     C(R4)=M-1
+         SLL   R4,4                     C(R4)=000M-1 X 16 (USE AS INDX)
+         L     R8,12(R4,R3)             C(R8)=HHXX-END HH OF CURR EXTNT
+         SRL   R8,16                    C(R8)=00HH
+*
+         L     R8,8(R4,R3)              C(R8)=END HHCC OF CURR EXTENT
+         SLL   R8,16                    C(R8)=CC00
+         SRL   R8,16                    C(R8)=00CC=END CC OF EXTENT
+         LR    R5,R6                    C(R5)=CCHH
+         SRL   R5,16                    C(R5)=00CC=CC JUST FILLED
+         CR    R8,R5                    COMPARE FOR LAST CYLINDER
+         BH    ISLPA33                  B IF END CC IS HIGH
+*
+*                                       EOT, EOC, AND EOE
+*
+* SET REG 6 (REG B) TO CC FROM NEXT EXTENT
+*
+         LA    R4,16(R4)                C(R4)=MX16  INDEX TO NEXT EXTNT
+         L     R8,4(R4,R3)              C(R8)=STR BBCC OF NEXT EXTENT
+         SLL   R8,16                    C(R8)=CC00
+         LR    R6,R8                    C(R6)=CC00, HH SET LATER
+*
+* SET M IN DCBLPDA = M+1
+*
+         SRL   R4,4                     C(R4)=000M
+         A     R4,ISLONEF               C(R4)=000M+1 (M=1 FOR EXTENT 0)
+         STC   R4,DCBLPDA               C(LPDA)=000M+1
+*
+* SET STATUS BIT-3 ON = NEW EXTEN STARTS WITH THIS BUFFR
+*
+         L     R3,IOBPTRB               C(R3)=PTR B = A(NEXT SLOT) OR-
+         LA    R3,0(R3)                 C(R3)=A(STATUS BITS)
+         OI    0(R3),X'10'              TURN STATUS BIT-3 ON
+*
+         B     ISLPA34
+*
+*
+* SET REG 6 (REG B) TO CC +1            EOT, EOC, NOT EOE
+*
+ISLPA33  A     R5,ISLONEF               C(R5)=00CC+1, PREVIOUS CC +1
+         SLL   R5,16                    C(R5)=CC00
+         LR    R6,R5                    C(R6)=CC00, HH SET BELOW
+*
+* SET REG 6 (REG B) TO HH FROM FIRSH
+*
+ISLPA34  ST    R6,ISLFXWK1              C(FXWK1)=CC00
+         MVC   ISLFXWK1+2(2),DCBFIRSH   C(FXWK1)=CCHH, HH FROM FIRSH
+         L     R6,ISLFXWK1              C(R6)=CCHH
+*
+* SET REG 5 (REG A) TO R FROM FIRSH
+*
+ISLPA35  EQU   *
+         SR    R5,R5
+         IC    R5,DCBFIRSH+2            C(R5)=000R, R FROM FIRSH
+*
+* PREFORMAT SHARED TRACK OF NEW CYLINDER IF NECESSARY
+*
+         TM    DCBOPTCD,X'08'           TEST OPTCD BIT-4 FOR CYL OVFL
+         BC    1,ISLPA40                B IF ON = CYL OVFL
+*                                                                   
+         B     ISLPA50            B, NOT SHARED                     
+*
+*                                       SHARED TRACKS - PREFORMAT
+*
+* INITIALIZE CP19
+*****************
+*
+ISLPA40  LA    R2,ISLIOBC               C(R2)=A(IOBC)
+*
+* BE SURE CP19 NOT IN USE
+*
+         L     R4,IOBECBAD              C(R4)=A(ECB)
+         TM    0(R4),X'40'              TEST ECB BIT 1 (C-BIT)
+         BC    1,ISLPA41                B IF 1, I/O COMPLETE-DONT WAIT
+         LA    R13,ISLVRSAV             C(R13)=A(VRSAV)
+         LR    R3,R1                    SAVE R1
+         LR    R1,R4                    C(R1)=A(ECB)
+         LR    R4,R0                    SAVE R0
+         WAIT  ECB=(1)                  WAIT
+         LR    R0,R4                    RESTORE R0
+         LR    R1,R3                    RESTORE R1
+ISLPA41  STM   R2,R11,ISLVRSAV+28       SAVE REGS 2-11
+*
+*  1. SET IOBC+32 TO NEW CC AND NEW M IF ANY
+*
+         ST    R6,ISLFXWK2              C(FXWK2)=CCHH FROM REG B
+         MVC   32(3,R2),DCBLPDA         MOVE MBB FROM LPDA
+         MVC   35(3,R2),ISLFXWK2        MOVE CCH FROM REG B (FXWK2)
+*
+*  2. SET CM27 TO NEW CC AND NEW M IF ANY
+*
+         L     R10,DCBWKPT6             C(R10)=A(VPTRS)
+         L     R10,16(R10)              C(R10)=A(CP19)
+         USING CM1,R10                  ADDRESSABILITY CP19      S20201
+         MVC   CM27(L3),DCBLPDA         MOVE MBB FROM LPDA       S20201
+         MVC   CM27+K3(L4),ISLFXWK2     MOVE CCHH FROM FXWK2     S20201
+         DROP  R10                      *                        S20201
+*
+*  3. SET UP AREA Z WITH NEW CC
+*
+         LA    R9,ISLAREAZ              C(R9)=A(AREA Z)
+         L     R3,ISL10                 C(R3)=10 = COUNT
+         LA    R4,6(R9)                 C(R4)=A(Z+6)
+ISLPA42  MVC   0(4,R4),ISLFXWK2         STORE CCHH IN Z
+         A     R4,ISL8                  STEP Z
+         BCT   R3,ISLPA42               LOOP
+*
+*
+* EXECUTE CP19 - PREFORMAT NEW CYLINDER
+***************************************
+*
+         LM    R2,R11,ISLVRSAV+28       RESTORE REGS 2-11
+         LA    R13,ISLVRSAV             C(R13)=A(VRSAV)
+         LR    R3,R0                    SAVE R0
+         LR    R4,R1                    SAVE R1
+         EXCP  IHAIOB                   EXECUTE CHANNEL PROGRAM
+         LR    R0,R3                    RESTORE R0
+         LR    R1,R4                    RESTORE R1
+         LA    R2,ISLIOBA               C(R2)=A(IOBA)
+*
+         B     ISLPA50
+*
+*----------------------------------------------------------------------
+*
+         EJECT
+***********************************************************************
+* CHART PB - SET FBW                                                  *
+***********************************************************************
+*
+*
+* C(R7)=A(LAST SLOT SCHED) AS IT WAS FROZEN BEFORE I/O
+*    SET REG 8 = NO OF BUFFRS NEEDED TO COMPLETE TRACK  - REG C
+*
+ISLPB01  L     R6,0(R7)                 C(R6)=A(LAST BUFF)
+         LA    R6,0(R6)
+         SR    R3,R3
+         SR    R8,R8
+         TM    0(R7),X'08'        IS LAST SCHD BUFFER = EOT?        
+         BO    ISLPB01A           YES.                              
+         IC    R3,4(R6)                 C(R3)=LAST R
+ISLPB01A L     R4,ISLVPTRS+20     C(R4) = A(CP20)                   
+         ST    R7,88(R4)          SAVE C(R7) = A(SLOT N)            
+         IC    R8,IOBB            C(R8) = NUMB OF FULL UNSCHD BUF   
+         LTR   R8,R8              IS NUM OF FULL UNSCHED BUFF = 0   
+         BE    ISLPB01D           YES. NO EOT BUFFERS               
+ISLPB01B LA    R7,4(R7)           A(NEXT UNSCHD SLOT)               
+         C     R7,ISLBUFN         DEOS C(R7) = A(LAST BUFFER SLOT)  
+         BNH   *+8                NO.                               
+         LA    R7,IOBS            A(FIRST BUFFER SLOT)              
+         TM    0(R7),X'08'        IS THIS UNSCHD BUFFER = EOT?      
+         L     R6,0(R7)           C(R6) = A(LAST FULL UNSCHD BUFFER)
+         BO    ISLPB01C           YES.                              
+         BCT   R8,ISLPB01B        EXAMINE ALL UNSCHD BUFFERS        
+ISLPB01D MVI   ISLFBW+3,X'FF'     NO EOT BUFFERS. SET FBW OFF = FF  
+         STH   R3,64(R4)          STORE R3 INTO LAST SCHED R        
+         B     ISLPB01F                                             
+ISLPB01C IC    R8,4(R6)           FIND EOT FUB. C(R8)=R OF EOT FUB. 
+         SR    R8,R3                                                
+ISLPB01E STH   R8,ISLFBW+2        SET FBW                           
+         LTR   R8,R8            IS R8   NEG OR ZERO                 
+         BC    12,ISLPB01G              YES                         
+ISLPB01F L     R7,88(R4)          RESTORE R4                        
+         B     ISLFY41                                              
+ISLPB01G SR    R8,R8             CLEAR R8                           
+         IC    R8,4(R6)        RESET R8                             
+         B     ISLPB01E                                             
+*
+         EJECT
+***********************************************************************
+* CHART F8 - INITIALIZE CP18 FOR CURRENT BUFFER SET                   *
+***********************************************************************
+*
+*
+* SET OFFST AND D ACCORDING TO RECFM (IOBA FLAGS BIT 7)
+*
+ISLF801  L     R10,DCBWKPT6             C(R10)=A(VPTRS)
+         BALR  R16,0                                                
+         USING *,R16                                                
+*
+* CALC FSTBF = # OF SLOTS SLOT X IS FROM SLOT #1 IN BUF CTRL TABLE
+*
+ISLF803  L     R3,IOBPTRA               C(R3)=C(PTR A)=A(SLOT X)
+         LA    R3,0(R3)
+         LA    R4,IOBS                  C(R4)=A(SLOT #1)
+         SR    R3,R4                    C(R3)= # OF BYTES X IS FROM #1
+         SRA   R3,2                     DIV BY 4, C(R3)= DIFF IN SLOTS
+         ST    R3,ISLFSTBF              C(FSTBF)= # OF SLOTS FROM #1
+*                                         THAT FIRST BUF SCHED IS
+*
+* CALC ADDR OF WR CKD X (SCHED TO WR FIRST) FOR TIC IN CP18
+*
+         L     R5,ISLOFFST              C(R4+R5)=OFFST
+         MR    R4,R3                    FSTBF X OFFST, C(R5)= THE # OF
+*                                         BYTES WR CKD X IS FROM THE
+*                                         FIRST BYTE OF WR CKD #1
+         L     R10,12(R10)              C(R10)=A(CP18)
+         LA    R4,24(R10)               C(R4)=A(WR CKD #1)
+         AR    R4,R5                    C(R4)=A(WR CKD X)
+         IC    R6,16(R10)               C(R6)=TIC OP CODE AT CP18+16
+         ST    R4,16(R10)               C(CP18+16)=A(WR CKD X),4 BYTES
+         STC   R6,16(R10)               C(CP18+16)=TIC OP CODE,1 BYTE
+FIRSTIME EQU   X'80'                    TESTED AND RESET BY SIO  S20201
+*                                       APPDGE                   S20201
+         USING CL1,R10                  ADDRESSABILITY ON CP18   S20201
+         OI    CL2,FIRSTIME             SWITCH TO INDICATE 1ST   S20201
+*                                       ENTRY T                  S20201
+*                                       SIO APPDGE
+         DROP  R10                      *                        S20201
+*
+* LOCATE CC FLAG IN LAST WR CKD THAT WAS EXECUTED (WR CKD X -1) AND
+* TURN CC FLAG ON (CP18)
+*
+         LTR   R3,R3                    FSTBF VS 0
+         BC    7,ISLF805                B IF NOT ZERO
+         IC    R3,ISLBUFNO              C(R3)=NO OF BUFFERS
+ISLF805  EQU   *
+         BCTR  R3,0                     C(R3)=BUF N-1
+         L     R5,ISLOFFST              C(R4+R5)=OFFST
+         MR    R4,R3                    PREV LAST BUF X OFFST, C(R5)=
+*                                         THE # OF BYTES LAST WR CKD
+*                                         EXECUTED IS FROM THE FIRST
+*                                         BYTE OF WR CKD #1
+         A     R5,ISLD                  C(R5)=# OF BYTES TO CC FLAG
+         AR    R5,R10                   C(R5)=A(CC FLAG OF LAST WR CKD)
+*                                         IN CP18 THAT WAS EXECUTED
+         OI    0(R5),X'40'              TURN ON CC BIT
+*
+* CALC LSTBF = FBW SLOTS FROM FSTBF -1, MAY WRAPAROUND
+*
+         L     R3,ISLFSTBF              C(R3)=# OF SLOTS FROM SLOT #1
+         A     R3,ISLFBW                C(R3)= FSTBF + FBW
+         BCTR  R3,0                     C(R3)=FSTBF + FBW-1 = LSTBF
+         SR    R4,R4                    C(R4)= 0000
+         IC    R4,ISLBUFNO              C(R4)=NO OF BUFFRS
+         CR    R3,R4                    LSTBF VS BUFNO, TEST WRAPAROUND
+         BL    ISLF806                  B IF NO WRAPAROUND, LSTBF OK
+         SR    R3,R4                    C(R3)=LSTBF-BUFNO = LSTBF
+*                                         LSTBF SET FOR WRAPAROUND
+ISLF806  ST    R3,ISLLSTBF              C(LSTBF)= # OF SLOTS FROM #1
+*                                         THAT LAST BUF SCHED IS
+*
+* LOCATE CC FLAG IN LAST WR CKD TO BE EXECUTED(WR CKD X + FBW) AND
+* TURN CC FLAG OFF (CP18)
+*
+         L     R5,ISLOFFST              C(R4+R5)=OFFST
+         MR    R4,R3                    LSTBF X OFFST, C(R5)= THE # OF
+*                                         BYTES LAST WR CKD TO BE
+*                                         EXECUTED IS FROM THE FIRST
+*                                         BYTE OF WR CKD #1
+         A     R5,ISLD                  C(R5)=# OF BYTES TO CC FLAG
+         AR    R5,R10                   C(R5)=A(CC FLAG OF LAST WR CKD)
+*                                         IN CP18 TO BE EXECUTED
+         NI    0(R5),X'BF'              TURN OFF CC BIT
+         ST    R5,ISLCCFAD              C(CCFAD)=A(CC FLAG OF LAST WR)
+         EJECT
+***********************************************************************
+* CHART F9 - INITIALIZE CP20 FOR CURRENT TRACK                        *
+***********************************************************************
+*
+         USING ISLY,R9
+         USING CQ1,R10                  ADDRESSABILITY CP20      S20201
+*
+* F9 HOUSEKEEPING
+*
+ISLF901  L     R6,IOBPTRA               C(R6)=C(PTR A)=A(SLOT X)
+         L     R6,0(R6)                 C(R6)=C(SLOT X)=A(1ST BUF)
+         LA    R6,0(R6)
+         MVC   ISLFXWK1(4),1(R6)        C(FXWK1)=CHHR OF CNT IN 1ST BUF
+         L     R7,ISLFXWK1              C(R7)=CHHR
+         BCTR  R7,0                     C(R7)=CCHR-1
+*
+* TEST LAST BUFFER FOR END OF TRACK (T-BIT ON)
+*
+         L     R3,ISLLSTBF              C(R3)=LSTBF
+         SLA   R3,2                     MULT BY 4, C(R3)=LSTBF IN BYTES
+         LA    R3,IOBS(R3)              C(R3)=A(LSTBF SLOT IN BCT)
+         TM    0(R3),X'08'              TEST S BIT 4 VS 1 (T-BIT)
+         BC    1,ISLF902                B IF T-BIT ON
+*
+*                                       T-BIT OFF, NO CP20 YET
+*
+* SET IOBA+32 (IOBDADAD) = COUNT OF 1ST BUF SCHED, R=R-1 FOR SRCH ID
+*
+         MVC   IOBDADAD+3(1),0(R6)      C(IOBA+35)=C FROM 1ST BUF
+         ST    R7,IOBDADAD+4            C(IOBA+35)=CCHHR WITH R=R-1
+         IC    R4,IOBCPSAD              SAVE SIOCC
+         ST    R10,IOBCPSAD             C(CPSAD)=CP18 START ADR
+         STC   R4,IOBCPSAD              RESTORE SIOCC
+*
+* SET CL1 IN CP18 TO REFERENCE IOBA+35
+*
+         LA    R3,IOBDADAD+3            C(R3)=A(IOBA+35)
+         IC    R4,0(R10)                SAVE OP
+         ST    R3,0(R10)                STORE A(IOBA+35)
+         STC   R4,0(R10)                RESTORE OP
+*
+         B     ISLG260
+*
+ISLF904A MVC   ISLFXWK1(1),ISLOCNT+3   H FROM OVRFL COUNT           
+*                                       T-BIT ON, INITL CP20
+* CLEAR TWO SW
+*
+ISLF902  NI    IOBFLAGS,X'FB'           SET FLAGS BIT 5 = 0 (TWOSW OFF)
+         OI    ISLIXLT,X'08'            SET IXLT LEV1 BIT-4 ON- TRK IX
+*
+* GET KEY ADR FROM CP18 ACCORDING TO RECFM (IOBA FLAGS BIT 7)
+*
+         TM    IOBFLAGS,X'01'           TEST FLAGS BIT 7 (1=F,RKP 0)
+         BC    1,ISLF903                B IF RECFM IS F,RKP 0
+*                                       RECFM NOT F,RKP 0
+         L     R3,ISLCCFAD              C(R3)=CC FLAG ADR LAST WR CKD
+         S     R3,ISL12                 C(R3)=A(CCW WORD 1 OF WR K)
+         L     R3,0(R3)                 C(R3)=C(CCW WORD 1 OF WR K)
+         LA    R3,0(R3)                 C(R3)=A(KEY OF LAST WR CKD)
+         B     ISLF904
+*                                       RECFM IS F,RKP 0
+ISLF903  L     R3,ISLCCFAD              C(R3)=CC FLAG ADR LAST WR CKD
+         S     R3,ISL4                  C(R3)=A(CCW WORD 1 OF WR CKD)
+         L     R3,0(R3)                 C(R3)=C(CCW WORD 1 OF WR CKD)
+         LA    R3,0(R3)                 C(R3)=A(COUNT OF LAST WR CKD)
+         A     R3,ISL8                  C(R3)=A(KEY OF LAST WR CKD)
+*
+ISLF904  ST    R3,ISLKEYAD              C(KEYAD)=A(KEY OF LAST WR CKD)
+*
+* SET CP20 LINE CQ14A = CCHHR FROM COUNT OF 1ST BUF SCHED, R=R-1
+*                         MBB FROM IOBA+32 (IOBDADAD)
+*
+         LR    R5,R10                   C(R5)=A(CP18,CL1)
+*
+         L     R10,DCBWKPT6             C(R10)=A(VPTRS)
+         L     R10,20(R10)              C(R10)=A(CP20)
+         STM   R4,R5,88(R10)      SAVE REGS                         
+         MVC   112(3,R10),IOBDADAD      C(CQ14A)=MBB FROM IOBA+32
+         MVC   115(1,R10),0(R6)         C(CQ14A)=C FROM 1ST BUF
+         ST    R7,116(R10)              C(CQ14A)=MBBCCHHR WITH R=R-1
+ISLF904E EQU   *                   R = 0                            
+         IC    R4,24(R10)                                           
+         ST    R5,24(R10)         C(CQ4) = A(CL1)                   
+         STC   R4,24(R10)                                           
+         LA    R4,X'31'            SRCH ID EQ                       
+         STC   R4,0(R10)           STORE OP CODE                    
+         LA    R5,5                LENGTH OF 5                      
+         STH   R5,6(R10)           STORE LENGTH                     
+         LA    R4,X'05'            WRITE DATA                       
+         LA    R5,56(R10)          DATA ADRESS = CQ8                
+         LA    R3,3                LENGTH OF 3                      
+ISLF904D ST    R5,16(R10)          STORE DATA ADDRESS               
+         STC   R4,16(R10)          STORE OP CODE                    
+         L     R4,ISLLSTBF        A(LAST SCHD BUFFER)               
+         STH   R3,22(R10)          STORE LENGTH                     
+         SLA   R4,2                                                 
+         LA    R4,IOBS(R4)                                          
+         L     R4,0(R4)                A(BUFF LAST)                 
+         MVC   CQ7(L4),K0(R4)           SEEK ADDRESSFOR CYLINDER S20201
+         LM    R4,R5,88(R10)      RESTORE REGS                      
+*
+* SET CL1 IN CP18 TO REFERENCE CQ14A+3
+*
+         LA    R3,115(R10)              C(R3)=A(CQ14A+3)
+         IC    R4,0(R5)                 SAVE OP
+         ST    R3,0(R5)                 STORE A(CQ14A+3)
+         STC   R4,0(R5)                 RESTORE OP
+*
+* TEST COUNT OF 1ST BUFFR SCHED, HH VS FIRSH HH, FOR NEW CYLINDER
+*
+         MVC   ISLFXWK1(1),3(R6)       H(TRK BYTE) FROM BUFFER CNT  
+         EX    R0,ISLPA01A              REDUCE TO TRACK ADDR
+         EX    R0,ISLPA01B              COUNT VS FIRSH
+         BE    ISLF909                  B IF EQUAL, NEW CYLINDER
+*
+* TEST IF LAST IX ENTRY IS ON A SHARED TRACK
+*
+* CALC - NO ENTRIES REMAINING = HIRT - LAST IX ENTRY, R-R
+*
+ISLF905  MVC   ISLF9WK1+3(1),ISLHIRT
+         L     R3,ISLF9WK1              C(R3)=000R FROM HIRT
+ISLF906A EQU   *
+*                                       = R OF LAST IX ENTRY ON TRACK
+         MVC   ISLF9WK1+3(1),ISLOCNT+4
+*                                       = R OF LAST IX ENTRY
+         S     R3,ISLF9WK1              C(R3)=HIRT-OCNT
+         ST    R3,ISLNOENT              C(NOENT)=HIRT-OCNT
+*
+* TEST NO ENTRIES
+*
+ISLF906  EQU   *
+         LTR   R3,R3                    TEST NOENT VS 0
+         BC    8,ISLF908                B IF ZERO - END OF IX TRACK
+         C     R3,ISLTWOF               TEST NOENT VS 2
+         BL    ISLG101                  BR LOW  -  NOENT=1
+         BNE   ISLF907                  B NOT 2, ROOM FOR MORE THAN 2
+*
+* NO ENTRIES = 2, SET TWO SW ON
+*
+         OI    IOBFLAGS,X'04'           SET FLAGS BIT 5 = 1 (TWOSW ON)
+*
+* NO ENTRIES = 2 OR MORE, BUMP R IN NORMAL AND OVERFLOW COUNTS
+*
+ISLF907  SR    R3,R3
+         IC    R3,ISLOCNT+4             C(R3)=R FROM OCNT
+         LA    R3,1(R3)                 C(R3)=R+1
+         STC   R3,ISLNCNT+4             C(NCNT)=CCHHR, R=R+1
+         LA    R3,1(R3)                 C(R3)=R+2
+         STC   R3,ISLOCNT+4             C(OCNT)=CCHHR, R=R+2
+         MVC   ISLNCNT+2(2),ISLOCNT+2   C(NCNT)=CCHHR, HH FROM OCNT
+         B     ISLG201
+*
+* NO ENTRIES = 0, BUMP HH IN NORMAL AND OVERFLOW COUNTS AND SET R = 1
+*
+ISLF908  EQU   *                                                 A34959
+         IC    R3,ISLNCNT+3             C(R3) = H FROM NCNT      A34959
+         LA    R3,1(R3)                 C(R3) = R+1              A34959
+         STC   R3,ISLNCNT+3             NCNT WITH R + 1          A34959
+         B     ISLF9095
+*
+* NEW CYLINDER, NORMAL AND OVERFLOW COUNTS RESET USING 1ST BUFFR SCHED
+*
+ISLF909  EQU   *
+         MVC   ISLNCNT(4),0(R6)         C(NCNT)=CCHH FROM 1ST BFR
+*                             SET TRACK = 0
+*
+         MVC   ISLNCNT+2(2),ISLZEROF    C(NCNT)=CCHH WITH HH=00
+ISLF9095 EQU   *
+         MVI   ISLNCNT+4,X'01'          C(NCNT)=CCHHR WITH R=1
+         MVC   ISLOCNT(4),ISLNCNT       C(OCNT)=CCHH FROM NCNT
+         MVI   ISLOCNT+4,X'02'          C(OCNT)=CCHHR WITH R=2
+         B     ISLG201
+*
+         EJECT
+*                                                                     *
+* CHART G1 - CONTINUATION OF CHART F9, INDEX ENTRIES SPLIT            *
+***********************************************************************
+*
+* NO ENTRIES = 1, BUMP R IN NORMAL COUNT AND HH IN OVERFLOW COUNT
+*                 SET R = 1 IN OVERFLOW COUNT
+*
+ISLG101  SR    R3,R3
+         IC    R3,ISLNCNT+4             C(R3)=R FROM NCNT
+         A     R3,ISLTWOF               C(R3)=R+2
+         STC   R3,ISLNCNT+4             C(NCNT)=CCHHR, R=R+2
+         L     R3,ISLOCNT               C(R3)=CCHH FROM OCNT
+         A     R3,ISLONEF               C(R3)=CCHH+1
+         ST    R3,ISLOCNT               C(OCNT)=CCHH+1
+         MVI   ISLOCNT+4,X'01'          C(OCNT)=CCHHR, R=1
+*
+* SET IOBA+35 (IOBDADAD) = NORMAL CCHHR, R=R-1 FOR SRCH ID
+*
+         MVC   IOBDADAD+3(5),ISLNCNT    C(IOBA+35)=CCHHR FROM NCNT
+         L     R3,IOBDADAD+4            C(R3)=CHHR
+         BCTR  R3,0                     C(R3)=CHHR-1
+         ST    R3,IOBDADAD+4            C(DADAD)=MBBCCHHR WITH R=R-1
+*
+*----------------------------------------------------------------------
+*
+*                                       NOT A SHARED TRACK
+*
+* INITL CP20 FOR UNSHARED TRACK (NON-FORMATTED TRACK)
+*
+ISLG102  L     R3,ISLKEYAD              C(R3)=A(KEY OF LAST WR CKD)
+         IC    R4,CQ18                  SAVE OP AT CQ18          S20201
+         ST    R3,CQ18                  STORE KEY ADR AT CQ18    S20201
+         STC   R4,CQ18                  RESTORE OP               S20201
+         IC    R4,CQ22                  SAVE OP AT CQ22          S20201
+         ST    R3,CQ22                  STORE KEY ADR AT CQ22    S20201
+         STC   R4,CQ22                  RESTORE OP               S20201
+*
+* TEST LAST BUFFER FOR END OF CYLINDER (C-BIT ON)
+*
+         L     R3,ISLLSTBF              C(R3)=LSTBF
+         SLA   R3,2                     MULT BY 4, C(R3)=LSTBF IN BYTES
+         LA    R3,IOBS(R3)              C(R3)=A(LSTBF SLOT IN BCT
+         TM    0(R3),X'04'              TEST S BIT 5 VS 1 (C-BIT)
+         BC    1,ISLG103                B IF C-BIT ON
+*
+*                                       C-BIT OFF
+         LA    R3,96(R10)               C(R3)=A(CQ13)
+ISLG104  IC    R4,CQ24                  SAVE OP A CQ24           S20201
+         ST    R3,CQ24                  STORE A(CQ13) AT CQ24    S20201
+         STC   R4,CQ24                  RESTORE OP               S20201
+         LA    R3,CQ27                  C(R3)=A(CQ27)            S20201
+         IC    R4,CQ20                  SAVE OP AT CQ20          S20201
+         ST    R3,CQ20                  STORE A(CQ27) AT CQ20    S20201
+         STC   R4,CQ20                  RESTORE OP               S20201
+         LA    R3,CQ21                  C(R3)=A(CQ21)            S20201
+         IC    R4,CQ29                  SAVE OP AT CQ29          S20201
+         ST    R3,CQ29                  STORE A(CQ21) AT CQ29    S20201
+         STC   R4,240(R10)              RESTORE OP               S20201
+         B     ISLG221
+*----------------------------------------------------------------------
+*
+*
+*                                       C-BIT ON
+ISLG103  MVC   ISLDCNT(5),ISLOCNT       C(DCNT)=CCHHR FROM OCNT
+         SR    R3,R3
+         IC    R3,ISLDCNT+4             C(R3)=R FROM DCNT
+         LA    R3,1(R3)                 C(R3)=R+1
+         STC   R3,ISLDCNT+4             C(DCNT)=CCHHR, R=R+1
+         LA    R3,CQ25                  C(R3)=A(CQ25)            S20201
+         B     ISLG104
+         EJECT
+*                                                                     *
+* CHART G2 - CONTINUATION OF CHARTS F9 AND G1                         *
+***********************************************************************
+*
+* TEST IF OVFLO HH IS ON A SHARED TRACK (IS IT FORMATTED)
+*
+*                                       NOT A SHARED TRACK
+ISLG201  EQU   *                                                    
+*
+* INITL CP20 FOR UNSHARED TRACK (NON FORMATTED) AND SET IOBA+35
+*
+*                                       SET IOBA+35 = NORMAL CCHHR-1
+ISLG210  MVC   IOBDADAD+3(5),ISLNCNT    C(IOBA+35)=CCHHR FROM NCNT
+         L     R3,IOBDADAD+4            C(R3)=CHHR
+         BCTR  R3,0                     C(R3)=CHHR-1
+         ST    R3,IOBDADAD+4            C(DADAD)=MBBCCHHR WITH R=R-1
+         L     R3,ISLKEYAD              C(R3)=A(KEY OF LAST WR CKD)
+         IC    R4,CQ18                  SAVE OP AT CQ18          S20201
+         ST    R3,CQ18                  STORE KEY ADR AT CQ18    S20201
+         STC   R4,CQ18                  RESTORE OP               S20201
+         IC    R4,CQ22                  SAVE OP AT CQ22          S20201
+         ST    R3,CQ22                  STORE KEY ADR AT CQ22    S20201
+         STC   R4,CQ22                  RESTORE OP               S20201
+*
+* TEST LAST BUFFER FOR END OF CYLINDER (C-BIT ON)
+*
+         L     R3,ISLLSTBF              C(R3)=LSTBF
+         SLA   R3,2                     MULT BY 4, C(R3)=LSTBF IN BYTES
+         LA    R3,IOBS(R3)              C(R3)=A(LSTBF SLOT IN BCT)
+         TM    0(R3),X'04'              TEST S BIT 5 VS 1 (C-BIT)
+         BC    1,ISLG211                B IF C BIT ON
+*
+*                                       C-BIT OFF
+         LA    R3,96(R10)               C(R3)=A(CQ13)
+         IC    R4,CQ24                  SAVE OP AT CQ24          S20201
+         ST    R3,CQ24                  STORE A(CQ13) AT CQ24    S20201
+         STC   R4,CQ24                  RESTORE OP               S20201
+ISLG220  LA    R3,CQ21                  C(R3)=A(CQ21)            S20201
+         IC    R4,CQ20                  SAVE OP AT CQ20          S20201
+         ST    R3,CQ20                  STORE A(CQ21) AT CQ20    S20201
+         STC   R4,CQ20                  RESTORE OP               S20201
+*
+ISLG221  LA    R3,CQ15                  C(R3)=A(CQ15)            S20201
+         IC    R4,IOBCPSAD              SAVE SIOCC
+         ST    R3,IOBCPSAD              C(CPSAD)=CP20 START ADR, CQ15
+         STC   R4,IOBCPSAD              RESTORE SIOCC
+         MVC   CQ30(L7),IOBDADAD        C(CQ30)=MBBCCHH FROM     S20201
+*                                       IOBA+32                  S20201
+         MVI   CQ30+K7,K0               C(CQ30)=MBBCCHHR, R=0    S20201
+         L     R3,CQ30+K4               C(R3)=CHHR               S20201
+         A     R3,ISLTENF               C(R3)=CHHR, HH=HH+1
+         ST    R3,CQ30+K4               C(CQ30)=MBBCCHHR, HH+1,  S20201
+*                                       R=0                      S20201
+*
+* SET NORMAL DATA = COUNT FROM 1ST BUF SCHED (BOTH SHARED AND UNSHARED)
+*
+ISLG250  MVC   ISLNDAT(3),IOBDADAD      C(NDAT)=MBB FROM IOBA+32
+         MVC   ISLNDAT+3(4),0(R6)       C(NDAT)=CCHH FROM 1ST BUF
+         MVC   ISLODAT(7),ISLNDAT       C(ODAT)=MBBCCHH FROM NDAT
+*                                                                   
+         L     R5,ISLVPTRS+20     C(R5) = A(CP20)                   
+         L     R9,ISLLSTBF             GET ADDR OF LAST BUFER SCHED 
+         SLA   R9,2                                                 
+         LA    R9,IOBS(R9)                                          
+         L     R9,0(R9)                                             
+         MVC   56(2,R5),10(R9)     MOVE IN YY                       
+         MVC   58(1,R5),4(R9)      MOVE IN R FROM BUFF FOR CAP RCD  
+         MVC   ISLNDAT+7(1),4(R9)       SET R FOR NORMAL INDEX      
+         XC    10(2,R9),10(R9)    CLEAR BUFFER AREA                 
+*
+* SET UP AREA Y
+*
+ISLG252  L     R10,DCBWKPT6             C(R10)=A(VPTRS)
+         L     R9,0(R10)                C(R9)=A(Y)
+         MVC   ISLY+18(8),ISLNCNT       C(Y+18)=NORM COUNT
+         MVC   ISLY+26(10),ISLNDAT      C(Y+26)=NORM DATA
+         MVC   ISLY+36(8),ISLOCNT       C(Y+36)=OVFL COUNT
+         MVC   ISLY+44(10),ISLODAT      C(Y+44)=OVFL DATA
+         MVC   ISLY+54(8),ISLDCNT       C(Y+54)=DUMM COUNT
+*
+* END OF EXPANSION
+*
+ISLG260  B     ISLFY21                  RETURN TO FY
+*----------------------------------------------------------------------
+*
+*
+*                                       C-BIT ON
+*
+* TEST TWO SW, IS THERE ROOM FOR JUST 2 MORE ENTRIES AT END OF CYLINDER
+*
+ISLG211  TM    IOBFLAGS,X'04'           TEST FLAGS BIT 5 VS 1 (TWOSW)
+         BC    1,ISLG212                B IF ON
+*
+*                                       TWOSW OFF
+         MVC   ISLDCNT(5),ISLOCNT       C(DCNT)=CCHHR FROM OCNT
+         SR    R3,R3
+         IC    R3,ISLDCNT+4             C(R3)=R FROM DCNT
+         LA    R3,1(R3)                 C(R3)=R+1
+         STC   R3,ISLDCNT+4             C(DCNT)=CCHHR, R=R+1
+         LA    R3,CQ25                  C(R3)=A(CQ25)            S20201
+         B     ISLG213A
+*
+*                                       TWOSW ON
+ISLG212  MVC   ISLDCNT(5),ISLOCNT       C(DCNT)=CCHHR FROM OCNT
+         L     R3,ISLDCNT               C(R3)=CCHH FROM DCNT
+         A     R3,ISLONEF               C(R3)=CCHH+1
+         ST    R3,ISLDCNT               C(DCNT)=CCHH+1
+         MVI   ISLDCNT+4,X'01'          C(DCNT)=CCHHR, R=1
+*
+* TEST IF DUMMY HH IS A SHARED TRACK (FORMATTED)
+*                                       NOT A SHARED TRACK
+ISLG213  LA    R3,CQ25                  C(R3)=A(CQ25)            S20201
+         IC    R4,CQ29                  SAVE OP A CQ29           S20201
+         ST    R3,CQ29                  STORE C(R3) AT CQ29      S20201
+         STC   R4,CQ29                  RESTORE OP               S20201
+*
+         LA    R3,CQ27                  C(R3)=A(CQ27)            S20201
+ISLG213A EQU   *
+         IC    R4,CQ24                  SAVE OP A CQ24           S20201
+         ST    R3,CQ24                  STORE C(R3) AT CQ24      S20201
+         STC   R4,CQ24                  RESTORE OP               S20201
+         B     ISLG220
+*
+*
+PATCH    DC    XL((*-IGG019IA)/25)'00'  ZEROED PATCH AREA      @ZA10227
+*
+         END

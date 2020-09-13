@@ -1,0 +1,777 @@
+         TITLE     'IEFU83 - SMF RECORD LAYOUTS(14,15,21,30,64)'
+SMFREC   DSECT
+         IFASMFR   14
+         ORG       SMFJFCB1      ALIGN W/JFCB AREA IN RECORD
+         IEFJFCBN                PUT IN JFCB MAP
+         ORG       SMFREC
+         IFASMFR   21
+         ORG       SMFREC
+         IFASMFR   64
+         ORG       SMFREC
+         IFASMFR   30
+         TITLE     'IEFU83 - COMMUNICATIONS VECTOR TABLE (CVT)'
+CVTMAP   CVT       DSECT=YES
+         TITLE     'IEFU83 - TASK CONTROL BLOCK(TCB)'
+         IKJTCB
+         TITLE     'IEFU83 - TIMING CONTROL TABLE(TCT)'
+         IEFTCT
+         TITLE     'IEFU83 - JOB MANAGEMENT RECORD(JMR)'
+         IEFJMR
+         TITLE     'IEFU83 - PREFIXED STORAGE AREA(PSA)'
+         IHAPSA
+         TITLE     'IEFU83 - SCC IN-CORE ACCOUNT TABLES'
+         ACCTABLE
+         TITLE     'IEFU83 - SMF EXIT WORK AREA'
+         EXITCORE
+SMFKEY   DS        CL9  KEY AREA FOR TABLE LOOKUP
+         ECFOLLOW
+         TITLE    'IEFU83 - GETMAINED AREA WHEN UJI-AREA NOT OK'
+         U83CORE
+DOUBLE   DS        D
+DISPLAY  DS        CL5
+MSGWORK WTO 'CLEAN*DRIVE(XXX)TR=XXX/TW=XXX/PR=XXX/PW=XXX/NB=XXX/EG=XXX'X
+               ,ROUTCDE=5,DESC=2,MF=L
+         TITLE     'IEFU83 - BINARY SEARCH CONTROL TABLE'
+         TABLE
+         TITLE     'IEFU83 - TABLE ELEMENT LAYOUT'
+         SMFIOTAB
+         TITLE     'IEFU83 - MAIN PROGRAM'
+IEFU83   CSECT
+***********************************************************************
+*                                                                     *
+*      PROGRAM-NAME: IEFU83 - SMF WRITER RECORD CHECK RTN             *
+*      DATE WRITTEN: JUNE 1980.                                       *
+*      INSTALLATION: U.S. SENATE COMPUTER CENTER                      *
+*      AUTHOR: D. HALBIG                                              *
+*      FUNCTION: EXTRACT DATA SET I/O INFORMATION FROM                *
+*          SMF RECS 14,15, AND 64(VSAM) TO BE PLACED                  *
+*          IN A WORK AREA.  THE WORK AREA IS USED BY                  *
+*          IEFACTRT (STEPTERM & JOBTERM) TO DISPLAY                   *
+*          I/O AND DADSM RELATED PERFORMANCE DATA IN                  *
+*          A BATCH JOB'S STEP & JOB DEALLOCATION MESSAGES             *
+*          THE WORK AREA ANCHOR IS FOUND BY FOLLOWING THE             *
+*          FOLLOWING CHAIN: PSA->CVT->NEXT-CURRENT TCB->              *
+*          CURRENT BATCH JOB TCB->TCT->JMR->USER COMMUNICATION        *
+*          AREA(PTR TO WORK AREA).                                    *
+*                                                                     *
+*          10/17/80 - ADD SUPPORT FOR SMF REC 21 - SUPPORT            *
+*          PLACES NON-ROLLABLE MESSAGE ON OPERATOR'S CONSOLE          *
+*          WHEN:                                                      *
+*              1) THE TOTAL OF TEMPORARY READ & WRITE                 *
+*                 ERRORS FOR A TAPE DRIVE EXCEEDS 20;                 *
+*          OR  2) A PERMANENT READ OR WRITE ERROR OCCURS              *
+*                 ON A TAPE DRIVE.                                    *
+*                                                                     *
+*         10/29/80 - REVISE S/A CHAINING LOGIC - SOME RECORD TYPES    *
+*         (14,15,64) PERMIT USE OF THE UJI-GETMAINED AREA. OTHERS,    *
+*         SUCH AS THE SMF TYPE 21 RECORD, CANNOT GUARANTEE THE        *
+*         AVAILABILITY OF THE AREA.  SUCH RECORDS MUST DO THEIR       *
+*         OWN GETMAIN. THE U83-GETMAINED AREA IS MADE ADDRESSABLE     *
+*         ONLY FOR THOSE ROUTINES FOLLOWING THE SMF64RTN.             *
+*                                                                     *
+*         08/13/81 - ADDED LOGIC TO GAIN LOCAL LOCK BEFORE            *
+*         COMPLETING S/A CHAINING FOR NON-GETMAIN ENTRY(REC           *
+*         TYPE 14, 15, 64).  CHANGE NECESSARY TO PREVENT ADDRESS      *
+*         SPACES WHICH ISSUE CLOSE MACROS UNDER SEVERAL TCB'S         *
+*         FROM CLOBBERING THE SAVE AREA.  PROBLEM FIRST OCCURRED      *
+*         WHEN ROSCOE ISSUED DATA SET CLOSE REQUESTS FROM SEVERAL     *
+*         DIFFERENT TCBS IN HIS ADDRESS SPACE.                        *
+*                                                                     *
+*         11/23/81(DGH) - ADD BYPASS CODE; FEATURE PERMITS ALL        *
+*           SMF EXITS TO BE BYPASSED IF BYPASS FLAG IS SET.           *
+*           BYPASS FLAG IS SET BY SMF EXIT IEFUJV (SEE IEFUJV         *
+*           FOR FURTHER DETAILS).                                     *
+*                                                                     *
+*         01/24/83(DGH) - ADD FILTER FOR SMF RECORD 30, SUBTYPE 2 & 3.*
+*           BEST/1 MODELS CAN BE IMPROVED BY CLOSER MATCHING OF SMF   *
+*           & RMF DATA.  SMF INTERVAL RECORDING PROVIDES FOR STEP-    *
+*           TERM-LIKE RECORDS TO BE ISSUED AT THE SAME (NON-SYNCHED)  *
+*           INTERVAL AS RMF.  HOWEVER, THE VASTLY INCREASED DATA      *
+*           VOLUME WITH SMF INTERVAL ACCOUNTING CAN MAKE SUCH AN      *
+*           EFFORT UNMANAGEABLE.  AS A COMPROMISE, THIS EXIT CANCELS  *
+*           SMF INTERVAL RECORDS FOR ALL JOB STEPS EXCEPT THOSE WITH  *
+*           PROGRAM NAME ENTRIES IN 'SYS1.USER.PARMLIB(SP1IACCT)';    *
+*           ENTRIES IN THAT LIST REFLECT ONLY SIGNIFICANT RESOURCE    *
+*           CONSUMERS WHO ARE OF INTEREST IN BEST/1 MODELLING.        *
+*                                                                     *
+*           ********NOTICE TO DEVELOPERS/MAINTAINERS**************    *
+*               FOR EACH RECORD TYPE PROCESSED BY THIS EXIT, THE      *
+*               DECISION TO KEEP (RC=0) OR CANCEL(RC=4) IS MADE       *
+*               WITHIN THE SPECIFIC PROCESSING ROUTINE (E.G. SMF14RTN)*
+*               IF NO SPECIFIC PROCESSING ROUTINE EXISTS FOR THE      *
+*               RECORD, THEN THE RECORD IS UNCONDITIONALLY KEPT (RC=0)*
+*                                                                     *
+*          REGISTER            USAGE                                  *
+*             R15            ENTRY POINT/RETURN CODE/WORK REG         *
+*             R14            ERROR INDICATOR/RETURN ADDR/WORK REG     *
+*             R13            SAVE AREA/WORK AREA                      *
+*             R12            MAIN PROGRAM BASE REGISTER               *
+*             R11            MAIN ROUTINES BASE REGISTER              *
+*             R10            MAIN ROUTINES RETURN ADDR REGISTER       *
+*             R9             POINTER TO SMF RECORD                    *
+*             R8             FUNCTION RETURN ADDRESS REGISTER         *
+*             R7             POINTER TO TABLES USED BY FUNCTIONS      *
+*             R6-R0          WORK REGS                                *
+*                                                                     *
+***********************************************************************
+         REGEQU
+         SAVE      (14,12),,IEFU83-&SYSDATE-&SYSTIME
+         LR        R12,R15     ESTABLISH BASE REG
+         L         R9,0(,R1)   GET PTR TO SMF RECORD
+         USING     IEFU83,R12  TELL ASSEMBLER
+         USING     SMFREC,R9   TELL ASSEMBLER
+         CLI       SMF14RTY,21      RECORD TYPE 21?
+         BE        MAINNOCH      BIF YES - GO TO U83 GETMAIN RTN
+         CLI       SMF14RTY,14   IS IT SMF REC 14?
+         BE        MAINCHEK      BIF YES
+         CLI       SMF14RTY,15   IS IT SMF REC 15?
+         BE        MAINCHEK      BIF YES
+         CLI       SMF14RTY,30   IS TI SMF REC 30?
+         BE        MAINNOCH      BIF YES - GO TO U83 GETMAIN RTN
+         CLI       SMF14RTY,64   TYPE 64 SMF REC?
+         BE        MAINCHEK      BIF YES
+*
+         SLR       R15,R15       IF ANY OTHER RECORD TYPE, DON'T CANCEL
+         B         MAINEXIT      BIF NOT
+*
+MAINNOCH EQU      *
+***********************************************************************
+*                                                                     *
+*        RECORDS PROCESSED THROUGH THIS AREA DO NOT REQUIRE ACCESS TO *
+*        THE USER WORK AREA GETMAINED BY IEFUJI.  A SEPARATE AREA     *
+*        GETMAINED JUST FOR USE BY IEFU83/84 IS AVAILABLE INSTEAD.    *
+*                                                                     *
+*        NOTE IEFU83 AND IEFU84 ARE THE SAME ROUTINE; IF THE ENTRY    *
+*        IS TO IEFU84, NO SVC'S MAY BE ISSUED.  THEREFORE, AS A       *
+*        PRECAUTION, THE BRANCH FORM OF GETMAIN/FREEMAIN IS USED HERE.*
+*        IF ADDITIONAL RECORD PROCESSING ROUTINES ARE ADDED IN THIS   *
+*        AREA, EACH ONE MUST BE REVIEWED FOR COMPATIBILITY WITH THE   *
+*        'NO-SVC' REQUIREMENT.  SMF TYPE 21 RECORDS CAUSE IEFU83 TO   *
+*        BE ENTERED; SMF TYPE 30 RECORDS CAUSE IEFU84 TO BE ENTERED.  *
+*                                                                     *
+***********************************************************************
+OBTAIN1  SETLOCK OBTAIN,TYPE=LOCAL,MODE=UNCOND,REGS=USE,RELATED=(RLSE1)
+         SR        R2,R2          ASSUME LOCAL LOCK NOT PREV. HELD
+         B         OBTNCHK1(R15)  USE RETURN CODE FOR WTG BRANCH LIST
+OBTNCHK1 EQU       *
+         B         OBTNOK1        RC=0; LOCAL LOCK NOT PREVIOUSLY HELD
+         B         OBTNPRV1       RC=4; LOCAL LOCK PREVIOUSLY HELD
+         EX        0,*            RC=8; LOCAL LOCK OBTAIN FAILED - S0C3
+*
+OBTNPRV1 EQU       *
+         L         R2,=C'PREV'    SET FLAG NOTING LOCK PREVIOUSLY HELD
+OBTNOK1  EQU       *
+*
+         L         R4,16(0,0)     --> TO CVT
+         L         R4,0(,R4)      --> NEXT/CURRENT TCB/ASCB STUFF
+         L         R7,12(,R4)     --> OUR ASCB
+         L         R4,4(,R4)      --> OUR TCB
+*
+         LA        R0,U83SIZE     SIZE OF U83'S OWN AREA
+         GETMAIN   RU,LV=(0),BRANCH=YES,SP=U83POOL
+*
+         ST        R1,8(,R13)     COMPLETE
+         ST        R13,4(,R1)         S/A
+         LR        R13,R1                 CHAINING
+*
+         USING     U83CORE,R13    MAKE GETMAINED AREA ADDRESSABLE
+         ST        R2,U83LOCKS    HOLD ONTO PREVIOUS LOCAL LOCK STATUS
+*
+RLSE1    SETLOCK RELEASE,TYPE=LOCAL,REGS=USE,RELATED=(OBTAIN1)
+*
+         SLR       R15,R15        START BY ASSUMING RECORD IS KEPT
+*
+MAINDO30 EQU       *
+         CLI       SMF14RTY,30  RECORD TYPE 30?
+         BNE       MAINDO21     BIF NOT: TRY 21
+         L         R11,=A(SMF30RTN)
+         BALR      R10,R11      PERFORM REC 30 PROCESSOR
+         B         MAINFREE
+*
+MAINDO21 EQU       *
+         CLI       SMF14RTY,21     RECORD TYPE 21?
+         BNE       MAINFREE        BIF NOT
+         L         R11,=A(SMF21RTN) GET ADDR OF REC 21 PROCESSOR
+         BALR      R10,R11          PERFORM IT
+*
+MAINFREE EQU       *
+*
+         LR        R6,R15         HOLD ONTO ROUTINE RETURN CODE
+*
+OBTAIN2  SETLOCK OBTAIN,TYPE=LOCAL,MODE=UNCOND,REGS=USE,RELATED=(RLSE2)
+*
+         L         R4,16(0,0)     GET CVT POINTER
+         L         R4,0(,R4)      GET NEXT/CURRENT TCB/ASCB POINTERS
+         L         R7,12(,R4)     GET CURRENT ASCB POINTER
+         L         R4,4(,R4)      GET CURRENT TCB POINTER
+*
+         LA        R0,U83SIZE      SET UP U83 FREEMAIN
+         LR        R1,R13
+         L         R5,4(,R13)      GET CALLER'S S/A POINTER
+         L         R2,U83LOCKS     GET PREVIOUS STATUS OF LOCAL LOCK
+         DROP      R13
+*
+         FREEMAIN  RU,LV=(0),A=(1),BRANCH=YES,SP=U83POOL
+*
+         C         R2,=C'PREV'     WAS LOCAL LOCK HELD BEFORE U84?
+         BE        MAINHELD        BIF YES; LEAVE W/ LOCAL LOCK HELD
+*
+RLSE2    SETLOCK RELEASE,TYPE=LOCAL,REGS=USE,RELATED=(OBTAIN2)
+*
+MAINHELD EQU       *
+         LR        R13,R5          PUT CALLER'S S/A PTR IN 13
+         LR        R15,R6          GET BACK RETURN CODE VALUE
+         B         MAINEXIT
+*
+MAINCHEK EQU      *
+***********************************************************************
+*                                                                     *
+*        RECORDS PROCESSED THROUGH THIS AREA REQUIRE ACCESS TO THE    *
+*        AREA GETMAINED BY IEFUJI FOR EACH JOB AND TSO SESSION.  IF   *
+*        THE ANCHOR CANNOT BE FOUND, OR IS DETECTED TO BE INVALID,    *
+*        NO RECORD PROCESSING WILL OCCUR.                             *
+*                                                                     *
+***********************************************************************
+         SLR       R15,R15      IF PREMATURE BRANCH, DON'T CANCEL REC
+         L         R5,16(0,0)   GET ADDR OF CVT
+         USING     CVTMAP,R5    MAKE IT ADDRESSABLE
+         L         R5,CVTTCBP   GET PTR TO NEXT-CURRENT TCBS
+         L         R5,4(,R5)    GET ADDR OF CURRENT(OUR) TCB
+         USING     TCB,R5       MAKE IT ADDRESSABLE
+         L         R5,TCBTCT    GET ADDR OF TCT(TIMING CNTL TABLE)
+         USING     SMFTCT,R5    MAKE IT ADDRESSABLE
+         LA        R5,0(,R5)    CLEAR HI-BYTE
+         LTR       R5,R5        VALID TCT POINTER?
+         BZ        MAINEXIT     BIF NOT
+         L         R5,TCTJMR    GET ADDR OF JMR(JOB MGMT RECORD)
+         USING     JMR,R5       MAKE IT ADDRESSABLE
+         LA        R5,0(,R5)    CLEAR HI-BYTE
+         LTR       R5,R5        VALID JMR POINTER?
+         BZ        MAINEXIT     BIF NOT
+         TM        JMRFLG,JMRWARM IS THIS A WARM RESTART?
+         BO        MAINEXIT     BIF YES: ANCHOR IN USER COMM INVALID
+         TM        JMRUSEID,X'10'  HAS BYPASS FLAG BEEN SET?
+         BO        MAINEXIT        BIF YES
+         L         R5,JMRUCOM   GET WORK AREA ANCHOR FROM USER COMM
+         LA        R5,0(,R5)   CLEAR HI-BYTE
+         LTR       R5,R5       IS THERE AN ANCHOR PRESENT?
+         DROP      R5
+         BZ        MAINEXIT    BIF NOT: CAN'T PASS INFO TO ACTRT
+*
+OBTAIN3  SETLOCK   OBTAIN,TYPE=LOCAL,MODE=UNCOND,REGS=USE,             X
+               RELATED=RLSE3
+         SR        R2,R2          ASSUME LOCK NOT HELD PREVIOUSLY
+         B         OBTNCHK3(R15)  USE RETURN CODE FOR WTG BRANCH LIST
+OBTNCHK3 EQU       *
+         B         OBTNOK3        RC=0; LOCAL LOCK NOT PREVIOUSLY HELD
+         B         OBTNPRV3       RC=4; LOCAL LOCK PREVIOUSLY HELD
+         EX        0,*            RC=8; LOCAL LOCK OBTAIN FAILED - S0C3
+*
+OBTNPRV3 EQU       *
+         L         R2,=C'PREV'    SET FLAG NOTING LOCK PREVIOUSLY HELD
+*
+OBTNOK3  EQU       *
+         ST        R5,8(,R13)  COMPLETE S/A CHAINING
+         ST        R13,4(,R5)
+         LR        R13,R5
+         USING     EXITCORE,R13 MAKE THE WORK AREA ADDRESSABLE
+         ST        R2,ECLOCKS     STORE LOCK STATUS
+*
+MAINDO14 EQU       *
+         CLI       SMF14RTY,14  RECORD TYPE 14?
+         BNE       MAINDO15     BIF NOT; TRY 15
+         L         R11,=A(SMF14RTN)  GET ADDR OF REC 14 PROCESSOR
+         BALR      R10,R11      PERFORM IT
+         B         MAINEND      DONE FOR NOW
+*
+MAINDO15 EQU       *
+         CLI       SMF14RTY,15  RECORD TYPE 15?
+         BNE       MAINDO64     BIF NOT: TRY 64
+         L         R11,=A(SMF15RTN)
+         BALR      R10,R11      PERFORM REC 15 PROCESSOR
+         B         MAINEND
+*
+MAINDO64 EQU       *
+         L         R11,=A(SMF64RTN) GET ADDR OF REC 64 PROCESSOR
+         BALR      R10,R11      PERFORM IT
+*
+MAINEND  EQU       *
+         LR        R6,R15       HOLD ONTO RETURN CODE FOR A SEC
+         L         R13,SAVEAREA+4
+         CLC       ECLOCKS,=C'PREV' WAS LOCAL LOCK HELD PRIOR TO U83?
+         BE        MAINPREV     BIF YES
+*
+RLSE3    SETLOCK   RELEASE,TYPE=LOCAL,REGS=USE,                        X
+               RELATED=OBTAIN3
+*
+MAINPREV EQU       *
+         LR        R15,R6       PUT RETURN CODE BACK WHERE IT SHOULD BE
+*
+MAINEXIT EQU       *
+         RETURN    (14,12),RC=(15)
+         TITLE     'IEFU83 - FUNCTIONS'
+         TBINSRCH
+         TITLE     'IEFU83 - SELF-DEFINING CONSTANTS'
+         LTORG
+         TITLE     'IEFU83 - SMF RECORD 14 PROCESSOR'
+SMF14RTN DS        0H
+***********************************************************************
+*                                                                     *
+*        ROUTINE TO PROCESS SMF TYPE 14 (NON VSAM INPUT) RECORD.      *
+*        SELECTED DATA ITEMS ARE EXTRACTED FROM THE RECORD AND        *
+*        INSERTED IN A VARIABLE-LENGTH TABLE; THE TABLE RESIDES       *
+*        IN THE WORK AREA ANCHORED IN THE JMR USER COMM FIELD.        *
+*        THIS WORK AREA IS GETMAINED BY IEFUJI(JOB INITIATION)        *
+*        AND EXISTS FOR THE DURATION OF THE JOB.  THE TABLE DATA      *
+*        IS USED BY IEFACTRT STEPTERM TO LIST I/O RELATED             *
+*        DIAGNOSTIC INFORMATION.                                      *
+*                                                                     *
+***********************************************************************
+         USING     SMF14RTN,R11    MAKE RTN ADDRESSABLE
+         TM        SMF14RIN,SMF14EOV IS THIS AN END-OF-VOL REC?
+         BO        SMF14XIT        BIF YES; DO NOT PROCESS
+*
+         MVC       SMFKEY(8),SMFTIOE5 DDNAME
+         CLI       SMFKEY,C' '     IS DDNAME BLANK?
+         BNE       S14DDNOK        BIF NOT
+         MVC       SMFKEY(8),=C'*CONCAT*' OTHERWISE, CONSTANT
+S14DDNOK EQU       *
+         MVI       SMFKEY+8,X'01'  1ST ENTRY
+         LA        R15,SMFKEY      SET UP FOR TABLE LOOKUP/INSERT
+         LA        R7,ECSMFTAB     GET ADDR OF TABLE TO BE UPDATED
+         BAL       R8,TBINSRCH
+         B         S14TBHIT        RC=0; EXISTING ENTRY FOUND
+         B         S14TBADD        RC=4; NEW ENTRY ADDED
+         B         SMF14XIT        RC=8; TABLE OVERFLOW
+         BAL       R14,S14ERROR    RC=12; RTN LOGIC ERROR
+*
+S14TBHIT EQU       *
+S14TBADD EQU       *
+         USING     SMFIOTAB,R2     MAKE ELEMENT ADDRESSABLE
+         MVC       SNFLAGS,SMF14RIN    MOVE IN FLAG VALUES
+         NI        SNFLAGS,255-(SMF14RV0+SMF14DDA+SMF14IS+SMF14JIS)
+         LH        R1,SNOPNCNT     # OF TIMES OPENED
+         LA        R1,1(,R1)
+         STH       R1,SNOPNCNT
+         MVC       SNVOLSER,SMFSRTEV VOLSER
+         MVC       SNUCBTYP,SMFUCBTY  UCBTYPE
+         MVC       SNEXTCNT,SMF14NEX # OF EXTENTS
+         SR        R0,R0
+         ICM       R0,1,SMF14NUC # OF UCB SEGMENTS
+         BP        S14NUMOK      BIF NUMBER OK
+         LA        R0,1          OTHERWISE, SET TO ONE
+S14NUMOK EQU       *
+         SR        R1,R1
+         IC        R1,SMF14SUC   SIZE OF UCB SEGMENT
+         LA        R3,SMF14UCB   ADDR OF 1ST UCB SEGMENT
+         SR        R4,R4         EXCP COUNTER
+         B         S14ADDER      BRANCH TO ADDER
+*
+S14LOOP  EQU       *
+         LA        R3,0(R1,R3)   BUMP UP TO NEXT SEGMENT
+S14ADDER EQU       *
+         A         R4,SMFEXCP-SMF14UCB(,R3)  EXCP COUNT FIELD
+         BCT       R0,S14LOOP    LOOP UNTIL ALL SEGMENTS COUNTED
+         ST        R4,SNEXCP     STOW # OF EXCP'S
+         MVC       SNDCBFL(1),SMFDCBFL  DCBOFLGS - OPEN FLAGS
+         MVC       SNDSORG,SMFDCBOR  DSORG
+         MVC       SNOPTCD,SMFDCBOP  OPTCD
+         MVC       SNDEBPAT,SMFDEBOP DEBOPATB (OPEN TYPE)
+         MVC       SNRECFM,SMFDCBRF  RECFM
+         MVC       SNLRECL,JFCLRECL  LRECL
+         MVC       SNBLKSIZ,JFCBLKSI BLKSIZE
+         SR        R1,R1
+         ICM       R1,7,JFCBDRLH     AVG BLK LENGTH
+         STH       R1,SNAVGBLK
+         SR        R1,R1
+         IC        R1,JFCBUFNO     # OF BUFFERS
+         STH       R1,SNBUFNO
+         TM        SMF14RIN,SMF14DAD  DASD?
+         BZ        S14TAPE            BIF NOT; IS TAPE
+*
+         LH        R1,SMF14NTU        # OF TRACKS USED
+         ST        R1,SNTRKUSD
+         MVC       SNTRKRLS,SMF14NTR  # OF TRACKS RELEASED
+         MVC       SNTRKALC,SMF14NTA  # OF TRACKS ALLOCATED
+         B         SMF14XIT           NOW LEAVE
+S14TAPE  EQU       *
+         B         SMF14XIT
+         DROP      R2
+*
+S14ERROR EQU       *
+*
+SMF14XIT EQU       *
+         SR        R15,R15       BEGIN BY ASSUMING WE WON'T CANCEL
+         TM        SMF14RIN,SMF14TDS FOR A TEMPORARY D.S.?
+         BZR       R10           BIF NOT TEMPORARY; DON'T CANCEL
+*
+         LA        R15,4         IT'S TEMPORARY, SO CANCEL
+         BR        R10       RETURN TO CALLER
+         LTORG
+         DROP      R11       DROP ADDRESSABILITY TO ROUTINE
+         TITLE      'IEFU83 - SMF RECORD 15 PROCESSOR'
+SMF15RTN DS        0H
+***********************************************************************
+*                                                                     *
+*        ROUTINE TO PROCESS SMF TYPE 15 (NON VSAM OUPUT) RECORD.      *
+*        SELECTED DATA ITEMS ARE EXTRACTED FROM THE RECORD AND        *
+*        INSERTED IN A VARIABLE-LENGTH TABLE; THE TABLE RESIDES       *
+*        IN THE WORK AREA ANCHORED IN THE JMR USER COMM FIELD.        *
+*        THIS WORK AREA IS GETMAINED BY IEFUJI(JOB INITIATION)        *
+*        AND EXISTS FOR THE DURATION OF THE JOB.  THE TABLE DATA      *
+*        IS USED BY IEFACTRT STEPTERM TO LIST I/O RELATED             *
+*        DIAGNOSTIC INFORMATION.                                      *
+*                                                                     *
+***********************************************************************
+         USING     SMF15RTN,R11    MAKE RTN ADDRESSABLE
+         TM        SMF14RIN,SMF14EOV IS THIS AN END-OF-VOL REC?
+         BO        SMF15XIT        BIF YES; DO NOT PROCESS
+         MVC       SMFKEY(8),SMFTIOE5 DDNAME
+         CLI       SMFKEY,C' '     IS DDNAME BLANK?
+         BNE       S15DDNOK        BIF NOT
+         MVC       SMFKEY(8),=C'*CONCAT*' OTHERWISE, CONSTANT
+S15DDNOK EQU       *
+         MVI       SMFKEY+8,X'01'  1ST ENTRY
+         LA        R15,SMFKEY      SET UP FOR TABLE LOOKUP/INSERT
+         LA        R7,ECSMFTAB     GET ADDR OF TABLE TO BE UPDATED
+         BAL       R8,TBINSRCH
+         B         S15TBHIT        RC=0; EXISTING ENTRY FOUND
+         B         S15TBADD        RC=4; NEW ENTRY ADDED
+         B         SMF15XIT        RC=8; TABLE OVERFLOW
+         BAL       R14,S15ERROR    RC=12; RTN LOGIC ERROR
+*
+S15TBHIT EQU       *
+S15TBADD EQU       *
+         USING     SMFIOTAB,R2     MAKE ELEMENT ADDRESSABLE
+         MVC       SNFLAGS,SMF14RIN   MOVE IN FLAG VALUES
+         NI        SNFLAGS,255-(SMF14RV0+SMF14DDA+SMF14IS+SMF14JIS)
+         LH        R1,SNOPNCNT     # OF TIMES OPENED
+         LA        R1,1(,R1)
+         STH       R1,SNOPNCNT
+         MVC       SNVOLSER,SMFSRTEV VOLSER
+         MVC       SNUCBTYP,SMFUCBTY  UCBTYPE
+         MVC       SNEXTCNT,SMF14NEX # OF EXTENTS
+         SR        R0,R0
+         ICM       R0,1,SMF14NUC # OF UCB SEGMENTS
+         BP        S15NUMOK      BIF NUMBER OK
+         LA        R0,1          OTHERWISE, SET TO ONE
+S15NUMOK EQU       *
+         SR        R1,R1
+         IC        R1,SMF14SUC   SIZE OF UCB SEGMENT
+         LA        R3,SMF14UCB   ADDR OF 1ST UCB SEGMENT
+         SR        R4,R4         EXCP COUNTER
+         B         S15ADDER      BRANCH TO ADDER
+*
+S15LOOP  EQU       *
+         LA        R3,0(R1,R3)   BUMP UP TO NEXT SEGMENT
+S15ADDER EQU       *
+         A         R4,SMFEXCP-SMF14UCB(,R3)  EXCP COUNT FIELD
+         BCT       R0,S15LOOP    LOOP UNTIL ALL SEGMENTS COUNTED
+         ST        R4,SNEXCP     STOW # OF EXCP'S
+         MVC       SNDSORG,SMFDCBOR  DSORG
+         MVC       SNDCBFL(1),SMFDCBFL  DCBOFLGS - OPEN FLAGS
+         MVC       SNOPTCD,SMFDCBOP  OPTCD
+         MVC       SNDEBPAT,SMFDEBOP DEBOPATB (OPEN TYPE)
+         MVC       SNRECFM,SMFDCBRF  RECFM
+         MVC       SNLRECL,JFCLRECL  LRECL
+         MVC       SNBLKSIZ,JFCBLKSI BLKSIZE
+         SR        R1,R1
+         ICM       R1,7,JFCBDRLH     AVG BLK LENGTH
+         STH       R1,SNAVGBLK
+         SR        R1,R1
+         IC        R1,JFCBUFNO     # OF BUFFERS
+         STH       R1,SNBUFNO
+         TM        SMF14RIN,SMF14DAD  DASD?
+         BZ        S15TAPE            BIF NOT; IS TAPE
+*
+         LH        R1,SMF14NTU        # OF TRACKS USED
+         ST        R1,SNTRKUSD
+         MVC       SNTRKRLS,SMF14NTR  # OF TRACKS RELEASED
+         MVC       SNTRKALC,SMF14NTA  # OF TRACKS ALLOCATED
+         B         SMF15XIT           NOW LEAVE
+         DROP      R2
+*
+S15TAPE  EQU       *
+         B         SMF15XIT
+*
+S15ERROR EQU       *
+         EX        0,*            IF ERROR, DIE HERE W/ 0C3 ABEND
+*
+SMF15XIT EQU       *
+         SR        R15,R15        AT FIRST, ASSUME WE WON'T CANCEL
+         TM        SMF14RIN,SMF14TDS TEMPORARY DATA SET?
+         BZR       R10            BIF NOT; DON'T CANCEL
+*
+         LA        R15,4          IT'S TEMP, SO CANCEL
+         BR        R10       RETURN TO CALLER
+         LTORG
+         DROP      R11       DROP ADDRESSABILITY TO ROUTINE
+         TITLE      'IEFU83 - SMF RECORD 64 PROCESSOR'
+SMF64RTN DS        0H
+***********************************************************************
+*                                                                     *
+*        ROUTINE TO PROCESS SMF TYPE 64 (VSAM) RECORD                 *
+*        SELECTED DATA ITEMS ARE EXTRACTED FROM THE RECORD AND        *
+*        INSERTED IN A VARIABLE-LENGTH TABLE; THE TABLE RESIDES       *
+*        IN THE WORK AREA ANCHORED IN THE JMR USER COMM FIELD.        *
+*        THIS WORK AREA IS GETMAINED BY IEFUJI(JOB INITIATION)        *
+*        AND EXISTS FOR THE DURATION OF THE JOB.  THE TABLE DATA      *
+*        IS USED BY IEFACTRT STEPTERM TO LIST I/O RELATED             *
+*        DIAGNOSTIC INFORMATION.                                      *
+*                                                                     *
+***********************************************************************
+         USING     SMF64RTN,R11    MAKE RTN ADDRESSABLE
+         TM        SMF64RIN,X'80'  WAS RECORD WRITTEN BY 'CLOSE'?
+         BZ        SMF64XIT        BIF NOT; WANT ONLY CLOSE RECS
+*
+         LH        R1,SMF64ESL     GET OFFSET TO RELOCATE SECTION
+         LA        R1,SMF64STS(R1) GET ADDR OF RELOCATE SECTION
+         CLI       SMF64DKL+2-SMF64STS(R1),C' ' IS DDNAME PRESENT?
+*
+         BNH       SMF64XIT        BIF NOT; REC NOT FOR PROB. PROG.
+         MVC       SMFKEY(8),SMF64DKL+2-SMF64STS(R1) USE DDNAME FOR KE
+         TM        SMF64DTY,X'80'  IS REC FOR DATA COMPONENT?
+         BO        S64DATA         BIF YES
+*
+         MVI       SMFKEY+8,SVIDXCUR  INDEX COMPONENT - TO-DATE INFO
+         LA        R7,ECSMFTAB     GET ADDR OF TABLE IN WORK AREA
+         LA        R15,SMFKEY      GET ADDR OF KEY VALUE
+         BAL       R8,TBINSRCH     LOOK UP THIS DDNAME/COMPONENT
+         B         S64IOK2         RC=0; DDNAME ENTRY ALREADY PRES.
+         B         S64IOK1         RC=4; DDNAME ENTRY CREATED
+         B         SMF64XIT        RC=8; TABLE OVERFLOW
+         BAL       R14,S64ERROR    RC=12; LOGIC ERROR
+*
+S64IOK1  EQU       *
+         USING     SMFIOTAB,R2     MAKE ELEMENT ADDRESSABLE
+S64IOK2  EQU       *
+         MVI       SVFLAGS,SNVSAM  MARK AS A VSAM DATA SET
+         LH        R1,SVOPNCNT     # OF TIMES OPENED
+         LA        R1,1(,R1)
+         STH       R1,SVOPNCNT
+         LH        R1,SMF64ESL
+         LA        R1,SMF64STS(R1)    ADDR OF STATS SECTION
+         MVC       SVNIL(SMF64DIL-SMF64NIL),SMF64NIL-SMF64STS(R1)
+         MVI       SMFKEY+8,SVIDXCNG KEY FOR 'CHNGD SINCE LAST OPEN'
+         LA        R15,SMFKEY
+         BAL       R8,TBINSRCH
+         B         S64IOK3         RC=0; EXISTING ENTRY FOUND
+         B         S64IOK4         RC=4; NEW ENTRY BUILT
+         B         SMF64XIT         RC=8; TABLE OVERFLOW
+         BAL       R14,S64ERROR     RC=12; RTN LOGIC ERROR
+*
+S64IOK3  EQU       *
+S64IOK4  EQU       *
+         MVI       SVFLAGS,SNVSAM   MARK AS VSAM ENTRY
+         LH        R1,SVOPNCNT
+         LA        R1,1(,R1)
+         STH       R1,SVOPNCNT
+         LH        R1,SMF64ESL     LENGTH OF UCB SECTION
+         LA        R1,SMF64STS(R1)  ADDR OF STATS SECTION
+         MVC       SVDIL(SMF64DBS-SMF64DIL),SMF64DIL-SMF64STS(R1)
+         B         SMF64XIT
+*
+S64DATA  EQU       *
+         MVI       SMFKEY+8,SVDATCUR  DATA COMPONENT - TO-DATE INFO
+         LA        R7,ECSMFTAB     GET ADDR OF TABLE IN WORK AREA
+         LA        R15,SMFKEY      GET ADDR OF KEY VALUE
+         BAL       R8,TBINSRCH     LOOK UP THIS DDNAME/COMPONENT
+         B         S64DOK2         RC=0; DDNAME ENTRY ALREADY PRES.
+         B         S64DOK1         RC=4; DDNAME ENTRY CREATED
+         B         SMF64XIT        RC=8; TABLE OVERFLOW
+         BAL       R14,S64ERROR    RC=12; LOGIC ERROR
+*
+S64DOK1  EQU       *
+         USING     SMFIOTAB,R2     MAKE ELEMENT ADDRESSABLE
+S64DOK2  EQU       *
+         MVI       SVFLAGS,SNVSAM  MARK AS A VSAM DATA SET
+         LH        R1,SVOPNCNT     # OF TIMES OPENED
+         LA        R1,1(,R1)
+         STH       R1,SVOPNCNT
+         LH        R1,SMF64ESL     LENGTH OF UCB SECTION
+         LA        R1,SMF64STS(R1) ADDR OF STATS SECTION
+         MVC       SVNIL(SMF64DIL-SMF64NIL),SMF64NIL-SMF64STS(R1)
+         MVI       SMFKEY+8,SVDATCNG KEY FOR 'CHNGD SINCE LAST OPEN'
+         LA        R15,SMFKEY
+         BAL       R8,TBINSRCH
+         B         S64DOK3         RC=0; EXISTING ENTRY FOUND
+         B         S64DOK4         RC=4; NEW ENTRY BUILT
+         B         SMF64XIT         RC=8; TABLE OVERFLOW
+         BAL       R14,S64ERROR     RC=12; RTN LOGIC ERROR
+*
+S64DOK3  EQU       *
+S64DOK4  EQU       *
+         MVI       SVFLAGS,SNVSAM   MARK AS VSAM ENTRY
+         LH        R1,SVOPNCNT
+         LA        R1,1(,R1)
+         STH       R1,SVOPNCNT
+         LH        R1,SMF64ESL     LENGTH OF UCB SECTION
+         LA        R1,SMF64STS(R1) ADDR OF STATS SECTION
+         MVC       SVDIL(SMF64DBS-SMF64DIL),SMF64DIL-SMF64STS(R1)
+         B         SMF64XIT
+*
+S64ERROR EQU       *
+         EX        R0,*           FORCE AN 0C3
+*
+SMF64XIT EQU       *
+         SR        R15,R15        DON'T CANCEL THIS RECORD
+         BR        R10       RETURN TO CALLER
+         LTORG
+         DROP      R11       DROP ADDRESSABILITY TO ROUTINE
+         TITLE     'IEFU83 - ADDRESSABILITY FOR U83''S AREA'
+***********************************************************************
+*                                                                     *
+*        MAKE IEFU83'S AREA ADDRESSABLE                               *
+*                                                                     *
+***********************************************************************
+         USING   U83CORE,R13
+         TITLE     'IEFU83 - SMF RECORD TYPE 21 PROCESSOR'
+SMF21RTN DS        0H
+***********************************************************************
+*                                                                     *
+*        SMF RECORD TYPE 21 PROCESSOR                                 *
+*                                                                     *
+***********************************************************************
+         USING     SMF21RTN,R11     MAKE RTN ADDRESSABLE
+         SR        R1,R1
+         IC        R1,SMF21TR
+         SR        R2,R2
+         IC        R2,SMF21TW
+         AR        R1,R2      TOTAL # OF TEMP READ & WRITE ERRORS
+         C         R1,=A(20)   IS IT GREATER THAN 20?
+         BH        S21CLEAN    BIF YES: ISSUE 'CLEAN' MSG
+         CLI       SMF21PR,00  ANY PERMANENT READS?
+         BNE       S21CLEAN    BIF YES
+         CLI       SMF21PW,00  ANY PERMANENT WRITE ERRORS?
+         BE        SMF21XIT    BIF NOT
+S21CLEAN EQU       *
+         MVC       MSGWORK(S21MSGL),S21MSG MOVE MESSAGE PATTERN
+         UNPK      DOUBLE(5),SMF21CA(3) GET DEVICE ADDR
+         TR        DOUBLE(4),S21TABLE CONVERT ADDR TO HEX DISPLAY
+         MVC       MSGWORK+16(3),DOUBLE+1
+         SR        R1,R1
+         IC       R1,SMF21TR # OF TEMP READ ERRORS
+         CVD      R1,DOUBLE
+         MVC      DISPLAY(4),=X'F0212020' EDIT PATTERN
+         ED       DISPLAY(4),DOUBLE+6
+         MVC      MSGWORK+23(3),DISPLAY+1
+         IC       R1,SMF21TW # OF TEMP WRITE ERRORS
+         CVD      R1,DOUBLE
+         MVC      DISPLAY(4),=X'F0212020' EDIT PATTERN
+         ED       DISPLAY(4),DOUBLE+6
+         MVC      MSGWORK+30(3),DISPLAY+1
+         IC       R1,SMF21PR # OF PERMANENT READ ERRORS
+         CVD      R1,DOUBLE
+         MVC      DISPLAY(4),=X'F0212020'
+         ED       DISPLAY(4),DOUBLE+6
+         MVC      MSGWORK+37(3),DISPLAY+1
+         IC       R1,SMF21PW # OF PERMANENT WRITE ERRORS
+         CVD      R1,DOUBLE
+         MVC      DISPLAY(4),=X'F0212020'
+         ED       DISPLAY(4),DOUBLE+6
+         MVC      MSGWORK+44(3),DISPLAY+1
+         IC       R1,SMF21NB # OF NOISE BLOCKS
+         CVD      R1,DOUBLE
+         MVC      DISPLAY(4),=X'F0212020'
+         ED       DISPLAY(4),DOUBLE+6
+         MVC      MSGWORK+51(3),DISPLAY+1
+         IC       R1,SMF21ERG  # OF ERASE GAPS
+         CVD      R1,DOUBLE
+         MVC      DISPLAY(4),=X'F0212020'
+         ED       DISPLAY(4),DOUBLE+6
+         MVC      MSGWORK+58(3),DISPLAY+1
+         LA       R1,MSGWORK
+         WTO      MF=(E,(1))
+SMF21XIT EQU      *
+         SLR      R15,R15         DON'T CANCEL RECORD
+         BR       R10
+S21MSG   WTO 'CLEAN*DRIVE(XXX)TR=XXX/TW=XXX/PR=XXX/PW=XXX/NB=XXX/EG=XXXX
+               ',ROUTCDE=5,DESC=2,MF=L
+S21MSGL  EQU     *-S21MSG    LENGTH OF MSG & CONTROL INFO
+S21TABLE DC       240C'/',C'0123456789ABCDEF'
+         LTORG
+         DROP     R11
+         TITLE     'IEFU83 - SMF RECORD 30 PROCESSOR'
+SMF30RTN DS        0H
+***********************************************************************
+*                                                                     *
+*        ROUTINE TO FILTER OUT SMF TYPE 30 SUBTYPE 2 & 3'S IF         *
+*        ASSOCIATED PROGRAM NAME  IS NOT IN SMF INTERVAL FILTER LIST  *
+*                                                                     *
+***********************************************************************
+         USING     SMF30RTN,R11
+         LA        R15,0          ASSUME WE WON'T CANCEL
+         USING     SMFRCD30,R9    MAKE SPECIAL DSECT ADDRESSABLE
+         LH        R2,SMF30SON    GET COUNT OF SUBSYSTEM SECTIONS
+         LTR       R2,R2
+         BNP       SMF30XIT       BIF NO SUBSYSTEM SECTION PRESENT
+*
+         LR        R1,R9          SET UP WORK REG FOR BASE ADDR
+         A         R1,SMF30SOF    ADD OFFSET TO SUBSYSTEM SECTION
+         USING     SMF30PSS,R1    MAKE SUBSYSTEM SECTION ADDRESSABLE
+         CLC       SMF30TYP,=XL2'0002' NON-LAST INTERVAL ACCOUNTING?
+         BE        S30INTRC       BIF YES; CHECK FURTHER
+         CLC       SMF30TYP,=XL2'0003' LAST INTERVAL ACCOUNTING?
+         BNE       SMF30XIT       BIF NOT; LET RECORD PASS UNTOUCHED
+*
+S30INTRC EQU       *
+         LH        R2,SMF30ION    GET COUNT OF ID SECTIONS
+         LTR       R2,R2          IS THE NUMBER POSITIVE?
+         BNP       SMF30XIT       BIF NOT; CAN'T USE THIS GUY
+*
+         LR        R15,R9         GET BASE ADDR OF RECORD
+         A         R15,SMF30IOF   ADD OFFSET TO ID SECTION
+         USING     SMF30ID,R15    MAKE IT ADDRESSABLE
+         TM        SMF30UIF,X'10' WAS EXIT BYPASS SWITCH SET BY IEFUJV?
+         BNO       S30NBYP        BIF NOT; KEEP TESTING
+         LA        R15,0          OTHERWISE, KEEP RECORD
+         B         SMF30XIT
+*
+S30NBYP  EQU       *
+         LA        R15,SMF30PGM   GET PGM NAME
+         DROP      R15            DROP DSECT
+         L         R7,16(0,0)     GET CVT POINTER
+         USING     CVTMAP,R7      MAKE CVT ADDRESSABLE
+         ICM       R7,15,CVTUSER  IS THE ACCOUNTING AREA PRESENT?
+         BNZ       S30HVAR        BIF YES; CONTINUE
+         LA        R15,4          OTHERWISE, CANCEL INTERVAL RECORD
+         B         SMF30XIT       & LEAVE
+*
+S30HVAR  EQU       *
+         USING     ACCTABLE,R7    MAKE ACCOUNTING AREA ADDRESSABLE
+         CLI       ACFLAG,ACEMPTY IN PROCESS OF BEING LOADED?
+         BNE       S30AROK        BIF NOT; AREA OK
+         LA        R15,4          OTHERWISE, CANCEL INTERVAL RECORD
+         B         SMF30XIT       & LEAVE
+*
+S30AROK  EQU       *
+         CLI       ACVERSN,ACVER# WAS SAACLOAD VERSION CORRECT?
+         BE        S30VEROK       BIF YES; CONTINUE
+         LA        R15,4          OTHERWISE, CANCEL INTERVAL RECORD
+         B         SMF30XIT
+*
+S30VEROK EQU       *
+         L         R7,ACIAADDR    SMF INT ACCT ELIGIBILITY LIST
+         BAL       R8,TBINSRCH    LOOK UP PGM NAME IN LIST
+         B         S30HIT         RC=0; WE HAVE A HIT
+         BAL       R14,S30ERROR   RC=4; (SHOULDN'T OCCUR FOR READ-ONLY)
+         B         S30NOHIT       RC=8; NO HIT: KILL SMF RECORD
+         BAL       R14,S30ERROR   RC=12; ERROR IN SEARCH ROUTINE
+*
+S30HIT   EQU       *
+         SLR       R15,R15        PERMIT SMF RECORD TO GO THRU
+         B         SMF30XIT
+*
+S30NOHIT EQU       *
+         LA        R15,4          KILL RECORD
+         B         SMF30XIT
+*
+S30ERROR EQU       *
+         EX        R0,*           IF ERROR, DIE WITH AN 0C3.
+*
+SMF30XIT EQU        *
+         BR         R10           RETURN TO CALLER
+         LTORG
+         DROP       R1,R7,R9,R11  DROP ADDRESSABILITY
+         USING      SMFREC,R9     REESTABLISH ADDRESSABILITY FOR SMFREC
+          END

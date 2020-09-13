@@ -1,0 +1,773 @@
+ /* COPYRIGHT 1983 BY THOMAS GLEN SMITH */
+ /* ABEPI */
+ /**********************************************************************
+ *                                                                     *
+ * ABEPI IS DESIGNED TO PROCESS PROGRAMMED INSTRUCTION TEXT.           *
+ * THIS IS TEXT INTERSPERSED WITH PROGRAMMED INSTRUCTION LANGUAGE      *
+ * (PIL).                                                              *
+ *                                                                     *
+ * THE ABEPI SUBROUTINE EXPECTS SIX ENTRY POINTS TO BE PASSED TO       *
+ * IT WHEN IT IS INVOKED:                                              *
+ *                                                                     *
+ * GET(KEY,TXT)                                                        *
+ *   KEY IS FIXED BIN(31,0), AND WILL BE SET BY ABEPI TO THE LINE      *
+ *   NUMBER (RELATIVE 1) OF THE LINE IT WANTS RETREIVED.  TXT IS       *
+ *   CHAR(*) VAR, AND WILL BE SET BY GET TO THE DESIRED LINE.          *
+ *                                                                     *
+ * PUT(TXT)                                                            *
+ *   TXT IS CHAR(*) VAR, AND IS THE CHARACTER STRING TO BE WRITTEN     *
+ *   AT THE TERMINAL BY THE PUT SUBROUTINE.                            *
+ *                                                                     *
+ * DOPRM(PROMPT,ANSWER)                                                *
+ *   PROMPT IS CHARACTER(80) VAR, AND IS SET BY ABEPI TO THE TEXT      *
+ *   TO BE WRITTEN AT THE TERMINAL AS A PROMPTING MESSAGE.             *
+ *   ANSWER IS CHAR(*) VAR, AND IS SET BY DOPRM TO THE RESPONSE        *
+ *   FROM THE TERMINAL                                                 *
+ *                                                                     *
+ * DOCMD(MYCMD,HELPSTR)                                                *
+ *   MYCMD IS CHAR(240) VAR, AND WILL BE SET BY ABEPI TO THE COMMAND   *
+ *   THAT IS TO BE EXECUTED.  HELPSTR IS CHAR(4) VAR, AND WILL BE SET  *
+ *   BY ABEPI TO NULL.                                                 *
+ *                                                                     *
+ * SETL(RHHDRPT,RH_SYMTREE,SYMBOLPM,ANSWER);                           *
+ *   SYMBOLPM                                                          *
+ *   IS CHAR(8), AND WILL BE SET TO THE SYMBOLIC VARIABLE NAME         *
+ *   (EXCLUDING THE PRECEDING AMPERSAND) FOR WHICH THE REPLACEMENT     *
+ *   VALUE IS TO BE SET.  ANSWER IS THE REPLACEMENT VALUE TO BE        *
+ *   ASSOCIATED WITH THE SYMBOLIC VARIABLE.                            *
+ *                                                                     *
+ * REP(RHHDRPT,RH_SYMTREE,REPBUF)                                      *
+ *   REPBUF IS A STRUCTURE AS FOLLOWS:                                 *
+ *                                                                     *
+ *        DCL 1 REPBUF,                                                *
+ *             2 BUFLEN FIXED BIN(15,0),                               *
+ *             2 OFFSET FIXED BIN(15,0),                               *
+ *             2 BF CHAR(*)                                            *
+ *                                                                     *
+ *   BUFLEN IS SET TO THE LENGTH OF THE TEXT IN BF PLUS 4.  OFFSET     *
+ *   IS SET TO 0, AND BF CONTAINS THE TEXT IN WHICH REPLACEMENTS       *
+ *   FOR SYMBOLIC VARIABLES IS TO BE MADE.                             *
+ *                                                                     *
+ * STAK(CMD)                                                           *
+ *   CMD IS CHAR(*) VAR, AND CONTAINS A COMMAND TO BE STACKED ON THE   *
+ *   COMMAND STACK.                                                    *
+ *                                                                     *
+ **********************************************************************/
+   %INCLUDE ABESUB;
+ ABESUB(ABEPI) PARMS(GET,PUT,DOPRM,DOCMD,REP,SETL,STAK,KEY,LABI,LABTAB,
+   CTLSW,TSOCMD,RHHDRPT,RHPTR) RECURS(YES);
+   %INCLUDE ABESUBA;
+   DCL (GET,DOPRM,DOCMD,REP,STAK) ENTRY;
+   DCL TSOCMD ENTRY(CHAR(240) VAR, CHAR(4) VAR);
+   DCL PUT ENTRY(CHAR(*) VAR);
+   DCL SETL ENTRY(PTR,PTR,CHAR(8),CHAR(256) VAR);
+   DCL (KEY,LABI) FIXED BIN(31,0);
+   DCL CTLSW FIXED BIN(15,0);
+   DCL 1 LABTAB(256) UNALIGNED,
+     2 $KEY FIXED BIN,
+     2 $LAB CHAR(8);
+
+   DCL (PREFIX,SUFFIX) ENTRY(CHAR(*),CHAR(*))
+     RETURNS(FIXED BIN(15,0));
+   DCL SETCAPS ENTRY;
+
+   DCL (CURSTMTNO,CURIND,IND,L) FIXED BIN;
+   DCL 1 STMTSTR BASED(STMTPTR),
+     2 STMTLEN FIXED BIN(15,0),
+     2 STMT CHAR(L REFER(STMTLEN)) VAR;
+   DCL (M,N,OL) FIXED BIN(15,0);
+   DCL OP CHAR(256) VAR;
+   DCL CMD CHAR(256) VAR;
+   DCL GBLSW BIT(1) STATIC INIT('0'B);
+   DCL $CNT FIXED BIN INIT(0);
+   DCL TRUE FIXED BIN(15,0) STATIC INIT(1);
+   DCL FALSE FIXED BIN(15,0) STATIC INIT(0);
+   DCL (ASISSW,LISTSW) FIXED BIN(15,0) INIT(0);
+   DCL UNGET_STACK PTR;
+   DCL 1 UNGET_STACK_ELEMENT BASED(USEPTR),
+     2 UNGET_STACK_NEXT PTR,
+     2 UNGET_STACK_STMTPTR PTR,
+     2 UNGET_STACK_STMTNO FIXED BIN,
+     2 UNGET_STACK_IND FIXED BIN,
+     2 UNGET_STACK_CMD CHAR(256) VAR;
+
+   HALT;
+   /* INITIALIZATION */
+   STMTPTR,UNGET_STACK=NULL;
+
+   /* MAINLINE */
+ OUT_OF_BLOCK:
+   CALL STMT_PROC(0);
+ EOJ:
+   CALL UNGET_STACK_PURGE;
+   IF STMTPTR^=NULL
+     THEN FREE STMTSTR;
+   RETURN; /* ALL DONE */
+
+ BADSTMT: PROC(MSG);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN AN ERROR IS ENCOUNTERED.                                *
+ *                                                                     *
+ **********************************************************************/
+   DCL MSG CHAR(*);
+   MSGDATA=MSG;
+   RHRC=16;
+   GOTO EOJ;
+   END BADSTMT;
+
+ CALL_PROC: PROC RECURSIVE;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PROCESS A CALL STATEMENT.                                 *
+ *                                                                     *
+ **********************************************************************/
+   DCL (IND,SAVEKEY) FIXED BIN;
+   DCL SAVE PTR;
+
+   SAVE=UNGET_STACK;
+   UNGET_STACK=NULL;
+   IND=CURIND;
+   IF STMT=''
+     THEN CALL BADSTMT('$CALL M/B FOLLOWED BY A LABEL');
+   SAVEKEY=KEY;
+   CALL GOTO_PROC_SUB(STMT,IND);
+   CALL STMT_PROC(0);
+   CALL GOTO_NUM_PROC(SAVEKEY,IND);
+   UNGET_STACK=SAVE;
+   END CALL_PROC;
+
+ CMD_PROC: PROC RECURSIVE;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PROCESS A CMD STATEMENT.                                  *
+ *                                                                     *
+ **********************************************************************/
+   DCL HELPSTR CHAR(4) VAR INIT('');
+
+   IF STMT=''
+     THEN RETURN;
+   CALL DOCMD(STMT,HELPSTR);
+   END CMD_PROC;
+
+ CONTROL_PROC: PROC RECURSIVE;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PROCESS A CONTROL STATEMENT.                              *
+ *                                                                     *
+ **********************************************************************/
+
+   CALL SETCAPS(STMT);
+   SELECT(STMT);
+     WHEN('COMMAND','CMD') CTLSW=0;
+     WHEN('WRITE')         CTLSW=1;
+     WHEN('NL')            CTLSW=2;
+     WHEN('GDDM')          CTLSW=3;
+     WHEN('LIST')          LISTSW=1;
+     WHEN('ASIS')          ASISSW=1;
+     OTHERWISE CALL BADSTMT('$CONTROL STATEMENT, BAD OPERAND='××STMT);
+     END; /* SELECT */
+   END CONTROL_PROC;
+
+ DATA_PROC: PROC RECURSIVE;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PROCESS A DATA STATEMENT.                                 *
+ *                                                                     *
+ **********************************************************************/
+   DCL IND FIXED BIN;
+   DCL STMTNO FIXED BIN;
+   DCL RHP(16) PTR;
+   DCL ORG(16) PTR;
+   DCL PARY(16) CHAR(256) VAR;
+   DCL PARQCK(16) BIT(1);
+   DCL NUMCK BIT(16) STATIC INIT('0'B);
+   DCL (I,J,K,NAMECNT) FIXED BIN;
+
+   IF STMT=''
+     THEN DO;
+       PARY(1)=RHNAME;
+       PARY(2)='';
+       RHP(1)=RHPTR;
+       NAMECNT=1;
+       END;
+     ELSE DO;
+       CALL SETCAPS(STMT);
+       I=#ABEPRS(STMT,PARY,PARQCK,NUMCK);
+       DO NAMECNT=1 TO HBOUND(PARY,1) WHILE(PARY(NAMECNT)^='');
+         RHP(NAMECNT)=#RHPLOC(PARY(NAMECNT),RHHDRPT);
+         IF RHP(NAMECNT)=NULL
+           THEN CALL BADSTMT('$DATA STMT, NAME='××PARY(NAMECNT)××
+             ' NOT FOUND');
+         END;
+       NAMECNT=NAMECNT-1;
+       END;
+   DO I=1 TO NAMECNT;
+     ORG(I)=RHP(I)->RECPTR;
+     J=#CMD('TOP',RHP(I),RHHDRPT);
+     END;
+   IND=CURIND+1;
+   STMTNO=KEY;
+   DO UNTIL(K=0);
+     K=0;
+     DO I=1 TO NAMECNT;
+       IF RHP(I)->RECPTR^=RHP(I)
+         THEN DO;
+           K=K+1;
+           J=#CMD('USE SET',RHP(I),RHHDRPT);
+           CALL #SETC(RHHDRPT,RH_SYMTREE,RHP(I)->RHNAME,
+             SUBSTR(RHP(I)->RECPTR->RECSTR,1,
+               SUFFIX(RHP(I)->RECPTR->RECSTR,' '))
+             );
+           END;
+       END;
+     IF K=0
+       THEN LEAVE;
+     CALL #SETA(RHHDRPT,RH_SYMTREE,'SEQ',RHP(1)->RECPTR->RECSEQ);
+     CALL GOTO_NUM_PROC(STMTNO,IND);
+     CALL STMT_PROC(IND);
+     K=0;
+     DO I=1 TO NAMECNT;
+       IF RHP(I)->RECPTR^=RHP(I)->LSTHDR
+         THEN DO;
+           J=#CMD('DOWN 1',RHP(I),RHHDRPT);
+           K=K+1;
+           END;
+       END;
+     END;
+   CALL GOTO_NUM_PROC(STMTNO,IND);
+   CALL SKIP_PROC(IND);
+   DO I=1 TO NAMECNT;
+     CALL #NC(RHP(I),ORG(I));
+     END;
+   END DATA_PROC;
+
+ EXP_PROC: PROC(EXP) RECURSIVE RETURNS(FIXED BIN(15,0));
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO EVALUATE A STRING CONTAINING AN EXPRESSION.               *
+ *                                                                     *
+ **********************************************************************/
+   DCL EXP CHAR(*) VAR;
+   DCL I FIXED BIN;
+   DCL MSG CHAR(100) VAR;
+
+   MSGDATA='';
+   I=#CMD('CALC ('××EXP××')',RHPTR,RHHDRPT);
+   MSG=MSGDATA;
+   MSGDATA='';
+   IF I^=0
+     THEN IF MSG=''
+       THEN CALL BADSTMT('RC='××I××' FROM CALC EVALUATING EXPRESSION');
+       ELSE CALL BADSTMT(MSG);
+   IF MSG^='0'
+     THEN RETURN(TRUE);
+     ELSE RETURN(FALSE);
+   END EXP_PROC;
+
+ GOTO_NUM_PROC:  PROC(STMTNUM,IND);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO GOTO A STATEMENT WITH SPECIFIED STATEMENT NUMBER.         *
+ *                                                                     *
+ **********************************************************************/
+   DCL IND FIXED BIN;
+   DCL STMTNUM FIXED BIN;
+
+   CALL UNGET_STACK_PURGE;
+   KEY=STMTNUM-1;
+   CALL READ(IND); /* BRANCH TO STATEMENT */
+   END GOTO_NUM_PROC;
+
+ GOTO_PROC:  PROC(PRM,IND);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PROCESS A GOTO STATEMENT.                                 *
+ *                                                                     *
+ **********************************************************************/
+   DCL PRM CHAR(256) VAR;
+   DCL IND FIXED BIN;
+
+   CALL UNGET_STACK_PURGE;
+   CALL GOTO_PROC_SUB(PRM,IND);
+   GOTO OUT_OF_BLOCK;
+   END GOTO_PROC;
+
+ GOTO_PROC_SUB:  PROC(PRM,IND);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PROCESS A GOTO STATEMENT.                                 *
+ *                                                                     *
+ **********************************************************************/
+   DCL PRM CHAR(256) VAR;
+   DCL IND FIXED BIN;
+
+   DO I=1 REPEAT I+1 WHILE(I<=LABI)
+     UNTIL($LAB(I)=PRM);
+     END;
+   IF I <= LABI
+     THEN KEY = $KEY(I);
+     ELSE DO;
+       DO FOREVER=1 REPEAT FOREVER;
+         CALL READ(IND); /* GET NEXT STATEMENT */
+         IF LENGTH(STMT)=0
+           THEN GO TO EOJ; /* ALL DONE */
+         IF CMD='$'
+           THEN CALL LABEL_PROC;
+         IF LABI>0
+           THEN IF $LAB(LABI)=PRM
+             THEN LEAVE;
+         END;
+       KEY=$KEY(LABI);
+       END;
+   END GOTO_PROC_SUB;
+
+ IF_PROC: PROC RECURSIVE;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN THE CURRENT STATEMENT IS AN IF STATEMENT.               *
+ *                                                                     *
+ **********************************************************************/
+   DCL IND FIXED BIN;
+
+   IND=CURIND;
+   IF STMT=''
+     THEN CALL BADSTMT('IF M/B FOLLOWED BY AN EXPRESSION');
+   IF EXP_PROC(STMT)=TRUE
+     THEN DO;
+       CALL STMT_PROC(IND+1);
+       CALL READ(IND);
+       IF CURIND<IND
+         THEN DO;
+           CALL UNGET;
+           RETURN; /* DONE AT THIS INDENTATION LEVEL */
+           END;
+       IF CMD='$ELSE'
+         THEN CALL SKIP_PROC(IND); /* SKIP ELSE CLAUSE */
+         ELSE CALL UNGET;
+       END;
+     ELSE DO;
+       CALL SKIP_PROC(IND); /* SKIP THEN CLAUSE */
+       CALL READ(IND);
+       IF CURIND<IND
+         THEN DO;
+           CALL UNGET;
+           RETURN; /* DONE AT THIS LEVEL */
+           END;
+       IF CMD='$ELSE'
+         THEN DO;
+           IF LISTSW^=0
+             THEN CALL PUT(CMD××' '××STMT);
+           CALL STMT_PROC(IND);
+           END;
+         ELSE CALL UNGET;
+       END;
+   END IF_PROC;
+
+ INPUT_PROC: PROC RECURSIVE;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN THE CURRENT STATEMENT IS AN INPUT STATEMENT.            *
+ *                                                                     *
+ **********************************************************************/
+   DCL 1 REPBUF,
+     2 BUFLEN FIXED BIN(15,0),
+     2 OFFSET FIXED BIN(15,0),
+     2 BF CHAR(300);
+   DCL VALUE CHAR(256) VAR;
+
+   BUFLEN = 260;
+   OFFSET = 0;
+   BF='&INPUT';
+   CALL REP(RHHDRPT,RH_SYMTREE,REPBUF);
+   VALUE=SUBSTR(BF,1,SUFFIX(BF,' '));
+   CALL SETL(RHHDRPT,RH_SYMTREE,'ANSWER ',VALUE);
+   END INPUT_PROC;
+
+ LABEL_PROC: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PROCESS A LABEL STATEMENT.                                *
+ *                                                                     *
+ **********************************************************************/
+   DCL I FIXED BIN;
+
+   IF LABI=0
+     THEN I=1;
+     ELSE DO I=1 TO LABI;
+       IF $LAB(I)=STMT
+         THEN LEAVE;
+       END;
+   IF I>LABI
+     THEN DO; /* LABEL M/B ADDED TO TABLE */
+       LABI=LABI+1;
+       IF LABI>256
+         THEN SIGNAL ERROR;
+       $KEY(LABI)=KEY;
+       $LAB(LABI)=STMT;
+       END;
+   END LABEL_PROC;
+
+ LI_PROC: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PROCESS AN LI STATEMENT.                                  *
+ *                                                                     *
+ **********************************************************************/
+
+   $CNT=STMT;
+   END LI_PROC;
+
+ MYGET: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * MYGET IS CALLED TO OBTAIN THE NEXT STMT.  IT WILL PERFORM SYMBOLIC  *
+ * SUBSTITUTION, AND WILL HANDLE CONTINUATION.  WHEN MYGET IS DONE,    *
+ * VARIABLE STMT WILL CONTAIN THE NEXT INPUT STATEMENT IN ITS         .*
+ * ENTIRETY.                                                           *
+ *                                                                     *
+ **********************************************************************/
+   DCL T PTR;
+   DCL I FIXED BIN;
+   DCL TXT CHAR(1024) VAR;
+   DCL 1 REPBUF,
+     2 BUFLEN FIXED BIN(15,0),
+     2 OFFSET FIXED BIN(15,0),
+     2 BF CHAR(1024);
+
+   IF STMTPTR^=NULL
+     THEN DO;
+       FREE STMTSTR;
+       STMTPTR=NULL;
+       END;
+   IF UNGET_STACK^=NULL
+     THEN DO;
+       USEPTR=UNGET_STACK;
+       UNGET_STACK=UNGET_STACK_NEXT;
+       STMTPTR=UNGET_STACK_STMTPTR;
+       KEY=UNGET_STACK_STMTNO;
+       CURIND=UNGET_STACK_IND;
+       CMD=UNGET_STACK_CMD;
+       FREE UNGET_STACK_ELEMENT;
+       USEPTR=NULL;
+       END;
+     ELSE DO;
+       L=1024;
+       ALLOCATE STMTSTR;
+       STMT='';
+       DO UNTIL(I^=0); /* DO UNTIL END OF STATEMENT */
+         I=1; /* DEFAULT TO END OF STATEMENT */
+         KEY = KEY + 1;
+         CALL GET(KEY,TXT);
+         IF LENGTH(TXT)=0
+           THEN LEAVE;
+         IF INDEX(TXT,'&')^=0
+           THEN DO;
+             BUFLEN = LENGTH(TXT)+4;
+             OFFSET = 0;
+             BF=TXT;
+             CALL REP(RHHDRPT,RH_SYMTREE,REPBUF);
+             TXT = SUBSTR(BF,1,BUFLEN-4);
+             END;
+         IF LENGTH(TXT)>0
+           THEN TXT=SUBSTR(TXT,1,SUFFIX(TXT,' '));
+         IF LENGTH(TXT)>0
+           THEN IF SUBSTR(TXT,LENGTH(TXT),1)='+'
+             THEN DO;
+               I=0; /* INDICATE IT IS NOT END OF STATEMENT */
+               TXT=SUBSTR(TXT,1,LENGTH(TXT)-1);
+               END;
+         IF LENGTH(TXT)+LENGTH(STMT)>STMTLEN
+           THEN DO;
+             T=STMTPTR;
+             L=STMTLEN+1024;
+             ALLOCATE STMTSTR;
+             STMT=T->STMT;
+             FREE T->STMTSTR;
+             END;
+         IF LENGTH(TXT)=0
+           THEN STMT=STMT××' ';
+           ELSE STMT=STMT××TXT;
+         END;
+       END;
+   END MYGET;
+
+ READ: PROC(IND);
+ /**********************************************************************
+ *                                                                     *
+ * READ IS CALLED TO OBTAIN THE NEXT STMT.                             *
+ *                                                                     *
+ **********************************************************************/
+   DCL IND FIXED BIN;
+   DCL (I,M,N,OL) FIXED BIN(15,0);
+
+   IF UNGET_STACK^=NULL
+     THEN DO;
+       CALL MYGET;
+       RETURN;
+       END;
+   CALL MYGET; /* GET NEXT INPUT STATEMENT */
+   IF LENGTH(STMT)=0
+     THEN DO; /* END OF FILE */
+       CMD='';
+       CURIND=-1;
+       IF LISTSW^=0
+         THEN
+           CALL PUT('END-OF-FILE');
+       RETURN;
+       END;
+   CURIND=PREFIX(STMT,' '); /* FIND FIRST NONBLANK */
+   IF CURIND^=0
+     THEN IF ASISSW=1
+       THEN IF SUBSTR(STMT,CURIND,1)='$'
+         THEN STMT=SUBSTR(STMT,CURIND); /* STRIP LEADING BLANKS */
+         ELSE IF ^(CTLSW=1 × CTLSW=2)
+           THEN STMT=SUBSTR(STMT,CURIND); /* STRIP LEADING BLANKS */
+           ELSE;
+       ELSE IF SUBSTR(STMT,1,1)='_'
+         THEN SUBSTR(STMT,1,1)=' ';
+         ELSE STMT=SUBSTR(STMT,CURIND); /* STRIP LEADING BLANKS */
+   IF $CNT>0
+     THEN $CNT=$CNT-1; /* $LI IS IN EFFECT */
+     ELSE IF LENGTH(STMT)^=0
+       THEN IF SUBSTR(STMT,1,1)^='$'
+         THEN SELECT(CTLSW);
+           WHEN(0) CMD='$CMD';
+           WHEN(1) DO;
+             CMD='$WRITE';
+             IF STMT=''
+               THEN CURIND=IND+1;
+             END;
+           WHEN(2) DO;
+             CMD='$CMD';
+             STMT='NL '××STMT;
+             CURIND=IND+1;
+             END;
+           WHEN(3) DO;
+             CMD='$CMD';
+             STMT='GDDM '××STMT;
+             CURIND=IND+1;
+             END;
+           END; /* SELECT */
+         ELSE DO; /* IT IS SOME SORT OF $ COMMAND */
+           M,N,OL=0;
+           CALL #ABEGOP(STMT,M,N,OL,CMD);
+           IF N>=LENGTH(STMT)
+             THEN STMT=' ';
+             ELSE DO;
+               STMT=SUBSTR(STMT,N+1);
+               IF STMT^='' & CMD^='$WRITE'
+                 THEN STMT=SUBSTR(STMT,PREFIX(STMT,' '));
+               END;
+           END;
+   END READ;
+
+ SELECT_PROC: PROC RECURSIVE;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PROCESS A SELECT STATEMENT.                               *
+ *                                                                     *
+ **********************************************************************/
+   DCL IND FIXED BIN;
+
+   IND=CURIND+1;
+   DO FOREVER=1 REPEAT FOREVER;
+     CALL READ(IND); /* GET NEXT STMT */
+     IF CURIND<IND
+       THEN DO;
+         CALL UNGET;
+         RETURN; /* DONE AT THIS INDENTATION LEVEL */
+         END;
+     IF LISTSW^=0
+       THEN CALL PUT(CMD××' '××STMT);
+     SELECT(CMD);
+       WHEN('$WHEN') DO;
+         IF EXP_PROC(STMT)=TRUE
+           THEN DO;
+             CALL STMT_PROC(CURIND+1); /* DO WHEN-CLAUSE */
+             CALL READ(IND);
+             IF CURIND>=IND
+               THEN CALL SKIP_PROC(IND); /* SKIP REST OF THIS SELECT */
+               ELSE CALL UNGET;
+             RETURN;
+             END;
+           ELSE CALL SKIP_PROC(CURIND+1);
+         END;
+       WHEN('$OTHERWISE') DO;
+         CALL STMT_PROC(CURIND+1); /* DO OTHERWISE CLAUSE */
+         RETURN; /* THIS SHOULD BE THE END OF SELECT */
+         END;
+       OTHERWISE CALL BADSTMT('INVALID COMMAND IN $SELECT='××CMD);
+       END; /* SELECT */
+     END;
+
+   END SELECT_PROC;
+
+ SKIP_PROC: PROC(IND);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO SKIP ALL STATEMENTS BELOW A CERTAIN INDENTATION.  NOTE    *
+ * THAT A CALL TO SKIP_PROC WILL ALWAYS RESULT IN SKIPPING AT LEAST    *
+ * ONE STATEMENT.                                                      *
+ *                                                                     *
+ **********************************************************************/
+   DCL IND FIXED BIN;
+
+   DO UNTIL(CURIND<=IND);
+     CALL READ(IND);
+     END;
+   CALL UNGET;
+   END SKIP_PROC;
+
+ STACK_PROC: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PROCESS A STACK STATEMENT.                                *
+ *                                                                     *
+ **********************************************************************/
+
+   CALL STAK(STMT);
+   END STACK_PROC;
+
+ STMT_PROC: PROC(PIND) RECURSIVE;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PROCESS THE CURRENT STMT.                                 *
+ *                                                                     *
+ **********************************************************************/
+   DCL (IND,PIND) FIXED BIN;
+
+   IND=PIND;
+   DO FOREVER=1 REPEAT FOREVER;
+     CALL READ(IND);
+     IF CURIND<IND
+       THEN LEAVE;
+     IF LISTSW^=0
+       THEN CALL PUT(CMD××' '××STMT);
+     SELECT(CMD);
+       WHEN('$')        CALL LABEL_PROC;
+       WHEN('$*')       ;
+       WHEN('$CALL')    CALL CALL_PROC;
+       WHEN('$CMD')     CALL CMD_PROC;
+       WHEN('$CONTROL') CALL CONTROL_PROC;
+       WHEN('$DATA')    CALL DATA_PROC;
+       WHEN('$ELSE')    CALL BADSTMT('$ELSE W/O MATCHING $IF');
+       WHEN('$GOTO')    CALL GOTO_PROC(STMT,IND);
+       WHEN('$IF')      CALL IF_PROC;
+       WHEN('$INPUT')   CALL INPUT_PROC;
+       WHEN('$LI')      CALL LI_PROC;
+       WHEN('$RETURN')  RETURN;
+       WHEN('$SELECT')  CALL SELECT_PROC;
+       WHEN('$STACK')   CALL STACK_PROC;
+       WHEN('$TSO')     CALL TSO_PROC;
+       WHEN('$UNTIL')   CALL UNTIL_PROC;
+       WHEN('$WHILE')   CALL WHILE_PROC;
+       WHEN('$WRITE')   CALL WRITE_PROC;
+       OTHERWISE        CALL BADSTMT('INVALID COMMAND='××CMD);
+       END; /* SELECT */
+     END;
+   CALL UNGET; /* UNGET CURRENT STATEMENT */
+   END STMT_PROC;
+
+ TSO_PROC: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PROCESS A TSO STATEMENT.                                  *
+ *                                                                     *
+ **********************************************************************/
+
+   CALL TSOCMD(STMT,'RUN');
+   END TSO_PROC;
+
+ UNGET: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * UNGET IS CALLED TO UNGET THE CURRENT STATEMENT.  THAT IS, MAKE IT   *
+ * SO THAT THE CURRENT STATEMENT WILL BE RETRIEVED AT THE NEXT         *
+ * INVOCATION OF MYGET.                                                *
+ *                                                                     *
+ **********************************************************************/
+
+   ALLOCATE UNGET_STACK_ELEMENT SET(USEPTR);
+   UNGET_STACK_NEXT=UNGET_STACK;
+   UNGET_STACK=USEPTR;
+   UNGET_STACK_STMTPTR=STMTPTR;
+   STMTPTR=NULL;
+   UNGET_STACK_STMTNO=KEY;
+   UNGET_STACK_IND=CURIND;
+   UNGET_STACK_CMD=CMD;
+   END UNGET;
+
+ UNGET_STACK_PURGE: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PURGE THE UNGET_STACK, EITHER WHEN GOTO PROCESSING IS     *
+ * BEING DONE, OR AND END-OF-JOB.                                      *
+ *                                                                     *
+ **********************************************************************/
+
+   DO WHILE(UNGET_STACK^=NULL);
+     USEPTR=UNGET_STACK;
+     UNGET_STACK=UNGET_STACK_NEXT;
+     FREE UNGET_STACK_ELEMENT;
+     END;
+   END UNGET_STACK_PURGE;
+
+ UNTIL_PROC: PROC RECURSIVE;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PROCESS AN UNTIL STATEMENT.                               *
+ *                                                                     *
+ **********************************************************************/
+   DCL IND FIXED BIN;
+   DCL STMTNO FIXED BIN;
+   DCL EXP CHAR(1024) VAR;
+
+   IND=CURIND+1;
+   IF STMT=''
+     THEN CALL BADSTMT('$UNTIL M/B FOLLOWED BY AN EXPRESSION');
+   EXP=STMT;
+   STMTNO=KEY;
+   DO UNTIL(EXP_PROC(EXP)=TRUE);
+     CALL GOTO_NUM_PROC(STMTNO,IND);
+     CALL STMT_PROC(IND);
+     END;
+   CALL GOTO_NUM_PROC(STMTNO,IND);
+   CALL SKIP_PROC(IND);
+   END UNTIL_PROC;
+
+ WHILE_PROC: PROC RECURSIVE;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PROCESS A WHILE STATEMENT.                                *
+ *                                                                     *
+ **********************************************************************/
+   DCL IND FIXED BIN;
+   DCL STMTNO FIXED BIN;
+   DCL EXP CHAR(1024) VAR;
+
+   IND=CURIND+1;
+   IF STMT=''
+     THEN CALL BADSTMT('$WHILE M/B FOLLOWED BY AN EXPRESSION');
+   EXP=STMT;
+   STMTNO=KEY;
+   DO WHILE(EXP_PROC(EXP)=TRUE);
+     CALL GOTO_NUM_PROC(STMTNO,IND);
+     CALL STMT_PROC(IND);
+     END;
+   CALL GOTO_NUM_PROC(STMTNO,IND);
+   CALL SKIP_PROC(IND);
+   END WHILE_PROC;
+
+ WRITE_PROC: PROC RECURSIVE;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PROCESS A WRITE STATEMENT.                                *
+ *                                                                     *
+ **********************************************************************/
+   DCL IND FIXED BIN;
+
+   CALL PUT(STMT);
+   END WRITE_PROC;
+
+   END ABEPI;

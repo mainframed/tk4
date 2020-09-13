@@ -1,0 +1,940 @@
+RPFHCPY  TITLE 'RPF VTAM HARDCOPY MONITOR'
+***********************************************************************
+*                                                                     *
+*        MODULE:        RPFHCPY.                                      *
+*                                                                     *
+*        FUNCTION:      PROCESS THE 'HAR' COMMAND ISSUED BY RPFEDIT.  *
+*                       THE SYNTAX OF THE 'HAR' COMMAND IS            *
+*                       1. HAR PRINTERNAME,N,M. PRINT LINES N-M.      *
+*                       2. HAR PRINTERNAME,*,N. PRINT N LINES STARTING*
+*                          WITH THE CURRENT LINE                      *
+*                       3. HAR PRINTERNAME.     PRINT THE LINES ON    *
+*                          THE SCREEN                                 *
+*                       4. HAR PRINTERNAME,N,M,<TITLE×NOTITLE>,       *
+*                          <EJECT×NOEJECT>,<INDENT×NOINDENT>,         *
+*                          <C=CC>,<F='TEXT'>,                         *
+*                          <P=NN>,SCS×DSC (CROSS DOMAIN)              *
+*                          WITH 'NOTITLE' YOU DO NOT GE HEADER LINES  *
+*                          ON THE PRINTED PAGES.                      *
+*                          WITH 'NOEJECT' NO SKIP WILL BE MADE.       *
+*                          WITH 'C=CC' YOU CAN PRINT MORE COPIES.     *
+*                          WITH 'INDENT' THE HARDCOPY PRINT WILL BE   *
+*                          SHIFTED 8 POSITIONS TO THE RIGHT, SO YOU   *
+*                          CAN EASY DRILL HOLES IN THE LEFT SIDE      *
+*                          OF THE PAPER.                              *
+*                       SCS/DSC SHOULD BE SPECIFIED IF THE PRINTER    *
+*                       DOES NOET BELONG TO ANOTHER DOMAIN (MSNF)     *
+*                       P=NN SPECIFIES THE NUMBER OF LINES ON A       *
+*                       PAGE (DEFAULT P=72)                           *
+*                       'TITLE' FORCE HEADER LINES ON THE PRINTED     *
+*                       WITH 'NOTITLE' THE HEADERS ARE OMITTED (DEF.) *
+*                       WITH F='TEXT', ON EACH PAGE A FOOTNOTE WILL   *
+*                       BE PRINTED.                                   *
+*                                                                     *
+*                       A POINTER TO THE 'HAR' COMMAND IS IN BYTES    *
+*                       0-3 IN 'CMDAREA' IN THE RPFCOMM DSECT         *
+*                       AFTER COMPLETION A MESSAGE OR SUITABLE ERROR  *
+*                       MESSAGE WILL BE SET IN 'CMDAREA'.             *
+*                                                                     *
+*        REGISTER USAGE: R13,R12: BASE REGISTERS.                     *
+*                        R11, ADDRESS OF RPFCOMM AREA.                *
+*                        R10, ADDRESS OF THE OPERANDS OF THE 'HAR'    *
+*                             COMMAND GIVEN IN THE RPF EDITOR.        *
+*                        R2-R9 ARE WORK REGISTERS                     *
+*                                                                     *
+*        RETURNCODES IN R15:                                          *
+*                       00 HARCOPY MADE (MSG IN CMDAREA)              *
+*                       08 ERROR DETECTED (ERRMSG IN CMDAREA)         *
+*                                                                     *
+********************************************(C)-1982 SKYBIRD SYSTEMS***
+         SPACE 2
+RPFHCPY  CSECT
+         SAVE  (14,12),,*          \
+         USING RPFHCPY,15           ×
+         LA    11,SAVE              ×
+         ST    13,SAVE+4            ×
+         ST    11,8(0,13)           ×
+         LR    13,11                > LINKAGE CONVENTIONS
+         B     START                ×
+         DS    0F                   ×
+SAVE     DC    18F'0'               ×
+START    DS    0H                   ×
+         DROP  15                  /
+         LA    12,2048(13)
+         LA    12,2048(12)         SECOND BASE REGISTER
+         USING SAVE,13,12          ESTABLISH ADDRESSEBILITY
+         L     11,0(1)
+         USING COMMAREA,11
+         ICM   10,15,CMDAREA       PICKUP POINTER TO 'HAR' CMD
+         LA    10,4(10)            POINT TO OPERANDS
+         LA    1,1
+         ST    1,COPIES            DEFAULT: COPIES= 1
+         MVI   SWMODE,X'40'        DEFAULT: NOTITLE,EJECT,NOINDENT
+         CLC   NUMBERED(3),=C'YES' NUMBERED?
+         BE    INIT03              YES: SKIP BLANK TEST
+*------- ----- ------------------- CHECK IF COL.72-80 BLANK
+         L     3,FIRSTREC          START WS
+         LA    3,NEXTENT(3)        POINT AFTER TOP LINE
+         LA    4,NEXTENT           LENGTH ONE LINE
+         L     5,LASTREC           END WS
+         S     5,=A(NEXTENT)       POINT BEFORE BOTTOM LINE
+INIT01   DS    0H
+         CLC   72(8,3),BLANKS      CLO.72-80 BLANK?
+         BNE   INIT03              NO: EXIT
+         BXLE  3,4,INIT01          YES: NEXT
+         OI    SWMODE,X'20'        DEFAULT: INDENT
+*------- ----- ------------------- GENERATE CONTROL BLOCKS
+INIT03   DS    0H
+         GENCB BLK=ACB,AM=VTAM,APPLID=APPLID1,MACRF=NLOGON
+         LTR   15,15
+         BNZ   ERROR3              ACB NOT CREATED
+         ST    1,ACB1ADDR          SAVE ACB ADDRESS
+         ST    0,ACB1LEN           SAVE ACB LENGTH
+         LR    2,1                 ACB ADDRESS INTO REG.2
+         OPEN  ((2))               OPEN ACB
+         LTR   15,15
+         BNZ   ERROR5              ACB NOT OPENED
+         GENCB BLK=NIB,AM=VTAM,MODE=RECORD,LISTEND=YES
+         LTR   15,15
+         BNZ   ERROR3              NIB NOT CREATED
+         ST    1,NIBWADDR          WORK NIB ADDRESS
+         ST    0,NIBWLEN           WORK NIB LENGTH
+         L     2,NIBWADDR          POINT TO WORK NIB
+         L     3,ACB1ADDR          POINT TO VTAM ACB
+         GENCB BLK=RPL,AM=VTAM,ACB=(3),NIB=(2),                        C
+               OPTCD=(ACQUIRE,SPEC,SYN)
+         LTR   15,15
+         BNZ   ERROR3              RPL NOT CREATED
+         ST    1,RPLWADDR          WORK RPL ADDRESS
+         ST    0,RPLWLEN           WORK RPL LENGTH
+TEST     DS    0H
+         OC    0(116,10),BLANKS    XLATE TO UPPER CASE
+         LR    4,10                POINT TO LU-NAME IN COMMAND
+         MVC   LUNAME,BLANKS       BLANK LUNAME
+         LA    5,LUNAME            ADDRESS LUNAME
+         LA    6,9                 MAX 8 CHARS
+TEST03   CLI   0(4),C' '           BLANK ?
+         BE    HAR                 YES: EXIT
+         CLI   0(4),C','           COMMA ?
+         BE    HAR                 YES: EXIT
+         CLI   0(4),X'00'          NULL ?
+         BE    HAR                 YES: EXIT
+TEST05   MVC   0(1,5),0(4)         1 CHAR
+         LA    4,1(4)              NEXT CHAR
+         LA    5,1(5)              NEXT CHAR
+         BCT   6,TEST03            MOVE NEXT CHAR
+*------- ----- ------------------- SCAN FOR KEY-WORDS
+HAR      LR    3,10                START OPERANDS
+         LA    4,1                 INCREMENT
+         LA    5,115(10)           END COMMAND
+HAR01A   CLC   0(6,3),=C',TITLE'   TITLES ?
+         BNE   HAR01B              NO: TRY OTHER
+         OI    SWMODE,X'80'        INDICATE TITLE
+HAR01B   CLC   0(7,3),=C'NOTITLE'  NO TITLES ?
+         BNE   HAR01C              NO: TRY OTHER
+         NI    SWMODE,X'FF'-X'80'  INDICATE NO TITLES
+HAR01C   CLC   0(6,3),=C',EJECT'   EJECT ?
+         BNE   HAR01D              NO: TRY TRY OTHER
+         OI    SWMODE,X'40'        INDICATE EJECT
+HAR01D   CLC   0(7,3),=C'NOEJECT'  NO EJECT ?
+         BNE   HAR01E              NO: TRY TRY OTHER
+         NI    SWMODE,X'FF'-X'40'  INDICATE NO EJECT
+HAR01E   CLC   0(7,3),=C',INDENT'  INDENT ?
+         BNE   HAR01F              NO: TRY OTHER
+         OI    SWMODE,X'20'        INDICATE INDENT
+HAR01F   CLC   0(8,3),=C'NOINDENT' NO INDENT ?
+         BNE   HAR01G              NO: TRY OTHER
+         NI    SWMODE,X'FF'-X'20'  INDICATE NO INDENT
+HAR01G   CLC   0(3,3),=C'SCS'      SCS PRINTER?
+         BNE   HAR01H              NO: TRY OTHER
+         OI    SWMODE,X'02'        INDICATE SCS
+HAR01H   CLC   0(3,3),=C'DSC'      DSC PRINTER?
+         BNE   HAR01Z              NO: TRY OTHER
+         OI    SWMODE,X'01'        INDICATE DSC
+HAR01Z   DS    0H
+         BXLE  3,4,HAR01A          NEXT CHARS
+*------- ----- ------------------- FIND OPERAND(S)
+         LR    3,10                START OPERANDS
+         LA    4,1                 INCREMENT
+         LA    5,115(10)           END COMMAND
+*------- ----- ------------------- SKIP 1ST OPERAND (LUNAME)
+HAR03    CLI   0(3),C' '           BLANK ?
+         BE    HAR05               YES: EXIT
+         CLI   0(3),C','           COMMA ?
+         BE    HAR05               YES: EXIT
+         CLI   0(3),X'00'          NULL ?
+         BE    HAR05               YES: EXIT
+         BXLE  3,4,HAR03           NEXT CHAR
+*------- ----- ------------------- FIND LINE NUMBER(S)
+HAR05    DS    0H
+         L     4,FIRSTSCR          DEFAULT: FIRST ON SCREEN
+         L     5,LASTSCR           DEFAULT: LAST ON SCREEN
+         LA    3,1(3)              POINT AFTER LU-NAME
+         CLI   0(3),X'F0'          .LT. 0?
+         BL    HAR22               YES: LINE NUMBER(S) NOT SPECIFIED
+         CLI   0(3),X'F9'          .GT. 9?
+         BH    HAR22               YES: LINE NUMBER(S) NOT SPECIFIED
+         ST    3,SAVE3             SAVE REG.3 FOR COPIE ROUTINE
+         BAL   14,LINE             GET LINE NUMBERS
+         LTR   15,15
+         BE    HAR07               FIND LINES
+         C     15,F0004            RC= 0004 - INVALID LINE(S) ?
+         BE    ERROR6
+         C     15,F0008            RC= 0008 - LINE(S) NOT NUMERIC ?
+         BE    ERROR7
+         B     ERROR8              UNEXPECTED RETURNCODE
+*------- ----- ------------------- PROCESS # OF LINES FROM *
+HAR07    CLI   LN1FLD,C'*'         CURRENT LINE ?
+         BNE   HAR09
+         CLC   LN2FLD,C9999        LAST LINE ?
+         BNE   HAR08
+         L     4,FIRSTSCR          ADDRESS CURRENT LINE
+         L     5,LASTREC           ADDRESS LAST LINE
+         LA    1,NEXTENT           LENGTH 1 ENTRY
+         SR    5,1                 SKIP LAST BOTTOM LINE
+         B     HAR22               START PRINT
+HAR08    PACK  WORKFLD,LN2FLD      PACK # OF LINES
+         CVB   4,WORKFLD           BINARY # OF LINES
+         LTR   4,4                 LINE-2 ZERO ?
+         BNZ   HAR08B
+         LA    4,1                 DEFAULT 1 LINE
+HAR08B   BCTR  4,0                 DECREMENT 1
+         LA    5,NEXTENT           100 CHARS/LINE
+         MR    4,4                 OFFSET INTO REG.5
+         L     4,FIRSTSCR          ADDRESS FIRST LINE TO PRINT
+         AR    5,4                 ADDRESS LAST LINE TO PRINT
+         C     5,LASTREC           BOTTOM LINE ?
+         BL    HAR22               PRINT LINES
+         MVI   ERR9+12,C'2'        LINE-2 NOT FOUND
+         B     ERROR9
+*------- ----- ------------------- PROCESS FROM NNNN TO NNNN
+HAR09    CLC   LN2FLD,C9999        LAST LINE ?
+         BNE   HAR10
+         L     4,LASTREC           ADDRESS LAST LINE
+         LA    1,NEXTENT
+         SR    4,1                 SKIP BOTTOM LINE
+         MVC   LN2FLD+2(6),80(4)   NUMBER LAST LINE
+         MVC   LN2FLD(2),=C'00'    LEADING ZERO
+HAR10    L     3,FIRSTREC
+         XR    4,4
+         XR    5,5
+HAR11    CLC   80(6,3),LN1FLD+2
+         BNE   HAR13
+         LR    4,3
+         XR    5,5
+HAR13    CLC   80(6,3),LN2FLD+2
+         BNE   HAR15
+         LR    5,3
+         B     HAR17
+HAR15    LA    3,NEXTENT(3)
+         C     3,LASTREC
+         BNH   HAR11
+HAR17    MVI   ERR9+11,C'1'
+         LTR   4,4
+         BZ    ERROR9
+         MVI   ERR9+11,C'2'
+         LTR   5,5
+         BZ    ERROR9
+*------- ----- ------------------- SAVE LINE ADDRESSES
+HAR22    DS    0H
+         ST    4,NEXTLINE          SAVE ADDRESS FIRST RECORD
+         ST    5,LASTLINE          SAVE ADDRESS LAST RECORD
+         ST    4,COPYNEXT          SAVE REG.4 FOR COPIE
+         ST    5,COPYLAST          SAVE REG.5 FOR COPIE
+*------- ----- ------------------- SCAN FOR COPIES (C=NN) COMMAND
+HAR25    LR    3,10                START OPERANDS
+         LA    4,1                 INCREMENT
+         LA    5,115(10)           END COMMAND
+HAR25A   CLC   0(2,3),=C'C='       COPIES ?
+         BE    HAR25C              YES: FIND COPIES
+         BXLE  3,4,HAR25A          NEXT CHARS
+         B     HAR26               NO: SKIP COPIES
+*------- ----- ------------------- PROCESS COPIES COMMAND
+HAR25C   LA    3,2(3)              POINT # OF COPIES
+         BAL   14,SCAN             FIND # OF COPIES
+         LTR   15,15               RC= 0000 ?
+         BNZ   ERROR10             NO: ERROR
+         MVI   FILLCHAR,X'F0'      LEADING ZERO
+         BAL   14,SHIFT            INSERT LEADING ZEROES
+         BAL   14,NUMTST           NUMERIC TEST
+         LTR   15,15               RC= ZERO ?
+         BNZ   ERROR11             NO: ERROR
+         PACK  DOUBLE,NUMFLD       PACK FOR BCT
+         CVB   1,DOUBLE            BINARY FOR BCT
+         ST    1,COPIES            SAVE
+HAR26    LR    3,10                START OPERANDS
+         LA    4,1                 INCREMENT
+         LA    5,115(10)           END COMMAND
+HAR26A   CLC   0(2,3),=C'P='       PAGESIZE?
+         BE    HAR26C              YES: FIND PAGESIZE
+         BXLE  3,4,HAR26A          NEXT CHARS
+         B     HAR27               NO: SKIP PAGESIZE
+*------- ----- ------------------- PROCESS PAGESIZE
+HAR26C   LA    3,2(3)              POINT # OF PAGESIZE
+         BAL   14,SCAN             FIND # OF PAGESIZE
+         LTR   15,15               RC= 0000 ?
+         BNZ   ERROR10             NO: ERROR
+         MVI   FILLCHAR,X'F0'      LEADING ZERO
+         BAL   14,SHIFT            INSERT LEADING ZEROES
+         BAL   14,NUMTST           NUMERIC TEST
+         LTR   15,15               RC= ZERO ?
+         BNZ   ERROR11             NO: ERROR
+         PACK  PAGESIZE(3),NUMFLD  PACK
+*------- ----- ------------------- SCAN FOR FOOT NOTE (F=XXXXX) COMMAND
+HAR27    LR    3,10                START OPERANDS
+         LA    4,1                 INCREMENT
+         LA    5,115(10)           END COMMAND
+HAR28    CLC   0(2,3),=C'F='       FOOT NOTE?
+         BE    HAR29               YES: FIND FOOT NOTE
+         BXLE  3,4,HAR28           NEXT CHARS
+         B     TEST11              NO: SKIP
+HAR29    DS    0H
+         OI    SWMODE,X'10'        INDICATE FOOT NOTE
+         MVI   SEPCHAR,X'40'       BLANK AS SEPCHAR
+         LA    3,2(3)              POINT AFTER "F="
+         LA    5,50(3)             MAX.50 CHARS IN FOOT NOTE
+         LA    6,PRT4FTN           START FOOT NOTE
+         MVC   0(80,6),BLANKS      CLEAR FOOT NOTE
+         TM    SWMODE,X'20'        INDENT?
+         BZ    HAR29C              NO: SKIP
+         LA    6,8(6)              YES: INDENT FOOT NOTE
+HAR29C   DS    0H
+         CLI   0(3),X'7D'          QUOTE?
+         BNE   HAR30
+         MVI   SEPCHAR,X'7D'       QUOTE AS SEPCHAR
+         LA    3,1(3)              POINT AFTER QUOTE
+         LA    5,2(5)              ADD 2 CHARS TO LENGTH
+HAR30    DS    0H
+         CLC   0(1,3),SEPCHAR      END OF FOOT NOTE ?
+         BE    TEST11              YES: EXIT
+         CLI   0(3),X'00'          END OF MESSAGE?
+         BE    TEST11              YES: EXIT
+         MVC   0(1,6),0(3)         MOVE 1 CHAR FOOT NOTE
+         LA    6,1(6)              NEXT CHAR
+         BXLE  3,4,HAR30           NEXT CHAR
+         B     ERROR12             FOOT NOTE INVALID
+*------- ----- ------------------- OBTAIN SESSION PARAMETERS
+TEST11   DS    0H
+         L     2,RPLWADDR          POINT TO WORK RPL
+         L     3,NIBWADDR          POINT TO WORK NIB
+         LA    4,LUNAME            ADDRESS LUNAME
+         MODCB AM=VTAM,NIB=(3),NAME=(*,0(4)),LOGMODE=C' '
+         LTR   15,15               RC= 0000
+         BNZ   ERROR3              ACB ERROR
+         TM    SWMODE,X'03'        TYPE (SCS/DSC) SPECIFIED?
+         BNZ   TEST37              YES: SKIP SESSION PARAMETERS
+TEST21   DS    0H
+         XC    SESSAREA(36),SESSAREA CLEAR SESSION PARAMETERS
+         XC    SESSAREA+36(255),SESSAREA+36 CLEAR USER DATA
+         MODCB AM=VTAM,RPL=(2),OPTCD=(SESSPARM,SYN),                   C
+               AREA=SESSAREA,AREALEN=291 (36 + 255)
+         LTR   15,15
+         BNZ   ERROR3              VTAM CB ERROR
+         INQUIRE RPL=(2)           GET SESSION PARAMETERS
+         LTR   15,15
+         BNZ   ERROR1              VTAM CB ERROR
+         LTR   0,0
+         BNZ   ERROR1              VTAM CB ERROR
+TEST23   DS    0H
+         LA    3,LUTTAB            START LU-TYPE TABLE           (BXLE)
+         LA    4,LUTENT            LENGTH 1 ENTRY                (BXLE)
+         LA    5,LUTTAB+(LUTLEN-LUTENT) ADDRESS LAST ENTRY       (BXLE)
+TEST36S  DS    0H
+         CLC   SESSAREA+13(1),0(3) LU-TYPE FOUND ?
+         BE    TEST36X             YES: GET PRINT CC-CHARS
+         BXLE  3,4,TEST36S         NO: TRY NEXT ENTRY
+         B     ERROR2              INVALID PRINTER NAME
+TEST36X  DS    0H
+         CLI   0(3),B'00000001'    LU1 (SCS)?
+         BNE   TEST37              NO: SKIP
+         OI    SWMODE,X'02'        INDICATE SCS
+TEST37   DS    0H
+         MODCB AM=VTAM,RPL=(2),OPTCD=(ACQUIRE,SPEC,SYN)
+         LTR   15,15               RC= 0000 ?
+         BNZ   ERROR3              PRINTER NOT AVAILABLE
+         OPNDST RPL=(2)            CONNECT
+         LTR   15,15               RC= 0000 ?
+         BNE   ERROR1              HARDCOPY FAILED
+         LTR   0,0                 PRINTER AVAILABLE ?
+         BNE   ERROR1              HARDCOPY FAILED
+         OI    SWMODE,X'08'        INDICATE BEGIN BRACKET
+         CLC   PAGESIZE(3),=PL3'0' ZERO PAGESIZE?
+         BNE   TEST38              NO: SKIP
+         MVC   PAGESIZE(3),=PL3'72' SET PAGESIZE
+TEST38   DS    0H                  .
+         TM    SWMODE,X'02'        SCS?
+         BZ    TEST39              NO: SKIP
+         XC    DOUBLE,DOUBLE       CLEAR
+         MVC   DOUBLE+5(3),PAGESIZE
+         CVB   1,DOUBLE            .
+         STC   1,VFC+5             .
+         LA    6,VFC               .
+         LA    7,L'VFC             .
+         BAL   14,PRT              SEND VERTICAL FORMS CONTROL
+         LTR   15,15               .
+         BNZ   ERROR1              .
+TEST39   DS    0H                  .
+         TM    SWMODE,X'10'        FOOTNOTE?
+         BNO   HAR31               NO: SKIP
+         SP    PAGESIZE,=PL3'4'    4 LINES FOR FOOT NOTE
+*------- ----- ------------------- FORMAT HEADER
+HAR31    DS    0H
+         L     9,COPIES            GET # OF COPIES
+         BAL   14,TIME             GET TIME
+         BAL   14,DATE             GET DATE
+         MVC   PRT1HDR1+40(8),TIMEDISP+2 TIME INTO HEADER
+         MVC   PRT1HDR1+24(8),DATEDISP DATE INTO HEADER
+         MVC   PRT1HDR1+8(7),USERID USERID INTO HEADER
+         MVC   PRT1HDR2+8(8),MEMBER MEMBER INTO HEADER
+         MVC   PRT1HDR2+27(44),DSNAME  DSNAME INTO HEADER
+         MVC   PRT1HDR4(80),HDRNUM DEFAULT: NUM SCALE LINE
+         ZAP   LINECNT,=PL3'999'   FORCE PAGE SKIP
+*        ZAP   LINECNT,=PL3'4'     INIT LINECOUNT
+         TM    SWMODE,X'20'        INDENT ?
+         BO    HAR34               YES: NUM SCALE LINE
+         CLC   NUMBERED(3),=C'YES' LINE NUMBERS ?
+         BE    HAR34               YES: NUM SCALE LINE
+         MVC   PRT1HDR4(80),HDRNON NONUM SCALE LINE
+*------- ----- ------------------- PRINT BLOCK OF LINES
+HAR34    DS    0H
+         L     6,NEXTLINE          GET ADDRESS LINE IN WS
+         CLC   0(1,6),CMDCHAR      COMMAND LINE?
+         BNE   HAR34C              NO: SKIP
+         OC    1(79,6),BLANKS      XLATE TO UPPER CASE
+         CLC   1(5,6),=C'EJECT'    EJECT?
+         BNE   HAR34C              NO: SKIP
+         LA    6,NEXTENT(6)        SKIP CMDLINE
+         ST    6,NEXTLINE
+         ZAP   LINECNT,=PL3'999'   FORCE PAGE SKIP
+HAR34C   DS    0H
+         CP    LINECNT,PAGESIZE    PAGE FULL?
+         BL    HAR35               NO: SKIP
+         CLC   PRT2NEXT,PRT2FRST   INCOMPLETE BLOCK?
+         BE    HAR34D              NO: SKIP
+*------- ----- ------------------- PRINT INCOMPLETE BLOCK
+         LA    6,PRT2TXT
+         L     7,PRT2NEXT
+         MVI   0(7),X'19'          INSERT END-OF-MESSAGE
+         LA    7,1(7)              ADJUST LENGTH
+         SR    7,6
+         BAL   14,PRT
+         LTR   15,15
+         BNZ   ERROR1
+         MVC   PRT2NEXT,PRT2FRST
+         TM    SWMODE,X'10'        FOOT NOTE ?
+         BZ    HAR34D              NO: NEXT BLOCK OF LINES
+*------- ----- ------------------- SEND FOOT NOTE
+         LA    6,PRT4TXT
+         LA    7,PRT4LEN
+         BAL   14,PRT              SEND FOOT NOTE
+         LTR   15,15
+         BNZ   ERROR1
+         ZAP   LINECNT,=PL3'999'   FORCE NEW PAGE
+HAR34D   DS    0H
+         ZAP   LINECNT,=PL3'4'     ZERO LINE COUNT
+         TM    SWMODE,X'40'        EJECT?
+         BZ    HAR34T              NO: SKIP EJECT
+*------- ----- ------------------- SEND FORM FEED
+HAR34E   DS    0H
+         LA    6,PRT3TXT           ADDRESS TEXT
+         LA    7,PRT3LEN           LENGTH TEXT
+         BAL   14,PRT              SEND FORM FEED
+         LTR   15,15
+         BNZ   ERROR1              HARDCOPY FAILED
+HAR34T   DS    0H
+         TM    SWMODE,X'80'        TITLE?
+         BZ    HAR35               NO: SKIP TITLE
+*------- ----- ------------------- SEND TITLE
+         LA    6,PRT1TXT           ADDRESS TEXT
+         LA    7,PRT1LEN           LENGTH TEXT
+         BAL   14,PRT              SEND HEADER
+         LTR   15,15
+         BNZ   ERROR1              HARDCOPY FAILED
+         AP    LINECNT,=PL3'4'     INCREMENT LINECOUNT
+*------- ----- ------------------- LINE FROM WS TO PRINT AREA
+HAR35    DS    0H
+         L     3,PRT2NEXT          ADDRESS NEXT PRINT LINE
+         C     3,PRT2LAST          PRINT AREA FULL?
+         BH    HAR46               YES: SEND PRINT AREA TO PRINTER
+         L     6,NEXTLINE          ADDRESS NEXT LINE IN WORKSPACE
+         C     6,LASTLINE          ALL DONE?
+         BH    HAR46               SEND LAST (INCOMPLETE) BLOCK
+         TM    SWMODE,X'20'        INDENT ?
+         BO    HAR37               YES: INSERT BLANKS
+         CLC   NUMBERED(3),=C'YES' LINE NUMBERS ?
+         BNE   HAR38               NO: NONUM
+*------- ----- ------------------- NUM
+HAR36    DS    0H
+         MVI   0(3),X'40'          BLANK TO PRT
+         MVC   1(6,3),80(6)        LINE NUMBER TO PRT
+         MVI   7(3),X'40'          BLANK TO PRT
+         MVC   8(72,3),0(6)        DATA TO PRT
+         B     HAR39
+*------- ----- ------------------- INDENT
+HAR37    MVC   0(8,3),BLANKS       INDENT WITH BLANKS
+         MVC   8(72,3),0(6)        DATA TO PRT
+         B     HAR39
+*------- ----- ------------------- NONUM
+HAR38    MVC   0(80,3),0(6)        DATA TO PRT
+         B     HAR39
+HAR39    MVI   80(3),X'15'         INSERT NEW LINE CHAR
+         LA    6,NEXTENT(6)        NEXT LINE IN WORKSPACE
+         ST    6,NEXTLINE          SAVE ADDRESS
+         LA    3,PRT2ENT(3)        NEXT LINE IN PRINT AREA
+         ST    3,PRT2NEXT          SAVE ADDRESS
+         AP    LINECNT,=PL3'1'     INCREMENT LINE COUNT
+         B     HAR34               NEXT LINE
+*------- ----- ------------------- SEND DATA
+HAR46    DS    0H
+         LA    6,PRT2TXT           ADDRESS TEXT
+         L     7,PRT2NEXT          POINT AFTER LAST ENTRY USED
+         MVI   0(7),X'19'          INSERT END OF MESSAGE
+         LA    7,1(7)              ADJUST LENGTH
+         SR    7,6                 LENGTH INTO REG.7
+         BAL   14,PRT              SEND TEXT
+         LTR   15,15
+         BNZ   ERROR1              HARDCOPY FAILED
+         MVC   PRT2NEXT,PRT2FRST   RESET POINTER TO NEXT PRT LINE
+         CLC   NEXTLINE,LASTLINE   ALL DONE?
+         BH    HAR46F              YES: CHECK FOOTNOTE
+         CP    LINECNT,PAGESIZE    PAGE FULL?
+         BL    HAR47               NO: NEXT BLOCK OF LINES
+HAR46F   DS    0H
+         TM    SWMODE,X'10'        FOOT NOTE ?
+         BZ    HAR47               NO: NEXT BLOCK OF LINES
+*------- ----- ------------------- SEND FOOT NOTE
+         LA    6,PRT4TXT
+         LA    7,PRT4LEN
+         BAL   14,PRT              SEND FOOT NOTE
+         LTR   15,15
+         BNZ   ERROR1
+         ZAP   LINECNT,=PL3'999'   FORCE NEW PAGE
+         B     HAR47               NEXT BLOCK OF LINES
+*------- ----- ------------------- CHECK IF ALL DONE
+HAR47    DS    0H
+         CLC   NEXTLINE,LASTLINE   ALL DONE?
+         BH    HAR48               YES: CHECK COPIES
+         B     HAR34               NO: NEXT LINES
+*------- ----- ------------------- COPIES
+HAR48    DS    0H
+         MVC   NEXTLINE,COPYNEXT   RESET CURRENT LINE
+         MVC   LASTLINE,COPYLAST   RESET LAST LINE
+         ZAP   LINECNT,=PL3'999'   FORCE NEW PAGE
+         BCT   9,HAR34             NEXT COPIE
+         LA    6,PRT3TXT           ADDRESS TEXT
+         LA    7,PRT3LEN           LENGTH TEXT
+         OI    SWMODE,X'04'        SEND END BRACKET
+         BAL   14,PRT              SEND FORM FEED
+         LTR   15,15
+         BNZ   ERROR1              HARDCOPY FAILED
+         MVC   CMDAREA(22),MSG1    HARDCOPY MADE
+         XR    15,15               RC= 0000
+         B     RETURN
+ERROR1   DS    0H
+         MVC   CMDAREA(22),ERR1    ACB ERROR
+         XC    SHOWAREA,SHOWAREA
+         SHOWCB AM=VTAM,RPL=(2),FIELDS=(RTNCD,FDBK2),                  C
+               AREA=SHOWAREA,LENGTH=8
+         LTR   15,15
+         BNZ   ERROR1K             VTAM CB ERROR
+         SYCONVHX IN=SHOWAREA+3,OUT=CMDAREA+18,L=1
+         SYCONVHX IN=SHOWAREA+7,OUT=CMDAREA+20,L=1
+         CLC   CMDAREA+18(4),=C'0008' LU NOT AVAILABLE?
+         BE    ERROR1E
+         CLC   CMDAREA+18(4),=C'1000' LU NOT AVAILABLE?
+         BE    ERROR1E
+         B     ERROR1K
+ERROR1E  DS    0H
+         MVC   CMDAREA(22),ERR4    LU NOT AVAILABLE
+         B     ERROR1K
+ERROR1K  DS    0H
+         LA    15,8
+         B     RETURN
+ERROR2   MVC   CMDAREA(22),ERR2    INVALID PRINTER NAME
+         MVC   CMDAREA+07(8),LUNAME LU-NAME INTO MESSAGE
+         LA    15,8
+         B     RETURN
+ERROR3   MVC   CMDAREA(22),ERR3    MODCB/GENCB FAILED
+         LA    15,8
+         B     RETURN
+ERROR5   MVC   CMDAREA(22),ERR5    ACB IN USE
+         LA    15,8
+         B     RETURN
+ERROR6   MVC   CMDAREA(22),ERR6    LINE-X INVALID
+         LA    15,8
+         B     RETURN
+ERROR7   MVC   CMDAREA(22),ERR7    LINE-X NOT NUMERIC
+         LA    15,8
+         B     RETURN
+ERROR8   MVC   CMDAREA(22),ERR8    UNEXPECTED RETURN CODE
+         LA    15,8
+         B     RETURN
+ERROR9   MVC   CMDAREA(22),ERR9    LINE-X NOT FOUND
+         LA    15,8
+         B     RETURN
+ERROR10  MVC   CMDAREA(22),ERR10   INVALID COPIE
+         LA    15,8
+         B     RETURN
+ERROR11  MVC   CMDAREA(22),ERR11   COPIES NOT NUMERIC
+         LA    15,8
+         B     RETURN
+ERROR12  MVC   CMDAREA(22),ERR12   FOOT NOTE INVALID
+         LA    15,8
+         B     RETURN
+*------- ----- ------------------- SEND DATA
+*            - REG.2 = ADDRESS SEND RPL
+*            - REG.3 = ADDRESS VTAM ACB
+*            - REG.6 = ADDRESS MESSAGE AREA (MUST BE SET BY CALLER)
+*            - REG.7 = LENGTH MESSAGE AREA (MUST BE SET BY CALLER)
+*------- ----- ------------------- SEND PRINT DATA
+PRT      ST    14,SAVE14P
+         L     2,RPLWADDR          POINT TO SEND/RECEIVE RP
+         L     3,ACB1ADDR          POINT TO VTAM ACB
+         TM    SWMODE,X'02'        SCS PRINTER?
+         BZ    PRT03               NO: SKIP
+         LA    6,2(6)              SKIP WCC
+         SH    7,=H'3'             ADJUST LENGTH (2-WCC + 1-EM)
+PRT03    DS    0H
+         MODCB AM=VTAM,RPL=(2),ACB=(3),AREA=(6),RECLEN=(7),            C
+               STYPE=REQ,CONTROL=DATA,CHAIN=ONLY,BRACKET=(NBB,NEB),    C
+               POST=RESP,OPTCD=(CS,SYN),RESPOND=(NEX,FME,NRRN),        C
+               CHNGDIR=(NCMD),RTYPE=DFSYN
+         LTR   15,15
+         BNZ   PRT99
+         TM    SWMODE,X'08'        BEGIN BRACKET ?
+         BNO   PRT04               NO: SKIP BB
+         MODCB AM=VTAM,RPL=(2),BRACKET=(BB,NEB)
+         LTR   15,15               RC= 0000
+         BNZ   PRT99               NO: EXIT
+         B     PRT06
+PRT04    TM    SWMODE,X'04'        END BRACKET ?
+         BNO   PRT06               NO: SKIP EB
+         MODCB AM=VTAM,RPL=(2),BRACKET=(NBB,EB)
+         LTR   15,15               RC= 0000
+         BNZ   PRT99               NO: EXIT
+PRT06    DS    0H
+         SEND  RPL=(2)             SEND MESSAGE
+PRT99    DS    0H
+         NI    SWMODE,X'FF'-X'0C'  RESET BRACKET INDICATOR
+         L     14,SAVE14P          RESTORE REG.14
+         BR    14                  RETURN
+*------- ----- ------------------- NUMERIC TEST
+NUMTST   ST    14,SAVE14           SAVE REG.14
+         LA    3,8                 LENGTH
+         LA    4,NUMFLD            FIELD TO BE TESTED
+NUMTST01 CLI   0(4),X'F0'          LOW ?
+         BL    NUMTST03            YES: NOT NUMERIC
+         CLI   0(4),X'F9'          HIGH ?
+         BH    NUMTST03            YES: NOT NUMERIC
+         LA    4,1(4)              NEXT CHAR.
+         BCT   3,NUMTST01          TEST MAX 8 CHARS.
+         LA    15,0                RC= 0000, NUMERIC
+         B     NUMTST99            GOTO EXIT
+NUMTST03 LA    15,8                RC= 0008, NOT NUMERIC
+NUMTST99 L     14,SAVE14           RESTORE REG.14
+         BR    14                  RETURN
+*------- ----- ------------------- REP TRAILING " " WITH LEADING "0"
+*        IN:   NUMFLD, FIELD TO BE SHIFTED, MAX 8 CHAR,
+*              FILLCHAR, FILL CHARACTER.
+*        OUT:  NUMFLD, TRAILING SPACES REPLACED WITH
+*                      LEADING ZEROES.
+*              REG.15, RC= 0000 - NORMAL END
+*                      RC= 0004 - ALL SPACES
+*------- ----- -------------------
+SHIFT    ST    14,SAVE14           SAVE REG.14
+         LA    3,8                 MAX 8 CHARS
+         XR    15,15               RC= 0000
+SHIFT01  CLI   NUMFLD+7,X'40'      LAST CHAR SPACE ?
+         BNE   SHIFT99             NO: GOTO EXIT
+         MVC   WRKFLD+1(7),NUMFLD  MOVE FIRST 5 CHARS INTO WRKFLD+1
+         MVC   WRKFLD(1),FILLCHAR  INSERT LEADING ZERO
+         MVC   NUMFLD,WRKFLD       RESTORE NUMFLD
+         BCT   3,SHIFT01           SHIFT MAX 8 TIMES
+         LA    15,4                RC= 0004 - ALL SPACES
+SHIFT99  L     14,SAVE14           RESTORE REG.14
+         BR    14                  RETURN
+*------- ----- ------------------- SCAN FOR DATA BETWEEN " " OR ","
+*        IN:   REG.3,  POINTS TO FIRST CHAR TO SCAN
+*        OUT:  NUMFLD, CHARS PRECEEDING ' ' OR ','
+*              REG.3,  POINTS TO LAST CHAR SCANNED
+*              REG.15, RETURN CODE 0000 - CHARS FOUND
+*                                  0008 - NO CHARS FOUND
+*------- ----- -------------------
+SCAN     ST    14,SAVE14           SAVE REG.14
+         LA    15,8                RC= 0008, INITIAL: NO CHARS FOUND
+         LA    4,9                 MAX 9 CHARS
+         LA    5,NUMFLD            POINT TO NUMFLD
+         MVC   NUMFLD,BLANKS       CLEAR NUMFLD
+SCAN01   CLI   0(3),X'40'          SPACE ?
+         BE    SCAN03              YES: END OF SCAN
+         CLI   0(3),X'6B'          COMMA ?
+         BE    SCAN03              YES: END OF SCAN
+         MVC   0(1,5),0(3)         MOVE 1 CHAR INTO NUMFLD
+         LA    3,1(3)              NEXT CHAR TO SCAN
+         LA    5,1(5)              NEXT CHAR NUMFLD
+         BCT   4,SCAN01            SCAN MAX 9 TIMES
+         B     SCAN99              GOTO EXIT, NO CHARS FOUND
+SCAN03   LA    15,0                RC= 0000, SCAN SUCCESSFUL
+SCAN99   L     14,SAVE14           RESTORE REG.14
+         BR    14                  RETURN
+*------- ----- ------------------- SCAN FOR LINE NUMBERS
+*        IN:   REG.3, START ADDRESS SCAN,
+*        OUT:  LN1FLD, LINE-1
+*              LN2FLD, LINE-2
+*              LN3FLD, LINE-3
+*              REG.15, RC= 0000 - ALL LINES VALID,
+*                      RC= 0004 - INVALID LINE FOUND,
+*                      RC= 0008 - LINES NOT NUMERIC.
+*                ERR6, ERROR INDICATING LINE NUMBER
+*                ERR7, ERROR INDICATING LINE NUMBER
+*------- ----- -------------------
+LINE     ST    14,SAVE14LN         SAVE REG.14
+         MVI   ERR6+14,C'1'        MOVE LINE ID IN ERROR MSG
+         MVI   ERR7+10,C'1'        MOVE LINE ID IN ERROR MSG
+         BAL   14,SCAN             SCAN FOR LN1FLD
+         LTR   15,15               RC= 0000 ?
+         BNZ   LINE73              NO: LN1 INVALID
+         ST    3,SAVE3             SAVE REG.3
+         CLI   NUMFLD,C'*'         * - CURRENT LINE ?
+         BE    LINE04              YES: SKIP NUMTST
+         MVI   FILLCHAR,X'F0'      '0' INTO FILLCHAR
+         BAL   14,SHIFT            REP TRAILING SPACE WITH LEADING ZERO
+         C     15,F0004            RC= 0004 - ALL SPACES
+         BE    LINE03
+         CLC   NUMFLD,C0000        LINE-1 ZERO ?
+         BE    LINE73
+LINE03   BAL   14,NUMTST           NUMERIC TEST
+         LTR   15,15               RC= 0000 ?
+         BNZ   LINE75              NO: LN1 NOT NUMERIC
+LINE04   MVC   LN1FLD,NUMFLD       SAVE LN1 INTO LN1FLD
+         L     3,SAVE3             RESTORE REG.3
+         LA    3,1(3)              POINT TO LN2
+         MVI   ERR6+14,C'2'        MOVE LINE ID IN ERROR MSG
+         MVI   ERR7+10,C'2'        MOVE LINE ID IN ERROR MSG
+         BAL   14,SCAN             SCAN FOR LN2FLD
+         LTR   15,15               RC= 0000 ?
+         BNZ   LINE73              NO: LN2 INVALID
+         ST    3,SAVE3             SAVE REG.3
+         MVI   FILLCHAR,X'F0'      '0' INTO FILLCHAR
+         BAL   14,SHIFT            REP TRAILING SPACE WITH LEADING ZERO
+         C     15,F0004            RC= 0004 - ALL SPACES ?
+         BE    LINE05
+         CLC   NUMFLD,C0000        LINE-2 ZERO ?
+         BE    LINE73
+LINE05   BAL   14,NUMTST           NUMERIC TEST
+         LTR   15,15               RC= 0000 ?
+         BNZ   LINE75              NO: LN2 NOT NUMERIC
+         MVC   LN2FLD,NUMFLD       SAVE LN2 INTO LN1FLD
+         LA    15,0                RC= 0000 - SCAN SUCCESSFUL
+         B     LINE99              EXIT
+LINE73   LA    15,4                RC= 0004 - INVALID LINE(S) FOUND
+         B     LINE99              EXIT
+LINE75   LA    15,8                RC= 0008 - LINE(S) NOT NUMERIC
+         B     LINE99              EXIT
+LINE99   L     14,SAVE14LN         RESTORE REG.14
+         BR    14                  RETURN
+*------- ----- ------------------- GET TIME: HH:MM:SS
+TIME     ST    14,SAVE14TI         SAVE REG.14
+         TIME  DEC                 GET TIME OF DAY
+         SRL   0,4                 SHIFT OUT THOUSANDS OF SECONDS
+         ST    0,TIMEWORK
+         OI    TIMEWORK+3,X'0F'    INSERT SIGN
+         MVC   TIMEDISP,PATT1      PATTERN INTO OUTPUT FILED
+         ED    TIMEDISP(10),TIMEWORK
+TIME99   L     14,SAVE14TI         RESTORE REG.14
+         BR    14                  RETURN
+*------- ----- ------------------- GET DATE: DD/MM/YY
+DATE     ST    14,SAVE14D          SAVE REG 14
+         L     6,X'4C'             POINTER CVT
+         UNPK  DAYNBR,57(3,6)      JULIAN DATE
+         PACK  YEAR,DAYNBR(2)
+         MVC   DATEDISP+6(2),DAYNBR YEAR IN DATE
+         DP    YEAR(4),=PL1'4'     DIVIDE BY 4
+         CP    YEAR+3(1),=PL1'0'   LEAP YEAR
+         BNE   DATE2               BRANCH IF NOT
+         ZAP   FEB,=PL2'29'        29 DAYS IN FEBRUARI
+         ZAP   MNDNR,=PL2'1'       (RE-) INITIALIZE
+DATE2    EQU   *
+         LA    7,JAN               MONTHTABLE
+         ZAP   DAY,58(2,6)
+DATE3    EQU   *
+         CP    DAY(3),0(2,7)
+         BNH   DATE4
+         SP    DAY,0(2,7)          SUBTRACT ULTIMO DATE
+         LA    7,2(7)              NEXT MONTH
+         AP    MNDNR,=PL1'1'
+         B     DATE3               RETURN
+DATE4    EQU   *
+         UNPK  UNPKMND,MNDNR
+         OI    UNPKMND+2,X'F0'
+         MVC   DATEDISP+3(2),UNPKMND+1
+         UNPK  UNPKMND,DAY
+         OI    UNPKMND+2,X'F0'
+         MVC   DATEDISP(2),UNPKMND+1
+         MVI   DATEDISP+2,X'61'
+         MVI   DATEDISP+5,X'61'    SLASHES BETWEEN NUMBERS
+         L     14,SAVE14D          RESTORE R14
+         BR    14                  BACK TO CALLER
+SAVE14D  DC    F'0'                SAVE AREA REG.14
+DAYNBR   DS    CL5
+YEAR     DC    PL4'0'
+JAN      DC    PL2'31'
+FEB      DC    PL2'28'
+MRT      DC    PL2'31'
+APR      DC    PL2'30'
+MAY      DC    PL2'31'
+JUN      DC    PL2'30'
+JUL      DC    PL2'31'
+AUG      DC    PL2'31'
+SEP      DC    PL2'30'
+OKT      DC    PL2'31'
+NOV      DC    PL2'30'
+DEC      DC    PL2'31'
+MNDNR    DC    PL2'1'
+UNPKMND  DS    CL3
+DATEDISP DS    CL8
+DAY      DC    PL3'0'
+*------- ----- ------------------- RETURN
+RETURN   L     2,SAVE+4            ADDRESS SAVE AREA
+         ST    15,16(2)            SAVE RETURN CODE
+         CLC   ACB1ADDR,F0000
+         BE    RETURN05
+         L     2,RPLWADDR
+         CLSDST RPL=(2)
+         L     2,ACB1ADDR          POINT TO ACB
+         CLOSE ((2))               CLOSE ACB
+         L     1,ACB1ADDR
+         L     0,ACB1LEN
+         FREEMAIN RC,LV=(0),A=(1)  FREE ACB
+RETURN05 CLC   NIBWADDR,F0000
+         BE    RETURN11
+         L     1,NIBWADDR
+         L     0,NIBWLEN
+         FREEMAIN RC,LV=(0),A=(1)  FREE NIB
+RETURN11 CLC   RPLWADDR,F0000
+         BE    RETURN99
+         L     1,RPLWADDR
+         L     0,RPLWLEN
+         FREEMAIN RC,LV=(0),A=(1)  FREE RPL
+RETURN99 L     13,SAVE+4
+         LM    14,12,12(13)
+         BR    14
+NIBWADDR DC    F'0'                ADDRESS WORK NIB
+NIBWLEN  DC    F'0'                LENGTH WORK NIB
+RPLWADDR DC    F'0'                ADDRESS WORK RPL
+RPLWLEN  DC    F'0'                LENGTH WORK RPL
+ACB1ADDR DC    F'0'                ADDRESS WORK ACB
+ACB1LEN  DC    F'0'                LENGTH WORK ACB
+DEVCAREA DC    CL8' '              DEVICE CHARS
+TIMEWORK DC    F'0'                WORK AREA TIME
+TIMEDISP DC    CL10' '             OUTPUT AREA TIME
+MSG1     DC    CL22'-------- HARDCOPY MADE'
+ERR1     DC    CL22' HARDCOPY FAILED: XXXX'
+ERR2     DC    CL22'- LU= XXXXXXXX INVALID'
+ERR3     DC    CL22'--- GENCB/MODCB FAILED'
+ERR4     DC    CL22' PRINTER IN USE, RETRY'
+ERR5     DC    CL22'---- ACB IN USE, RETRY'
+ERR6     DC    CL22'------- LINE-X INVALID'
+ERR7     DC    CL22'--- LINE-X NOT NUMERIC'
+ERR8     DC    CL22' UNEXPECTED RETURNCODE'
+ERR9     DC    CL22'----- LINE-X NOT FOUND'
+ERR10    DC    CL22'------- COPIES INVALID'
+ERR11    DC    CL22'--- COPIES NOT NUMERIC'
+ERR12    DC    CL22'---- INVALID FOOT NOTE'
+VFC      DC    XL7'00002BC2020000' VERTICAL FORMS CONTROL (0000VFC00)
+*              LEADING 2-ZEROES AND TRAILING 1-ZERO ARE DELETED BY PRT
+PRT1TXT  DC    X'F548'             WCC: WRITE ERASE
+PRT1HDR1 DC    CL80'USERID= XXXXXXX , DATE= XX/XX/XX, TIME= XX:XX:XX'
+         DC    X'15'
+PRT1HDR2 DC    CL80'MEMBER= XXXXXXXX, DATASET= XXXXXXXXXXXXXXXXXXXXX'
+         DC    X'15'
+PRT1HDR4 DC    CL80' '
+         DC    X'15'
+         DC    CL80' '
+         DC    X'15'
+         DC    X'19'
+PRT1LEN  EQU   *-PRT1TXT
+PRT2NEXT DC    A(PRT2LNE)
+PRT2FRST DC    A(PRT2LNE)
+PRT2LAST DC    A(PRT2LST)          LAST PRINT LINE
+PRT2TXT  DC    X'F548'             WCC: WRITE ERASE
+PRT2ENT  EQU   81                  LENGTH 1 ENTRY
+PRT2LNE  DS    10CL(PRT2ENT)       FIRST PRINT LINE
+PRT2LST  EQU   *-PRT2ENT
+         DC    X'19'               END OF MESSAGE
+PRT2LEN  EQU   *-PRT2TXT
+PRT3TXT  DC    X'F548'             WCC: WRITE ERASE
+         DC    X'150C'             NL/FF
+         DC    X'19'               END OF MESSAGE
+PRT3LEN  EQU   *-PRT3TXT
+PRT4TXT  DC    X'F548'             WCC: WRITE ERASE
+         DC    CL80' ',X'15'       BLANK LINE
+         DC    CL80' ',X'15'       BLANK LINE
+         DC    CL80' ',X'15'       BLANK LINE
+PRT4FTN  DC    CL80' ',X'15'       FOOT NOTE
+         DC    X'19'               END OF MESSAGE
+PRT4LEN  EQU   *-PRT4TXT
+HDRTXT   DC    CL88' ...... ----+----1----+----2----+----3----+----4---C
+               -+----5----+----6----+----7----+----8'
+         ORG   HDRTXT
+HDRNUM   DS    CL80
+         ORG   HDRTXT+8
+HDRNON   DS    CL80
+         ORG
+SAVE14P  DC    F'0'                SAVE AREA PRT
+SAVE14TI DC    F'0'                SAVE AREA TIME
+SAVE14LN DS    F                   SAVE AREA REG.14 LINE SUBROUTINE
+SAVE14   DS    F                   SAVE AREA REG.14 ALL SUBROUTINES
+SAVE14T  DC    F'0'
+SAVE3    DS    F                   SAVE AREA REG.3 SCAN
+NEXTLINE DS    F                   SAVE AREA CURRENT LINE (HAR)
+LASTLINE DS    F                   SAVE AREA LAST LINE (HAR)
+COPYNEXT DS    F                   SAVE AREA CURRENT LINE (HAR)
+COPYLAST DS    F                   SAVE AREA LAST LINE (HAR)
+BUFFEND  DS    F
+FILLCHAR DC    CL1' '              FILL CHARACTER SHIFT ROUTINE.
+NUMFLD   DS    CL8                 WORK FIELD NUMTST/SHIFT
+WRKFLD   DS    CL8                 WORK FIELD NUMTST/SHIFT
+LN1FLD   DS    D                   LINE-1 COPY/LINE
+LN2FLD   DS    D                   LINE-2 COPY/LINE
+LN3FLD   DS    D                   LINE-3 COPY/LINE
+WORKFLD  DC    D'0'                WORK AREA
+PATT1    DC    X'F02021207A20207A2020' PATTERN TIME
+SHOWAREA DS    03D                 WORK AREA SHOWCB
+SACID    DS    CL4                 = COMM-ID
+SANAME   DS    CL8                 = LU-NAME
+LUNAME   DC    CL8' '
+LINECNT  DC    PL3'4'              LINE COUNT (HAR)
+PAGESIZE DC    PL3'00'             MAX.LINES PER PAGE
+CMDCHAR  DC    CL1'^'              CMD CHARACTER
+D0000    DC    D'0'                DOUBLE WORD BINARY ZERO
+C0000    DC    C'00000000'
+C9999    DC    C'99999999'
+F0000    DC    F'0'
+F0004    DC    F'4'
+F0008    DC    F'8'
+DOUBLE   DC    D'0'
+COPIES   DC    F'1'
+SEPCHAR  DC    X'00'
+SWMODE   DC    XL1'00'             MODE SWITCH
+*                                  1... ....  TITLE
+*                                  .1.. ....  EJECT
+*                                  ..1. ....  INDENT
+*                                  ...1 ....  FOOT NOTE
+*                                  .... 1...  BEGIN BRACKET
+*                                  .... .1..  END BRACKET
+*                                  .... ..1.  SCS PRINTER (LU1)
+*                                  .... ...1  DSC PRINTER (LU3)
+APPLID1  DC    X'08'               LENGTH APPLID
+         DC    C'RPFHCPY '         APPLID
+LUTTAB   EQU   *
+LUTENT   EQU   1
+         DC    B'00000000'         LU0
+         DC    B'00000001'         LU1 SCS
+         DC    B'00000011'         LU3 DSC
+LUTLEN   EQU   *-LUTTAB
+SESSAREA DS    CL291               SESSION PARAMETERS
+         LTORG
+COMMAREA RPFCOMM
+OFFSETN3 EQU   9*NEXTENT
+         END

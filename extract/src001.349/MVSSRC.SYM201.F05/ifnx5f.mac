@@ -1,0 +1,637 @@
+         JHEAD 'DC FIXED-FLOATING POINT CONVERSION',                   X
+               PHASEID=X5F,                                            X
+               LEVEL=10
+         COPY  JCOMMON                  GET COMMON DEFINITION
+         EJECT
+         COPY  X5COM                    GET PHASE COMMON DEFINITION
+         EJECT
+*
+*DUMMY SECTION FOR WORKING STORAGE
+*
+WSDSECT  DSECT
+HOLD     DS    D                        DOUBLE WORD FOR CVB INST
+AFIRST   DS    F                        SAVE AREA FOR BEGINNING POINTER
+SAVEAD   DS    F                        SAVE AREA FOR ENDING POINTER
+* ZWDE THRU ZWACC ARE STORED AND LOADED BY MULTIPLE OPS
+* AND MUST BE IN GIVEN SEQUENCE.
+ZWDE     DS    F                   DECIMAL EXPONENT
+ZWSF     DS    F                   FIXED PT SCALE AND FLOATING PT EXPON
+ZWTXPT   DS    F                   SAVE TEXT POINTER
+         DS    0F                  ENSURE WORD ALIGNMENT OF ZWACC
+ZWACC    DS    XL20                ACCUMULATOR
+         DS    0F                  SET PROPER ALIGNMENT FOR ZWW1
+ZWW1     DS    XL56                WORK AREA
+ZWW2     EQU   ZWW1+L'ZWW1-4       LOW WORD OF WORK AREA
+*
+DCLNGTH  DS    F                        LENGTH MODIFIER
+VASCTL   DS    C                        DECON FLAG
+ZWSW     DS    C                   CONTROL SWITCHES AND VALUE SIGN
+*                             BIT 7 X'01' = FLOATING POINT  (ELSE FIXD)
+*                                 6    2  = VALUE FOUND (MAYBE ZERO)
+*                                 5    4  = FLT.PT IS INITIALIZED (WSF)
+*                                 4    8  = FLT.PT IS L-CON
+*
+         EJECT
+*TITLE 'FFPCONV'                                                      *
+*FUNCTION/OPERATION - TO DO ALL FIXED OR FLOATING POINT CONVERSION FOR*
+*   DC STATEMENTS.  IT IS CALLED BY          ONCE FOR EACH CONSTANT TO*
+*   BE CONVERTED.                                                     *
+*ENTRY POINT- L     R12,                                              *
+*            BALR R9,R12                                              *
+*INPUT- R10 WILL POINT TO AN UNCLASSIFIED TEXT BUCKET CONTAINING THE  *
+*          CONSTANT TO BE CONVERTED.  THE FIRST BYTE OF THE TEXT      *
+*          BUCKET IS THE BUCKET CODE (NOT USED).  THE SECOND BYTE     *
+*          CONTAINS THE LENGTH - 1 OF THE CONSTANT THAT FOLLOWS.      *
+*       R11 WILL POINT TO AN INPUT ARRAY OF 8 FULLWORDS, FULLWORD     *
+*          ALIGNED.  IF BYTE 1, WORD 1 = 1, THEN THE LENGTH IS IN BITS*
+*          OTHERWISE THE LENGTH IS IN BYTES.  BYTE 4, WORD 1 IS THE   *
+*          TYPE (19=L-CON, 1A=DOUBLE WORD, 1B=FLOATING POINT FULLWORD,*
+*          1C=FIXED POINT FULLWORD, AND 1D=HALFWORD).  WORD 2 IS THE  *
+*          LENGTH IN BYTES OR BITS, DEPENDENT ON BYTE 1, WORD 1.  WORD*
+*          3 IS THE SCALING FACTOR, AND WORD 4 IS THE EXTERNAL        *
+*          EXPONENT.  WORDS 5-8 ARE NOT USED FOR INPUT.               *
+*       $HEVAL+4 WILL POINT TO AN AREA OF CORE FOR WORKING STORAGE    *
+*OUTPUT-R10 POINTS TO A , OR A ' BUCKET.                              *
+*       R11 POINTS TO THE INPUT ARRAY.  BYTE 2 WORD 1 IS THE ERROR    *
+*          CODE BYTE.  WORDS 5-8 ARE THE RIGHT JUSTIFIED CONSTANT.    *
+*EXTERNAL ROUTINES- NONE                                              *
+*EXITS- NORMAL - $EXIT                                                *
+*       ERROR - SAME, EXCEPT THE ERRORS ARE LOGGED IN THE ERROR BYTE. *
+*TABLES/WORK AREAS-                                                   *
+*                   (ZWDE)     F   MODIFIED EXPONENT SAVE AREA        *
+*                   (ZWSF)     F   FIXED PT SCALE & FLOATING PT EXPON *
+*                   (ZWTXPT)   F   TEXT POINTER SAVE AREA             *
+*                   (ZWACC)   5F   ACCUMULATOR                        *
+*                   (ZWW1)   56C   WORK AREA                          *
+*                   (DCLNG)    F   LENGTH MODIFIER                    *
+*                   (VASCTL)   C   DECON FLAG BYTE                    *
+*                   (ZWSW)     C   CONTROL SWITCH AND VALUE SIGN      *
+*                   (SAVEAD)   F   POINTER SAVE AREA                  *
+*                   (AFIRST)   F   POINTER SAVE AREA                  *
+*                   (HOLD)     D   DOUBLE WORD FOR CVB                *
+*ATTRIBUTES- N/A                                                      *
+*NOTES-                                                               *
+         EJECT
+*
+*    INITIALIZATION
+*
+         USING WSDSECT,R4
+         USING X5COM,R7                 DEFINE COMMON USING
+         JCSECT (X5F00)                 INITIATE CSECT
+*C127000                                                       @AX14184
+         JMODID ,                       CREATE ROUTINE IDENTIFIER
+FXFLCV   JSAVE BASE=NO                  SAVE REGISTERS
+         JENTRY (X5F01=FXFLCV)          DEFINE ENTRY
+         USING FXFLCV,R3                DEFINE PHASE USING
+         LR    R3,R12                   ESTABLISH BASE
+         L     R4,ALPTR                 FETCH WORKING STORAGE POINTER
+         MVI   ZARYERR(R11),BIT0-BIT0   ZERO ERROR BYTE
+         L     R2,ZARYLEN(0,R11)        FETCH LENGTH MODIFIER VALUE
+         TM    ZARYSGN(R11),BIT0        IS LENGTH MODIFIER BITS
+         BO    CNV3                     YES
+         SLL   R2,3                     NO, BYTES, SO SHIFT FOR BITS
+CNV3     BCTR  R2,0                     DECREMENT BIT LENGTH BY ONE
+         ST    R2,DCLNGTH               SAVE BIT LENGTH VALUE
+         CLI   ZARYTYPE(R11),BTYPEFL    IS THIS FLOATING POINT
+         BH    ZWFXCV                     NO.  FIXED POINT
+         CLI   ZARYTYPE(R11),BTYPEL     IS THIS AN L-CON
+         BH    ZWFLCV                     NO.  FLOATING POINT
+         MVI   ZWSW,BIT4+BIT7             YES. SET INDICATOR FOR L-CON
+         B     ZWA1                     GO INITIALIZE
+         SPACE
+ZWFLCV   MVI   ZWSW,BIT7                SET INDICATOR FOR FLOATING PT
+ZWA1     XR    ZWRD,ZWRD                LOWER LIMIT SCALE FACTOR
+         LA    ZWRE,30                  UPPER LIMIT SCALE FACTOR
+         B     ZWA2                       GO AROUND FIXED POINT SET UP
+         SPACE
+ZWFXCV   MVI   ZWSW,BIT0-BIT0           SET INDICATOR FOR FIXED POINT
+         LA    ZWRD,187                 LOWER
+         LCR   ZWRD,ZWRD                  LIMIT SCALE FACTOR
+         LA    ZWRE,346                 UPPER LIMIT SCAL FACTOR
+ZWA2     LR    ZWRARY,R11               SAVE INPUT ARRAY POINTER
+         L     ZWRA,ZARYSCL(ZWRARY)     FETCH SCALE FACTOR
+         L     ZWRH,ZARYEXP(ZWRARY)     FETCH EXTRN EXPONENT MODIFIER
+         LR    ZWRB,R10                 LOAD SCAN CHAR POINTER
+         STM   ZWRH,ZWRB,ZWDE           SAVE EXP, SCALE MOD AND TXT PTR
+         XC    ZWACC,ZWACC         CLEAR ACCUMULATOR
+         SR    ZWRL,ZWRL           PREPARE TO MARK DECIMAL POINT
+         LR    ZWRF,ZWRB           SET UP FOR NO EXP DIGITS TEST
+         LR    ZWRI,ZWRH           SAVE EXPONENT MODIFIER
+         EJECT
+*B
+*B SCAN TEXT MARKING DECIMAL,END OF VALUE,FIRST TERMINATOR.
+*B CONVERT EXPONENT IF ANY AND MODIFY.
+*B
+ZWB1     LR    ZWRJ,ZWRB           MARK END OF VALUE FIELD
+         GOIF  D0(ZWRB),JCOMMA,EQ=ZWC1  CHECK FOR END OF OPERAND
+         GOIF  D0(ZWRB),JQUOTE,EQ=ZWC1  CHECK FOR END OF OPERAND
+         GOIF  D0(ZWRB),JBLANK,EQ=ZWZ4  CHECK FOR END OF OPER  @AX14184
+         CLI   0(ZWRB),JE               BRANCH
+         BNE   ZWB3                     IF CHARACTER NOT E
+         LA    ZWRB,1(ZWRB)             STEP OVER E
+         BAL   ZWRG,ZWS1           STEP OVER SIGN IF PRESENT
+         BAL   ZWRG,DECON          CONVERT EXPONENT
+         LR    ZWRLAST,ZWRB             SET TERMINATOR POINTER
+         GOIF  D0(ZWRB),JCOMMA,EQ=ZWB1A  OK IF COMMA
+         GOIF  D0(ZWRB),JQUOTE,EQ=ZWB1A  OK IF QUOTE
+         B     ZWZ4                     GO LOG ERROR AND EXIT
+ZWB1A    EQU   *                        BRANCH LABEL
+         CLI   1(ZWRJ),JMINUS      BRANCH
+         BNE   ZWB2                     UNLESS EXP NEGATIVE
+         LCR   ZWRH,ZWRH           COMPLEMENT EXPONENT
+         SPACE
+ZWB2     AR    ZWRI,ZWRH           ADD TO EXP MODIFIER
+         ST    ZWRI,ZWDE           STORE MODIFIED EXP
+         B     ZWC1                     EXIT-ALL CHAR HAVE BEEN SCANNED
+         SPACE
+ZWB3     CLI   0(ZWRB),JPERIOD          BRANCH
+         BNE   ZWB4                     UNLESS CHAR DECIMAL POINT
+         LR    ZWRL,ZWRB           MARK DECIMAL POINT
+ZWB4     LA    ZWRB,1(ZWRB)             ADVANCE TEXT POINTER
+         B     ZWB1                     CONTINUE LOOP
+*C
+*C SAVE POINTER TO TERMINATOR.CHECK EXPONENT AND SCALE FACTOR RANGE AND
+*C CHECK FOR NO EXPONENT DIGITS. SET UP TO SCAN VALUE.
+*C
+ZWC1     AH    ZWRI,=H'5'               MAKE RANGE SYMETRIC
+         LR    ZWRLAST,ZWRB             SAVE TERMINATOR POINTER
+         LPR   ZWRI,ZWRI           TAKE MAGNITUDE
+         CH    ZWRI,=H'80'         BRANCH
+         BNH   ZWC2                     IF EXPONENT WITHIN RANGE
+         OI    ZARYERR(ZWRARY),ZRCD13   SET EXPONENT OUT OF RANGE INDIC
+         SR    ZWRI,ZWRI                SET EXPONENT TO ZERO AND
+         ST    ZWRI,ZWDE                  CONTINUE AS IF EXP WAS ZERO
+         SPACE
+ZWC2     LA    ZWRH,ZRCD11              SET NO. FOR SCL FAC RANGE ERROR
+         CR    ZWRA,ZWRD           BRANCH
+         BL    ZWZ3                     IF SF TOO SMALL
+         CR    ZWRA,ZWRE           BRANCH
+         BH    ZWZ3                     IF SF TOO LARGE
+         CR    ZWRB,ZWRF           BRANCH TO ERROR ROUTINE
+         BE    ZWZ4                     IF NO EXP DIGIT OR TEXT
+         L     ZWRB,ZWTXPT         RESET TEXT POINT TO BEGINNING VALUE
+         BAL   ZWRG,ZWS1           STEP OVER VALUE SIGN IF PRESENT
+         SPACE
+         LTR   ZWRL,ZWRL           IF NO DECIMAL
+         BNZ   ZWD1                  SET MARK TO
+         LR    ZWRL,ZWRJ             END OF VALUE
+         EJECT
+*D
+*D STEP OVER DECIMAL POINT. CHECK FOR END OF VALUE.
+*D
+ZWD1     CR    ZWRB,ZWRL           IF NEXT CHAR
+         BNE   ZWD2                     DECIMAL POINT
+         LA    ZWRB,1(ZWRB)             ADVANCE VALUE POINTER
+         LR    ZWRL,ZWRB             AND DECIMAL MARKER
+ZWD2     CR    ZWRB,ZWRJ           IF END OF VALUE
+         BNL   ZWM1                  BRANCH
+*E
+*E CONVERT PIECE OF VALUE.CHECK FOR ZERO.COMPUTE ADJUSTED EXP FOR PIECE
+*E
+ZWE1     BAL   ZWRG,DECON          CONVERT PIECE OF VALUE
+         TM    VASCTL,BIT0+BIT1    IF ONE OR MORE DIGITS CONVERTED
+         BZ    ZWE2                     AND NON-DIGIT REACHED, BRANCH
+         TM    VASCTL,BIT0         IF NO DIGITS FOUND
+         BO    ZWZ4                     BRANCH TO INVALID TERM. MESSAGE
+         LA    ZWRB,9(ZWRF)        CORRECT VALUE POINTER
+ZWE2     OI    ZWSW,BIT6           SET VALUE FOUND SWITCH
+         LTR   ZWRD,ZWRH           COPY AND TEST VALUE
+         BZ    ZWD1                     BRANCH IF ZERO
+         LR    ZWRG,ZWRL           LOCATION DECIMAL
+         SR    ZWRG,ZWRB             MINUS LOCATION CHAR AFTER FLD CNVT
+         A     ZWRG,ZWDE             PLUS EXP GIVES ADJ EXP FOR THIS
+*                                    PIECE OF VALUE
+         TM    ZWSW,BIT5+BIT7      BRANCH UNLESS FIRST NON-ZERO
+         BNM   ZWG1                  PIECE FLOATING VALUE
+*F
+*F IF FLOATING PT COMPUTE WORKING SCALE FACTOR.
+*F
+         LCR   ZWRC,ZWRG           COMPLEMENT ADJ EXP
+         MH    ZWRC,=HS13'3.322'   MULT BY LOG 10 BASE 2 (3.527 HEX)
+         SRA   ZWRC,13             SCALE PRODUCT
+ZWF1     BCTR  ZWRC,0              COUNT NUMBER BITS
+         SRA   ZWRD,1                AND SUBTRACT
+         BP    ZWF1                     FROM PRODUCT
+         SRA   ZWRC,2              ROUND DOWN TO MULTIPLE OF 4
+         SLA   ZWRC,2
+         AH    ZWRC,=H'124'          AND ADD 124
+         ST    ZWRC,ZWSF           STORE WORKING SCALE FACTOR
+         OI    ZWSW,BIT5           SET FL PT INIT SWITCH
+         LPR   ZWRF,ZWRC           IF WORKING SCALE FACTOR WILL
+         CH    ZWRF,=H'400'          PRODUCE INVALID CHARACTERISTIC
+         BH    ZWQ7                     BRANCH TO INVALID EXP MSG
+*G
+*G COMPUTE AMT OF BINARY SHIFT. SPLIT INTO WORD INDEX AND BIT SHIFT.
+*G RESET WORKING AREA. TEST SIGN OF ADJ EXPONENT.
+*G
+ZWG1     LA    ZWRC,32             32
+         AR    ZWRC,ZWRG             PLUS ADJ EXP
+         A     ZWRC,ZWSF           PLUS SCALE FACTOR GIVES BIN SHIFT
+         SPACE
+* NOTE - ZWSF HAS S-MODIFIER VALUE IF F-, H-CON,
+*             OR THE WORKING SCALE FACTOR IF L-, D-, OR E-CON.
+         SRDA  ZWRC,5              SEPARATE INTO BIT AND WORD SHIFTS
+         SRL   ZWRD,27             POSITION BIT SHIFT
+         SLL   ZWRC,2              POSITION WORD SHIFT
+         XC    ZWW1,ZWW1           CLEAR WORK AREA
+         LTR   ZWRG,ZWRG           TEST ADJ EXP
+         BNP   ZWI1                BRANCH IF ZERO OR NEG
+         EJECT
+*H
+*H ADJ EXP IS PLUS.  MULTIPLY VALUE BY 5 TO THE GIVEN POWER.
+*H
+         ST    ZWRH,ZWW2           STORE VALUE
+         LR    ZWRA,ZWRC           WORD SHIFT IN BYTES
+         SH    ZWRA,=H'16'           LESS 16 = LEFT LIMIT OF WORK AREA
+         BP    ZWJ8                     BRANCH IF LIMIT DEFINES NO WORK
+ZWH1     SR    ZWRI,ZWRI           RESET WORK AREA POINTER
+         SR    ZWRH,ZWRH           CLEAR CARRY REG
+ZWH2     L     ZWRF,ZWW2(ZWRI)     LOAD PART OF VALUE
+         M     ZWRE,=F'5'          TIMES 5
+         ALR   ZWRF,ZWRH           ADD CARRY
+         BC    12,ZWH3             PROPAGATE
+         AH    ZWRE,=H'1'            CARRY
+ZWH3     LTR   ZWRH,ZWRE           SAVE CARRY AND TEST SIGN
+         BNM   ZWH4                  IF NEGATIVE
+         AH    ZWRH,=H'5'            CORRECT
+ZWH4     ST    ZWRF,ZWW2(ZWRI)     STORE PARTIAL PRODUCT
+         SH    ZWRI,=H'4'          STEP AREA POINTER LEFT
+         CR    ZWRI,ZWRA           IF LEFT LIMIT NOT REACHED
+         BNL   ZWH2                  BRANCH
+         LTR   ZWRH,ZWRH           TEST FINAL CARRY
+         BZ    ZWH5                     IF NOT ZERO
+         OI    ZARYERR(ZWRARY),DCTRUN   SET TRUNCATION INDICATOR
+ZWH5     BCT   ZWRG,ZWH1           DECREMENT ADJ EXP AND CLOSE LOOP
+         B     ZWJ1                     SHIFT VALUE
+*I
+*I ADJ EXP IS NOT PLUS. SHIFT VALUE AS INDICATED BY THE WORD INDEX AND
+*I DIVIDE BY 5 TO THE MAGNITUDE OF THE GIVEN POWER. RESET WORD INDEX
+*I
+ZWI1     LCR   ZWRC,ZWRC           COMPLEMENT WORD SHIFT GIVES LEFT
+*                                    LIMIT WORK AREA
+         BP    ZWD1                     BRANCH IF LIMIT DEFINES NO WORK
+         ST    ZWRH,ZWW2(ZWRC)     STORE VALUE IN WORK AREA SHIFTED
+         LCR   ZWRG,ZWRG           COMPLEMENT AND TEST ADJ EXP GIVES
+*                                    COUNT FOR NUMBER TIMES TO DIVIDE
+         BZ    ZWI5                     BRANCH IF ZERO
+ZWI2     LR    ZWRI,ZWRC           SET WORKING POINTER TO LEFT LIMIT
+         SR    ZWRE,ZWRE           CLEAR UPPER DIVIDEND REG
+ZWI3     L     ZWRF,ZWW2(ZWRI)     LOAD PART OF DIVIDEND
+         D     ZWRE,=F'10'         DIVIDE
+         SLL   ZWRF,1                BY 5
+         CH    ZWRE,=H'5'          IF REMAINDER
+         BL    ZWI4                     TOO LARGE
+         SH    ZWRE,=H'5'            CORRECT REMAINDER
+         AH    ZWRF,=H'1'            AND DIVIDEND
+ZWI4     ST    ZWRF,ZWW2(ZWRI)     STORE PARTIAL QUOTIENT
+         AH    ZWRI,=H'4'          STEP WORKING POINTER RIGHT
+         BNP   ZWI3                REPEAT UNTIL RIGHT LIMIT REACHED
+         BCT   ZWRG,ZWI2           REDUCE COUNT AND CLOSE LOOP
+ZWI5     SR    ZWRC,ZWRC           CLEAR WORD SHIFT
+         OC    ZWW1(L'ZWW1-L'ZWACC),ZWW1  TEST HI PART OF WORK AREA
+         BE    ZWJ1                     IF NOT ZERO
+         OI    ZARYERR(ZWRARY),DCTRUN   SET TRUNCATION INDICATOR
+         EJECT
+*J
+*J SHIFT VALUE PER WORD SHIFT AND BIT SHIFT. TRUNCATE TO 160
+*J BITS AND ADD TO ACCUMULATOR.
+*J
+ZWJ1     SR    ZWRG,ZWRG           RESET CARRY REG
+         LA    ZWRH,16             INIT ACCUMULATOR POINTER
+ZWJ2     SR    ZWRE,ZWRE           RESET WORKING REGISTERS
+         SR    ZWRF,ZWRF
+         LTR   ZWRC,ZWRC           TEST WORD INDEX
+         BP    ZWJ4                     IF PLUS LEAVE WORK AREA CLEAR
+         BZ    ZWJ3                     IF ZERO FETCH ONE WORD OF RESLT
+         L     ZWRF,ZWW2+4(ZWRC)   FETCH LO WORD OF RESULT
+ZWJ3     L     ZWRE,ZWW2(ZWRC)     FETCH HI WORD OF RESULT
+ZWJ4     SLDL  ZWRE,0(ZWRD)        BIT SHIFT
+         ALR   ZWRE,ZWRG           ADD IN CARRY
+         BC    3,ZWJ5              BRANCH IF CARRY LEAVING ONE IN ZWRG
+         SR    ZWRG,ZWRG           RESET CARRY
+ZWJ5     LTR   ZWRH,ZWRH           END OF ACCU
+         BM    ZWJ7                     YES, BRANCH
+         AL    ZWRE,ZWACC(ZWRH)    ADD IN PIECE FROM ACCUMULATOR
+         BC    12,ZWJ6             BRANCH IF NO CARRY
+         LA    ZWRG,1              SET CARRY
+ZWJ6     ST    ZWRE,ZWACC(ZWRH)    STEP WORKAREA PT
+         SH    ZWRC,=H'4'          STEP ACCU PT
+         SH    ZWRH,=H'4'          REPEAT FOR EACH WORD OF ACCU
+         B     ZWJ2                     LOOP
+ZWJ7     LTR   ZWRE,ZWRE           TEST CARRY
+         BZ    ZWD1                     IF ON
+ZWJ8     OI    ZARYERR(ZWRARY),DCTRUN   SET TRUNCATION INDICATOR
+         B     ZWD1                     STEP OVER DECIMAL POINT
+*M
+*M SET UP TO FORMAT RESULT. BRANCH TO APPROPRIATE ROUTINE.
+*M
+ZWM1     LM    ZWRL,ZWRJ,ZWSF      GET SCALE FACTOR AND TEXT POINTER,
+         L     ZWRC,DCLNGTH             GET BIT LENGTH
+         LCR   ZWRC,ZWRC             AND COMPLEMENT
+         TM    ZWSW,BIT5+BIT6      WHAT FORMAT REQUIRED
+         BZ    ZWZ4                     BRANCH IF TEXT TRIVIAL
+         BO    ZWP1                     BRANCH IF FLOAT PT AND NON-ZERO
+         EJECT
+*N
+*N FORMAT FIXED POINT RESULT.
+*N
+ZWN1     TM    ZWACC+L'ZWACC-4,BIT0     TEST DROPPED BIT
+         BZ    ZWN2                       NO ROUND NEEDED
+         LA    ZWRI,L'ZWACC-4           LOAD INDEX REG
+ZWN3     LA    ZWRA,1                   LOAD ROUND/CARRY BIT
+         AL    ZWRA,ZWACC-4(ZWRI)       ADD IN PIECE OF VALUE
+         ST    ZWRA,ZWACC-4(ZWRI)
+         BC    12,ZWN2                  IF NO CARRY, GO QUIT
+         SH    ZWRI,=H'4'                 ELSE PROPAGATE CARRY
+         BP    ZWN3                         THRU ALL OF ZWACC
+         OI    ZARYERR(ZWRARY),DCTRUN   IF CARRY OUT, SET TRUNC. INDIC.
+ZWN2     CLI   0(ZWRJ),JMINUS           IF VALUE SIGN IS NEGATIVE
+         BE    ZWN4                       GO DO NEG. OUTPUT
+* VALUE IS POSITIVE.  MOVE INTACT TO OUTPUT.
+         LM    ZWRG,ZWRB,ZWACC
+         STM   ZWRG,ZWRB,ZARYCON(ZWRARY)  STORE IN OUTPUT AREA
+* TEST FOR TRUNCATION OF HIGH-ORDER BITS (POSITIVE DATA)
+         CH    ZWRC,=H'-63'             IS LENGTH OVER 2 WORDS
+         BL    ZWN6                       YES.  GO DO HI 2 WORDS
+         OR    ZWRG,ZWRH                TEST HI 2 WORDS FIRST
+         BNZ   ZWN8                     SHOULD BE ZERO
+         SLDA  ZWRA,63(ZWRC)            TEST TRUN. IN BITS OF LO 2 WDS
+         B     ZWN6+L'ZWN6                THEN GO TEST
+ZWN6     SLDA  ZWRG,127(ZWRC)           TEST TRUN. IN BITS OF HI 2 WDS
+         BC    10,ZWZ5                  IF OKAY GO PUT IT OUT
+         B     ZWN8                     ELSE GO LOG ERROR
+* VALUE IS NEGATIVE.  COMPLIMENT IT AND PUT IN OUTPUT.
+ZWN4     LA    ZWRI,L'ZWACC-4           LOAD UP INDEX
+         SR    ZWRA,ZWRA                CLEAR REDUCTION BIT
+ZWN5     L     ZWRB,ZWACC-4(ZWRI)       PICK UP A WORD
+         LCR   ZWRB,ZWRB                COMPLIMENT IT, 2'S COMP
+         SLR   ZWRB,ZWRA                REDUCE TO 1'S COMP IF ABOVE    X
+                                            FIRST NON-ZERO WORD
+         BC    2,ZWN0                   BRANCH IF VALUE IS STILL ZERO
+* BRANCH GOES WRONG IF ZERO IS DEVELOPED ABOVE 1ST NON-ZERO. BUT THAT'S
+*  OKAY, AS, ONCE ZWRA IS = 1, RELOADING IT DOESN'T MATTER ANYWAY.
+         LA    ZWRA,1                   BEGIN 1'S COMPLIMENT NEXT WORD
+ZWN0     ST    ZWRB,ZARYCON-4(ZWRARY,ZWRI) STORE IN OUTPUT AREA
+         SH    ZWRI,=H'4'               NEXT
+         BP    ZWN5                       WORD
+* TEST FOR TRUNCATION OF HIGH-ORDER BITS (NEGATIVE DATA)
+         LM    ZWRG,ZWRB,ZARYCON(ZWRARY) PICK UP COMP. VALUE
+         CH    ZWRC,=H'-63'             IS LENGTH OVER 2 WORDS
+         BL    ZWN7                       YES.  GO DO HI 2 WORDS
+         SLDA  ZWRG,63                  TEST HI 2 WORDS FIRST
+         BC    3,ZWN8                   SHOULD BE MAX NEG OR ZERO
+         SLDA  ZWRA,63(ZWRC)            TEST TRUN. IN BITS OF LO 2 WDS
+         B     ZWN7+L'ZWN7                THEN GO TEST
+ZWN7     SLDA  ZWRG,127(ZWRC)           TEST TRUN. IN BITS OF HI 2 WDS
+         BC    12,ZWZ5                  IF OKAY GO PUT IT OUT
+* SET TRUNCATION INDICATOR AND GO PUT OUT VALUE
+ZWN8     OI    ZARYERR(ZWRARY),DCTRUN   ELSE SET TRUNCATION BIT
+         B     ZWZ5                         THEN GO PUT IT OUT.
+         EJECT
+*P
+*P NORMALIZE FLOATING POINT RESULT
+*P
+ZWP1     L     ZWRD,ZARYSCL(ZWRARY)     GET S-MODIFIER
+         CLI   ZWACC,BIT3               IS HIGH HEX DIGIT GT 0
+         BNL   ZWP2                     -YES.
+* VALUE NEEDS NORMALIZATION.            -NO.
+         MVC   ZWW1(L'ZWACC),ZWACC      PUT IN TEMP STORAGE
+         MVO   ZWACC+10(10),ZWW1+10(10) SHIFT VALUE LEFT 4 BITS
+         MVO   ZWACC+00(11),ZWW1+00(11)
+         AH    ZWRL,=H'4'               ADJUST WORKING SCALE FACTOR
+         B     ZWP1                     RETEST NORMALIZATION
+* ROUND VALUE TO LENGTH
+*   CALCULATE LEFT SHIFT FOR ROUNDING-BIT
+ZWP2     LR    ZWRE,ZWRD                GRAB S-MOD (HEX BYTES)
+         SLA   ZWRE,2                     MAKE INTO BITS
+         TM    ZWSW,BIT4                IS THIS AN L-CON
+         BZ    ZWP3                       NO. GO TO  D-,E- FORMULA
+         CH    ZWRC,=H'-63'               YES. IS LENGTH .GT. 64 BITS
+         BNL   ZWP3                         NO. USE D,E-CON FORMULA
+         CH    ZWRC,=H'-71'                 YES. IS LENGTH .GT. 72
+         BL    ZWP4                           YES. USE LONG L FORMULA
+         SH    ZWRE,=H'-71'                   NO. SPECIAL L FORMULA,
+         B     ZWP5                             GO SHIFT
+ZWP4     AH    ZWRE,=H'8'               LONG L-CON FORM.
+ZWP3     AH    ZWRE,=H'134'             SHORT L-CON, D-E-CON.
+         AR    ZWRE,ZWRC                SUBTRACT LENGTH-1
+*
+ZWP5     CH    ZWRE,=H'127'             WILL ANY OF VALUE BE RETAINED
+         BH    ZWQ1                       NO.  SKIP ROUNDING.
+         SRDL  ZWRE,5                   SPLIT SHIFT INTO
+         SRL   ZWRF,32-5                  BITS AND
+         SLL   ZWRE,2                     WORDS  (IN BYTE TERMS).
+         LCR   ZWRE,ZWRE
+         LA    ZWRI,L'ZWACC-4(,ZWRE)    INIT INDEX WORD-SHIFT ADJUSTED
+         LA    ZWRA,1                   LOAD ROUND BIT
+         SLL   ZWRA,0(ZWRF)             POSITION IT
+ZWP6     AL    ZWRA,ZWACC-4(ZWRI)       ADD IN PIECE OF VALUE
+         ST    ZWRA,ZWACC-4(ZWRI)
+         BC    12,ZWQ1                  IF NO CARRY, GO QUIT
+         LA    ZWRA,1                     ELSE LOAD CARRY REGISTER,
+         SH    ZWRI,=H'4'
+         BP    ZWP6                       GO PROPAGATE CARRY
+*OVERFLOW ON ROUNDING. NUTS.
+         MVI   ZWACC,X'10'              PUT CORRECTED VALUE
+         SH    ZWRL,=H'4'  (ART'S FIX)  ADJUST WORKING SCALE FACTOR
+         EJECT
+*Q
+*Q SHIFT RIGHT PER SCALE MOD., PLACE EXPONENT(S), POSITION FOR OUTPUT
+*Q
+ZWQ1     LR    ZWRB,ZWRD                GET S-MOD
+         AH    ZWRB,=H'1'               BUMP TO MOVE EXTRA BYTE IF     X
+                                          S-MOD IS ODD
+         SRA   ZWRB,1                   MAKE INTO BYTES
+         XC    ZWW1(L'ZWACC-3),ZWW1     CLEAR NEW HIGH BYTES
+         LA    ZWRI,ZWW1+1(ZWRB)        INDEX MOVE. ADD 1 FOR EXP.
+         MVC   0(L'ZWACC-5,ZWRI),ZWACC  MOVE AND SHIFT BY BYTES
+         TM    ZARYSCL+3(ZWRARY),BIT7   WAS S-MOD ODD
+         BZ    ZWQ2                       NO. LET IT SIT
+         MVO   ZWW1+1(16),ZWW1+1(16)    SHIFT BACK 1 HEX DIGIT
+ZWQ2     MVC   ZWACC(L'ZWACC-3),ZWW1    BRING IT HOME
+*VALUE IN ZWW1 USED LATER IN LOST PRECISION TEST
+*
+*CALCULATE EXPONENT BYTE AND INSERT IT IN VALUE
+         LA    ZWRB,384                 FORM
+         SR    ZWRB,ZWRL                  CHARACTERISTIC
+         SRA   ZWRB,2
+         AR    ZWRB,ZWRD                ADJUST FOR S-MODIFIER
+         LR    ZWRA,ZWRB
+         SRA   ZWRA,7                   TEST FOR
+ZWQ7     LA    ZWRH,ZRCD70              CHARACTERISTIC
+         BNZ   ZWZ3                       OUT OF BOUNDS
+         CLI   0(ZWRJ),JMINUS           IF VALUE IS NEGATIVE
+         BNE   ZWQ6                       NOT NEG
+         LA    ZWRB,X'80'(,ZWRB)          PUT - SIGN
+ZWQ6     STC   ZWRB,ZWACC               PLUG IN EXPONENT
+         TM    ZWSW,BIT4                IS THIS A L-CON
+         BZ    ZWQ3                       NO.  GO DO FINALS.
+*THIS IS AN L-CON, PROCESS LOWER EXPONENT
+         LM    ZWRE,ZWRF,ZWACC+8        PICK LOW 2 WORDS
+         SRDL  ZWRE,8                   MAKE ROOM FOR EXPONENT
+         STM   ZWRE,ZWRF,ZWACC+8
+         STM   ZWRE,ZWRF,ZWW1+8         SAVE FOR LATER TEST
+         SH    ZWRB,=H'14'              LOWER EXPONENT IS 14 LESS
+         STC   ZWRB,ZWACC+8             PLUG IT IN
+* IF LOW EXPONENT UNDERFLOWED, THE SIGN BIT WILL BE WRONG.
+*  CORRECT FOR THAT POSSIBILITY.
+         NI    ZWACC+8,BITFF-BIT0       KILL WHATEVER SIGN BIT
+         CLI   0(ZWRJ),JMINUS           IS VALUE NEGATIVE
+         BNE   ZWQ3                     BIF NO
+         OI    ZWACC+8,BIT0             YES, PUT - SIGN
+* CLODDY LOOP TO SHIFT VALUE FROM ZWACC TO DCVW, AND ALSO MOVE
+* TEST VALUE FROM ZWW1 TO LOW ZWW1.
+ZWQ3     AH    ZWRC,=H'127'             COMPUTE SHIFT
+         SRDL  ZWRC,5
+         SRL   ZWRD,32-5                BIT SHIFT
+         SLL   ZWRC,2                   WORD SHIFT IN BYTES
+         XC    ZARYCON(12,ZWRARY),ZARYCON(ZWRARY)  CLEAR RECEIVING AREA
+         XC    ZWW1+16(12),ZWW1+16      CLEAR RECIEVING AREA
+         SR    ZWRI,ZWRI                CLEAR LOOP INDEX
+         SR    ZWRG,ZWRG                CLEAR CARRY REG
+         SR    ZWRH,ZWRH                CLEAR CARRY REG
+ZWQ4     L     ZWRE,ZWACC(ZWRI)         PICK UP WORD
+         L     ZWRL,ZWW1(ZWRI)          PICK UP WORD
+         SR    ZWRF,ZWRF                CLEAR RH WORD
+         SR    ZWRJ,ZWRJ                CLEAR RH WORD
+         SRDL  ZWRE,0(ZWRD)             SHIFT PER BIT SHIFT
+         SRDL  ZWRL,0(ZWRD)             SHIFT PER BIT SHIFT
+         OR    ZWRE,ZWRG                PUT IN BIT FROM PREVIOUS WORD
+         OR    ZWRL,ZWRH                PUT IN BIT FROM PREVIOUS WORD
+         LR    ZWRG,ZWRF                SAVE OUTSHIFT FOR NEXT WORD
+         LR    ZWRH,ZWRJ                SAVE OUTSHIFT FOR NEXT WORD
+         LA    ZWRB,0(ZWRI,ZWRC)        ADD 2 INDEX REGS TOGETHER
+         ST    ZWRE,ZARYCON(ZWRARY,ZWRB)  PUT WORD OFFSET PER WD SHIFT
+         ST    ZWRL,ZWW1+16(ZWRB)       PUT WORD OFFSET PER WD SHIFT
+         AH    ZWRI,=H'4'               BUMP INDEX
+         CH    ZWRB,=H'12'              TEST WHERE LATEST WD STORED
+         BL    ZWQ4                       BR IF NOT LAST WORD
+* TEST THE VALUE AT ZWW1+4 FOR LOST PRECISION
+         OC    ZWW1+16(16),ZWW1+16      ZERO IF SHIFTED OUT ALL BITS
+         BNZ   ZWZ5                       IF BIT, GO OUTPUT
+         LA    ZWRH,ZRCD109
+         BAL   ZWRG,MERROR              POST ERROR MESSAGE, THEN
+         B     ZWZ5                       GO OUTPUT
+         EJECT
+*S1
+*S1 STEP OVER SIGN.
+*S1
+ZWS1     CLI   0(ZWRB),JPLUS            IF CHARACTER IS PLUS
+         BE    ZWS11                    BRANCH
+         CLI   0(ZWRB),JMINUS           IF CHARACTER
+         BCR   7,ZWRG                IS - RETURN
+ZWS11    LA    ZWRB,1(ZWRB)        STEP TEXT POINTER
+         BR    ZWRG                     RETURN
+*Z
+*Z ERROR ROUTINE  AND RETURN ROUTINE.
+*Z
+ZWZ4     LA    ZWRH,ZRCD39              LOAD ERROR NUMBER
+ZWZ3     BAL   ZWRG,MERROR         STORE ERROR MESSAGE
+         XC    16(16,ZWRARY),16(ZWRARY) CLEAR OUTPUT AREA
+ZWZ5     LR    R10,ZWRLAST              LOAD POINTER TO TERM CHAR
+         LR    R11,ZWRARY               RESTORE INPUT ARRAY POINTER
+XIT      JRETURN ,                      EXIT
+*
+MERROR   STC   ZWRH,ZARYERR(0,ZWRARY)   SET ERROR
+         BR    ZWRG                     AND RETURN
+         EJECT
+*DECON- CONVERT A PIECE OF THE VALUE
+*       INPUT- CONDEX POINTS TO FIRST CHAR
+*       OUTPUT-BINVAL CONTAINS CONVERTED VALUE
+*              CONDEX TO TERMINATING CHAR
+*              ZWRF POINTS TO FIRST CHAR OF FIELD
+*              VASCTL CONTAINS X'00'  NO ERRORS
+*                        BIT1  X'40'  TOO LONG
+*                        BIT0  X'80'  NO CHAR TO CONVERT
+         SPACE 2
+DECON    MVI   VASCTL,BIT0-BIT0         AND FLAG
+         ST    CONDEX,AFIRST            SAVE POINTER TO BEGINNING-1
+ADDIT    CLI   0(CONDEX),J9             IS CHARACTER NUMERIC
+         BH    SETUP                    NO, BRANCH
+         LA    CONDEX,1(0,CONDEX)       UP TO NEXT CHAR
+         B     ADDIT                    LOOP, LOOKING FOR NON-NUMERIC
+SETUP    ST    CONDEX,SAVEAD            SAVE END POINTER
+         LR    CNT,CONDEX               LOAD ENDING POINTER
+         L     CONDEX,AFIRST            BEGIN AT BEGINNING
+         SR    CNT,CONDEX               MINUS BEGINNING PTR = # OF CHAR
+         BZ    ZNONE                    BRANCH IF NO CHAR TO CONVERT
+SET1     CH    CNT,=H'10'               YES, IS IT GREATER THAN MAX
+         BL    GOTOIT                   NO, OK
+         BH    GTTEN                    YES, TRY TO GET DOWN TO NINE
+         CLC   0(10,CONDEX),=X'02010407040803060407'  =10 CHARS, IS IT X
+                                                        .GT. 2**31-1
+         BNH   GOTOIT                   NO, CONVERT
+ZLONG    OI    VASCTL,BIT1              YES, SET FLAG
+         LA    CNT,9                    AND CONVERT 9
+GOTOIT   BCTR  CNT,0                    DECREMENT FOR MOVE
+         EX    CNT,PACKIT               PACK VALUE INTO HOLD
+         OI    HOLD+7,BIT4+BIT5         SET POSITIVE SIGN
+         CVB   BINVAL,HOLD              CONVERT HOLD TO BINARY
+LEAV     LR    ZWRF,CONDEX              SET TO FIRST CHAR
+         L     CONDEX,SAVEAD            SET TO TERMINATOR
+         BR    REG                      RETURN
+GTTEN    CLI   0(CONDEX),J0             IS FIRST CHARACTER A ZERO
+         BNE   ZLONG                    NO, TOO LONG
+         LA    CONDEX,1(0,CONDEX)       YES, IGNORE ZERO
+         BCTR  CNT,0                    DECREMENT COUNT
+         LTR   CNT,CNT                  ARE THERE CHAR TO CONVERT
+         BNZ   SET1                    YES, NOW SEE IF SHORT ENOUGH
+ZNONE    OI    VASCTL,BIT0              SET CODE, NONE TO CONVERT
+         B     LEAV                     AND EXIT
+PACKIT   PACK  HOLD(8),0(00,CONDEX)     EXECUTED PACK TO PACK HOLD
+         EJECT
+*
+*LITERAL POOL
+*
+         SPACE
+         LTORG
+*
+         EJECT
+*
+*REGISTER EQUATES
+*
+ZWRA     EQU   R0                       REGISTERS- SCALE FACTOR
+ZWRB     EQU   R1                                  POINTER TO SCAN CHAR
+ZWRARY   EQU   R2                                  POINTER TO IN ARRAY
+ZWRLAST  EQU   R5                                  LAST CONSTANT ADDR
+ZWRC     EQU   R6                                  WORKING SCALE FACTOR
+ZWRD     EQU   R7                                  LOWER LIMIT SCALE
+ZWRE     EQU   R8                                  UPPER LIMIT SCALE
+ZWRF     EQU   R9                                  LOW WORD OF RESULT
+ZWRL     EQU   R10                                 POSITION OF DEC PONT
+ZWRJ     EQU   R11                                 END POINTER
+ZWRI     EQU   R12                                 EXPONENT MODIFIER
+ZWRG     EQU   R14                                 ADJECTIVE EXPONENT
+ZWRH     EQU   R15                                 BINARY RESULT
+CONDEX   EQU   ZWRB                     POINTER TO SCAN CHAR
+CNT      EQU   ZWRF                     COUNTER FOR CHAR TO CONVERT
+REG      EQU   ZWRG                     RETURN REGISTER-DECON
+BINVAL   EQU   ZWRH                     BINARY VALUE-DECON
+*
+*ERROR CODE EQUATES
+*
+ZRCD11   EQU   BIT0                     SCALE MODIFIER ERROR
+ZRCD13   EQU   BIT1                     EXPONENT MODIFIER ERROR
+DCTRUN   EQU   BIT2                     TRUNCATION ERROR
+ZRCD39   EQU   BIT3                     INVALID DELIMITER
+ZRCD70   EQU   BIT4         FLOATING POINT CHARACTERISTIC OUT OF RANGE
+ZRCD109  EQU   BIT5                     PRECISION LOST
+*
+*MODIFIER TYPES
+*
+BTYPEFL  EQU   X'08'                    MODIFIER TYPE - FLOATING POINT
+BTYPEL   EQU   X'06'                    L-CON MODIFIER TYPE
+*
+*INPUT ARRAY EQUATES
+*
+*LENGTH IN BYTES IF SIGN = 0, LENGTH IN BITS IF SIGN = 1
+ZARYSGN  EQU   0                        INPUT ARRAY - SIGN
+ZARYERR  EQU   1                                      ERROR CODE
+ZARYTYPE EQU   3                                      TYPE(BUCKET CODE)
+ZARYLEN  EQU   4                                      LENGTH
+ZARYSCL  EQU   8                                      SCALE FACTOR
+ZARYEXP  EQU   12                                     EXTERNAL EXPONENT
+ZARYCON  EQU   16                                     RIGHT JUSTIFIED  X
+                                                        CONSTANT
+         JPATCH X5F00,5FA
+         END

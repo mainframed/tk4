@@ -1,0 +1,822 @@
+CNSLMON  TITLE 'CNSLMON PROGRAM'
+CNSLMON  CSECT                    DEFINE CSECT
+         COVER
+*A. CNSLMON SCANS THE ASVT LOOKING AT EACH JOB AND ENFORCES THE CPU
+*   TIME LIMITS SET IN "CPUTABLE".  THOSE LIMITS FOLLOW:
+*
+*              CLASS     TIME LIMIT
+*
+*                F       10 SECONDS
+*                A       30 SECONDS
+*                T       30 SECONDS
+*
+*
+*B. CNSLMON SCANS THE MASTER CONSOLE'S BUFFER TO CHECK FOR AND PROCESS
+*   ANY MESSAGES CONTAINED IN "MSGTABLE".
+*
+*
+*C. CNSLMON CHECKS FOR AND PROCESSES COMMANDS PASSED TO IT BY MODIFY
+*   COMMANDS (F CNSLMON,XXXXXXXX) WHERE XXXXXXXX IS CONTAINED IN
+*   "CMDTABLE", OR THE STOP COMMAND (P CNSLMON).  THE COMMANDS IN
+*   "CMDTABLE" FOLLOW:
+*
+*        COMMAND                       PROGRAM ACTIVITY
+*
+*        F CNSLMON,CPUT                DISPLAY CPUTABLE
+*        F CNSLMON,HELP                DISPLAY CMDTABLE
+*        F CNSLMON,MSGT                DISPLAY MSGTABLE
+*        F CNSLMON,STAT                DISPLAY CNSLMON STATISTICS
+*
+         TITLE 'CNSLMON INITIALIZATION'
+*
+*     REGISTER EQUATES AND USAGE
+*
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11                      ANOTHER BASE REG
+R12      EQU   12                      BASE REG
+R13      EQU   13                      WORKAREA BASE REG AND SAVE AREA
+R14      EQU   14                      RETURN ADDR
+R15      EQU   15                      RETURN CODE
+*
+*     HOUSEKEEPING
+*
+         SAVE  (14,12),,*              SAVE REGISTERS
+         LR    R12,R15                 SET REG 12 TO ENTRY ADDR
+         LA    R11,4095(R12)           SETUP SECOND BASE REG
+         LA    R11,1(R11)              COULDN'T QUITE MAKE IT
+         USING CNSLMON,R12,R11         ESTABLISH ADDRESSABILITY
+         ST    R13,SAVEAREA+4          STORE SAVE AREA ADDR
+         LR    R2,R13                  ALSO STASH IT TEMPORARILY
+         LA    R13,SAVEAREA            LOAD ADDR OF MY SAVE AREA
+         ST    R13,8(R2)               STORE IT IN CALLING SAVE AREA
+         USING PSA,R0
+         TIME  DEC                     GET INITIALIZATION TIME
+         ST    R0,TIME                 STORE THE TIME
+         ST    R1,DATE                 STORE THE DATE
+         MVC   STAT0+23(5),=X'2020202020' MOVE IN EDIT PATTERN
+         ED    STAT0+23(5),DATE+1      EDIT THE DATE
+         MVC   STAT0+29(8),=X'21207A20207A2020' MOVE IN EDIT PATTERN
+         ED    STAT0+29(8),TIME        EDIT THE TIME
+         RUN   SUPSTAT                 GO GET INTO SUPERVISOR STATE
+         SYSEVENT DONTSWAP             MAKE NONSWAPPABLE
+         RUN   PROBSTA                 GO BACK TO PROBLEM STATE
+*
+*     SAVE MY ASID
+*
+         L     R2,548(R0)              GET MY ASCB ADDR
+         MVC   MYASID,36(R2)           SAVE MY ASID
+*
+*     LOCATE CONSOLE ADDRESS SPACE
+*
+         L     R1,16(0)                LOAD ADDR OF CVT
+         L     R1,556(R1)              LOAD ADDR OF ASVT
+         LA    R1,524(R1)              POINT BEFORE FIRST ENTRY
+CNSLMON1 LA    R1,4(R1)                POINT TO NEXT ENTRY
+         CLC   0(4,R1),=X'80000000'    END OF TABLE?
+         BE    CNSLMON2
+         TM    0(R1),X'80'             AVAILABLE ASCB?
+         BO    CNSLMON1                IF SO, IGNORE IT
+         L     R2,0(R1)                LOAD ADDR OF ASCB
+         ICM   R3,B'1111',176(R2)      LOAD & TEST PTR TO LOGON JOBNAME
+         BZ    CNSLMON1                IF ZERO, KEEP GOING
+         CLC   0(8,R3),=C'CONSOLE '    IS THIS THE SPECIFIED JOB?
+         BE    CNSLMON3                IF SO, QUIT SEARCH
+         B     CNSLMON1
+CNSLMON2 DS    0H
+         WTO   'CNSLMON ERROR, COULD NOT LOCATE CONSOLE ADDRESS SPACE',+
+               ROUTCDE=2
+         LA    R15,16                  INDICATE DISASTROUS ERROR
+         B     RETURN1                 THAT'S ALL
+CNSLMON3 DS    0H
+         MVC   CONSASID,36(R2)         SAVE CONSOLE'S ASID
+*
+*     NOW PREPARE FOR CROSS MEMORY STUFF
+*
+         RUN   SUPSTAT                 GO GET INTO SUPERVISOR STATE
+         LA    R2,1
+         AXSET AX=(R2)
+         RUN   PROBSTA                 GO BACK TO PROBLEM STATE
+         LA    R0,L'COMMND0            DO A "$TOSC01,D=T" SO THAT
+         LA    R1,COMMND0                CONSOLE MESSAGES WILL MATCH
+         RUN   ISSUE                       THE EXPECTED FORMAT
+         WTO   '*** CNSLMON HAS BEEN INITIATED ***',ROUTCDE=2
+         TITLE 'MAIN PROGRAM LOOP'
+MAINLOOP DS    0H
+         L     R1,16(0)                POINT TO CVT
+         L     R1,604(R1)              POINT TO RMCT
+         MVC   NOW,124(R1)             SAVE SRM'S CURRENT TIME OF DAY
+         RUN   CHECKCM                 CHECK FOR OPERATOR COMMANDS
+         RUN   CHECKCB                 CHECK STUFF IN CONTROL BLOCKS
+         RUN   GETCONS                 GET MASTER CONSOLE BUFFER
+         RUN   CHKCONS                 PROCESS MASTER CONSOLE BUFFER
+         STIMER WAIT,BINTVL=WAITIME    WAIT FOR A WHILE
+         B     MAINLOOP                AND DO IT AGAIN
+         TITLE 'PROGRAM TERMINATION'
+RETURN   XR    R15,R15                 SET RETURN CODE 0
+RETURN1  L     R13,SAVEAREA+4          LOAD ADDR OF CALLING SAVE AREA
+         L     R14,12(R13)             RESTORE R14
+         LM    R0,R12,20(R13)          RESTORE R0 THROUGH R12
+         BR    R14                     RETURN
+         TITLE 'CHECK FOR OPERATOR COMMAND INPUT'
+CHECKCM  BEGIN
+*
+*     ROUTINE TO CHECK FOR AND PROCESS OPERATOR COMMANDS
+*
+*     LOCAL REGISTER USE:
+*
+*     R2  - COMMUNICATION INTERFACE ADDRESS
+*     R3  - CIB POINTER
+*     R4  - CIB ADDRESS
+*     R5  - CMDTABLE
+*     R14 - LINKAGE
+*
+         EXTRACT COMMADDR,'S',         PEEK AT THE TCB                 +
+               FIELDS=COMM             FIND ADDRESS OF COMLIST
+         CLC   COMMADDR,=F'0'          IS ANY THING THERE?
+         BE    CHECKCM6                NO --> ABEND THE PROGRAM
+         L     R2,COMMADDR             GET COMM ADDRESS
+         USING COMLIST,R2              ADDRESS THE COMLIST
+         ICM   R3,B'0111',COMCIBPT+1   FIND THE CIB POINTER
+         BZ    CHECKCM5                NO COMMAND --> GET OUT FAST
+         USING STARTCIB,R3             ADDRESS THE CIB
+         LA    R4,COMCIBPT             GET CIB'S ADDRESS
+         QEDIT ORIGIN=(R4),CIBCTR=1    WE ONLY WANT 1 INPUT QUEUED
+         CLI   CIBVERB,CIBSTOP         DO THEY WANT STOP?
+         BE    RETURN                  YES --> GO DO IT
+         CLI   CIBVERB,CIBMODFY        IS THIS A MODIFY?
+         BNE   CHECKCM4                NO --> GET OUT OF DODGE
+         LA    R5,CMDTABLE             POINT TO THE COMMAND TABLE
+CHECKCM1 DS    0H
+         CLI   0(R5),END               END OF COMMAND TABLE ?
+         BE    CHECKCM3                YES --> GET OUT OF DODGE
+         CLC   0(4,R5),CIBDATA         IS THIS THE OPERATOR COMMAND ?
+         BE    CHECKCM2                YES --> PROCESS IT
+         LA    R5,48(R5)               IF NOT, BUMP TO THE NEXT ENTRY
+         B     CHECKCM1                  AND CHECK IT
+CHECKCM2 DS    0H
+         L     R15,4(R5)               LOAD THE ADDRESS OF THE ROUTINE
+         BALR  R14,R15                   AND EXECUTE IT
+         B     CHECKCM4                GET RID OF THE COMMAND AND EXIT
+CHECKCM3 DS    0H
+         WTO   '++ CNSLMON RECIEVED INVALID COMMAND',ROUTCDE=2
+CHECKCM4 DS    0H
+         QEDIT ORIGIN=(R4),BLOCK=(R3)  RELEASE THE COMMAND
+         DROP  R3                      RELEASE THE REGISTER
+CHECKCM5 DS    0H
+         DROP  R2                      RELEASE THE REGISTER
+         B     CHECKCMX                GET OUT OF DODGE
+CHECKCM6 DS    0H
+         WTO   '++ CNSLMON COULD NOT LOCATE COMM ADDRESS',ROUTCDE=2
+         ABEND 16                      ERROR EXIT
+CHECKCMX GOBACK                        RETURN TO SENDER
+         TITLE 'CHECK BATCH AND TSO FOR SYSTEM ABUSES'
+*
+*
+*     ROUTINE TO CHECK EACH BATCH & TSO JOB
+*
+*     LOCAL REGISTER USE:
+*
+*     R3  - # OF REMAINING ENTRIES IN ASVT
+*     R4 -  PTR TO OUCB
+*     R5  - PTR TO JOBNAME
+*     R6  - CPU TIME
+*     R7  - CPU TIME
+*     R8  - PTR TO NEXT AVAILABLE ENTRY IN JOBNAME TABLE
+*     R9  - PTR TO ASVT
+*     R10 - PTR TO ASCB
+*     R14 - LINKAGE
+         USING ASVT,R9                 ADDRESS ASVT
+         USING ASCB,R10                ADDRESS ASCB
+         USING OUCB,R4                 ADDRESS OUCB
+CHECKCB  BEGIN
+*
+*     WHIP THROUGH THE ASVT
+*
+         LA    R8,JOBTABLE             POINT TO START OF JOB TABLE
+         MVI   JOBTABLE,C' '           PLANT A BLANK
+         MVC   JOBTABLE+1(MAXJOBS*5-1),JOBTABLE   FILL WITH BLANKS
+         L     R1,16                   POINT TO CVT
+         USING CVT,R1                  ADDRESS CVT
+         L     R9,CVTASVT              POINT TO ASVT
+         DROP  R1                      FORGET CVT
+         L     R3,ASVTMAXU             LOAD MAXIMUM # OF ASVT ENTRIES
+CHECKCB1 DS    0H
+         TM    ASVTENTY,ASVTAVAL       IF THIS ASID IS AVAILABLE
+         BO    CHECKCB4                THEN KEEP LOOKING
+         L     R10,ASVTENTY            POINT TO ASCB
+         L     R4,ASCBOUCB             POINT TO OUCB
+         ICM   R5,15,ASCBJBNI          CHECK PTR TO BATCH JOBNAME
+         BZ    CHECKCB4                IF NOT BATCH, LOOK AT NEXT ONE
+         MVC   ASID,ASCBASID           STORE ASID
+         RUN   GETJES#                 GO GET THE JES NUMBER
+         CLI   0(R8),END               AT END OF JOB TABLE?
+         BE    CHECKCB7                FRAID SO
+         MVC   0(4,R8),JESNO           STUFF IN JES NUMBER
+         MVC   4(1,R8),OUCBCLS         STUFF IN JOB CLASS
+         LA    R8,5(R8)                POINT TO NEXT SPOT
+         TITLE 'CHECK FOR CPU LIMIT VIOLATIONS'
+*
+*     CHECK FOR CPU LIMIT VIOLATIONS
+*
+         LM    R6,R7,ASCBEJST          LOAD CPU TIME INTO REGISTERS
+         SRDA  R6,22                   CONVERT INTO 1024*MICROSECONDS
+         BINTIME 6                     CONVERT INTO 1/100S OF SECONDS
+         LA    R2,CPUTABLE             POINT TO START OF TABLE
+CHECKCB2 DS    0H
+         CLI   0(R2),END               IF AT END OF CPU TABLE
+         BE    CHECKCB4                   THEN EXIT NOW
+         CLC   0(1,R2),OUCBCLS         IF NOT RIGHT CLASS
+         BNE   CHECKCB3                   THEN KEEP LOOKING
+         C     R7,4(R2)                IF CPU TIME IS LEGAL
+         BNH   CHECKCB4                   THEN EXIT
+         MVC   COMMNDA+4(4),JESNO      MOVE JOB NUMBER TO COMMAND
+         MVC   COMMNDA+39(1),OUCBCLS   MOVE CLASS INTO COMMAND
+         LA    R0,L'COMMNDA            LOAD LENGTH OF COMMAND
+         LA    R1,COMMNDA              AND ITS ADDRESS
+         RUN   ISSUE                   TELL HIM THE PROBLEM
+         MVC   COMMND7+3(4),JESNO      MOVE JOB NUMBER TO COMMAND
+         LA    R0,L'COMMND7            LOAD LENGTH OF COMMAND
+         LA    R1,COMMND7              AND ITS ADDRESS
+         RUN   ISSUE                   CANCEL THE JOB
+         L     R15,#CPULIM             RETRIEVE COUNT OF HITS
+         LA    R15,1(R15)              INCREMENT
+         ST    R15,#CPULIM             STORE COUNT OF HITS
+         B     CHECKCB4                WE'RE THROUGH
+CHECKCB3 DS    0H
+         LA    R2,8(R2)                POINT TO NEXT TABLE ENTRY
+         B     CHECKCB2                AND KEEP LOOKING
+         TITLE 'RETURN TO CHECK THE NEXT ASCB'
+CHECKCB4 DS    0H
+         LA    R9,4(R9)                POINT TO NEXT ASCB
+         BCT   R3,CHECKCB1             AND KEEP GOING
+CHECKCB5 DS    0H
+         DROP  R9                      FORGET ASVT
+         DROP  R10                     FORGET ASCB
+         DROP  R4                      FORGET OUCB
+         B     CHECKCBX                EXIT NORMALLY
+CHECKCB6 DS    0H
+         WTO   'CNSLMON CAN''T FIND ACF2 CVT',ROUTCDE=2
+         ABEND 16                 EAT SHIT AND DIE!
+CHECKCB7 DS    0H
+         WTO   'CNSLMON HAS OVERFLOWED ITS JOB TABLE',ROUTCDE=2
+         ABEND 16                 EAT SHIT AND DIE!
+CHECKCBX GOBACK
+         TITLE 'COPY MASTER CONSOLE BUFFER'
+*
+*   ROUTINE TO COPY CONSOLE SCREEN TO OUR BUFFER
+*
+GETCONS  BEGIN
+         RUN   SUPSTAT
+         L     R2,16                   POINT TO CVT
+         L     R2,100(R2)              POINT TO UCM BASE
+         LR    R3,R2                   COPY UCM BASE PTR
+         S     R3,=F'4'                BACK UP 4
+         L     R3,0(R3)                LOAD PTR TO UCM PREFIX
+         L     R3,0(R3)                LOAD PTR TO MASTER CONSOLE UCME
+         MVC   UCMID,26(R3)            SAVE THE CONSOLE ID
+         L     R2,12(R3)               LOAD UCMUCB
+         MVC   STAT0+43(3),13(R2)      MOVE IN UCB NAME
+         L     R3,28(R3)               POINT TO RDCM
+         L     R3,0(R3)                POINT TO TDCM
+         LA    R3,48(R3)               POINT TO DCMASCRN FIELD
+         LA    R1,4                    THIS MANY BYTES
+         LA    R2,SCREENPT             THIS IS WHERE WE WANT TO MOVE TO
+         LA    R4,0                    PROTECT KEY IS ZERO
+         LH    R5,CONSASID             LOAD CONSOLE'S ASID
+         SSAR  R5                      SET SECONDARY ADDRESS SPACE
+         MVCP  0(R1,R2),0(R3),R4       MOVE THE POINTER
+         LA    R1,BUFFSIZE             LENGTH TO MOVE
+         LA    R2,BUFFER               THIS IS WHERE WE WANT TO MOVE TO
+         L     R3,SCREENPT             MOVE FROM HERE
+         S     R3,=F'6'
+         LA    R4,0                    PROTECT KEY IS ZERO
+GETCONS1 MVCP  0(R1,R2),0(R3),R4       MOVE A CHUNK
+         BZ    GETCONS2                QUIT IF EVERYTHING MOVED
+         SL    R1,=F'256'              DECREASE TRUE LENGTH
+         AL    R2,=F'256'              INCREASE TARGET ADDR
+         AL    R3,=F'256'              INCREASE SOURCE ADDR
+         B     GETCONS1
+GETCONS2 DS    0H
+         LH    R5,MYASID               LOAD MY ASID
+         SSAR  R5                      SET SECONDARY ADDRESS SPACE
+         RUN   PROBSTA
+GETCONSX GOBACK
+         TITLE 'PROCCESS MASTER CONSOLE BUFFER'
+*
+*     ROUTINE TO PROCESS CONTENTS OF CURRENT MASTER CONSOLE BUFFER
+*
+CHKCONS  BEGIN
+         LA    R4,BUFFER               POINT TO CONSOLE BUFFER
+         LA    R4,WCC@SBA(R4)          POINT PAST LINE HEADER
+         USING MSGMODEL,R4             ADDRESS MSG MODEL
+         LA    R6,NUMLINES             LOAD LINES IN A SCREEN
+CHKCONS1 DS    0H
+         LR    R2,R4                   LOAD ADDRESS OF LINE
+         SH    R2,=H'2'                BACK UP TWO CHARACTERS
+         CLI   0(R2),X'4F'             IF MESSAGE HAS BEEN ANSWERED
+         BE    CHKCONS4                  THEN CONTINUE
+         LA    R3,MSGTABLE             POINT TO START OF TABLE
+CHKCONS2 DS    0H
+         CLI   0(R3),END               IF AT END OF MESSAGE TABLE
+         BE    CHKCONS4                  THEN GET NEXT MESSAGE
+         CLC   0(8,R3),MSGTEXT         IS THIS MESSAGE IN THE TABLE?
+         BE    CHKCONS3                  YES --> PROCESS IT
+         CLC   0(8,R3),MSGTEXT+3       IS THIS MSG/REPLY IN THE TABLE?
+         BE    CHKCONS3                  YES --> PROCESS IT
+         LA    R3,52(R3)               BUMP TO NEXT TABLE ENTRY
+         B     CHKCONS2                GO CHECK THE MESSAGE
+CHKCONS3 DS    0H
+         L     R15,8(R3)               LOAD THE MESSAGE ROUTINE ADDR
+         BALR  R14,R15                 BRANCH TO THE ROUTINE
+CHKCONS4 DS    0H
+         LA    R4,LINESIZE(R4)         POINT TO NEXT LINE ON SCREEN
+         BCT   R6,CHKCONS1             LOOP BACK TO PROCESS LINE
+CHKCONSX GOBACK
+         TITLE 'ALLOCATION RECOVERY MESSAGES'
+*
+*     LOOK FOR ALLOCATION RECOVERY MESSAGES (IEF238D)
+*
+IEF238D  BEGIN
+         LA    R2,MSGTEXT+20           FIRST PLACE TO LOOK
+         LA    R1,8                    THIS MANY TRIES
+IEF238D1 CLC   0(7,R2),=C'- REPLY'     FIND THE TEXT OF THE MESSAGE
+         BE    IEF238D2                GOT IT
+         BCTR  R2,0                    BACK UP
+         BCT   R1,IEF238D1             LOOK AGAIN
+         WTO   'CNSLMON CAN''T LOCATE ''- REPLY''',ROUTCDE=2
+         B     IEF238DX                GET OUT OF DODGE
+IEF238D2 DS    0H
+         CLC   MSG1,0(R2)              IF 'WAIT' OPTION AVAILABLE
+         BE    IEF238D3                  THEN TAKE IT
+         CLC   MSG2,0(R2)              IF 'WAIT' OPTION AVAILABLE
+         BE    IEF238D3                  THEN TAKE IT
+         MVC   COMMND1(2),MSGTEXT      MOVE REPLY NUMBER TO COMMAND
+         LA    R0,L'COMMND1            LOAD LENGTH OF COMMAND
+         LA    R1,COMMND1              AND ITS ADDRESS
+         RUN   ISSUE                     ISSUE THE COMMAND (CANCEL)
+         L     R15,#DEVCAN             RETRIEVE COUNT OF HITS
+         LA    R15,1(R15)              INCREMENT
+         ST    R15,#DEVCAN             STORE COUNT OF HITS
+         B     IEF238DX                GET OUT OF DODGE
+IEF238D3 DS    0H
+         MVC   COMMND2(2),MSGTEXT      MOVE REPLY NUMBER TO COMMAND
+         LA    R0,L'COMMND2            LOAD LENGTH OF COMMAND
+         LA    R1,COMMND2              AND ITS ADDRESS
+         RUN   ISSUE                     ISSUE THE COMMAND (WAIT)
+         L     R15,#DEVWAIT            RETRIEVE COUNT OF HITS
+         LA    R15,1(R15)              INCREMENT
+         ST    R15,#DEVWAIT            STORE COUNT OF HITS
+IEF238DX GOBACK
+         TITLE 'ISSUE NOHOLD MESSAGE'
+IEF433D  BEGIN
+*
+*     REPLY 'NOHOLD' TO IEF433D MESSAGES
+*
+         MVC   COMMND3(2),MSGTEXT      MOVE REPLY NUMBER TO COMMAND
+         LA    R0,L'COMMND3            LOAD LENGTH OF COMMAND
+         LA    R1,COMMND3              AND ITS ADDRESS
+         RUN   ISSUE                     ISSUE THE COMMAND (NOHOLD)
+         L     R15,#DEVNHLD            RETRIEVE COUNT OF HITS
+         LA    R15,1(R15)              INCREMENT
+         ST    R15,#DEVNHLD            STORE COUNT OF HITS
+IEF433DX GOBACK
+         TITLE 'REPLY "NO" TO TSO MOUNTS'
+IEF455D  BEGIN
+*
+*     REPLY 'NO' TO IEF455D MESSAGES
+*
+         CLC   MSGJTYPE,=C'TSU '       IF NOT A TSO SESSION
+         BNE   IEF455DX                  THEN EXIT
+         MVC   COMMNDC(2),MSGTEXT      MOVE REPLY NUMBER TO COMMAND
+         LA    R0,L'COMMNDC            LOAD LENGTH OF COMMAND
+         LA    R1,COMMNDC              AND ITS ADDRESS
+         RUN   ISSUE                     ISSUE THE COMMAND (NOHOLD)
+IEF455DX GOBACK
+         TITLE 'CHECK FOR ENQUEUE MESSAGES'
+IEF099I  BEGIN
+*
+*     LOOK FOR DATASET ENQUEUE MESSAGES AND REQUEUE JOB
+*
+         CLC   MSGJTYPE,=C'JOB '       IF NOT A BATCH JOB
+         BNE   IEF099IX                  THEN EXIT
+         MVC   JESNO,MSGJES#           SAVE JOB NUMBER
+         TR    JESNO,NUMERIC           TRANSLATE BLANKS TO ZEROS
+         MVC   COMMND9+4(4),JESNO      MOVE JOB NUMBER TO COMMAND
+         LA    R0,L'COMMND9            LOAD LENGTH OF COMMAND
+         LA    R1,COMMND9              AND ITS ADDRESS
+         RUN   ISSUE                     AND ISSUE THE COMMAND
+         L     R15,#REQUEUE            RETRIEVE COUNT OF HITS
+         LA    R15,1(R15)              INCREMENT
+         ST    R15,#REQUEUE            STORE COUNT OF HITS
+         MVC   COMMND5+3(4),JESNO      MOVE JOB NUMBER TO COMMAND
+         LA    R0,L'COMMND5            LOAD LENGTH OF COMMAND
+         LA    R1,COMMND5              AND ITS ADDRESS
+         RUN   ISSUE                     AND ISSUE THE COMMAND
+         MVC   COMMND6+3(4),JESNO      MOVE JOB NUMBER TO COMMAND
+         LA    R0,L'COMMND6            LOAD LENGTH OF COMMAND
+         LA    R1,COMMND6                AND ITS ADDRESS
+         RUN   ISSUE                   AND ISSUE THE COMMAND
+         MVC   COMMND7+3(4),JESNO      MOVE JOB NUMBER TO COMMAND
+         LA    R0,L'COMMND7            LOAD LENGTH OF COMMAND
+         LA    R1,COMMND7              AND ITS ADDRESS
+         RUN   ISSUE                   AND ISSUE THE COMMAND
+         MVC   COMMND8+16(4),JESNO     MOVE JOB NUMBER TO COMMAND
+         PACK  PACKEDW,3(2,R4)         PACK THE MINUTES
+         AP    PACKEDW,PACKED15        ADD 15 MINUTES TO THE TIME
+         CP    PACKEDW,PACKED60        IF MINUTES NOT LESS THAN 60
+         BNL   IEF099I1                  THEN ADD 1 TO HOUR
+         UNPK  COMMND8+09(2),PACKEDW   UNPACK THE MINUTES
+         OI    COMMND8+10,SIGN           AND TURN OFF THE SIGN
+         MVC   COMMND8+6(2),0(R4)      MOVE IN THE HOUR
+         B     IEF099I2                  AND ISSUE THE AUTO COMMND
+IEF099I1 DS    0H
+         SP    PACKEDW,PACKED60        SUBTRACT 60 FROM MINUTES
+         UNPK  COMMND8+09(2),PACKEDW   UNPACK THE MINUTES
+         OI    COMMND8+10,SIGN           AND TURN OFF THE SIGN
+         PACK  PACKEDW,0(2,R4)         PACK THE HOUR
+         AP    PACKEDW,PACKED1         ADD ONE HOUR
+         UNPK  COMMND8+06(2),PACKEDW   UNPACK THE HOUR
+         OI    COMMND8+07,SIGN           AND TURN OFF THE SIGN
+IEF099I2 DS    0H
+         LA    R0,L'COMMND8            LOAD LENGTH OF COMMAND
+         LA    R1,COMMND8              AND ITS ADDRESS
+         RUN   ISSUE                     AND ISSUE THE COMMAND
+IEF099IX GOBACK
+         TITLE 'CHECK FOR PROPER JOB CLASS IF TAPE MOUNTS'
+IEF233A  BEGIN
+*
+*     LOOK FOR MOUNT MESSAGES AND CANCEL IF CLASS IS NOT OK
+*
+         CLC   MSGJTYPE,=C'JOB '       IF NOT A BATCH JOB
+         BNE   IEF233AX                  THEN CONTINUE
+         MVC   JESNO,MSGJES#           SAVE JOB NUMBER
+         TR    JESNO,NUMERIC           TRANSLATE BLANKS TO ZEROS
+         RUN   GETCLAS                 GET CLASS OF JOB
+         CLI   CLASS,C'F'              IF CLASS "F"
+         BE    IEF233A1                  THEN GO CANCEL
+         CLI   CLASS,C'A'              IF CLASS "A"
+         BE    IEF233A1                  THEN GO CANCEL
+         CLI   CLASS,C'T'              IF CLASS "T"
+         BE    IEF233A1                  THEN GO CANCEL
+         B     IEF233AX                ELSE LEAVE
+IEF233A1 DS    0H
+         MVC   COMMND4+4(4),JESNO      MOVE JOB NUMBER TO COMMAND
+         MVC   COMMND4+37(1),CLASS     MOVE CLASS INTO COMMAND
+         LA    R0,L'COMMND4            LOAD LENGTH OF COMMAND
+         LA    R1,COMMND4              AND ITS ADDRESS
+         RUN   ISSUE                     AND ISSUE IT
+         MVC   COMMND7+3(4),JESNO      MOVE JOB NUMBER TO COMMAND
+         LA    R0,L'COMMND7            LOAD LENGTH OF COMMAND
+         LA    R1,COMMND7              AND ITS ADDRESS
+         RUN   ISSUE                     AND ISSUE IT
+         L     R15,#MCLASS             RETRIEVE COUNT OF HITS
+         LA    R15,1(R15)              INCREMENT
+         ST    R15,#MCLASS             STORE COUNT OF HITS
+IEF233AX GOBACK
+         TITLE 'CHECK FOR WTO BUFFER SHORTAGE'
+IEA405E  BEGIN
+*
+*     LOOK FOR BUFFER SHORTAGE MESSAGES
+*
+         LA    R0,L'COMMNDB            LOAD LENGTH OF COMMAND
+         LA    R1,COMMNDB              AND ITS ADDRESS
+         RUN   ISSUE                     ISSUE THE COMMAND (VARY)
+IEA405EX GOBACK
+         TITLE 'CHECK FOR WTO BUFFER SHORTAGE RELIEVED'
+IEA406I  BEGIN
+*
+*     LOOK FOR BUFFER SHORTAGE MESSAGES
+*
+         LA    R0,L'COMMNDD            LOAD LENGTH OF COMMAND
+         LA    R1,COMMNDD              AND ITS ADDRESS
+         RUN   ISSUE                     ISSUE THE COMMAND (VARY)
+IEA406IX GOBACK
+         TITLE 'ISSUE COMMANDS'
+*
+*     ROUTINE TO ISSUE AN OPERATOR COMMAND VIA SVC 34
+*     R0 = COMMAND LENGTH
+*     R1 = PTR TO COMMAND TEXT
+*
+ISSUE    BEGIN
+         AH    R0,=H'4'                COMPUTE LENGTH FOR SVC 34
+         STH   R0,CMD                    AND STUFF IT IN
+         SH    R0,=H'5'                COMPUTE LENGTH FOR EX
+         LR    R15,R0                  SAVE IT IN R15
+         EX    R15,ISSUE1
+         LA    R1,CMD                  POINT TO COMMAND
+         LA    R0,0                    INDICATE MASTER CONSOLE
+         IC    R0,UCMID                MOVE IN CONSOLE ID
+         RUN   SUPSTAT                 SET TO SUPERVISOR STATE
+         MGCR  (R1)                    SEND THE COMMAND
+         RUN   PROBSTA                 BACK TO PROBLEM STATE
+         B     ISSUEX                  GET OUT OF DODGE
+ISSUE1   MVC   COMMAND(0),0(R1)        MOVE IN COMMAND
+ISSUEX   GOBACK
+         TITLE 'GET JES NUMBER'
+*
+*     ROUTINE TO GET THE JES # OF THE JOB DEFINED BY ASID
+*
+GETJES#  BEGIN
+         ACFINCVT R1,NONE=CHECKCB6     LOCATE THE ACF2 CVT
+         USING ACCVT,R1                ADDRESS IT
+         L     R0,ACCASVT              POINT TO 1ST ENTRY IN ACF2 ASVT
+         DROP  R1                      FORGET ACCVT
+         LH    R1,ASID                 LOAD ASID
+         SLL   R1,ASVINDEX             EACH ENTRY IS 32 BYTES
+         ALR   R1,R0                   POINT TO THIS GUY'S ENTRY
+         USING ACFASVT,R1              ADDRESS IT
+         MVC   JESNO,ASVJID+4          MOVE IN THE JES NUMBER
+         TR    JESNO,NUMERIC           TRANSLATE BLANKS TO ZEROS
+         DROP  R1                      FORGET ACFASVT
+GETJES#X GOBACK
+         TITLE 'GET JOB CLASS'
+*
+*     ROUTINE TO GET CLASS OF JOB IN QUESTION
+*
+GETCLAS  BEGIN
+         MVI   CLASS,C' '              INITIALIZE CLASS
+         LA    R8,JOBTABLE             POINT TO START OF JOB TABLE
+GETCLAS1 CLI   0(R8),C' '              NO MORE JOBS IN TABLE?
+         BE    GETCLAS3                  YES, QUIT
+         CLI   0(R8),END               END OF TABLE?
+         BE    GETCLAS3                  YES, QUIT
+         CLC   0(4,R8),JESNO           IS THIS THE JOB?
+         BE    GETCLAS2                  YEP
+         LA    R8,5(R8)                POINT TO NEXT ENTRY
+         B     GETCLAS1                KEEP LOOKING
+GETCLAS2 MVC   CLASS,4(R8)             SAVE JOB CLASS
+         B     GETCLASX                  AND LEAVE
+GETCLAS3 WTO   'CNSLMON COULDN''T DETERMINE JOB CLASS',ROUTCDE=2
+         ABEND 16                      EAT SHIT AND DIE!
+GETCLASX GOBACK
+         TITLE 'SET PROGRAM TO SUPERVISOR OR PROBLEM STATE'
+*
+*     SET PROGRAM TO SUPERVISOR STATE
+*
+SUPSTAT  BEGIN
+         STM   R0,R15,MODESAVE         SAVE REGISTERS
+         MODESET KEY=ZERO,MODE=SUP     GET AUTHORIZED
+         LM    R0,R15,MODESAVE         RESTORE REGISTERS
+SUPSTATX GOBACK
+*
+*     SET PROGRAM BACK TO PROBLEM STATE
+*
+PROBSTA  BEGIN
+         STM   R0,R15,MODESAVE         SAVE REGISTERS
+         MODESET KEY=NZERO,MODE=PROB   RELINQUISH AUTHORIZATION
+         LM    R0,R15,MODESAVE         RESTORE REGISTERS
+PROBSTAX GOBACK
+         TITLE 'DISPLAY (VIA WTO) THE  CPUTABLE'
+*
+*     ROUTINE TO DISPLAY THE CPUTIME/JOBCLASS TABLE
+*
+CPUTABD  BEGIN
+         MVC   WTOMSG,WTOBLANK         CLEAR THE OUTPUT AREA
+         MVC   WTOMSG(41),=C'++ CNSLMON JOBCLASS/CPUTIME TABLE DISPLAY'
+         LA    R1,WTOSTUFF             LOAD THE REGISTER AND
+         SVC   35                        DISPLAY THE LINE
+         LA    R6,CPUTABLE             POINT TO START OF TABLE
+CPUTABD1 DS    0H
+         CLI   0(R6),END               IF AT END OF CPU TABLE
+         BE    CPUTABDX                  THEN EXIT NOW
+         MVC   WTOMSG,WTOBLANK         CLEAR THE OUTPUT AREA
+         MVC   WTOMSG+00(12),=C'++ JOBCLASS:' INSERT DATA LABEL
+         MVC   WTOMSG+13(01),0(R6)     INSERT THE JOBCLASS
+         MVC   WTOMSG+15(12),=C'   CPU TIME:' INSERT DATA LABEL
+         L     R7,4(R6)                LOAD THE CPUTIME
+         CVD   R7,PACKED               CONVERT TO DECIMAL
+         MVC   WTOMSG+27(07),=X'402020214B2020' INSERT THE MASK
+         ED    WTOMSG+27(07),PACKED+5  EDIT THE NUMBER
+         LA    R1,WTOSTUFF             LOAD THE REGISTER AND
+         SVC   35                        DISPLAY THE LINE
+         LA    R6,8(R6)                POINT TO NEXT TABLE ENTRY
+         B     CPUTABD1                AND KEEP LOOKING
+CPUTABDX GOBACK
+         TITLE 'DISPLAY (VIA WTO) THE  MSGTABLE'
+*
+*     ROUTINE TO DISPLAY THE PROCESSED MESSAGES
+*
+MSGTABD  BEGIN
+         MVC   WTOMSG,WTOBLANK         CLEAR THE OUTPUT AREA
+         MVC   WTOMSG(35),=C'++ CNSLMON MESSAGE PROCESSING TABLE'
+         LA    R1,WTOSTUFF             LOAD THE REGISTER AND
+         SVC   35                        DISPLAY THE LINE
+         LA    R6,MSGTABLE             POINT TO START OF TABLE
+MSGTABD1 DS    0H
+         CLI   0(R6),END               IF AT END OF MSG TABLE
+         BE    MSGTABDX                  THEN EXIT NOW
+         MVC   WTOMSG,WTOBLANK         CLEAR THE OUTPUT AREA
+         MVC   WTOMSG+00(11),=C'++ MESSAGE:' INSERT DATA LABEL
+         MVC   WTOMSG+12(08),0(R6)     INSERT THE MESSAGE ID
+         MVC   WTOMSG+21(01),=C':'     INSERT CONSTANT
+         MVC   WTOMSG+23(40),12(R6)    INSERT THE MESSAGE DESCRIPTION
+         LA    R1,WTOSTUFF             LOAD THE REGISTER AND
+         SVC   35                        DISPLAY THE LINE
+         LA    R6,52(R6)               POINT TO NEXT TABLE ENTRY
+         B     MSGTABD1                AND KEEP LOOKING
+MSGTABDX GOBACK
+         TITLE 'DISPLAY (VIA WTO) THE  CMD TABLE'
+*
+*     ROUTINE TO DISPLAY THE OPERATOR  COMMANDS
+*
+HELP     BEGIN
+         MVC   WTOMSG,WTOBLANK         CLEAR THE OUTPUT AREA
+         MVC   WTOMSG(28),=C'++ CNSLMON OPERATOR COMMANDS'
+         LA    R1,WTOSTUFF             LOAD THE REGISTER AND
+         SVC   35                        DISPLAY THE LINE
+         LA    R6,CMDTABLE             POINT TO START OF TABLE
+HELP1    DS    0H
+         CLI   0(R6),END               IF AT END OF CMD TABLE
+         BE    HELPX                     THEN EXIT NOW
+         MVC   WTOMSG,WTOBLANK         CLEAR THE OUTPUT AREA
+         MVC   WTOMSG+00(11),=C'++ COMMAND:' INSERT DATA LABEL
+         MVC   WTOMSG+12(04),0(R6)     INSERT THE COMMAND
+         MVC   WTOMSG+17(01),C':'      INSERT CONSTANT
+         MVC   WTOMSG+19(40),8(R6)     INSERT COMMAND DESCRIPTION
+         LA    R1,WTOSTUFF             LOAD THE REGISTER AND
+         SVC   35                        DISPLAY THE LINE
+         LA    R6,48(R6)               POINT TO NEXT TABLE ENTRY
+         B     HELP1                   AND KEEP LOOKING
+HELPX    GOBACK
+         TITLE 'DISPLAY (VIA WTO) THE PROGRAM STATUS'
+*
+*     ROUTINE TO DISPLAY THE PROGRAM STATUS
+*
+STATUS   BEGIN
+         MVC   WTOMSG,WTOBLANK         CLEAR THE DISPLAY AREA
+         MVC   WTOMSG(49),STAT0        MOVE IN MESSAGE TEXT
+         LA    R1,WTOSTUFF             LOAD ADDR OF WTO PARAMETER LIST
+         SVC   35                      ISSUE THE WTO SVC
+         LA    R7,#CPULIM              POINT TO FIRST COUNTER
+         LA    R8,STAT1                POINT TO FIRST MESSAGE
+         LA    R9,#OFSTATS             SET LOOP COUNTER
+STATUS1  L     R10,0(R7)               GET COUNT
+         CVD   R10,PACKED
+         MVC   WTOMSG,WTOBLANK         CLEAR THE DISPLAY AREA
+         MVC   WTOMSG(49),0(R8)        MOVE IN MESSAGE TEXT
+         MVC   WTOMSG+42(7),=X'4020206B202120'   AND EDIT PATTERN
+         ED    WTOMSG+42(7),PACKED+5   EDIT THE BEAST
+         LA    R1,WTOSTUFF             LOAD ADDR OF WTO PARAMETER LIST
+         SVC   35                      ISSUE THE WTO SVC
+         LA    R7,4(R7)                POINT TO NEXT COUNTER
+         LA    R8,49(R8)               POINT TO NEXT MESSAGE
+         BCT   R9,STATUS1              AND KEEP GOING
+STATUSX  GOBACK
+         TITLE 'CONSTANTS AND DATA AREAS'
+*
+*     CONSTANTS AND DATA AREAS
+*
+         LTORG
+SAVEAREA DS    18F
+MODESAVE DS    16F                     REG SAVE AREA FOR MODESET
+TIME     DS    F
+DATE     DS    F
+NOW      DS    F
+MYASID   DS    H
+CONSASID DS    H
+SCREENPT DS    F
+#CPULIM  DC    F'0'   (MUST BE FIRST)  CPU LIMIT EXCEEDED
+#REQUEUE DC    F'0'                    REQUEUED FOR DATASET ENQUEUE
+#MCLASS  DC    F'0'                    WRONG CLASS FOR MOUNT
+#DEVWAIT DC    F'0'                    WAIT FOR DEVICE ALLOCATION
+#DEVNHLD DC    F'0'                    NOHOLD FOR JOB WAIT
+#DEVCAN  DC    F'0'                    CANCELED FOR DEVICE ALLOCATION
+#OFSTATS EQU   6
+STAT0    DC    C'++ CNSLMON STATS SINCE YYDDD HH:MM:SS (UCB=XXX)++'
+STAT1    DC    C'JOBS CANCELLED FOR CPU LIMIT ------------> XX,XXX'
+STAT2    DC    C'JOBS REQUEUED FOR DATASET ENQUEUE -------> XX,XXX'
+STAT3    DC    C'JOBS CANCELLED FOR MOUNT IN WRONG CLASS -> XX,XXX'
+STAT4    DC    C'REPLY "WAIT"   FOR DEVICE ALLOCATION ----> XX,XXX'
+STAT5    DC    C'REPLY "NOHOLD" FOR DEVICE ALLOCATION ----> XX,XXX'
+STAT6    DC    C'REPLY "CANCEL" FOR DEVICE ALLOCATION ----> XX,XXX'
+WTOSTUFF DS    0F                      FULL WORD ALIGN
+         DC    AL2(MSGLEN+4)           TEXT LENGTH+4
+         DC    B'1000000000000000'     MCS FLAGS
+WTOMSG   DC    CL70' '
+MSGLEN   EQU   *-WTOMSG
+         DC    B'0000000000000000'     DESCRIPTOR CODES
+         DC    B'0100000000000000'     ROUTING FLAGS (=2)
+WTOBLANK DC    (MSGLEN)C' '
+ASID     DS    H
+CMD      DC    H'104',H'0'             SVC 34 PARAMETER LIST HEADER
+COMMAND  DC    CL100' '
+CLASS    DC    C' '                    JOB'S EXECUTION CLASS
+JESNO    DC    CL4'0000'               JOB'S JES2 NUMBER
+PACKEDW  DC    PL4'0'
+PACKED1  DC    PL4'1'
+PACKED15 DC    PL4'15'
+PACKED60 DC    PL4'60'
+PACKED   DS    D
+SIGN     EQU   X'F0'
+END      EQU   X'FF'
+WAITIME  DC    F'100'                  1.0 SECOND STIMER WAIT TIME
+ZERO     DC    F'0'
+UCMID    DS    XL1                     CURRENT CONSOLE ID
+CONSID   DS    XL1                     DESIRED CONSOLE ID
+MSG1     DC    C'- REPLY DEVICE NAME,''WAIT'' OR'
+MSG2     DC    C'- REPLY ''WAIT'' OR ''CANCEL''.'
+NUMERIC  DC    256C'0'                 TRANSLATES BLANKS TO ZEROS
+         ORG   NUMERIC+C'1'
+         DC    CL9'123456789'
+         ORG
+COMMND0  DC    C'$TOSC01,D=T'
+COMMND1  DC    C'RR,CANCEL'
+COMMND2  DC    C'RR,WAIT'
+COMMND3  DC    C'RR,NOHOLD'
+COMMND4  DC    C'$DMJNNNN,''MOUNT REQUESTED FROM CLASS %'''
+COMMND5  DC    C'$HJNNNN'
+COMMND6  DC    C'$EJNNNN'
+COMMND7  DC    C'$CJNNNN'
+COMMND8  DC    C'$TA,T=HH.MM,''$AJNNNN'''
+COMMND9  DC    C'$DMJNNNN,''JOB DELAYED 15 MINUTES'''
+COMMNDA  DC    C'$DMJNNNN,''EXCESSIVE CPU TIME FOR CLASS %'''
+COMMNDB  DC    C'V (O-37E),OFFLINE'
+COMMNDC  DC    C'RR,NO'
+COMMNDD  DC    C'V O-37E,CONSOLE,ROUT=ALL'
+         TITLE 'CNSLMON CONTROL TABLES'
+*
+*        CONTROL TABLES
+*
+CMDTABLE DS    0F                      TABLE OF OPERATOR COMMANDS
+*                  CMD.    ROUTINE
+         DC    CL4'CPUT',A(CPUTABD),CL40'DISPLAY THE CPU TABLE'
+         DC    CL4'HELP',A(HELP),CL40'DISPLAY THESE COMMANDS'
+         DC    CL4'MSGT',A(MSGTABD),CL40'DISPLAY THE MESSAGE TABLE'
+         DC    CL4'STAT',A(STATUS),CL40'DISPLAY CNSLMON''S STATUS'
+         DC    X'FF'                   END OF TABLE
+*
+*
+CPUTABLE DS    0F                      TABLE OF CPU LIMITS
+*                X    SSMM               CLASS X : SS.MM SECONDS
+         DC    C'F',F'1000'              CLASS F : 10.00 SECONDS
+         DC    C'A',F'3000'              CLASS A : 30.00 SECONDS
+         DC    C'T',F'3000'              CLASS T : 30.00 SECONDS
+         DC    X'FF'                   END OF TABLE
+*
+*
+MAXJOBS  EQU   40
+JOBTABLE DC    (MAXJOBS)CL5' ' (4 CHAR JES NO, JOB CLASS)
+         DC    X'FF'      MARKS END OF TABLE - DO NOT REMOVE !!!
+*
+*
+MSGTABLE DS    0F                      TABLE OF CONSOLE MESSAGES
+*                  MESSAGE     ROUTINE
+         DC    CL8'IEA405E ',A(IEA405E),CL40'WTO BUFFER SHORTAGE'
+         DC    CL8'IEA406I ',A(IEA406I),CL40'WTO BUFFERS RELIEVED'
+         DC    CL8'IEF099I ',A(IEF099I),CL40'DATA SET ENQ LOCKOUT'
+         DC    CL8'IEF233A ',A(IEF233A),CL40'INPUT TAPE MOUNT'
+         DC    CL8'IEF238D ',A(IEF238D),CL40'ALLOCATION RECOVERY'
+         DC    CL8'IEF433D ',A(IEF433D),CL40'ALLOCATION RECOVERY'
+         DC    CL8'IEF455D ',A(IEF455D),CL40'TSO TAPE MOUNT'
+         DC    CL8'TMS001  ',A(IEF233A),CL40'OUTPUT TAPE MOUNT'
+         DC    X'FF'                   END OF TABLE
+         TITLE 'CNSLMON BUFFER AREA'
+*
+*
+LINESIZE EQU   84                      LENGTH OF LINE AT CONSOLE
+NUMLINES EQU   28                      NUMBER OF LINES ON SCREEN
+BUFFSIZE EQU   NUMLINES*LINESIZE       SCREEN BUFFER SIZE
+FULLSIZE EQU   32*LINESIZE             FULL SCREEN BUFFER SIZE
+COMMADDR DC    F'0'                    COMM LIST ADDRESS
+*
+BUFFER   DC    (BUFFSIZE)C' '          CONSOLE BUFFER IMAGE
+         DC    (FULLSIZE-BUFFSIZE)C' ' MAX BUFFER SIZE
+         TITLE 'CNSLMON DSECT AREA'
+*
+*     DSECTS
+*
+MSGMODEL DSECT
+WCC@SBA  EQU   10                      CONSOLE LINE HEADER
+MSGTIME  DC    C'HH.MM.SS '
+MSGJTYPE DC    C'JOB '
+MSGJES#  DC    C'NNNN'
+         DC    C' '
+MSGSTAR  DC    C'*'
+MSGTEXT  DC    C' '
+         TITLE 'CONTROL BLOCK MAPS'
+*
+*     CONTROL BLOCK MAPS
+*
+         PRINT NOGEN
+COMLISTX DSECT
+         IEZCOM ,
+STARTCIB DSECT
+         IEZCIB ,
+         IHAPSA  ,                     PSA
+         IHAASVT ,                     ASVT
+         CVT   DSECT=YES               CVT
+         IHAASCB ,                     ASCB
+         IRAOUCB ,                     OUCB
+         ACCVT ,                       ACF2 CVT
+         ACFASVT ,                     ACF2 ASVT
+         END   CNSLMON

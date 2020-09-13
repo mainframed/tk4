@@ -1,0 +1,603 @@
+*
+*     THIS ROUTINE IS A PREFIX TO COMMAND SCAN (IKJSCAN) TO ALLOW
+*     PCF TO TRAP COMMANDS AND SUBCOMMANDS FOR AN EXIT TO ANY
+*     COMMAND WHILE IN SUBCOMMAND MODE.  THIS ROUTINE ALSO CHECKS
+*     AUTHORIZATION AND DOES SMF RECORDING FOR SUBCOMMANDS AND
+*     DEBLOCKS MULTIPLE COMMANDS ENTERED ON A SINGLE LINE.
+*
+*********************************************************************
+*                                                                   *
+*                                                  BEGIN MBC MODS   *
+*                                                                   *
+*********************************************************************
+*
+*     THIS ROUTINE HAS BEEN MODIFIED BY MBC TO REPLACE THE PCF COMMAND
+*     AUTHORIZATION CHECKING WITH RACF COMMAND AUTHORIZATION CHECKING
+*     ALL SECTIONS OF CODE WHICH HAVE BEEN CHANGED ARE EITHER BRACKETED
+*     BY COMMENTS INDICATING THE BEGINNING OF THE MBC MOD OR INDICATED
+*     BY THE CHARACTERS **MBC** IN COLUMS 65 THROUGH 71. THE BRACKET
+*     NOTATION WAS USED IN AREAS WHERE SUBSTANCIAL SECTIONS OF CODE
+*     HAVE BEEN REMOVED OR MODIFIED.
+*
+*********************************************************************
+*                                                                   *
+*                                                    END MBC MODS   *
+*                                                                   *
+*********************************************************************
+*
+MBCSCAN  PCFSAVE TITLE=COMMAND_SCAN_PREFIX
+         USING CSPL,R2
+         PCFTEST ,R3,SCAN,,,,R6         CHECK PSB FOR PCF        CLW1M2
+*
+*     DEBLOCK COMMANDS ENTERED SEPERATED BY SEMICOLONS INTO
+*      SEPERATE BUFFERS EACH AND STACK
+*
+         MVC   IOPLSTK(12),CSPL  INITIALIZE STACK PARAMETER LIST
+         L     R8,CSPLECT     GET ECT ADDRESS
+         USING ECT,R8
+         TM    PCFDELIM,255-X'40' IS DELIMITER NULL OR BLANK     CLW1M2
+         BZ    SCAN           YES, SKIP DEBLOCKING CODE          CLW1M2
+         L     R5,CSPLCBUF    POINT TO COMMAND BUFFER
+         CLI   3(R5),0        IS OFFSET ZERO
+         BNE   SCAN           IF NO, ALREADY SCANNED
+         CLI   4(R5),C' '     IS FIRST CHAR BLANK
+         BNE   CHKDELIM       YES, PROBABLY BEEN HERE
+         CLC   ECTPCMD,=CL8'EXEC'  IS THIS IMPLIED EXEC
+         BE    SCAN           YES, SKIP AHEAD
+*
+*     SET UP FOR RIGHT TO LEFT BUFFER SCAN FOR DELIMITER
+*
+CHKDELIM LH    R4,0(R5)       GET LENGTH OF BUFFER
+         LA    R11,0(R5,R4)   POINT TO END OF BUFFER+1
+         SH    R4,=H'4'       DECREMENT LENGTH TO ALLOW FOR HEADER
+         BNP   SCAN           IF ZERO, GO PROCESS
+SEMLP    BCTR  R11,0          BACK UP ONE CHAR
+         CLC   0(1,R11),PCFDELIM  LOOK FOR DELIMITER             CLW1M2
+         BE    STACK          FOUND IT
+SEMDEC   BCT   R4,SEMLP       NO, DECREMENT TO BEGINNING
+         B     SCAN           THEN GO PROCESS NORMALLY
+STACK    MVI   0(R11),C' '    CLEAR SEMICOLON
+         LH    R10,0(R5)      GET BUFFER LENGTH
+         LA    R10,4(R10,R5)  END OF BUFFER+5
+         SR    R10,R11        LESS CURRENT POINTER
+         LR    R9,R10         SAVE VALUE FOR NEW BUFFER
+         SH    R9,=H'5'       LENGTH FOR EX MOVES
+         BCT   R4,*+8         REDUCE COUNT
+         B     SCAN           IF NO MORE, EXIT
+         BCTR  R11,0          BACK UP SCAN PTR
+*
+*     LOOK FOR TWO DELIMITERS TOGETHER TO INDICATE ONE
+*
+         CLC   0(1,R11),PCFDELIM  LOOK FOR SECOND DELIMITER      CLW1M2
+         LR    R15,R11        COPY SCAN PTR
+         BE    SEMSQ          GO SQUEEZE OUT DELIMITER
+         LTR   R9,R9          WAS SINGLE DELIM AT END
+         BNP   SEMSQ          YES, MOVE CMD OVER
+         ICM   R14,15,ECTIOWA  GET STACK PTR ADDR
+         BZ    STCKA          NO STACK, MOVE ON
+*
+*     CHECK FOR EMPTY LIST SOURCE DESCRIPTORS AND DELETE
+*
+         L     R14,0(R14)     GET TOP STACK ELEMENT PTR
+         ICM   R14,15,0(R14)  GET TOP STACK ELEMENT
+         BNP   STCKA          TERMINAL ELEMENT, MOVE ON
+         USING LSD,R14
+         L     R1,LSDADATA    GET ADDR OF LIST FROM LSD
+         AH    R1,LSDTOTLN    ADD LENGTH
+         CL    R1,LSDANEXT    COMPARE TO END
+         BNE   STCKA          MORE COMMANDS IN PROC
+         STACK PARM=STPB,DELETE=TOP,MF=(E,IOPLSTK) DELETE EMPTY LSD
+         DROP  R14
+*
+*     THIS ROUTINE WILL STACK COMMANDS
+*
+STCKA    LA    R1,16(R10)     ADD ROOM FOR LIST SOURCE DESCR
+         GETMAIN R,LV=(R1),SP=78  GET SPACE IN CORRECT SUBPOOL
+         XC    0(20,R1),0(R1)  CLEAR LSD TO BUFFER HEADER
+         LA    R0,16(R1)      POINT TO NEW BUFFER ADDRESS
+         USING LSD,R1
+         ST    R0,LSDADATA    STORE IN LSD
+         ST    R0,LSDANEXT    AS FIRST AND LAST
+         LR    R15,R1         SAVE AREA ADDRESS
+         STH   R10,LSDTOTLN   STORE IN LSD
+         STH   R10,16(R1)     AND NEW BUFFER LENGTH
+         MVI   19(R1),1       SET OFFSET TO ONE TO PREVENT RESCAN
+         EX    R9,MVCMD       MOVE IN COMMAND
+         STACK PARM=STPB,STORAGE=((R15),PROCN,PROMPT),MF=(E,IOPLSTK)
+         PCFERR ERREXIT,IKJSTCK,,RTCODE  GEN ERROR MSG AND EXIT
+         DROP  R1
+*
+*     MOVE REMAINING COMMANDS TO RIGHT END OF BUFFER
+*
+         LA    R15,0(R11,R9)  MOVE TO END OF BUFFER -1
+BLNKLP   CLI   1(R15),C' '    ANY TRAILING BLANKS
+         BNE   BLNKLN         NO, CONTINUE
+         BCT   R15,BLNKLP     YES, SKIP OVER FOR OPER
+BLNKLN   BCTR  R9,0           REDUCE LENGTH FOR PROPOGATE
+         LTR   R9,R9          WAS NULL COMMAND ENTERED
+         BM    SEMSQ          IF LENGTH NEGATIVE
+         EX    R9,BLNKCMD     PROPOGATE BLANKS
+         CR    R11,R15        WAS BLANK COMMAND ENTERED
+         BNM   SKPSQZ         YES, SKIP SQUEEZE
+SEMSQ    LR    R1,R4          COPY REMAINING LENGTH
+SEMSQ1   MVC   1(1,R15),0(R11)  SQUEEZE TO RIGHT
+         MVI   0(R11),C' '    CLEAR TO BLANK
+         BCTR  R11,0          DECREMENT
+         BCTR  R15,0
+         BCT   R1,SEMSQ1      LOOP
+         LA    R11,1(R15,R4)  RESET SCAN PTR
+SKPSQZ   MVI   3(R5),1        SET OFFSET TO ONE TO PREVENT RESCAN
+         B     SEMDEC         CONTINUE
+*
+*     GO TO IKJSCAN
+*
+SCAN     LR    R1,R2              RESTORE CSPL PTR
+         L     R15,=V(IKJSCAN)    GET REAL SCAN ENTRY
+         BALR  R14,R15            GO TO SCAN FOR COMMAND
+         LTR   R15,R15            CHECK RETURN CODE
+         BNZ   EXITN              IF ERROR, IMMEDIATE EXIT
+         LTR   R3,R3              IS THIS PCF ENVIRONMENT
+         BZ    EXITN              NO, EXIT
+         ST    R15,RTCODE        ZERO RETURN CODE                CLW003
+         ICM   R9,15,PCFTMPW      GET TMP WORK AREA IF INIT
+         BZ    FRSTME             SKIP AHEAD IF FIRST TIME
+         USING TMPWRKA1,R9
+         ICM   R11,15,CPPLPTR     GET CPPL ADDR FROM TMP WA
+         USING CPPL,R11
+         MVC   CPPL+4(12),TPL+4  REFRESH CPPL                    CLW003
+         L     R4,CPPLPSCB        GET PSCB ADDRESS
+         USING PSCB,R4
+*
+*     IF PCF, CHECK FOR SUBCOMMAND EXIT AND ACCOUNTING
+*
+FRSTME   L     R5,CSPLOA      ELSE GET ANSWER AREA
+         USING CSOA,R5        SET ADDRESSIBILITY
+         L     R7,CSOACNM     GET ADDR OF COMD NAME
+         LTR   R7,R7          WAS A COMMAND FOUND
+         BZ    EXIT           NO, EXIT
+         CLI   0(R7),C'X'     WAS IS SUBCOMMAND EXIT
+         BNE   SUBCMD         NO, CHECK FOR OTHER SUBCMDS
+         CLI   CSOALNM+1,1    DOUBLE CHECK EXIT
+         BNE   SUBCMD         WRONG LENGTH, MOVE ON
+*
+*     IF 'X' EXIT, GO FIND REAL COMMAND REQUESTED
+*
+         ICM   R9,15,PCFTMPW  GET TMP WORK ADDR IF INITIALIZED
+         BZ    SCAN           NO, IGNORE EXIT
+         CLC   CSPLSP+20(4),CSPLCBUF  IS THIS A MAJOR CMD
+         BE    SCAN           YES, IGNORE EXIT
+         TESTAUTH FCTN=1      IS CURRENT ENVIRONMENT APF AUTHORIZED
+         LTR   R15,R15        CHECK RETURN CODE
+         BZ    SCAN           IF AUTHORIZED, NO EXIT ALLOWED
+         MVC   CSPLEX(24),CSPL BUILD A NEW CSPL
+         LA    R2,CSPLEX      SET BASE TO NEW CSPL
+         LA    R1,CSPLEXF     POINT TO NEW FLAG WORD
+         MVI   0(R1),0        ASSURE SYNTAX CHECK FOR EXIT
+         ST    R1,CSPLFLG     SAVE IN NEW CSPL
+         MVI   0(R7),C' '     BLANK OUT EXIT
+         CLC   ECTPCMD(4),=C'SPF '  IS SPF PRIMARY CMD           CLW008
+         BE    SCAN           YES, IGNORE EXIT                   CLW008
+RESCAN   LA    R1,CSPL        USE OUR CSPL FOR NEW SCAN
+         L     R15,=V(IKJSCAN)  GET COMMAND SCAN ADDR
+         BALR  R14,R15        SCAN FOR REAL COMMAND
+         PCFERR ERREXIT,IKJSCAN  IF ERROR,EXIT
+         L     R5,CSPLOA      OK,GET THIS ANSWER
+         L     R7,CSOACNM     AND COMMAND NAME ADDR
+         LTR   R7,R7          WAS ONE FOUND
+         BZ    EXIT           NO, EXIT
+*
+*     DO ACCOUNTING AND AUTHORIZATION BEFORE EXIT
+*
+NOPERCNT TM    PCFSWS,PCFACTG  IS ACCOUNTING REQUESTED
+         BZ    SEARCH         NO, SKIP OVER
+         BAL   R10,SMF        NO, WRITE TO SMF BEFORE EXIT
+SEARCH   MVC   BLDLNAME,=CL8' '  CLEAR BLDL NAME AREA
+         MVC   SCMDSWS,PCFSWS    SAVE SUBCOMMAND OPTIONS
+         LH    R15,CSOALNM    GET COMMAND NAME LENGTH
+         BCTR  R15,0          REDUCE FOR EXECUTE
+         EX    R15,BLDLMV     MOVE NAME TO BLDL LIST
+         CLC   BLDLNAME,=CL8'X'  IS EXIT TO EXIT
+         BE    RESCAN         IGNORE AND LOOK FOR MORE
+         XC    BLDLNAME+8(4),BLDLNAME+8  CLEAR DATA AREA
+         BAL   R10,AUTH       GO TO TABLE LOOKUP
+*********************************************************************
+*                                                                   *
+*                                                  BEGIN MBC MODS   *
+*                                                                   *
+*********************************************************************
+         LTR   R15,R15        DID WE FIND THIS CMD
+         BNZ   EXIT           NO, GET OUT
+         SR    R1,R1          CLEAR WORK REG
+         TM    CSOAFLG,CSOAEXEC  IS THIS IMPLICIT EXEC           CLW008
+         BO    PERCNT         YES, TEST CLIST AUTH               CLW008
+         B     ATTACH         GO EXECUTE
+PERCNT   EQU   *
+         L     R1,CSPLCBUF   GET BUFFER ADDR                     CLW008
+*********************************************************************
+*                                                                   *
+*                                                  END MBC MODS     *
+*                                                                   *
+*********************************************************************
+         MVI   3(R1),0       CLEAR OFFSET VALUE                  CLW008
+         MVC   BLDLNAME,=CL8'EXEC'    POINT TO EXEC CMD
+         B     ATTACH         GO ATTACH EXEC
+NOFND    LTR   R0,R0          CHECK USER LEVEL
+         BNZ   EXIT           NOT ZERO, IGNORE EXIT
+         MVI   CMDSWS,0       CLEAR ACCTG, TRY TO FIND CMD
+         CLC   BLDLNAME,=CL8'TIME '  IS COMMAND TIME             CLW017
+         BE    ATTACH         DO NOT TRY BLDL                    CLW017
+*
+*   AUTHORIZED USERS WITH COMMAND REQUEST NOT FOUND IN PCFTBLS
+*   WILL PROCEED WITH NORMAL TMP SEARCH -- LPA, ACTIVE LPA, BLDL
+*
+BLDLSVC  STM   R3,R9,SVT042   SAVE VOLATILE REGS
+         LM    R0,R1,BLDLNAME    GET CMD NAME                    CLW003
+         L     R3,CVTPTR      GET CVT PTR
+         L     R15,CVTLPDSR(R3)  AND LPA SEARCH ROUT ENTRY
+         BALR  R14,R15        SEARCH INACTIVE LPA
+         LA    R14,0          MODULE FOUND RETURN HERE
+         LM    R3,R9,SVT042   RESTORE REGS
+         LTR   R14,R14        WAS RETURN AT +4
+         BZ    ATTACH         NO, CMD FOUND IN LPA
+*     SEARCH ACTIVE LPA
+         LA    R0,BLDLNAME    POINT TO CMD NAME
+         SR    R1,R1          CLEAR REG
+         IDENTIFY EPLOC=(0),ENTRY=(1) INVOKE SEARCH
+         CH    R15,=H'8'      IS RET CODE 8
+         BE    ATTACH         YES
+         CH    R15,=H'20'     OR 20
+         BE    ATTACH         OK
+         CH    R15,=H'12'     IF NOT 12
+         BNE   EXIT           THEN NOT FOUND
+*
+*     ISSUE BLDL ONLY IF AUTHORIZED (LEVEL 0) BUT COMMAND NOT FOUND
+*
+BLDL     BLDL 0,BLDLENT       DO BLDL FOR LEVEL 0 USER
+         PCFERR ERREXIT,BLDL,4  CHECK FOR ERROR
+         MVI  RCODE+3,0       ZERO RETURN CODE
+         BE   EXIT            EXIT IF COMMAND NOT FOUND
+*
+*    IF FOUND, COMPLETE ACCOUNTING FOR PREVIOUS WORK AND CHECK FOR TEST
+*
+ATTACH   CLC   BLDLNAME,=CL8'TEST'  IS COMMAND TEST
+         BE    EXIT       TEST WILL NOT WORK AS AN EXIT
+         TM    PCFSWS,PCFACTG  DOES EXIT COMD REQ ACCTG
+         BZ    TEST           NO, SKIP
+         BAL   R10,SMF        YES, RECORD ALL PREVIOUS
+*
+*     SET UP ECT AND CHECK FOR TIME COMMAND
+*
+TEST     MVC   MCMD,ECTPCMD      SAVE CURRENT MAJOR COMMAND
+         MVC   ECTSCMD,=CL8' '   CLEAR SUBCOMMAND SLOT FOR ACCTG
+         MVC   ECTPCMD,BLDLNAME  MOVE IN EXIT COMMAND FOR USER PROMPT
+         MVC   CPPLCBUF,CSPLCBUF  SET UP CPPL
+         CLC   BLDLNAME,=CL8'TIME '  IS REQ FOR TIME CMD
+         BNE   TIME               NO, GO ATTACH
+         L     R15,PCFTMPW2       GET PROT TMP WORKAREA ADDR
+         USING TMPWRKA2,R15
+         ICM   R15,15,TMPTIME     YES, SEE IF PRESENT
+         BZ    AUTHERR            NOT IN SYSTEM
+         DROP  R15
+         LA    R1,CPPL            POINT TO CPPL
+         BALR  R14,R15            CALL TIME ROUTINE
+         MVI   CMDSWS,0           SET NO ACCOUNTING
+         B     SKPATH             EXIT
+*
+*     SET UP PARMS AND ATTACH COMMAND AS EXIT
+*
+TIME     NI    ECTSWS,255-ECTNOPD-ECTATRM  CLEAR SWS
+         TM    CSOAFLG,CSOAVNP   CHECK COMMAND SCAN
+         BZ    CLRECB         RIGHT, OPERANDS
+         OI    ECTSWS,ECTNOPD  SET NO OPERANDS SW
+CLRECB   XC    ECB,ECB        CLEAR ECB
+         LA    R1,ECB         GET ADDR OF ECB
+         XC    MSGA(20),MSGA  CLEAR STAX PARM LIST
+         STAX  EXSTAX,USADDR=ECB,REPLACE=NO,MF=(E,MSGA)
+         MVC   ATTACHL(ATTACHE-ATTACHC),ATTACHC                  CLW1M1
+         LA    R15,ATTACHL                                       CLW1M1
+         LA    R1,CPPL        GET CPPL ADDRESS
+CKTTR    L     R0,BLDLNAME+8  CHECK IF BLDL ALREADY ISSUED
+         LTR   R0,R0          IS TTR PRESENT
+         BNZ   ATTDE          YES, USE DE
+         ATTACH EPLOC=BLDLNAME,ECB=ECB,MF=(E,(1)),SF=(E,(15)),   CLW1M1*
+               ESTAI=(EXSTAI,ECB)                                CLW1M1
+         B     STCB           GO SAVE TCB
+ATTDE    ATTACH DE=BLDLNAME,ECB=ECB,MF=(E,(1)),SF=(E,(15)),      CLW1M1*
+               ESTAI=(EXSTAI,ECB)                                CLW1M1
+STCB     ST    R1,TCB         SAVE NEW TCB ADDR
+         PCFERR ERREXIT,ATTACH      ANY ERRORS
+*
+*     WAIT FOR COMPLETION, DETACH, AND FREE FILES
+*
+         WAIT  ECB=ECB
+         DETACH TCB,STAE=YES  REMOVE COMMAND                     CLW1M1
+         STAX                 , CANCEL ATTN EXIT
+         MVC   ECTRTCD(3),ECB+1 SET RETURN CODE IN ECT
+         TM    ECB+4,3       ABEND OR ATTENTION                  CLW1M1
+         BZ    SKPATH        NO                                  CLW1M2
+         MVC   MSGA(DETMSGE-DETMSG),DETMSG  MOVE IN MSG SKEL     CLW1M1
+         LA    R10,MSGA      POINT TO MESSAGE AREA               CLW1M1
+         USING DETMSG,R10    SET ADDRESSIBILITY                  CLW1M1
+         LA    R1,DETMSG1    RELOCATE ADCON                      CLW1M1
+         ST    R1,DETMSG+4                                       CLW1M1
+         TM    ECB+4,2       WAS IT ATTENTION                    CLW1M1
+         BZ    DETABND       NO, ASSUME ABEND                    CLW1M1
+         MVC   DETMSGA(12),=CL12'ATTENTION.' COMPLETE THE MSG    CLW1M1
+         B     DETPUTL       AND WRITE IT                        CLW1M1
+DETABND  MVC   DETMSGA(6),=CL6'ABEND'  COMPLETE ABEND MSG        CLW1M1
+         UNPK  DETMSGA+6(7),ECB+1(4)   WITH ABEND CODE           CLW1M1
+         TR    DETMSGA+6(6),TRANS-240  CORRECT ZONES             CLW1M1
+         MVI   DETMSGA+12,C'.'  ADD PERIOD                       CLW1M1
+DETPUTL  MVC   DETMSGB(8),ECTPCMD  MOVE IN COMMAND NAME          CLW1M1
+         DROP  R10                                               CLW1M1
+         PUTLINE PARM=PUTL,TERMPUT=EDIT,MF=(E,IOPLSTK),          CLW1M1*
+               OUTPUT=(MSGA,TERM,SINGLE,INFOR)                   CLW1M1
+         PCFERR ERREXIT,IKJPUTL,4   ANY SERIOUS ERRORS           CLW1M1
+*
+*     RESTORE ECT AND COMPLETE ACCOUNTING
+*
+SKPATH   MVC   ECTSCMD,ECTPCMD  MOVE EXIT CMD TO SUBCMD
+         MVC   ECTPCMD,MCMD     RESTORE MAJOR CMD FOR RET
+         TM    CMDSWS,PCFACTG  ACCOUNT FOR USE
+         BZ    NOEACT         NO, SKIP OVER
+         BAL   R10,SMF        RECORD STATISTICS
+*
+*     PROMPT USER WITH COMMAND NAME BEING RETURNED TO
+*
+NOEACT   MVC   MCMDHDR(4),=X'000C0000'  SET LENGTH AND OFFSET
+         PUTLINE PARM=PUTL,TERMPUT=EDIT,MF=(E,IOPLSTK),                *
+               OUTPUT=(MCMDHDR,TERM,SINGLE,DATA)
+         PCFERR ERREXIT,IKJPUTL,4  IF RET CODE GT 4,ERROR
+         MVC   PCFSWS,SCMDSWS  RESTORE SUBCOMMAND OPTIONS
+         B     EXITX          EXIT
+*
+*     EXIT ATTN ROUTINE WILL TERMINATE COMMAND ONLY
+*
+EXSTAX   L     R1,8(R1)       GET CP ECB ADDR
+         OI    4(R1),2        SET ATTENTION OCCURRED SWITCH      CLW1M1
+         POST  (R1),4         POST CP COMPLETE
+         BR    R14            RETURN
+*                                                                CLW1M1
+*     STAI ROUTINE WILL STOP THE ABEND AT THIS LEVEL             CLW1M1
+*                                                                CLW1M1
+         USING *,R15                                             CLW1M1
+EXSTAI   LA    R3,12          LOAD 12 IN WORK REG                CLW1M1
+         CR    R0,R3          DOES SDWA EXIST                    CLW1M1
+         BE    EXSET          NO, PARM ADDR IN REG 2             CLW1M1
+         USING SDWA,R1        SET ADDRESSIBILITY                 CLW1M1
+         L     R2,SDWAPARM    ELSE LOAD PARM                     CLW1M1
+         SETRP RC=16          CONTINUE ABEND                     CLW1M1
+EXSET    OI    4(R2),1        SET ABEND OCCURRED SWITCH          CLW1M1
+         LA    R15,16         CONTINUE ABEND                     CLW1M1
+         BR    R14            RETURN                             CLW1M1
+         DROP  R15,R1                                            CLW1M1
+*
+*     IF NOT EXIT, CHECK ACCOUNTING AND AUTHORIZATION
+*     ON NEXT SUBCOMMAND
+*
+SUBCMD   ICM   R9,15,PCFTMPW  GET TMP WORK ADDR IF INITIALIZED
+         BZ    EXIT           FIRST CMD ENTRY
+         CLC   CSPLSP+20(4),CSPLCBUF  IS THIS MAJOR CMD
+         BE    EXIT           YES, EXIT
+         CLC   ECTPCMD,=CL8'EXEC'  IS EXEC CMD IN CNTL
+         BE    EXIT           YES, NOT SUBCMD PROC
+         C     R2,ASRPLPTR    IS PARM LIST FROM ATTN EXIT
+         BE    EXIT           YES, NOT SUBCOMMAND MODE
+         L     R14,4(R13)     GET PTR TO CALLERS SAVE AREA       CLW015
+         ICM   R14,7,5(R14)   PTR TO WHERE CALLER SAVED REGS     CLW015
+         BZ    SCCONT         NO PREV CALLER FOUND               CLW015
+         L     R15,16(R14)    GET ENTRY POINT OF CALLER          CLW015
+         CLC   5(7,R15),=C'IKJDFLT'   IS THIS DEFAULT NAME ROUT  CLW015
+         BE    EXIT           YES, NOT SUBCMD REQUEST            CLW015
+         CLC   5(8,R15),=C'IKJEFD36'  IS THIS ALLOC COMMAND      CLW015
+         BE    EXIT           YES, NOT SUBCMD REQUEST            CLW015
+         ICM   R14,7,5(R14)   BACK UP TO PREV CALLER             CLW016
+         BZ    SCCONT         NO PREV CALLER FOUND               CLW016
+         CLI   16(R14),0      VALIDATE ENTRY ADDRESS             CLW016
+         BNE   SCCONT         NO GOOD, MOVE ON                   CLW016
+         L     R15,16(R14)    GET ENTRY POINT OF THIS CALLER     CLW016
+         CLC   5(8,R15),=C'IKJEBEMA'   EDIT CONTROLLER           CLW016
+         BE    EXIT           PREVENT DOUBLE SMF RECORDS         CLW016
+         CLC   5(8,R15),=C'IKJEBESU'   EDIT SUBMIT CONTROLLER    CLW016
+         BE    EXIT           PREVENT DOUBLE SMF RECORDS         CLW016
+SCCONT   TM    PCFSWS,PCFACTG  WAS  ACCOUNT SPEC ON PREVIOUS     CLW015
+         BZ    SCMDV          NO, SKIP OVER
+         BAL   R10,SMF        YES, COMPLETE OLD SUBCMD SMF
+SCMDV    BAL   R10,AUTH       LOOKUP NEW SUBCMD IN TABLE
+         MVC   BLDLNAME,=CL8' '  CLEAR BLDL NAME AREA
+         EX    R14,MOVCMD     MOVE CMD NAME TO BLDL AREA
+*********************************************************************
+*                                                                   *
+*                                                  BEGIN MBC MODS   *
+*                                                                   *
+*********************************************************************
+         LTR   R15,R15        DID WE FIND IT
+         BZ    SCMDATH        YES, GO AHEAD
+         CLC   ECTPCMD(4),=C'SPF '  IS SPF IN CNTL               CLW003
+         BNE   EXIT           NO, NOT FOUND IS VALID SUBCMD
+         OI    CSOAFLG,CSOAEXEC  INDICATE IMPLIED CLIST          CLW008
+         B     EXIT           AND EXIT                           CLW008
+*********************************************************************
+*                                                                   *
+*                                                    END MBC MODS   *
+*                                                                   *
+*********************************************************************
+*                                                                   *
+*     AUTHORIZATION ERROR ON EXIT COMMAND OR REGULAR SUBCOMMAND
+*                                                                   *
+AUTHERR  MVI   PCFSWS,0       SET NO ACCTG DEFAULT
+         MVC   MSGA,AUTHMSG   MOVE MSG TO WORKAREA
+         LA    R10,MSGA       SET ADDRESSIBILITY
+         USING AUTHMSG,R10
+         LA    R1,AUTHMSG1    RELOCATE OUTPUT LINE DESC
+         ST    R1,AUTHMSG
+         LA    R1,AUTHMSGA
+         ST    R1,AUTHMSG+8
+         LA    R1,AUTHMSGB
+         ST    R1,AUTHMSG1+8
+         IC    R1,PSCBATR2     GET COMMAND AUTH BYTE
+         SRL   R1,4            ELIMINATE DATASET PART
+         STC   R1,AUTHMSB2     STORE IN ERROR MSG
+         OI    AUTHMSB2,C'0'   ADD ZONE
+         MVC   AUTHMSBE(8),BLDLNAME  MOVE IN SUBCMD
+         PUTLINE PARM=PUTL,TERMPUT=EDIT,MF=(E,IOPLSTK),                *
+               OUTPUT=(AUTHMSG,TERM,MULTLVL,INFOR)
+         DROP  R10
+         PCFERR ERREXIT,IKJPUTL,4  IF RETCD GT 4, ERROR
+         B     EXITX          ELSE SET NULL PARMS
+*
+*     FOUND AUTHORIZED SUBCOMMAND
+*
+SCMDATH  MVI   ECTSCMD+7,0    SET PROCESS SWITCH                 CLW016
+         B     EXIT           NOW EXIT
+*
+*     ROUTINE TO CALL SMF RECORDING ROUTINE IF PRESENT
+*
+SMF      TM    PSCBATR2+1,X'80' IS PCF SMF REQ FOR THIS USER
+         BZR   R10            NO, RETURN
+         CLI   ECTSCMD+7,0    ANY SUBCMDS BEEN PROCESSED         CLW016
+         BE    SMFTIM         GO SET NEW CMD START TIME
+         MVC   ECTSCMD,BLDLNAME  SETUP SUBCMD NAME               CLW016
+         XC    ECB,ECB        CLEAR ECB
+         POST  PCFMFECB,ECB   ACTIVATE SMF ROUTINE
+         WAIT  ECB=ECB        WAIT FOR COMPLETION
+         MVC   ECTSCMD,=CL8' '   CLEAR OUT SUBCOMMAND
+SMFTIM   TIME  BIN            GET TIME FOR NEXT ACCT PERIOD
+         ST    R0,PCFCMDAT    SAVE FOR ACCOUNTING
+         MVI   PCFSWS,0       CLEAR SMF REQUEST
+         BR    R10            RETURN
+*
+*********************************************************************
+*                                                                   *
+*                                                  BEGIN MBC MODS   *
+*                                                                   *
+*********************************************************************
+*  THIS CLOSED SUBROUTINE WHICH PERFORMS RACF AUTHORIZATION CHECKING
+*  ON COMMANDS.
+*        ON RETURN REG15 CONTAINS A 0 IF THE COMMAND IS AUTHORIZED
+*                 AND AN 8 IF THE RACHECK FAILED
+*
+AUTH     EQU   *
+         ICM   R14,15,CSOACNM      GET COMMAND NAME ADDRESS
+         BZ    AUTHN               NOT FOUND, GET OUT
+         LA    R15,8               SET MAX COUNT
+         LR    R1,R14              COPY ADDR OF BEGINNING OF COMMAND
+AUTHLP   CLI   0(R1),C' '          IS IT A BLANK
+         BE    AUTHFD              YES, FOUND IT
+         LA    R1,1(R1)
+         BCT   R15,AUTHLP          LOOP
+AUTHFD   SR    R1,R14              COMPUTE LENGTH OF COMMAND
+         BCTR  R1,0                REDUCE FOR COMPARE
+         MVC   RCHKCMD,=CL8' '     CLEAR COMMAND
+         EX    R1,MOVENAM          MOVE IN FOR RACHECK
+         MVC   RCHKEX(RCHKEXL),RCHKPAT
+         RACHECK MF=(E,RCHKEX),ENTITY=RCHKCMD
+         LTR   R15,R15
+         BZR   R10
+AUTHN    LA    R15,8               SET BAD RETURN
+         BR    R10                 GET OUT
+*********************************************************************
+*                                                                   *
+*                                                    EMD MBC MODS   *
+*                                                                   *
+*********************************************************************
+*
+*     SYSTEM ERRORS AND ABEND EXITS
+*
+ERREXIT  MVC   MSGA(CMDERR2+2-CMDERR),CMDERR  MOVE MSG TO WORK
+         LA    R10,MSGA          SET ADDRESSIBILITY
+         USING CMDERR,R10
+         MVC   CMDERR1(8),0(R1)  MOVE IN ROUTINE NAME
+         UNPK  CMDERR2(3),RCODE+3(2)  ADD ZONES TO HEX RET CODE
+         TR    CMDERR2(2),TRANS-240   CORRECT ZONES FOR A-F
+         TPUT  (R10),CMDERR2+2-CMDERR  PUT OUT ERR MSG
+         DROP  R10
+         MVI   RTCODE+3,4        SET PARM ERROR                  CLW003
+         B     EXIT            EXIT
+*
+*     SET NULL RETURN AFTER EXIT SUBCOMMAND
+*
+EXITX    XC    RTCODE,RTCODE     CLEAR RETURN CODE               CLW003
+         XC    CSOACNM(CSOAFLG-CSOACNM),CSOACNM
+         MVI   CSOAFLG,CSOANOC  SET EMPTY BUFFER INDICATOR
+         TM    TMPSWS,TMPTEST IS MAJOR CMD TEST
+         BNO   EXIT           NO, EXIT
+         MVI   ECTSCMD,C'W'   TEST WILL NOT ACCEPT NULL RETN
+         MVI   CSOALNM+1,1    SO SET UP WHERE SUBCOMMAND
+         MVI   CSOAFLG,CSOAVNP  SET NO PARMS BUT VALID
+         LA    R1,ECTSCMD     ADDR OF WHERE CMD NAME
+         ST    R1,CSOACNM     SET COMMAND NAME ADDR
+*
+*     SET RETURN CODE AND RETURN TO CALLER
+*
+EXIT     L     R15,RTCODE        GET RETURN CODE                 CLW003
+EXITN    PCFEXIT ,
+         LTORG
+*
+*     CONSTANTS AND EXECUTED COMMANDS
+*
+ATTACHC  ATTACH SHSPV=78,SZERO=NO,SF=L                           CLW1M1
+ATTACHE  EQU   *                                                 CLW1M1
+BLNKCMD  MVC   2(*-*,R11),1(R11)    PROPOGATE BLANKS
+MVCMD    MVC   20(*-*,R1),1(R11)    MOVE CMD TO NEW BUFFER
+BLDLMV   MVC   BLDLNAME(*-*),0(R7)  MOVE CMD NAME TO BLD LIST
+CMPCMD   CLC   08(*-*,R15),0(R1)    COMPARE NAME TO TABLE ENTRY
+MOVCMD   MVC   BLDLNAME(*-*),0(R1)  MOVE CMD NAME TO BLDL
+AUTHMSG  DC    A(AUTHMSG1,1,AUTHMSGA)
+AUTHMSG1 DC    A(0,1,AUTHMSGB)
+AUTHMSGA DC    Y(L'AUTHMSA1+4,0)
+AUTHMSA1 DC    C'PCF001 UNAUTHORIZED COMMAND ACCESS ATTEMPTED+'
+AUTHMSGB DC    Y(AUTHMSBE+8-AUTHMSGB,0)
+AUTHMSB1 DC    C' USERID COMMAND ACCESS CODE '
+AUTHMSB2 DC    C'X DISALLOWS REQUESTED ACCESS TO '
+AUTHMSBE EQU   *
+DETMSG   DC    A(1,DETMSG1)                                      CLW1M1
+DETMSG1  DC    Y(DETMSGE-DETMSG1,0),C'PCF004 COMMAND '''         CLW1M1
+DETMSGB  DC    C'XXXXXXXX'' TERMINATED DUE TO '                  CLW1M1
+DETMSGA  DC    C'XXXXXXXXXXX  '                                  CLW1M1
+DETMSGE  EQU   *                                                 CLW1M1
+CMDERR   DC    C'PCF010 COMMAND SYSTEM ERROR - PCFSCAN '
+CMDERR1  DC    C'XXXXXXXX ERROR CODE '
+CMDERR2  DC    C'XX '
+TRANS    DC    C'0123456789ABCDEF'
+RCHKPAT  RACHECK CLASS='$AAMISC',ATTR=READ,MF=L
+RCHKEXL  EQU   *-RCHKPAT           LENGTH OF PATTER
+MOVENAM  MVC   RCHKCMD(0),0(R14)
+*
+*     DSECTS
+*
+WORKAREA DSECT
+         DS    18F            REG SAVE AREA
+SCMDSWS  DS    H              SUBCOMMAND OPTIONS FROM PCFAUTH
+CMDSWS   DS    H              COMMAND OPTIONS FROM PCFAUTH ROUT
+MCMDHDR  DS    F              PUTLINE HEADER AREA FOR FOLLOWING MSG
+MCMD     DS    CL8            MAJOR COMMAND NAME BEFORE EXIT
+RCHKCMD  DS    CL8
+SVECB    DS    F              ADDR OF PREV CP IN CONTROL BEFORE EXIT
+ECB      DS    D              ECB AND SWITCHES FOR ATTACHED CMD  CLW1M1
+TCB      DS    F              TCB FOR EXIT ATTCHED CMD
+IOPLSTK  DS    4F             IOPL FOR STACK SERVICE ROUTINE
+STPB     DS    2F             PARM FOR STACK SERVICE ROUTINE
+RTCODE   DS    F              RETURN CODE SAVE AREA
+PUTL     DS    3F             PUTLINE PARM LIST
+MSGA     DS    CL(AUTHMSBE+8-AUTHMSG)  MSG WORKAREA
+ATTACHL  DS    CL(ATTACHE-ATTACHC)  ATTACH PARMLIST              CLW1M1
+RCHKEX   RACHECK MF=L,ATTR=READ,CLASS='$AAMISC'
+REG14SAV DS    F              REG 14 SPECIAL SAVE AREA
+SVT042   DS    7F             REG SAVE AREA
+CSPLEX   DS    6F             CSPL FOR EXIT SCAN
+CSPLEXF  DS    F              CSPLFLG WORD FOR EXIT
+ENDWORK  EQU   *
+CVTPTR   EQU   16       CVT ADDR
+CVTLPDSR EQU   352      LPA SEARCH ROUT ENTRY
+         PCFCVT
+         IKJCSOA
+         IKJIOPL
+         IKJCSPL
+         IKJECT
+         IKJLSD
+         IKJCPPL
+         IKJPSCB
+         IKJTMPWA
+         IHASDWA                                                 CLW1M1
+         END

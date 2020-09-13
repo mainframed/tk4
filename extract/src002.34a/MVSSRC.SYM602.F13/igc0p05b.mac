@@ -1,0 +1,631 @@
+         GBLC  &LIB
+&LIB     SETC  'LIB1'                   SET VARIABLE TO LIB1
+         TITLE 'IGC0P05B DATA SET PROCESSOR - NON-DA TABLE REFORMATTINGX
+                   REPOSITION I/O  RESTART - SVC 52  OS/360'
+IGC0P05B CSECT
+*
+*
+*          RELEASE 21 DELETIONS/CHANGES
+*0794334000-335000                                               S21040
+*          RELEASE 20 DELETIONS/CHANGES
+*          RELEASE 19 - COMPLETE REVISION
+* 365000,369000,372000                                           M4887
+* 215000,415000                                                  M3525
+*
+*
+*STATUS CHANGE LEVEL 004
+*
+***********************************************************************
+*
+*TITLE - NON DA TABLE REFORMATTING
+*
+*FUNCTION/OPERATION - A.  REFORMAT BUFFER SEGMENTS (RSDSECT) INTO 200
+*                         BYTE WORK AREAS.  DO A CONDITIONAL GETMAIN
+*                         IF NECESSARY TO TRY TO ALLOT ONE 200 BYTE
+*                         AREA TO EACH TAPE DATA SET OPEN AT CHKPT TIME
+*
+*                     B.  FORM A LOGICAL LINK BETWEEN TABL ELEMENTS
+*                         AND THE NEW WORK AREAS, IE. A POINTER TO A
+*                         WORK AREA IN EACH TABL ELEMENT THAT REPRESENT
+*                         A TAPE DATA SET.
+*
+*                     C.  TEST EACH TAPE ENTRY FOR DOS TAPE OPTIONS
+*                         (BYPASS OPTIONAL LEADING TAPE MARK AND/OR
+*                         BYPASS EMBEDDED CHKPT RCDS).  TABFLG1 BIT
+*                         7 WILL BE SET FOR THESE ENTRIES TO INDICATE
+*                         THAT THEY ARE TO BE POSITIONED BY IGC0U05B.
+*                         ONLY THE FIRST 3 WORK AREA SEGMENTS WILL BE
+*                         USED FOR THESE ENTRIES, WITH THE FOURTH
+*                         USED AS A BUFFER IN IGC0U05B.
+*
+*ENTRY POINTS - IGC0P05B - INITIAL ENTRY TO THIS MODULE BY MEANS OF AN
+*                          XCTL FROM IGC0L05B OR IGC0Q05B.
+*
+*INPUT - REGISTER 8   BEGINNING OF DCB TABLE
+*        REGISTER 1   USER BUFFER AREA
+*        REGISTER 10  USER BUFFER AREA
+*        ALL OPENED DCB (S) WITH THEIR ASSOCIATED CONTROL BLOCKS
+*        THE 48 BYTE TABLE ENTRY (IES) THAT IS (ARE) USED IN RESTART
+*        RESTART WORKAREA
+*
+*OUTPUT - REGISTER 8   BEGINNING OF DCB TABLE
+*         REGISTER 1   USER BUFFER AREA
+*         REGISTER 6   SECONDARY WORK AREA GOTTEN IN THIS MODULE
+*         REGISTER 12  USER BUFFER AREA
+*
+*EXTERNAL ROUTINE - NONE
+*
+*EXITS - NORMAL - XCTL TO IGC0S05B, IGC0R05B, OR IGC0T05B
+*
+*      - ERROR - NONE
+*
+*TABLES/WORKAREAS - THE WORKAREA USED IS DESCRIBED BY THE DSECTS AT THE
+*                   END OF THE LISTING.
+*
+***********************************************************************
+*                                                                     *
+*    THE FOLLOWING IS A DESCRIPTION OF THE 48 BYTE TABLE ENTRY THAT   *
+*    IS USED IN THE RESTART PORTION OF CHECKPOINT/RESTART.  EACH      *
+*    ENTRY IN THE TABLE (ONE FOR EACH OPEN DATA SET AT CHECKPOINT)    *
+*    IS 48 BYTES LONG.                                                *
+*                                                                     *
+***********************************************************************
+*
+*        ------------------- 4 BYTES -----------------
+*
+*      0 +++++++++++++++++++++++++++++++++++++++++++++
+*        +DATA SET  +           DCB                  +
+*        + ORGN.    +         ADDRESS                +
+*        +++++++++++++++++++++++++++++++++++++++++++++ 4
+*        +FLAG BYTE +    WORKAREA SEGMENT            +
+*        + NO. 1    +         ADDRESS                +
+*      8 +++++++++++++++++++++++++++++++++++++++++++++
+*        +NUMBER    +         JFCB TTR               +
+*        + OF VOLS  +         ADDRESS                +
+*        +++++++++++++++++++++++++++++++++++++++++++++ 12
+*
+*     12 +++++++++++++++++++++++
+*        +TAPE LABL + FILE SEQ +        DEVICE = TAPE
+*        +INFO BYTE + NUMBER   +
+*        +++++++++++++++++++++++
+*
+*     12 +++++++++++++++++++++++
+*        +    OLD   TIOT       +        DA AND UNIT RECORD
+*        +      OFFSET         +
+*        +++++++++++++++++++++++
+*
+*                              +++++++++++++++++++++++
+*                              +FLAG BYTE +FLAG BYTE +
+*                              +  NO. 2   +  NO. 3   +
+*     16 +++++++++++++++++++++++++++++++++++++++++++++
+*        +FLAG BYTE +FLAG BYTE +                     +
+*        + NO. 4    + NO. 5    +   VOLUME ID NO. 1   +
+*        +++++++++++++++++++++++                     + 20
+*        +                                           +
+*        +                                           +
+*     24 +++++++++++++++++++++++++++++++++++++++++++++
+*        +                                           +
+*        +   VOLUME ID NO. 2                         +
+*        +                     +++++++++++++++++++++++ 28
+*        +                     +                     +
+*        +                     +   VOLUME ID NO. 3   +
+*     32 +++++++++++++++++++++++                     +
+*        +                                           +
+*        +                                           +
+*        +++++++++++++++++++++++++++++++++++++++++++++ 36
+*        +                                           +
+*        +   VOLUME &D NO. 4                         +
+*     40 +                     +++++++++++++++++++++++
+*        +                     +                     +
+*        +                     +                     +
+*        +++++++++++++++++++++++   VOLUME ID NO. 5   + 44
+*        +                                           +
+*        +                                           +
+*        +++++++++++++++++++++++++++++++++++++++++++++ 48
+*
+*
+*ATTRIBUTES - REENTRANT
+*             REUSABLE
+*             ENABLED
+*             PRIVILEGED
+*
+***********************************************************************
+*
+*
+*    REGISTER CONVENTION TO BE USED THRU-OUT REPI/O PHASE
+*
+***********************************************************************
+*
+WRKR1    EQU   0                        WORK/PARAMETER REGISTER
+WRKR2    EQU   1                        WORK/PARAMETER REGISTER
+DCBR     EQU   2                        CURRENT DCB REGISTER
+WRKR3    EQU   12                       WORK REGISTER
+WRKR4    EQU   13                       WORK REGISTER
+WRKR5    EQU   14                       WORK/PARAMETER REGISTER
+WRKR6    EQU   15                       WORK/PARAMETER REGISTER
+***********************************************************************
+*
+*    REGISTERS FOR IGC0P05B
+*
+***********************************************************************
+R1       EQU   1
+PRIMENO  EQU   2                       NUMBER OF PRIME WORK AREAS
+BASER    EQU   3                       BASE REGISTER
+SECONDNO EQU   4                       NUMBER OF SECONDARY WORK AREAS
+PPTABR1  EQU   5                       POINTER TO PRIME AREA
+PPTABR2  EQU   6                       POINTER TO SECONDARY WORK AREA
+WACNTR   EQU   7                       NUMBER OF WORK AREAS FORMATTED
+TABLR    EQU   8                       POINTER TO FIRST TABL ELEMENT
+CTABLR   EQU   9                       POINTER TO CURRENT TABL ELEMENT
+BUFR     EQU   10                      POINTER TO RSTWA
+DSCNTR   EQU   11                      NUMBER OF DATA SETS
+R13      EQU   13
+R15      EQU   15
+*
+***********************************************************************
+*
+*    OFFSETS TO BE USED IN REPI/O PHASE
+*
+***********************************************************************
+*
+DAFLG    EQU   X'80'                    INDICATES DA DATA SET    M3525
+*                                       PRESENT                  M3525
+TABENT   EQU   48                       TABLE ENTRY LENGTH
+UNRELCC  EQU   X'42'
+DEBID    EQU   X'0F'
+D0       EQU   0
+D1       EQU   1
+D4       EQU   4
+D8       EQU   8
+D40      EQU   40                      CONSTANT 40               Y02049
+L2       EQU   2
+X02      EQU   X'02'                   CONSTANT OF 2             Y02049
+L3       EQU   3
+L8       EQU   8
+L48      EQU   48
+L128     EQU   128
+ZERO     EQU   0
+*
+LTM      EQU   X'21'                   BYPASS DOS LEADING TM     S21040
+CHKPT    EQU   X'10'                   BYPASS EMBEDDED CHKPT RCD S21040
+DOSTAPE  EQU   X'01'                   INDICATE DOS TAPE         S21040
+*
+***********************************************************************
+*
+         BALR  BASER,ZERO               ESTABLISH ADDRESSABILITY
+         USING *,BASER                 BASE REGISTER
+         B     BEGIN               BRANCH AROUND EYE CATCHER     Y01909
+         CNOP  0,8                 ALIGN TO A DBL WORD BOUNDARY  Y01909
+         DC    C'IGC0P05B'         CSECT NAME                    Y01909
+BEGIN    EQU   *                                                 Y01909
+         USING TABL,CTABLR             TABL BASE REGISTER
+         USING RSTWA,BUFR              RESTART WORK AREA
+         USING RSDSECT,PPTABR1         UNTIL REPDCB05
+*        USING RSDSECT,WRKR3           AFTER REPDCB05
+*
+         LA    WRKR2,D0(WRKR2)         ZERO HIGH ORDER BYTE
+         LR    CTABLR,TABLR            INITIALIZE TABL POINTER
+         LR    BUFR,WRKR2              SAVE POINTER TO RSTWA
+         L     PPTABR1,TABSEGAD-D1     ADDRESS OF PRIME WORK AREA
+         LA    PPTABR1,D0(PPTABR1)     ZERO HIGH ORDER BYTE
+         SR    PPTABR2,PPTABR2         INIT SECONDARY WORK AREA PTR
+*
+REPDCB00 EQU   *
+*
+*        COUNT THE TABL ELEMENTS WHICH REPRESENT TAPE DEVICES AND
+*        KEEP TOTAL IN REG DSCNTR
+         SR    DSCNTR,DSCNTR
+*
+REPDCB01 TM    TABFLG1,TABTAPE         IS IT TAPE DEVICE
+         BNO   REPDCB02                BRANCH NO TO GET NEXT ENTRY
+         TM    TABFLG2,TABRSDS          IS THIS RESTART D/S      YM5359
+         BO    REPDCB02                 IF YES,SKIP THIS NTRY    YM5359
+         LA    DSCNTR,D1(DSCNTR)       ADD ONE TO COUNTER
+*
+*
+REPDCB02 EQU   *
+*
+         TM    TABFLG1,TABLAST         IS THIS THE LAST ENTRY
+         BO    REPDCB03                BR YES TO CHECK SIZE OF W.A.
+         LA    CTABLR,TABENT(CTABLR)   INCREMENT TABLR POINTER
+         B     REPDCB01                GO TO COUNT THIS ENTRY
+*
+*        DSCNTR NOW CONTAINS NUMBER OF TAPES TO BE REPOSITIONED
+*        NEXT, COMPUTE SIZE OF WORK AREA NEEDED TO PROCESS ALL
+*        TAPES IN PARALLEL
+*
+REPDCB03 EQU   *
+         LTR   PRIMENO,DSCNTR           TEST/SET CNTR FOR NUMBER M3525
+*                                       OF WORKAREAS             M3525
+         BZ    REPDCB25                 IF COUNT IS 0, NO TAPE   M3525
+*                                       PROCESSING NECESSARY     M3525
+         SR    SECONDNO,SECONDNO       NO SECONDARY WORKAREA
+*
+         LR    WRKR1,BUFR              ADDRESS OF BEGINNING OF RSTWA
+         A     WRKR1,RSWACL            LENGTH OF RSTWA
+         SH    WRKR1,QMWKALNG          SET ASIDE QMNGR WA SPACE  Y02049
+         ST    WRKR1,RSSSCR            SAVE ADDR FOR IGC0S05B    Y02049
+         SR    WRKR1,PPTABR1           LENGTH OF WORK AREA AVAILABLE
+*
+         LA    WRKR4,PPTABENT          SIZE OF WORK AREA FOR EACH ENTRY
+         MR    WRKR3,DSCNTR            SIZE OF AREA NEEDED IN WRKR4
+         SR    DSCNTR,DSCNTR           ZERO REGISTER TO INDICATE
+*                                      LENGTH OF SECONDARY WORK AREA
+         CR    WRKR1,WRKR4             WORK AREA LARGE ENOUGH
+         BNL   REPDCB15                BRANCH YES TO FORMAT WORK AREA
+*
+*
+*        TO ALLOW FOR SEGMENTED WORKAREAS THE SIZE MUST BE ROUNDED UP
+*        TO A 200 BYTE MULTIPLE AND THE NUMBER OF AREAS IN EACH SECTION
+*        MUST BE COMPUTED
+*
+REPDCB14 EQU   *
+         SR    WRKR4,WRKR1             CALC EXTRA SPACE NEEDED  ZA00608
+         SR    WRKR3,WRKR3             ZERO EVEN REGISTER FOR DIVIDE
+         LA    WRKR5,PPTABENT          SIZE OF EACH ENTRY
+         DR    WRKR3,WRKR5             NUMBER OF ENTRIES IN WRKR4
+*                                      REMAINDER IN WRKR3
+*
+         LTR   WRKR3,WRKR3             IS REMAINDER ZERO
+         BZ    REPDCB04                BRANCH YES TO MULTIPLY BACK
+         LA    WRKR4,D1(WRKR4)         ADD ONE TO ROUND UP
+REPDCB04 EQU   *
+         SR    PRIMENO,WRKR4           NO OF AREAS IN PRIME WORK AREA
+         LR    SECONDNO,WRKR4          AREAS NEEDED FOR SECOND W. A.
+         MR    WRKR3,WRKR5             WRKR4 IS SIZE FOR GETMAIN AS 200
+*                                         BYTE MULTIPLE
+*
+*
+*
+*
+         XC    GOTLOC(L8),GOTLOC       CLEAR GETMAIN RETURN AREA
+         LA    WRKR1,PPTABENT          MINIMUM FOR GETMAIN
+         ST    WRKR1,SIZELOC                IS ENOUGH FOR ONE WORK AREA
+         ST    WRKR4,SIZELOC+D4        MAXIMUM SIZE FOR GETMAIN
+         LA    R1,GETLIST              ADDR OF PARAM LIST FOR GETMAIN
+         LA    R13,GETSAVE             SAVE AREA FOR GETMAIN
+*
+         GETMAIN VC,LA=SIZELOC,A=GOTLOC,SP=250,MF=(E,(1))
+*
+*
+*        NOW DETERMINE HOW MUCH CORE, IF ANY, WAS GOTTEN
+*        THEN GO TO REPDCB05 TO FORMAT THE AREAS
+*        GOTLOC CONTAINS THE ADDRESS OF THE GOTTEN CORE
+*        GOTLOC + 4 CONTAINS THE SIZE OF THE GOTTEN CORE
+*
+         LTR   R15,R15                 TEST RETURN CODE FROM GETMAIN
+         BNZ   REPDCB13                NO GOTTEN CORE
+*
+         LA    WRKR5,PPTABENT          SIZE OF EACH WORK AREA
+         L     WRKR4,GOTLOC+D4         SIZE OF GOTTEN AREA
+         LR    DSCNTR,WRKR4            SAVE LENGTH OF 2ND WORK AREA
+         SR    WRKR3,WRKR3             ZERO EVEN REGISTER FOR DIVIDE
+*
+         DR    WRKR3,WRKR5             NUMBER OF ENTRIES IN WRKR4
+*
+         LR    SECONDNO,WRKR4          SAVE NUMBER OF ENTRIES
+         L     PPTABR2,GOTLOC          ADDRESS OF SECOND WORK AREA
+         B     REPDCB15                GO FORMAT WORK AREA
+REPDCB13 EQU   *
+         SR    SECONDNO,SECONDNO       NO SECONDARY WORK AREAS
+REPDCB15 EQU   *
+*
+         USING RSDSECT,WRKR3
+*
+         SR    WRKR6,WRKR6             ZERO FORMATTING SWITCH
+         SR    WRKR4,WRKR4             ZERO INDICATES PRIME WORK AREA
+         LR    CTABLR,TABLR            REINITIALIZE BASE FOR TABL ELTS
+*
+REPDCB17 EQU   *
+*
+         TM    TABFLG1,TABTAPE         IS IT TAPE
+         BNO   REPDCB18                BRNCH NO TO GET NEXT NTRY YM5359
+         TM    TABFLG2,TABRSDS          IS IT RESTART TAPE       YM5359
+         BNO   REPDCB06                 IF NOT CONTINUE          YM5359
+*
+REPDCB18 LA    CTABLR,TABENT(CTABLR)   INCREMENT TABL POINTER
+         B     REPDCB17                GO TO CHECK FOR TAPE
+*
+REPDCB06 LR    WRKR3,PPTABR1           POINT TO PRIME AREA
+         LR    WRKR5,PRIMENO           NO OF ELTS AVAILABLE
+*
+REPDCB07 SR    WACNTR,WACNTR
+*
+REPDCB08 EQU   *                                                 S21040
+         C     WRKR6,MASK3             ARE ALL AREAS FORMATTED
+         BE    REPDCB09                BRANCH YES TO SKIP FORMATTING
+*
+         XC    D0(PPTABENT,WRKR3),D0(WRKR3) ZERO WORK AREA       Y02049
+*
+         USING IHADCB,WRKR2
+         L     WRKR2,DCBDEBAD          POINTER TO SYSTEM JOBQ DEB
+         L     WRKR2,RSTCBAD           POINTER TO RESTART TCB
+         ST    WRKR2,RSDEBTCB          STORE TCB IN DEB
+         LA    WRKR2,RSDCBREP          POINTER TO RESTART DEB
+         ST    WRKR2,RSDEBDCB          STORE IN RESTART DEB
+         ST    WRKR2,RSIOBDCB          STORE IN RESTART IOB
+         MVI   RSDEBID,DEBID           STORE IDENTIFICATION FOR DEB
+         L     WRKR2,CVTPTR            GET CVT ADDR              Y02049
+         USING CVT,WRKR2               ADDR CVT                  Y02049
+         L     WRKR2,CVTXAPG           GET ADDR OF IOS APP'S     Y02049
+         ST    WRKR2,RSDEBAPP          STORE IN DEB              Y02049
+         USING IHADCB,WRKR2            RESTORE DCB ADDRESSING    Y02049
+         MVI   RSDEBAPP,X02            SET DEB EXT SCALE         Y02049
+         LA    WRKR2,RSDEB             POINTER TO DEB
+         ST    WRKR2,RSDCBDEB          STORE IN RESTART DCB
+         MVI   RSIOBFG1,UNRELCC        SET UNRELATED FLAG IN IOB
+         LA    WRKR2,RSECBAD           POINTER TO ECB
+         ST    WRKR2,RSIOBECB          STORE IN RESTART IOB
+         LA    WRKR2,RSCCWLST          CHANNEL PROGRAM ADDRESS
+         ST    WRKR2,RSIOBCPA          STORE IN RESTART IOB
+*
+*
+REPDCB09 EQU   *                                                 M4887
+         LA    WACNTR,D1(WACNTR)        NUMBER OF WORK AREAS     M4887
+*                                       USED                     M4887
+*
+REPDCB20 EQU   *                                                 M4887
+         TM    TABFLG1,TABLAST          IS THIS THE LAST ENTRY   M4887
+         BO    REPDCB11                BRANCH YES FORMATTING FINISHED
+*
+         LA    CTABLR,TABENT(CTABLR)
+*
+         TM    TABFLG1,TABTAPE          IS IT TAPE
+         BNO   REPDCB20                 BRACH NO TO SKIP ELEMENT M4887
+         TM    TABFLG2,TABRSDS          IS IT RESTART TAPE       YM5359
+         BO    REPDCB20                 YES-SKIP THIS NTRY       YM5359
+*
+         CR    WRKR5,WACNTR            IS THAT THE LAST WORK AREA
+         BNH   REPDCB10                BRANCH YES TO ADJUST POINTERS
+*
+         LA    WRKR3,PPTABENT(WRKR3)   POINT TO NEXT WORK AREA SEGMENT
+         B     REPDCB08                GO TO FORMAT NEXT ELT
+*
+*
+REPDCB10 EQU   *
+         O     WRKR6,MASK1             SET FORMAT SW - 1ST AREA DONE
+         X     WRKR4,MASK1             SWITCH WORK AREAS
+         BZ    REPDCB12                SECONDARY AREA USED
+*
+*        WE HAVE JUST USED THE PRIME WORK AREA
+         LTR   SECONDNO,SECONDNO       IS THERE SECONDARY SPACE
+         BZ    REPDCB12                BRANCH NO SECONDARY SPACE
+*
+         LR    WRKR3,PPTABR2           PTR TO SECONDARY SPACE
+         LR    WRKR5,SECONDNO          NO OF ELTS IN SECOND W.A.
+         B     REPDCB07                GO SET UP TABL
+*
+*
+REPDCB11 EQU   *
+         LR    WRKR3,PPTABR1           POINTER TO FIRST WORK AREA
+         STH   DSCNTR,RSSTAT3          PASS LENGTH OF 2ND WORK AREA
+*
+*        PLACE WORKAREA SEGMENT ADDRESSES IN DCB TABLE ENTRIES.
+*        USE ONLY FIRST THREE SEGMENTS FOR TAPES WITH DOS OPTIONS
+*        SPECIFIED
+*
+         USING IHADCB,WRKR2            DCB BASE REGISTER         S21040
+         LR    CTABLR,TABLR            INIT BASE FOR TABLE ENTRY S21040
+         LR    WRKR6,WRKR3             POINTER TO WORK AREA      S21040
+         LR    WRKR5,PRIMENO           NO ELEMENTS IN PRIME W.A. S21040
+*
+         SR    WACNTR,WACNTR           DOS TAPE COUNTER          S21040
+         SR    WRKR4,WRKR4             NON-DOS TAPE COUNTER      S21040
+         SR    DSCNTR,DSCNTR            INDICATE PRIME W.A.      S21040
+*
+REPDCB30 EQU   *                                                 S21040
+         TM    TABFLG1,TABTAPE         TAPE DEVICE               S21040
+         BZ    REPDCB55                BRANCH NO                 S21040
+         TM    TABFLG2,TABRSDS          IS IT RESTART TAPE       YM5359
+         BO    REPDCB55                 BR IF YES                YM5359
+*
+         TM    TABTPLBL,LTM            BYPASS LEADING TAPE MARK  S21040
+         BO    REPDCB45                BRANCH YES TO FLAG ENTRY  S21040
+*
+         L     WRKR2,TABDCBAD-D1       DCB ADDR FOR THIS ENTRY   S21040
+         TM    DCBMACRF,X'80'           IS THIS EXCP            SA64062
+         BO    REPDCB32                 YES-BYPASS CHKPT TST    SA64062
+         TM    DCBOPTCD,CHKPT          BYPASS CHKPT RCDS         S21040
+         BO    REPDCB45                BRANCH YES TO FLAG ENTRY  S21040
+*
+REPDCB32 EQU   *                                                SA64062
+         LA    WRKR4,D1(WRKR4)         ADD ONE TO OS TAPE COUNT  S21040
+         ST    WRKR6,TABVLID2          POINTER TO WORK AREA      S21040
+         MVC   TABSEGAD(L3),TABVLID2+D1 MOVE POINTER INTO TABLE  S21040
+*
+         CR    WRKR4,WRKR5             LAST WORK AREA            S21040
+         BE    REPDCB35                BR YES TO ADJUST POINTERS S21040
+*
+         LA    WRKR6,PPTABENT(WRKR6)   NEXT W.A. SEGMENT ADDRESS S21040
+         B     REPDCB55                TEST FOR LAST TABLE ENTRY S21040
+*
+REPDCB35 EQU   *                                                 S21040
+         LTR   DSCNTR,DSCNTR            DETERMINE WORK AREA USED S21040
+         BZ    REPDCB38                 BR ZERO - USED PRIME W.A S21040
+*
+         SR    DSCNTR,DSCNTR            INDICATE PRIMARY W.A.    S21040
+         B     REPDCB40                                          S21040
+*
+REPDCB38 EQU   *                                                 S21040
+         LTR   WRKR5,SECONDNO          SECONDAY WORK AREA        S21040
+         BZ    REPDCB40                BRANCH NO SECONDARY SPACE S21040
+*
+         LA    DSCNTR,D1(DSCNTR)        INDICATE SECONDARY W.A.  S21040
+         LR    WRKR6,PPTABR2           PTR TO SECONDARY SPACE    S21040
+         B     REPDCB55                TEST FOR LAST TABLE ENTRY S21040
+*
+REPDCB40 EQU   *                                                 S21040
+         SR    WRKR4,WRKR4             INITIALIZE TAPE COUNTER   S21040
+         LR    WRKR6,PPTABR1           PTR TO PRIMARY SPACE      S21040
+         B     REPDCB55                TEST FOR LAST TABLE ENTRY S21040
+*
+REPDCB45 EQU   *                                                 S21040
+*
+*        THIS SECTION OF CODE PLACES ADDRESS OF FIRST THREE WORK
+*        AREA SEGMENTS IN THE TAPE TABLE ENTRIES HAVING SPECIFIED
+*        EITHER BYPASS LEADING TAPE MARK AND/OR BYPASS EMBEDDED
+*        CHKPT RCDS (DOS TAPES).
+*
+         OI    TABFLG1,TABDOSTP        INDICATE DOS TAPE         S21040
+         LA    WACNTR,D1(WACNTR)       ADD ONE TO DOS TAPE COUNT S21040
+         ST    WRKR3,TABVLID2          POINTER TO WORK AREA      S21040
+         MVC   TABSEGAD(L3),TABVLID2+D1 MOVE POINTER INTO TABLE  S21040
+*
+         C     WACNTR,MASK3            THREE AREAS USED          S21040
+         BE    REPDCB50                BR YES TO REINITIALIZE    S21040
+*
+         LA    WRKR3,PPTABENT(WRKR3)   INCREMENT WORK AREA PTR   S21040
+         B     REPDCB55                TEST FOR LAST TABLE ENTRY S21040
+*
+REPDCB50 EQU   *                                                 S21040
+         SR    WACNTR,WACNTR           ZERO DOS TAPE COUNTER     S21040
+         LR    WRKR3,PPTABR1           POINT TO PRIME AREA       S21040
+*
+REPDCB55 EQU   *                                                 S21040
+         TM    TABFLG1,TABLAST         IS THIS THE LAST ENTRY    S21040
+         BO    REPDCB60                BR YES FORMATTING DONE    S21040
+*
+         LA    CTABLR,TABENT(CTABLR)   INCREMENT DCB TABLE PTR   S21040
+         B     REPDCB30                                          S21040
+*
+REPDCB60 EQU   *                                                 S21040
+         LR    WRKR3,PPTABR1           PTR TO FIRST WORK AREA    S21040
+         LA    WRKR3,RSCCW2
+         MVC   D0(L8,WRKR3),MODNM0S     SET MODULE NAME FOR XCTL
+REPDCB27 EQU   *                                                 M3525
+         LA    WRKR6,D8(WRKR3)
+         XC    RSERAS00(D40),RSERAS00  CLEAR SCRATCH AREA        Y02049
+         LR    WRKR2,BUFR              PASS POINTER TO RSTWA
+         LR    WRKR5,WRKR3              SET REG14 TO XCTL P.L.   YM5359
+         LR    WRKR3,BUFR              IN REG 12 TOO             Y02049
+*
+         XCTL  EPLOC=(WRKR5),SF=(E,(15))                         YM5359
+*
+*
+REPDCB12 O     WRKR6,MASK2             SET FORMAT SW - ALL AREA DONE
+         B     REPDCB06                GO TO FORMAT NEXT ENTRY
+REPDCB25 EQU   *                                                 M3525
+         LA    WRKR3,RSCCW2             POINT TO PARM LIST       M3525
+         MVC   D0(L8,WRKR3),MODNM0R     ANTICIPATE IGC0R05B AS   M3525
+*                                       THE NEXT LOAD            M3525
+         TM    RSDCBFLG,DAFLG           IS DA INDICATOR 'ON'     M3525
+         BO    REPDCB27                 IF YES, BR               M3525
+         MVI   D4(WRKR3),C'T'           SET NEXT LOAD TO         M3525
+*                                       IGC0T05B                 M3525
+         B     REPDCB27                 GO XCTL                  M3525
+         EJECT
+*     CONSTANTS USED IN REPI/O
+*
+MASK1    DC    F'1'                     FORMATTING MASK - 1ST AREA
+MASK2    DC    F'2'                     FORMATTING MASK - 2ND AREA
+MASK3    DC    F'3'                     FORMATTING MASK - COMPLETE
+QMWKALNG DC    H'456'                  LENGTH OF QMNGR WORKAREA  Y02049
+*                                      (256) + QMNGR PARM LIST   Y02049
+*                                      (24) + JFCB BUFFER (176)  Y02049
+MAXTRKNO DC    X'7FFF'                  MAX NO OF TRKS - PUT IN DEB
+MODNM0R  DC    C'IGC0R05B'                                       M3525
+MODNM0S  DC    C'IGC0S05B'                                       M3525
+*
+*                                                                     *
+*        MAINTENANCE SPACE                                       Y01909
+*                                                                     *
+PATCH    DC    XL((*-IGC0P05B)/20)'00'   FIVE PERCENT SPACE      Y01909
+*                                                                     *
+         EJECT
+***********************************************************************
+*
+         IEEVRSWA  VER=3                AOS2 VERSION OF WA
+         EJECT
+RSDSECT  DSECT
+*
+*    DATA EXTENT BLOCK
+*
+RSDEB    DS    0CL48
+GETSAVE  EQU   RSDEB
+SIZELOC  EQU   GETSAVE+72
+GOTLOC   EQU   SIZELOC+8
+GETLIST  EQU   GOTLOC+8
+         ORG   GETLIST                  ORG TO DEFINE GETLIST
+         GETMAIN VC,LA=SIZELOC,A=GOTLOC,MF=L
+         ORG   RSDEB                    RESET I.C.
+RSDEBTCB DC    X'00000000'              TCB ADDRESS
+RSDEBDEB DC    X'00000000'              DEB ADDRESS
+*
+*    DATA CONTROL BLOCK
+*
+RSDEBOFL DS    0CL1
+RSDEBIRB DC    X'00000000'              IRB ADDRESS
+RSDEBSYS DC    X'00000000'              1ST IOB ADDR IN SYS.PURGE CHAIN
+RSDEBUSR DC    X'00000000'              1ST IOB ADDR IN USER PRGE CHAIN
+RSDEBECB DC    X'00000000'              PARM.LIST ADDR TO PURGE ECB
+RSDEBID  DS    0CL1
+RSDEBDCB DC    AL4(RSDCBREP)            DCB ADDR
+RSDEBAPP DS    CL4                      I/O APPENDAGE VECTOR TABLE
+RSDEBMOD DS    0CL1
+RSDEBUCB DS    F                        UCB ADDRESS
+RSDEBBIN DS    H                        BIN NUMBER
+RSDEBSCC DS    H                        CYLINDER START ADDRESS
+RSDEBSHH DS    H                        TRACK START ADDRESS
+RSDEBECC DS    H                        CYLINDER END ADDRESS
+RSDEBEHH DS    H                        TRACK END ADDRESS
+RSDEBNTR DS    H                        NO. OF TRACKS IN THIS EXTENT
+*
+*    EVENT CONTROL BLOCK
+*
+RSECBAD  DS    CL4                      ECB ADDRESS
+RSDCBDEB DC    AL4(RSDEB)               DEB ADDRESS
+*
+RSDCBREP EQU   RSDEB+8                  POINT TO RELATIVE BEGINNING DCB
+*
+*    INPUT OUTPUT BLOCK
+*
+RSIOB    DS    0CL40
+RSIOBFG1 DC    X'00'                    I/O FLAGS BYTE 1
+RSIOBFG2 DC    X'00'                    I/O FLAGS BYTE 2
+RSIOBSN1 DS    CL1                      FIRST SENSE BYTE
+RSIOBSN2 DS    CL1                      SECOND SENSE BYTE
+RSIOBECB DC    AL4(RSECBAD)             ECB ADDRESS
+RSIOBCSW DS    D                        LAST CSW
+RSIOBCPA DS    AL4(RSCCW1)              CHANNEL PROGRAM ADDRESS
+RSIOBDCB DS    AL4(RSDCBREP)            DCB ADDRESS
+RSIOBRCP DS    CL4                      RESTART ADDRESS FOR IOS
+RSIOBINC DS    H                        INCREMENT BLOCK COUNT
+RSIOBECT DS    H                        NO. OF ERROR ENTRIES
+RSIOBDAD DS    D                        SEEK ADDRESS FOR DA
+*
+*    CHANNEL PROGRAM
+*
+RSCCWLST DS    0CL24
+RSCCW1   DS    D                        CCW1
+RSCCW2   DS    D                        CCW2
+RSCCW3   DS    D                        CCW3
+*
+RSSTATUS DS    0CL8
+RSSTAT1  DS    CL1                      STATUS BYTE 1
+RSSTAT2  DS    CL1                      STATUS BYTE 2
+RSSTAT3  DS    CL1                      STATUS BYTE 3
+RSSTAT4  DS    CL1                      STATUS BYTE 4
+         DS    0F                                                YM7875
+RSPASSFL DS    AL1                      PASSWORD CHK IND         YM7875
+RSTABAD  DS    AL3                      ADR OF CURR USING ENT    YM7875
+RSTLABEL DS    0CL80                    TAPE HDR RECORD          YM7875
+RSHDR    DS    CL3                      LABEL IDENT              YM7875
+RSHDRNUM DS    CL1                      LABEL NO.                YM7875
+RSDATAID DS    CL17                     DATA SET IDENT           YM7875
+         DS    CL32                                              YM7875
+RSDSSECR DS    CL1                      SECURITY IND(DATA SET)   YM7875
+         DS    CL26                     REST OF HDR1             YM7875
+         ORG   RSTLABEL                 DECLARE HDR2             YM7875
+         DS    CL47                     FRONT OF HDR2            YM7875
+RSDSIND  DS    CL1                      CHKPT D.S. INDR          YM7875
+         DS    CL32                     REST OF HDR2             YM7875
+RSSEGEND EQU   *                        LN OF SEG W/A FOR TAPE   YM7875
+PPTABENT EQU   RSSEGEND-RSDSECT         LENGTH OF TAPE WORK SEG  YM7875
+         EJECT
+CVT      DSECT
+         CVT
+         EJECT
+         DCBD  DSORG=PS
+         EJECT
+         IHJDSTAB                                                Y02076
+         END

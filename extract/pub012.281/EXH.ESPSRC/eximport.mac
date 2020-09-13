@@ -1,0 +1,1423 @@
+EXIMPORT TITLE 'EXIMPORT - MAKE JCL FOR DATA SET EXPORTS AND IMPORTS'
+*   FROM CBT FILE 416 (NON-PDS VERSION IN FILE 316)
+***********************************************************************
+*                                                                     *
+*       MODULE NAME = EXIMPORT                                        *
+*                                                                     *
+*       DESCRIPTIVE NAME = GENERATE THE JCL NECESSARY FOR             *
+*          EXPORTING AND IMPORTING THE DATA SETS ON A                 *
+*          SPECIFIED VOLUME.                                          *
+*                                                                     *
+*       FUNCTION =                                                    *
+*          CREATES ONE DATA SET WITH THE JCL FOR EXPORTING            *
+*          THE DATA SETS ON A SPECIFIED VOLUME AND ANOTHER            *
+*          FOR IMPORTING THE SAME DATA SETS.  FOR VSAM                *
+*          FILES, THE JCL WILL BE SET UP TO EXECUTE                   *
+*          IDCAMS, EXPORTING TO TAPE AND THEN IMPORTING               *
+*          BACK ONTO THE SAME VOLUME FROM THE TAPE.                   *
+*   N.B.: VSAM SUPPORT ASSUMES SPECIAL NAMING CONVENTION OF .DATA FOR *
+*          THE NAME, AND .AIX.DATA FOR ALTERNATE INDICES.             *
+*         THE CODE NOW SIMPLY GENERATES AN EXPORT AND AN IMPORT, WITH *
+*          NO DELETION OF THE VSAM DATA SET.                          *
+*                                                                     *
+*          FOR NON-VSAM PS FILES, THE PROGRAM IEBGENER IS             *
+*          EXECUTED TO COPY THE DATA SET TO TAPE AND THEN             *
+*          BACK TO THE SAME VOLUME.  FOR PO FILES, IEBCOPY            *
+*          IS USED.  ALSO A CLIST IS GENERATED TO SCRATCH             *
+*          THE TAPE FILES AFTER THE DATA SETS HAVE BEEN               *
+*          IMPORTED.                                                  *
+*                                                                     *
+*          OPERATION =                                                *
+*             READ THE PROGRAM PARAMETERS                             *
+*             OPEN THE VTOC FOR THE SPECIFIED VOLUME                  *
+*             FIGURE OUT THE DEVICE TYPE FOR BOTH THE CURRENT         *
+*               AND THE NEW DEVICES                                   *
+*             OPEN THE SPECIFIED OUTPUT FILES (FOR THE JCL)           *
+*             READ FORMAT 1 RECORDS OF VTOC FOR DATA SET NAME         *
+*             FOR VSAM FILES, IGNORE .INDEX FILES AND                 *
+*               REMOVE THE .DATA FROM THE REST SO EXPORT-             *
+*               IMPORT IS SET UP FOR THE CLUSTER.                     *
+*             FOR NON-VSAM FILE, CALCULATE PARAMETERS                 *
+*               TO RECONSTUCT THE DATA SET WHEN COPYING               *
+*               BACK TO THE VOLUME.                                   *
+*             WRITE OUT JCL TO BOTH EXPORT AND IMPORT DATA            *
+*               SETS.                                                 *
+*             WRITE OUT THE SCRATCH STATEMENTS INTO THE CLIST         *
+*               DATA SET.                                             *
+*             CONTINUE READING VTOC TIL ALL DATA SETS PROCESSED       *
+*             CLOSE VTOC AND OUTPUT FILES                             *
+*             EXIT                                                    *
+*                                                                     *
+*        NOTES =                                                      *
+*                                                                     *
+*           REGISTER CONVENTIONS = STANDARD CONVENTIONS.              *
+*              REGISTERS 0 TO 9  = WORK REGISTERS                     *
+*              REGISTER  10      = ADDRESSABILITY TO VTOC DCB1        *
+*              REGISTER  11      = ADDRESSABILITY TO REST OF          *
+*                                  EXIMPORT CSECT                     *
+*              REGISTER  12      = ADDRESSABILITY TO EXIMPORT         *
+*                                  CSECT                              *
+*              REGISTER  13      = SAVE AREA REGISTER AND             *
+*                                  ADDRESSABILITY TO GETMAINED        *
+*                                  WORK AREA                          *
+*              REGISTERS 14,15   = WORK REGISTERS                     *
+*                                                                     *
+*       MACROS =                                                      *
+*          SAVE, GETMAIN, RDJFCB, OPEN, CVAFSEQ, CVAFDIR,             *
+*          CLOSE, TRKCALC, PUT, DEVTYPE                               *
+*                                                                     *
+*       CHANGE ACTIVITY =                                             *
+*          10/21/83  WRITTEN.      BC.                                *
+*          10/28/83  ADDED SYSPRINT & CLIST                           *
+*                    CHANGED READING OF VTOC TO                       *
+*                      USE CVAF MACROS.     BC.                       *
+*          02/28/83  FIXED BUG IN 'SYSIN DD DUMMY' LINE               *
+*                    ADDED SUPPORT FOR PARTITIONED DATA SETS          *
+*                    ADDED SUPPORT FOR 3375S                          *
+*                    CHANGE 'VOL=' AND 'UNIT=' PARAMETERS TO          *
+*                      APPLY TO ALL DATA SETS                     BC. *
+*          03/02/83  MODIFIED ALLOCATION REQUIREMENTS FOR             *
+*                      NEW DEVICE TYPE.                               *
+*                    ADDED CAPABILITY TO SPECIFY NO VSAM.         BC. *
+*                                                                     *
+*          05/nn/14  Completely repurposed (don't need VSAM, so       *
+*                    didn't test).                                    *
+*                    Eliminated code not usable in MVS prior to z/OS  *
+*                    or OS/390.                                       *
+*                    Replaced lots of code with local macros and      *
+*                    services (see CBT files 860 and 861).            *
+*                    Changed naming convention; instead of appending  *
+*                    text, provided for changing the high-level index *
+*                    JCL allows unwanted output files to be omitted,  *
+*                    provided at least one is usable. DCB parameters  *
+*                    are now optional, and will be defaulted if not   *
+*                    specified, or will use current DCB parms going   *
+*                    to an existing data set.                         *
+*                                                                     *
+*   New PARM options (may also be supplied via SYSIN cards)           *
+*        A parameter in parentheses must be enclosed in apostrophes:  *
+*        e.g., ACCT='(ABCD,1234)' (and quotes doubled in PARM field)  *
+*                                                                     *
+*                                                                     *
+*        REBLOCK or RBLK reblocks output, use when old blocks will    *
+*                    fit on new device anyway to optimize space.      *
+*        QUIET       supress all but critical messages on SYSPRINT    *
+*        LOTS        print lots of (extraneous?) stuff on SYSPRINT    *
+*        ABEND/DUMP  abends after error rather than setting return    *
+*                    code                                             *
+*        DEBUG       produces extra information                       *
+*        NONVSAM or NOVSAM   skip VSAM data sets                      *
+*        VSAMONLY    process only VSAM data sets                      *
+*        NOTAPE      produces EXPORT JCL only, to copy DASD to DASD   *
+*                                                                     *
+*        ACCOUNT= or ACCT=         account field for JOB cards        *
+*        PGMR=                     programmer name for JOB cards      *
+*        JOBCLASS=                 Execution class for JOB cards      *
+*        MSGCLASS=                 SYSOUT class for JOB cards         *
+*        DATE=                     five characters to replace yyddd   *
+*                                  in HIX or TIX names.               *
+*        DSNMASK= or MASKDSN=      specify a data set selection mask, *
+*                                  using ? (character match) and      *
+*                                  * (terminal match) characters.     *
+*        HIX= or NEWINDEX=name     high-level index for data set      *
+*                                  names on destination DASD.         *
+*                                  Default is EXPyyddd                *
+*        VOL=serial                                                   *
+*        NEWVOL= or NUVOL=serial   specify output volume serial       *
+*        UNIT=name                                                    *
+*        NEWUNIT= or NUUNIT=name   specify the output unit using an   *
+*                    IBM device type (3330-1, 3390)                   *
+*        NEWDISP=                  output data set disposition        *
+*            NEWVOL defaults to the input volume, and NEWUNIT to the  *
+*            input device type, NEWDISP to (NEW,KEEP)                 *
+*        TPUNIT= or TAPUNIT=       specify the dump tape unit by type *
+*                                  or address; default is TAPE        *
+*        TPVOL= or TAPVOL=serial   specify a tape volume serial; if   *
+*                                  omitted, uses a scratch tape.      *
+*        TIX= or TAPINDEX=name     high-level index for data set      *
+*                                  names on tape.                     *
+*                                  Default is TAPyyddd                *
+*                                                                     *
+*   This new version maintained by Gerhard Postpischil                *
+*       contact at gerhard@postpischil.com                            *
+*                                                                     *
+*    N.B. VSAM DATA SETS ASSUME THAT THE LOW LEVEL OF THE DS NAME     *
+*          IS EITHER DATA OR INDEX, AND THAT ALTERNATE INDICES HAVE   *
+*          .AIX IMMEDIATELY PRIOR TO THAT.                            *
+*                                                                     *
+*                                                                     *
+* SAMPLE JCL =                                                        *
+*                                                                     *
+*  BOTH NON-VSAM (PO AND PS ONLY) AND VSAM FILES:                     *
+*                                                                     *
+*     //JOBNAME  JOB (GEE1,0104),'PROG NAME',CLASS=S,MSGCLASS=A,      *
+*     //         MSGLEVEL=(2,0),USER=SYSPGM,PASSWORD=????????         *
+*     //STEP1    EXEC  PGM=EXIMPORT,PARM='DATE=OCT14'                 *
+*     //VTOC   DD UNIT=3350,VOL=SER=DLX170,DISP=OLD                   *
+*     //EXPORT DD DSN=T99999.TEST.EXPJCL,VOL=SER=DLXTS1,UNIT=3380,    *
+*     //            DISP=(NEW,CATLG),SPACE=(TRK,(10,1))               *
+*     //IMPORT DD DSN=T99999.TEST.IMPJCL,VOL=SER=DLXTS1,UNIT=3380,    *
+*     //            DISP=(NEW,CATLG),SPACE=(TRK,(10,1))               *
+*     //CLIST  DD DSN=T99999.TEST.CLIST,VOL=SER=DLXTS1,UNIT=3380,     *
+*     //            DISP=(NEW,CATLG),SPACE=(TRK,(5,1))                *
+*     //SYSPRINT DD SYSOUT=*                                          *
+*                                                                     *
+*  VSAM ONLY:                                                         *
+*                                                                     *
+*     //JOBNAME  JOB (GEE1,0104),'PROG NAME',CLASS=S,MSGCLASS=A,      *
+*     //         MSGLEVEL=(2,0),USER=SYSPGM,PASSWORD=????????         *
+*     //STEP1    EXEC  PGM=EXIMPORT,                                  *
+*     //         PARM='DATE=OCT14,VSAMONLY'                           *
+*     //VTOC   DD UNIT=3350,VOL=SER=DLX170,DISP=OLD                   *
+*     //EXPORT DD DSN=T99999.TEST.EXPJCL,VOL=SER=DLXTSO,UNIT=3350,    *
+*     //            DISP=(NEW,CATLG),SPACE=(TRK,(10,1))               *
+*     //IMPORT DD DSN=T99999.TEST.IMPJCL,VOL=SER=DLXTSO,UNIT=3350,    *
+*     //            DISP=(NEW,CATLG),SPACE=(TRK,(10,1))               *
+*     //CLIST  DD DSN=T99999.TEST.CLIST,VOL=SER=DLXTS1,UNIT=3380,     *
+*     //            DISP=(NEW,CATLG),SPACE=(TRK,(5,1))                *
+*     //SYSPRINT DD SYSOUT=*                                          *
+*                                                                     *
+*  NO VSAM:                                                           *
+*                                                                     *
+*     //JOBNAME  JOB (GEE1,0104),'PROG NAME',CLASS=S,MSGCLASS=A,      *
+*     //         MSGLEVEL=(2,0),USER=SYSPGM,PASSWORD=????????         *
+*     //STEP1    EXEC  PGM=EXIMPORT,                                  *
+*     //         PARM='DATE=OCT14,NOVSAM'                             *
+*     //VTOC   DD UNIT=3350,VOL=SER=DLX170,DISP=OLD                   *
+*     //EXPORT DD DSN=T99999.TEST.EXPJCL,VOL=SER=DLXTSO,UNIT=3350,    *
+*     //            DISP=(NEW,CATLG),SPACE=(TRK,(10,1))               *
+*     //IMPORT DD DSN=T99999.TEST.IMPJCL,VOL=SER=DLXTSO,UNIT=3350,    *
+*     //            DISP=(NEW,CATLG),SPACE=(TRK,(10,1))               *
+*     //CLIST  DD DSN=T99999.TEST.CLIST,VOL=SER=DLXTS1,UNIT=3380,     *
+*     //            DISP=(NEW,CATLG),SPACE=(TRK,(5,1))                *
+*     //SYSPRINT DD SYSOUT=*                                          *
+*                                                                     *
+*  IMPORTING TO A DIFFERENT VOLUME:                                   *
+*                                                                     *
+*     //JOBNAME  JOB (GEE1,0104),'PROG NAME',CLASS=S,MSGCLASS=A,      *
+*     //         MSGLEVEL=(2,0),USER=SYSPGM,PASSWORD=????????         *
+*     //STEP1    EXEC  PGM=EXIMPORT,                                  *
+*     //         PARM='DATE=OCT14,UNIT=3380,VOL=DLXTS3'               *
+*     //VTOC   DD UNIT=3350,VOL=SER=DLX170,DISP=OLD                   *
+*     //EXPORT DD DSN=T99999.TEST.EXPJCL,VOL=SER=DLXTSO,UNIT=3350,    *
+*     //            DISP=(NEW,CATLG),SPACE=(TRK,(10,1))               *
+*     //IMPORT DD DSN=T99999.TEST.IMPJCL,VOL=SER=DLXTSO,UNIT=3350,    *
+*     //            DISP=(NEW,CATLG),SPACE=(TRK,(10,1))               *
+*     //CLIST  DD DSN=T99999.TEST.CLIST,VOL=SER=DLXTS1,UNIT=3380,     *
+*     //            DISP=(NEW,CATLG),SPACE=(TRK,(5,1))                *
+*     //SYSPRINT DD SYSOUT=*                                          *
+*                                                                     *
+*  NOTE:  WHEN IMPORTING TO A NEW VOLUME, IF 'VOL=' IS SPECIFIED      *
+*         WITHOUT 'UNIT=', THE NEW UNIT WILL DEFAULT TO THE SAME      *
+*         AS THE OLD.  IF 'UNIT=' IS SPECIFIED WITHOUT 'VOL=',        *
+*         THE VOLUME WILL BE RETAINED.                                *
+*                                                                     *
+*  COPYING SELECTED NONVSAM DATA TO A NEW VOLUME WITHOUT A TAPE STEP: *
+*                                                                     *
+*     //JOBNAME  JOB (GEE1,0104),'PROG NAME',CLASS=S,MSGCLASS=A,      *
+*     //         MSGLEVEL=(2,0),USER=SYSPGM,PASSWORD=????????         *
+*     //STEP1    EXEC  PGM=EXIMPORT,                                  *
+*     // PARM=('VOL=newvol','UNIT=33nn',NOTAPE,'HIX=index',NOVSAM,    *
+*     //            'DSN=T99999.PROD.*')                              *
+*     //         PARM='HIX=NEWINDEX,VOL=DLXTS3'               *
+*     //VTOC   DD UNIT=3350,VOL=SER=DLX170,DISP=OLD                   *
+*     //EXPORT DD DSN=T99999.TEST.EXPJCL,VOL=SER=DLXTSO,UNIT=3350,    *
+*     //            DISP=(NEW,CATLG),SPACE=(TRK,(10,1))               *
+*     //SYSPRINT DD SYSOUT=*                                          *
+*                                                                     *
+***********************************************************************
+         MACRO ,             DATA INITIALIZATION                GP14135
+&NM      COMDEF &PFX=        PFX=PAT FOR PATTERN, PFX= FOR DYN  GP14135
+         GBLB  &MVSXA        TEST FOR CVAF AVAILABILITY         GP14135
+         GBLB  &PDCNT        SET TO USE AUTHORIZED CODE         GP14140
+         LCLC  &P            PAT/DYN PREFIX                     GP14135
+&P       SETC  '&PFX'        SHORTER NAMES                      GP14135
+.*
+.*   THE FOLLOWING DATA ARE USED TO INIT PART OF THE GETMAIN'ED AREA
+.*
+&NM      DS    0D            JUST IN CASE                       GP14135
+&P.DCB1  DCB   DDNAME=VTOC,DSORG=PS,RECFM=U,KEYLEN=44,BLKSIZE=96,      *
+               MACRF=R,EODAD=CLOSE                              GP14135
+         AIF   (&PDCNT).SKPDCB6                                 GP14140
+&P.DCB6  DCB   DDNAME=VTOC,DSORG=PS,KEYLEN=8,BLKSIZE=256,              *
+               MACRF=(R),EODAD=POEODAD                          GP14135
+.SKPDCB6 AIF   (NOT &MVSXA).SKPLST3                             GP14135
+&P.LIST3 CVAFSEQ ACCESS=GT,IXRCDS=KEEP,BRANCH=NO,MF=L
+.SKPLST3 ANOP  ,
+&P.CALC  TRKCALC MF=L
+         READ  &P.DECB,SF,MF=L                                  GP14135
+&P.LINP  DC    P'00000000'
+&P.INITL EQU   *-&P.DCB1                                        GP14135
+         MEND  ,                                                GP14135
+         SPACE 1                                                GP14135
+         MACRO ,                                                GP14135
+&NM      GETSPC &LOC,&LEN,&ERR=                                 GP14135
+         LCLC  &L                                               GP14135
+&L       SETC  'L'''                                            GP14135
+&NM      MACPARM R1,&LOC     LOAD ADDRESS                       GP14135
+         MACPARM R15,&LEN,NULL=&L&LOC                           GP14135
+         MACPARM R14,FSTOP,OP=BAL,OPR=BALR  FIND STOPPER        GP14135
+         MACPARM &ERR,OP=B,MODE=1,NULL=*+4                      GP14135
+         MEND  ,                                                GP14135
+         SPACE 1                                                GP14135
+         MACRO ,                                                GP14135
+&NM      CLIST  &LOC,&LEN                                       GP14135
+         LCLC  &L                                               GP14135
+&L       SETC  'L'''                                            GP14135
+&NM      MACPARM R1,&LOC     LOAD ADDRESS                       GP14135
+         MACPARM R15,&LEN,NULL=&L&LOC                           GP14135
+         MACPARM R14,PRINTC,OP=BAL,OPR=BALR  FIND STOPPER       GP14135
+         MEND  ,                                                GP14135
+         SPACE 1
+         MACRO ,                                                GP14136
+&NM      SHOSTR &LOC,&LEN,&NAME                                 GP14136
+         LCLC  &L,&VAR                                          GP14136
+&L       SETC  'L'''                                            GP14136
+         AIF   (T'&NAME EQ 'O').NONAME                          GP14136
+         AIF   ('&NAME'(1,1) EQ '''').STNAME                    GP14136
+&VAR     SETC  '''&NAME '''                                     GP14136
+         AGO   .DC                                              GP14136
+.STNAME  ANOP  ,                                                GP14136
+&VAR     SETC  '&NAME'                                          GP14136
+         AGO   .DC                                              GP14136
+.NONAME  ANOP  ,                                                GP14136
+&VAR     SETC  '''&LOC '''                                      GP14136
+.DC      ANOP  ,                                                GP14136
+&NM      DC    S(&LOC),AL2(&L&LOC),CL8&VAR                      GP14136
+         MEND  ,                                                GP14136
+         SPACE 1                                                GP14135
+         PUNCH ' ORDER EXIMPORT(P) '   MAKE DEBUGGING EASIER    GP14135
+         PUNCH ' SETCODE AC(1) '  FOR SUBPDCNT                  GP14140
+         SPACE 1                                                GP14135
+         COPY  ASMOPTS                                          GP14135
+         SPACE 1                                                GP14135
+         GBLB  &PDCNT        OLD/NEW PDS DE COUNTING            GP14140
+&PDCNT   SETB  1               USE AUTHORIZED CODE              GP14140
+         ASMPARM LIST=YES                                       GP14135
+         SPACE 1                                                GP14135
+         PRINT &PRTSRC                                          GP14135
+EXIMPORT PGMHEAD ZERO31,BASE=(R12,R11,R10),BNDRY=PAGE,AM=24,RM=24,     *
+               PARM=R8                 PRESERVE PTR TO PARMS    GP14135
+         SPACE 1
+         SERVINIT ,          INITIALIZE SERVICES                GP14135
+         SERVLOAD @INPREAD,@PARSER,@PRINTER                     GP14135
+         SERVLOAD SUBBLKSI,SUBDSATR,SUBVERB,SUBXTSUM            GP14135
+         SERVLOAD SUBPDCNT   *>NEEDS AUTHORIZATION<*            GP14140
+         SPACE 1
+         SLR   R2,R2         KEEP TRACK OF GOOD OPENS           GP14135
+         PRTOPEN SYSPRINT,DEV=1                                 GP14135
+         CH    R15,=H'4'     DID IT WORK ?                      GP14135
+         BH    *+8             NO                               GP14135
+         LA    R2,4          SHOW AT LEAST ONE GOOD OPEN        GP14135
+         PRTL '#                Create Export/Import JCL',TITLE=1
+         PRTLIST TITLE3,TITLE=3                                 GP14135
+         PRTOPEN CLIST,DEV=2,OPT=NOWTO                          GP14135
+         CH    R15,=H'4'     DID IT WORK ?                      GP14135
+         BH    *+8             NO                               GP14135
+         LA    R2,4          SHOW AT LEAST ONE GOOD OPEN        GP14135
+         PRTOPEN EXPORT,DEV=3                                   GP14135
+         CH    R15,=H'4'     DID IT WORK ?                      GP14135
+         BH    *+8             NO                               GP14135
+         LA    R2,4          SHOW AT LEAST ONE GOOD OPEN        GP14135
+         PRTOPEN IMPORT,DEV=4,OPT=NOWTO                         GP14135
+         CH    R15,=H'4'     DID IT WORK ?                      GP14135
+         BH    *+8             NO                               GP14135
+         LA    R2,4          SHOW AT LEAST ONE GOOD OPEN        GP14135
+         LTR   R2,R2         ANYTHING OPENED ?                  GP14135
+         BP    GOODOUT         YES                              GP14135
+         WTO   'EXIMPORT: MISSING OUTPUT DD(S)'                 GP14135
+         ABEND 1403                                             GP14135
+         SPACE 1
+GOODOUT  LA    R14,DYNDATA   SET UP REGISTERS FOR               GP14135
+         LA    R15,INITL       LONG MOVE                        GP14135
+         L     R0,=A(PATDATA)                                   GP14135
+         LR    R1,R15                                           GP14135
+         MVCL  R14,R0        LOAD INITIAL DATA INTO WORKAREA    GP14135
+         OI    OC1,X'80'     SET FOR SINGLE DCB OPEN/CLOSE      GP14135
+         OI    OC2,X'80'     SET FOR SINGLE DCB OPEN/CLOSE      GP14135
+         MVC   TAPUNIT,=CL8'TAPE' DEFER UNIT FOR TAPE           GP14135
+         MVC   TAPVOL,BLANKS      PRESET TAPE VOLUME            GP14135
+ DEVTYPE DCBDDNAM-IHADCB+DCB1,DEVBUF,DEVTAB   DEVICE PARMS      GP14136
+         NI    DEVBUF+3,X'7F'     RESET VIO FLAG                GP14135
+         MVN   SRCDEV,DEVBUF+3         COPY INPUT               GP14135
+         MVC   TRKPCYL+L'TRKPCYL-2(2),DEVBUF+10  TRACKS / CYL   GP14135
+         MVI   MASKDSN,C'*'  ACCEPT ALL DS NAMES                GP14135
+         TIME  ,             GET THE TIME AND DATE              GP14135
+         ST    R1,DB         ONLY WANT DATE                     GP14135
+         UNPK  DATE,DB+1(3)  MAKE PRINTABLE                     GP14135
+         OI    DATE+L'DATE,C'0'   REALLY PRINTABLE              GP14135
+         MVC   NEWHIX,=C'EXP'                                   GP14135
+         MVC   NEWHIX+3(5),DATE   DEFAULT HIGH LEVEL INDEX      GP14135
+         MVC   TAPHIX,NEWHIX                                    GP14135
+         MVC2  TAPHIX,=C'TAP'     UNIQUE TAPE DSN               GP14135
+         MVI   TRTBLANK+X'00',X'04'    STOPPER FOR END SCAN     GP14135
+         MVI   TRTBLANK+X'40',X'04'    STOPPER FOR END SCAN     GP14135
+         MVC2  NEWDSP,=C'(NEW,KEEP)'                            GP14136
+         OC    NEWDSP,BLANKS                                    GP14136
+         MVC2  ACCT,=C'(acct,suba)'                             GP14136
+         OC    ACCT,BLANKS                                      GP14136
+         MVC2  PGMR,=C'HERC01'                                  GP14136
+         OC    PGMR,BLANKS                                      GP14136
+         MVI   JCLASS,C'A'                                      GP14136
+         MVI   MCLASS,C'C'                                      GP14136
+         SPACE 1
+*  GET PARMS FOR DATE, VSAM ONLY, VOLUME AND UNIT.
+*
+GETPARM  PARMLOAD R8,PTR=R8                                     GP14135
+         BAL   R14,USERINIT  PROCESS PARM OPTIONS               GP14135
+         SPACE 1
+*   ACCEPT INPUT AND OVERRIDES FROM SYSIN                       GP14136
+*                                                               GP14136
+         INPOPEN SYSIN,OPT=NOWTO                                GP14136
+         CH    R15,=H'4'     SUCCESSFUL?                        GP14136
+         BH    DONEIN          NO                               GP14136
+SINPUT   INPGET ,            READ A RECORD                      GP14136
+         CH    R15,=H'4'     SUCCESSFUL?                        GP14136
+         BH    DONEIN          NO; ERROR OR EOF                 GP14136
+         CH    R0,=H'80'     CARD FORMAT ?                      GP14136
+         BNE   SINUSE                                           GP14136
+         MVC   DB,72(R1)     COPY SEQUENCE NUMBER FIELD         GP14136
+         NC    DB,=8C'0'     MASK                               GP14136
+         CLC   DB,=8C'0'     ALL NUMERIC ZONES?                 GP14136
+         BNE   SINUSE          NO; LEAVE AS IS                  GP14136
+         LA    R0,72         IGNORE SEQUENCE FIELD              GP14136
+SINUSE   LR    R8,R1         COPY ADDRESS                       GP14136
+         LR    R9,R0         COPY LENGTH                        GP14136
+         TM    OPTFLAGS,FGLOTS    LOTS OF INFO ?                GP14136
+         BZ    SINBAL               NO                          GP14136
+         PRTDATA 'Input:',(0(R8),(R9),DEBR,PADL)                GP14136
+SINBAL   CLI   0(R8),C'*'    COMMENTS ?                         GP14136
+         BE    SINPUT          YES; IGNORE                      GP14136
+         BAL   R14,USERINIT  PROCESS OPTION(S)                  GP14136
+         B     SINPUT          LOOK FOR MORE                    GP14136
+         SPACE 1
+*  INITIALIZE THE WORK AREA.  OPEN THE VTOC AS A DATA SET.
+*              INITIALIZE DEVICE PARAMETERS.
+*
+         PARKEYBX SHOWSTR                                       GP14136
+SHOWSTR  SHOSTR ACCT,,Account                                   GP14136
+SHOWSTR2 SHOSTR PGMR,,'PgmrName'                                GP14136
+         SHOSTR JCLASS,,'JobClass'                              GP14136
+         SHOSTR MCLASS,,'MsgClass'                              GP14136
+         SHOSTR MASKDSN,,'DSN Mask'                             GP14136
+         SHOSTR NEWDSP,,'NewDisp'                               GP14136
+         SHOSTR NEWHIX,,'NewIndex'                              GP14136
+         SHOSTR NEWUNIT,,'NewUnit'                              GP14136
+         SHOSTR NEWVOL,,'NewVolum'                              GP14136
+         SHOSTR TAPHIX,,'TapIndex'                              GP14136
+         SHOSTR TAPUNIT,,'TapUnit'                              GP14136
+SHOWSTRN SHOSTR TAPVOL,,'TapVolum'                              GP14136
+         SPACE 1
+MSGOPTS  FDPRT '      Options now on are : ',NL                 GP14138
+         FDCLC  OPTFLAGS,ZEROES,2,BE=MSGOPTS0                   GP14138
+         FDFLAG OPTFLAGS,TABLE=OPTSHO1,SPACE=1,LEN=80           GP14138
+         FDFLAG PROFLAGS,TABLE=OPTSHO2,SPACE=1,LEN=80           GP14138
+         FD    *END                                             GP14138
+MSGOPTS0 FDPRT 'all off'                                        GP14138
+         FD    *END                                             GP14138
+         SPACE 1
+DONEIN   PRTLIST MSGOPTS          SHOW OPTION BITS              GP14138
+         LM    R5,R7,SHOWSTRP     GET SHOW POINTERS             GP14136
+SHOWLOOP MVC   DB(2),=X'4120'     LA R2,                        GP14136
+         MVC   DB+2(2),0(R5)            bddd                    GP14136
+         EX    0,DB               R2 <= VARIABLE ADDRESS        GP14136
+         LH    R3,2(,R5)          VARIABLE LENGTH               GP14136
+         PRTDATA (4(R5),8,PADR),(0(R2),(R3),DEBR)  SHOW VALUE   GP14136
+         BXLE  R5,R6,SHOWLOOP                                   GP14136
+         SPACE 1
+         TM    PROFLAGS,FGD2D     DISK TO DISK DIRECTLY ?       GP14138
+         BZ    NOTMIGR              NO                          GP14138
+         CLC   SRCVOL,NEWVOL      SAME DISK ?                   GP14138
+         BNE   NOTMIGR              NO; COPACETIC               GP14138
+  PRTDATA 'NOTAPE option requires NEWVOL other than source volume'
+         LA    R9,30                                            GP14138
+         B     CLOSEX                                           GP14138
+NOTMIGR  PRTDATA '//EXPORT   JOB',(ACCT,DEB,PADL),',',(PGMR,DEB),',',  *
+               DEV=3                                            GP14136
+         PRTDATA '//             CLASS=',JCLASS,',MSGCLASS=',MCLASS,   *
+               DEV=3                                            GP14136
+         TM    PROFLAGS,FGD2D     NO TAPE ?                     GP14136
+         BNZ   DONEINIT             YES; SKIP IT                GP14136
+         PRTDATA '//IMPORT   JOB',(ACCT,DEB,PADL),',',(PGMR,DEB),',',  *
+               DEV=4                                            GP14136
+         PRTDATA '//             CLASS=',JCLASS,',MSGCLASS=',MCLASS,   *
+               DEV=4                                            GP14136
+DONEINIT OC    MASKDSN,BLANKS     UPPER-CASE DSN MASK           GP14135
+         LA    R8,DCB1       GLOBAL ADDRESS OF DCB1             GP14138
+         USING IHADCB,R8     ADDRESSIBILITY TO DCB              GP14138
+         LA    R0,MYJFCB     GET ADDRESS OF JFCB                GP14135
+         ST    R0,EX1        STORE ADDRESS IN EXIT LIST         GP14135
+         MVI   EX1,X'87'     SET END OF LIST & JFCB BYTE        GP14135
+         LA    R0,EX1        GET ADDRESS OF EXIT LIST           GP14135
+         STCM  R0,7,DCBEXLSA           STORE IN DCB             GP14135
+         RDJFCB (DCB1,),MF=(E,OC1)  READ JOB FILE CONTROL BLOCK GP14135
+         LA    R9,64         SET JFCB ERROR CODE                GP14135
+         CLI   JFCBDSNM,C' '      ANYTHING READ?                GP14135
+         BNH   RETURN               IF NOT SUCCESSFUL, EXIT     GP14135
+         MVI   JFCBDSNM,X'04'          CHANGE DATASET NAME TO
+         MVC   JFCBDSNM+1(L'JFCBDSNM-1),JFCBDSNM   44 X'04'S    GP14135
+         OI    JFCBTSDM,JFCNWRIT       SET FLAG NOT TO WRITE BACK
+         MVC   SRCVOL,JFCBVOLS    SAVE VOLSER                   GP14135
+         CLI   NEWVOL,C' '   DID USER SUPPLY A NEW VOLSER?      GP14135
+         BH    *+4+6           YES                              GP14135
+         MVC   NEWVOL,SRCVOL RETAIN OLD AS NEW                  GP14135
+         OPEN  (DCB1,INPUT),TYPE=J,MF=(E,OC1) OPEN THE VTOC     GP14135
+         TM    DCBOFLGS,DCBOFOPN  SUCCESSFUL OPEN ?             GP14135
+         BZ    CLOSEX               NO                          GP14135
+         L     R0,DCBDEBAD        SAVE THE ADDRESS OF THE DEB   GP14135
+         ST    R0,@DEB              FOR READING THE VTOC        GP14135
+         CLIST CLIST1             OUTPUT FIRST LINE OF CLIST    GP14135
+         CLIST CLIST2             OUTPUT SECOND LINE OF CLIST   GP14135
+         SERVCALL UCBGN,DEVBUF-(UCBTBYT1-UCBOB)  GET GENERIC    GP14135
+         MVC   SRCUNIT,0(R1)                                    GP14135
+         CLC   NEWUNIT,SRCUNIT    SAME UNIT ?                   GP14135
+         BE    SHOWIN               YES; COPY INFO              GP14135
+         CLI   NEWUNIT,C' '       PREVIOUSLY SET?               GP14135
+         BNH   SHOWIN               NO; COPY FROM INPUT         GP14135
+         SERVCALL UCBDT,NEWUNIT   LOOK UP THE TYPE              GP14135
+         LTR   R15,R15       MATCHED ?                          GP14135
+         BNZ   SHOWOBAD        NO; FAIL WITH MESSAGE            GP14135
+         STC   R0,NEWDEV     SET NEW DEVICE                     GP14135
+         NI    NEWDEV,X'7F'  RESET VIO                          GP14135
+         CLM   R0,2,=AL1(UCB3DACC) DASD?                        GP14135
+         BNE   SHOWOBAD              NO; REJECT                 GP14135
+         B     SHOWIN                                           GP14135
+SHOWOBAD PRTDATA 'Output unit',(NEWUNIT,DEB,PAD),'not acceptable DASD'
+         LA    R9,32                                            GP14135
+         B     CLOSEX        FAIL                               GP14135
+SHOWIN   MVC   NEWDEV,SRCDEV      COPY INPUT INFO TO OUTPUT     GP14135
+         MVC   NEWUNIT,SRCUNIT                                  GP14135
+SHOWINOU PRTDATA 'Input volume',(SRCVOL,PAD),(SRCUNIT,PAD),'has type', *
+               (DEVBUF,4,X,PAD),'max block',(DEVBUF+4,4,I,DEBL,PAD),   *
+               ' Trk/Cyl',(TRKPCYL,I,DEB,PAD)
+         SR    R1,R1                                            GP14135
+         IC    R1,NEWDEV     DASD SUBTYPE                       GP14135
+         SERVCALL DVTBL      GET DEVICE TABLE                   GP14135
+         LR    R1,R0         COPY ADDRESS                       GP14135
+         MVC   NEWCAP+L'NEWCAP-2(2),4(R1) COPY TRACK CAPACITY   GP14135
+         MVC   NEWTPC+L'NEWTPC-2(2),2(R1) COPY TRACKS/CYLINDER  GP14135
+         PRTDATA ' Copy volume',(NEWVOL,PAD),(NEWUNIT,PAD),'has sub-typ*
+               e 20',(NEWDEV,1,X,PADR),'max block',(NEWCAP,I,DEBL,PAD),*
+               ' Trk/Cyl',(NEWTPC,I,DEB,PAD)                    GP14140
+         AIF   (NOT &MVSXA).COMGET1    MVS X/A OR LATER ?       GP14135
+.ZOSGET1 XC    BUFLIST,BUFLIST         INITIALIZE BUFFER LIST   GP14135
+         OI    BFLHFL,BFLHDSCB         DSCBS TO BE READ WITH LIST
+         MVI   BFLHNOE,1               ONE BUFFER LIST ENTRY
+         LA    R0,DS1FMTID             GET ADDRESS OF DSCB BUFFER
+         ST    R0,BFLEBUF              AND STORE IN BUFFER LIST
+         MVI   BFLELTH,DSCBLTH         READ ONLY DATA PORTION
+.COMGET1 LA    R9,16         PRESET FOR ERROR                   GP14135
+         CLI   DEVBUF+2,UCB3DACC  DASD ?                        GP14135
+         BNE   CLOSEX        NO; FAIL                           GP14135
+         TM    PROFLAGS,FGDEFIL   PAD DIRECTORY TRACK?          GP14140
+         BZ    READIT          NO; KEEP ORIGINAL COUNT          GP14140
+         LA    R0,X'0F'      SET MASK FOR DASD SUBTYPE          GP14135
+         IC    R1,DEVBUF+3   GET SUBTYPE                        GP14135
+         NR    R1,R0         MASK IT                            GP14135
+         SR    R2,R2                                            GP14135
+         IC    R2,UNITDE(R1) LOAD DIRECTORY BLOCKS PER TRACK    GP14135
+         ST    R2,IDEAL#          SAVE THE NUMBER               GP14135
+*
+*  READ THE VTOC FORMAT-1 RECORDS.  PROCESS ALL DATA SETS ON VOLUME
+*    WITH THE EXCEPTION OF A FEW (SUCH AS THE VTOC INDEX, CATALOG
+*    CATALOG INDEX, TEMPORARY DATA SETS, ETC.)
+*
+READIT   DS    0H            READ DSCB 1 SEQUENTIALLY           GP14135
+         AIF   (&MVSXA).COMRID1   MVS X/A OR LATER ?            GP14135
+         LA    R8,DCB1            JUST IN CASE                  GP14138
+         LA    R2,DS1DSNAM                                      GP14135
+         LA    R3,L'DS1DSNAM+DSCBLTH                            GP14135
+         READ  DECB,              Data Event Control Block             *
+               SF,                Sequential Forward                   *
+               (R8),              DCB address                          *
+               (R2),              Input buffer                         *
+               (R3),              Size (w/key)                         *
+               MF=E               Execute MF=L of DECB          GP14135
+         CHECK DECB               Wait for READ to complete
+         AGO   .COMLUK1
+.COMRID1 L     R9,@DEB       GET DEB ADDRESS AND READ VTOC      GP14135
+         CVAFSEQ DEB=(R9),BUFLIST=BUFLIST,DSN=DS1DSNAM,MF=(E,EX3)
+         LTR   R15,R15                 IF SUCCESSFUL,
+         BZ    RI05                      BRANCH
+         LR    R9,R15                  SAVE RETURN CODE
+         MVC   RCODE,CVSTAT              AND STATUS
+         CVAFDIR ACCESS=RLSE,BUFLIST=0,IXRCDS=NOKEEP,MF=(E,EX3)
+         LR    R15,R9                  RELEASE BUFFERS & RESTORE RC
+         C     R15,=F'4'               JUST A 4?
+         BNE   CLOSEX                  IF NOT, BRANCH TO ERROR EXIT
+         CLI   RCODE,STAT032           IS IT END OF DATA?
+         BE    CLOSE                   IF SO, NORMAL EXIT
+         ABEND 10,DUMP
+.COMLUK1 SPACE 1
+RI05     CLI   DS1FMTID,C'1'           FORMAT 1 RECORD?
+         BNE   READIT                  IF NOT, GO BACK FOR ANOTHER
+         MVC   REASON,=C'DSN MASK'     WHY SKIP                 GP14135
+         CLI   DS1DSNAM,C'*'      IEHMOVE TEMPORARY DS ?        GP14135
+         BE    SKIPDSN              YES; DON'T WANT             GP14135
+         LA    R1,DS1DSNAM        CHECK IF DS IS WANTED         GP14135
+         LA    R0,L'DS1DSNAM                                    GP14135
+         LA    R14,MASKDSN        MASK                          GP14135
+         LR    R15,R0             MASK LENGTH                   GP14135
+         BAL   R9,CLCMASK         CHECK IT                      GP14135
+          BNE  SKIPDS               NO MATCH - SKIP             GP14135
+         LM    R5,R7,NEVERBX      TABLE OF UNWANTED NAMES       GP14135
+LOOPNEVE LA    R1,DS1DSNAM        CHECK IF DS IS WANTED         GP14135
+         LA    R0,L'DS1DSNAM                                    GP14135
+         LR    R14,R5             MASK                          GP14135
+         LA    R15,L'NEVERDS      MASK LENGTH                   GP14135
+         BAL   R9,CLCMASK         CHECK IT                      GP14135
+          BE   SKIPDSN              MATCH - SKIP                GP14135
+         BXLE  R5,R6,LOOPNEVE     TRY ALL                       GP14135
+         CLC   =C'SYS',DS1DSNAM                                 GP14135
+         BNE   PROCDS                                           GP14135
+         MVC   DB(5),DS1DSNAM+3   TEST FOR SYSnnnnn             GP14135
+         NC    DB(5),=5C'0'                                     GP14135
+         CLC   DB(5),=5C'0'                                     GP14135
+         BNE   PROCDS                                           GP14135
+SKIPDSN  MVC   REASON,=CL8'DS NAME'    WHY SKIP                 GP14135
+SKIPDS   TM    OPTFLAGS,FGLOTS    LOTS OF INFO ?                GP14135
+         BZ    READIT               NO                          GP14135
+         PRTDATA   'SKIPPING',(DS1DSNAM,PAD,DEBR),(REASON,PAD)  GP14135
+         B     READIT
+*
+*  IF VSAM .INDEX FILE, SKIP IT.  IF .DATA, REMOVE THE .DATA SO
+*    ONLY THE CLUSTER NAME IS LEFT.  IF VSAM ALTERNATE INDEX,
+*    OUTPUT MESSAGE TO SYSPRINT AND GO ON TO THE NEXT DATA SET.
+*    FOR ALL DATA SETS TO BE PROCESSED, BUILD THE TAPE DATA SET
+*    NAME.
+*
+PROCDS   MVC   REASON,=CL8'DS ORG '    WHY SKIP                 GP14135
+         LA    R0,DS1DSORG   POINT TO DSORG+DCB PARM FIELDS     GP14135
+         LA    R1,RETDSATR   GET RETURNED WORK FIELD            GP14135
+         SUBCALL SUBDSATR    GET DATA SET ATTRIBUTES            GP14135
+         MVC   NEWDSO(DS1KEYL-DS1DSORG),DS1DSORG                GP14135
+         MVC   NEWDSORG(L'RETDSATR),RETDSATR                    GP14140
+         MVC   TPRECFM,RECFM      COPY FOR SEQUENTIAL           GP14135
+         MVC   TPLRECL,LRECL      COPY FOR SEQUENTIAL
+*  CHECK REBLOCKING - FIGURE OUT TAPE BLOCK SIZE
+*
+         LH    R7,DS1BLKL    ORIGINAL BLOCK SIZE                GP14135
+         CLI   RECFM,C'U'      UNDEFINED BLOCKS ?               GP14135
+         BNE   GB05              NO                             GP14137
+         STH   R7,DS1LRECL         ALSO SET AS BLOCK SIZE       GP14137
+         B     GB10              YES; LEAVE AS IS               GP14137
+GB05     L     R7,=F'32760'
+         CLI   RECFM,C'F'              FIXED RECORD LENGTH?     GP14135
+         BNE   GB10                    IF NOT, BRANCH
+         SLR   R0,R0                                            GP14135
+         ICM   R0,3,DS1LRECL           GET RECORD LENGTH        GP14135
+         BNP   GB10                                             GP14135
+         SLR   R6,R6
+         DR    R6,R0         GET INTEGER PART OF 32760/LRECL    GP14135
+         MR    R6,R0           AND MULTIPLY BY LRECL            GP14135
+GB10     ST    R7,TPBLK      SAVE FOR LATER                     GP14135
+         XC    ALLPRI(L'ALLPRI+L'ALLSEC+L'ALLDIR),ALLPRI        GP14135
+         MVC   ALLTYPE,BLANKS     CLEAR THE BUFFER              GP14135
+         SR    R1,R1                                            GP14140
+         IC    R1,DS1SCALO   GET ALLOCATION TYPE                GP14140
+         SRL   R1,6          RETAIN ONLY SIGNIFICANT BITS       GP14140
+         MH    R1,=AL2(L'ALLTYPE)                               GP14140
+         LA    R1,ALLTAB(R1) POINT TO PERTINENT ENTRY           GP14140
+         MVC   ALLTYPE,0(R1)      AND SHOW THAT                 GP14140
+        SERVCALC FUNCTN=TRKCAP,TYPE=DEVBUF+3,DD=DS1BLKL,R=1,           *
+               MF=(E,CALC)                                      GP14135
+         ST    R0,SRCBPT     SAVE # OF BLKS/TRK (ORIG UNIT)     GP14135
+         ST    R0,NEWBPT     SAVE # OF BLKS/TRK                 GP14135
+         LA    R1,NEWDSNAM                                      GP14135
+         LA    R2,NEWHIX                                        GP14135
+         BAL   R14,MAKEDSN                                      GP14135
+         LA    R1,TAPDSNAM                                      GP14135
+         LA    R2,TAPHIX                                        GP14135
+         BAL   R14,MAKEDSN                                      GP14135
+         TM    DS1DSORG+1,DS1ACBM      VSAM FILE?
+         BO    PD05                    IF SO, BRANCH
+         TM    OPTFLAGS,FGVSAM         VSAM ONLY?               GP14135
+         BO    SKIPDS                  IF SO, GO BACK           GP14135
+         CLI   DS1DSORG+1,0  ANYTHING ELSE FUNNY?               GP14135
+         BNE   SKIPDS                  IF SO, SKIP IT           GP14135
+         TM    DS1DSORG,DS1DSGPS+DS1DSGPO  IS IT EITHER PS OR PO?
+         BM    PD30                    IF SO, GO AHEAD
+         B     SKIPDS                  IF NEITHER, SKIP IT
+         SPACE 1
+PD05     TM    OPTFLAGS,FGPSPO         NON-VSAM WANTED?         GP14135
+         BO    SKIPDS        IF YES; SKIP VSAM DATA SET         GP14135
+         GETSPC NEWDSNAM               LOOK FOR END OF NAME     GP14135
+         SH    R1,=H'5'      BACK UP                            GP14135
+         CLC   =C'.DATA',0(R1)    DATA COMPONENT?               GP14135
+         BNE   SKIPDSN              IF NOT, SKIP IT             GP14135
+         MVC   0(5,R1),BLANKS     IF SO, CLEAR OUT FOR CLUSTER  GP14135
+         SH    R1,=H'4'           GO BACK 5 MORE CHARACTERS     GP14135
+         CLC   =C'AIX',0(R1)      IS THIS AN ALTERNATE INDEX?   GP14135
+         BE    SKIPDSN                 IF SO, SKIP IT
+         SPACE 1
+PD30     TM    DS1DSORG+1,DS1ACBM      VSAM FILE?
+         BO    VSAM                    IF SO, BRANCH TO VSAM SECTION
+         CLI   DS1DSORG+1,0  ANYTHING ELSE FUNNY?               GP14135
+         BNE   SKIPDS          YES; SKIP DS                     GP14135
+         TM    DS1DSORG,255-(DS1DSGPO+DS1DSGPS+DS1DSGU)  SUPPORTED?
+         BNZ   SKIPDS          NO; SKIP IT                      GP14135
+         PRTDATA 'Processing',(DS1DSNAM,PAD),                          *
+               (DSORG,PAD),RECFM,(LRECL,PAD),BLKSIZE,(OPTCD,PAD)
+         MVC   NEWDSO(DS1KEYL-DS1DSORG),DS1DSORG                GP14135
+         MVC   PROGRAM,=CL8'IEBGENER'  SET FOR SEQ COPY         GP14135
+         TM    DS1DSORG,DS1DSGPO       PARTITIONED DATA SET?    GP14135
+         BZ    SKIPPO                  IF NOT, SKIP PDS CODE    GP14135
+         SPACE 1
+*  FOR PARTITIONED DATA SET, COUNT NUMBER OF DIRECTORY BLOCKS
+*
+         PUSH  USING                                            GP14135
+         MVC   PROGRAM,=CL8'IEBCOPY '  SET FOR PDS COPY         GP14135
+         TM    DS1RECFM,X'C0'     RECFM=U ?                     GP14137
+         BNO   *+4+6                NO                          GP14137
+         MVC   DS1LRECL,DS1BLKL   SET LRECL TO BLOCK SIZE       GP14137
+         MVC   TPRECFM,=CL5'VS'   SET FOR IEBCOPY               GP14135
+         L     R1,=F'32760'  SET MAX                            GP14135
+         ST    R1,TPBLK      SET NEW BLOCK SIZE FOR TAPE        GP14135
+         MVC   TPLRECL,=C'32756'                                GP14135
+         DROP  R8                                               GP14138
+         AIF   (&PDCNT).NEWDE#   COULDN'T GET OLD CODE WORKING  GP14140
+         LA    R4,DCB6                 GET ADDRESS OF DCB6      GP14135
+         USING IHADCB,R4               ADDRESSIBILITY TO DCB    GP14135
+         LA    R0,JFCBDSNM             GET ADDRESS OF BUFFER    GP14135
+         ST    R0,EX2        STORE ADDRESS IN EXIT LIST         GP14135
+         MVI   EX2,X'87'     SET END OF LIST & JFCB BYTE        GP14135
+         LA    R0,EX2        GET ADDRESS OF EXIT LIST           GP14135
+         STCM  R0,7,DCBEXLSA           STORE IN DCB             GP14135
+         MVI   JFCBDSNM,0              CLEAR FLAG               GP14135
+         RDJFCB (DCB6),MF=(E,OC2)      JOB FILE CONTROL BLOCK   GP14135
+         LA    R9,64         PRESET FOR RDJFCB FAILURE          GP14135
+         CLI   JFCBDSNM,C' '           READ SOMETHING?          GP14135
+         BNH   RETURN                    NO; QUIT               GP14135
+         MVC   JFCBDSNM,DS1DSNAM       CHANGE TO PDS DS NAME    GP14135
+*FAILS*  OI    JFCBTSDM,JFCNWRIT+JFCNDSCB+JFCNDCB+JFCVSL        GP14135
+         OI    JFCBTSDM,JFCVSL+JFCNDCB                          GP14135
+         OPEN  (DCB6,INPUT),TYPE=J,MF=(E,OC2) OPEN THE DATASET  GP14135
+         TM    DCBOFLGS,DCBOFOPN       SUCCESSFUL?              GP14135
+         BZ    CLOSEX                    NO                     GP14135
+         SLR   R7,R7                   INITIALIZE R7
+POREAD   LA    R2,PDSDE                                         GP14135
+         LA    R3,256+8                                         GP14135
+         READ  DECB,SF,(R4),(R2),(R3),MF=E  READ THE 256-BYTE BLOCKS
+         CHECK DECB                    WAIT UNTIL I/O DONE
+         LA    R7,1(,R7)               COUNT THE NUMBER OF BLOCKS
+         B     POREAD
+         SPACE 1
+POEODAD  CLOSE MF=(E,OC2)              CLOSE THE FILE           GP14135
+         AGO   .COMDE#                                          GP14140
+.NEWDE#  ANOP  ,                                                GP14140
+*   THE OLD CODE GAVE ME THE SAME JFCB ON OPEN EVERY TIME (FIRST DS)
+*   UNTIL FIXED, CALLING AUTHORIZED SUBROUTINE.                 GP14140
+*   ADDITIONAL ADVANTAGE IS THAT IT DOES NOT CHANGE ACCESS DATE.
+*                                                               GP14140
+         SLR   R7,R7         PRESET IF FAILURE                  GP14140
+         L     R2,@DEB       GET DEB ADDRESS                    GP14140
+         N     R2,=X'00FFFFFF'    CLEAN IT                      GP14140
+         L     R2,DEBBASND-DEBBASIC(,R2)    GET UCB             GP14140
+         N     R2,=X'00FFFFFF'    CLEAN IT                      GP14140
+         SUBCALL SUBPDCNT,(DS1DSNAM,0(R2)),MF=(E,CALLPARM)      GP14140
+         CH    R15,=H'4'          DID IT WORK?                  GP14140
+         BL    CNTOK                YES                         GP14140
+         STM   R15,R0,DB                                        GP14140
+         PRTDATA 'PDS directory count routine failed:',(DB,4,I,DEB,PAD)*
+               ,'reason',(DB+4,I,DEB,PAD)                       GP14140
+         LA    R9,45         ARBITRARY ERROR CODE               GP14140
+         B     CLOSEX        AND FAIL                           GP14140
+CNTOK    LR    R7,R0              COPY COUNT                    GP14140
+.COMDE#  SPACE 1
+         L     R5,IDEAL#     GET IDEAL NUMBER OF DIR BLKS
+         LTR   R15,R5        MAKE SURE IT'S NOT ZERO            GP14135
+         BNP   PO30          IF IT IS, LEAVE IT ALONE
+         BCTR  R15,0
+         AR    R7,R15        SET DIVIDE TO ROUND, NOT TRUNCATE  GP14135
+         SLR   R6,R6         CLEAR OUT R6 FOR THE REMAINDER
+         DR    R6,R5         DIVIDE BY IDEAL NUMBER
+         MR    R6,R5         MULTIPLY (RESULT WILL BE IN R7)
+PO30     ST    R7,ALLDIR     SAVE NUMBER FOR IMPORT JCL         GP14135
+         POP   USING                                            GP14135
+         SPACE 1
+*  CONVERT SECONDARY ALLOCATION TO PROPER VALUE FOR NEW DEVICE.
+*    GET NEW BLOCK SIZE, RECORD FORMAT, AND BLOCKS PER TRACK    GP14135
+*
+SKIPPO   MVC   REASON,=CL8'TRK CAP'                             GP14135
+         L     R2,TRKPCYL    LOAD TRACKS PER CYLINDER           GP14135
+         LA    R1,DS1EXT1    POINT TO FIRST EXTENT              GP14135
+         SR    R0,R0                                            GP14135
+         ICM   R0,1,DS1NOEPV      GET NUMBER OF EXTENTS         GP14135
+         BNZ   *+8                  NON-ZERO                    GP14135
+         LA    R0,1          SET FOR ONE                        GP14135
+         MINH  R0,=H'3'      ONLY HAVE DSCB 1                   GP14135
+         CLI   DS1EXT1,X'40'   LABEL TRACK ?                    GP14135
+         BNE   NOLABEX           NO                             GP14135
+         BCTR  R0,0          SUBTRACT ONE                       GP14135
+         LA    R1,DS1EXT2    AND START WITH SECOND EXTENT       GP14135
+NOLABEX  SUBCALL SUBXTSUM    CALCULATE TRACKS IN DSCB1          GP14135
+         ST    R15,SRCPRI    SAVE OLD PRIMARY TRACKS +/-        GP14135
+         ST    R15,ALLPRI    SAVE NEW PRIMARY TRACKS +/-        GP14135
+         SPACE 1
+         SR    R1,R1                                            GP14135
+         IC    R1,SRCDEV     DASD SUBTYPE                       GP14135
+         SERVCALL DVTBL      GET DEVICE TABLE                   GP14135
+         LR    R1,R0         COPY ADDRESS                       GP14135
+         MVC   SRCCAP+L'SRCCAP-2(2),4(R1) COPY TRACK CAPACITY   GP14135
+         TM    PROFLAGS,FGRBLK    REBLOCK?                      GP14137
+         BNZ   COMPBLK              YES                         GP14137
+         CLC   NEWCAP,SRCCAP      SAME TRACK CAPACITY ?         GP14135
+         BNE   COMPBLK              NO; NEED TO RECALCULATE     GP14140
+         MVC   ALLPRI,SRCPRI      COPY PRIMARY SPACE AMOUNT     GP14140
+         MVC   ALLSEC+1(L'DS1SCALO-1),DS1SCALO+1                GP14140
+         B     CALCDONE             YES; NO SPACE FINAGLING     GP14135
+         SPACE 1
+*   OUTPUT DASD IS A DIFFERENT TRACK SIZE
+*     GET (APPROXIMATE?) BYTES IN INPUT DATA SET, AND CALCULATE
+*     SPACE NEEDED ON THE OUTPUT VOLUME.
+*   FOR RECFM U, IF THE OUTPUT TRACK SIZE ISN'T LARGE ENOUGH, SKIP
+*   IF USER DID NOT SPECIFY REBLOCK OPTION, USE OLD BLKSIZE IF IT FITS
+*
+COMPBLK  TM    PROFLAGS,FGRBLK    FORCED REBLOCK?               GP14137
+         BNZ   CALCBLK              YES; DO IT                  GP14137
+        SERVCALC FUNCTN=TRKCAP,TYPE=NEWDEV,DD=DS1BLKL, =1,             *
+               MF=(E,CALC)                                      GP14135
+         LTR   R15,R15       WILL IT FIT ?                      GP14137
+         BNZ   CALCBLK         NO                               GP14137
+         ST    R0,NEWBPT     SAVE # OF BLKS/TRK (NEW UNIT)      GP14135
+         MVC   NEWBLK,DS1BLKL     COPY OLD SIZE                 GP14137
+         B     CALCDONE                                         GP14137
+         SPACE 1
+CALCBLK  XC    DB,DB                                            GP14135
+         MVI   DB+2,UCB3DACC                                    GP14135
+         MVN   DB+3(1),NEWDEV     FAKE UCB TBYT DATA            GP14135
+         LA    R0,DB-(UCBTBYT1-UCBOB)  ONLY TBYT USED           GP14135
+         ICM   R1,8,NEWRCF                                      GP14135
+         ICM   R1,4,DS1KEYL                                     GP14135
+         ICM   R1,3,NEWLRL   RECORD LENGTH                      GP14135
+         SUBCALL SUBBLKSI    GET A BLOCK SIZE IN R1             GP14135
+         STCM  R1,8,NEWRCF   UPDATE RECORD FORMAT               GP14135
+         STH   R0,NEWBLK       AND BLOCK SIZE                   GP14135
+         CH    R15,=H'4'     USABLE ?                           GP14135
+         BH    SKIPDS          NO                               GP14135
+CALCDONE SERVCALC FUNCTN=TRKCAP,TYPE=NEWDEV,DD=NEWBLK,R=1,             *
+               MF=(E,CALC)                                      GP14135
+         ST    R0,NEWBPT     SAVE # OF BLKS/TRK (NEW UNIT)      GP14135
+         MVC   REASON,BLANKS           WHY SKIP                 GP14135
+         SR    R3,R3                                            GP14135
+         ICM   R3,3,DS1BLKL  INPUT BLOCK SIZE                   GP14135
+         M     R2,SRCBPT     =BYTES PER TRACK                   GP14135
+         M     R2,SRCPRI     =TOTAL BYTES                       GP14135
+         STM   R2,R3,DB      SAVE FOR DEBUGGING                 GP14135
+         LH    R1,NEWBLK                                        GP14135
+         M     R0,NEWBPT     =BYTES PER TRACK                   GP14135
+         LR    R15,R1        COPY AMOUNT                        GP14135
+         BCTR  R15,0         LESS ONE                           GP14135
+         A64F  (R0),(R15)      SET DIVIDE TO ROUND              GP14135
+         DR    R2,R1         =NUMBER OF TRACKS                  GP14135
+         ST    R3,DB         SAVE FOR MSG
+         TM    DS1SCALO,X'C0'     IS ALLOCATION IN CYLINDERS?   GP14135
+         BNO   STOPRI                  IF SO, BRANCH            GP14135
+         L     R15,NEWTPC                                       GP14135
+         BCTR  R15,0                                            GP14135
+         ALR   R3,R15                                           GP14135
+         SR    R2,R2                                            GP14135
+         D     R2,NEWTPC     =NUMBER OF TRACKS                  GP14135
+STOPRI   ST    R3,ALLPRI     SET NEW PRIME SPACE                GP14135
+         PRTLIST /FDOLDIE    SHOW CHARACTERISTICS               GP14137
+         SLR   R7,R7         CLEAR FOR INSERT                   GP14135
+         ICM   R7,7,DS1SCALO+1    GET SECONDARY ALLOCATION      GP14135
+         TM    DS1SCALO,X'C0'          IS ALLOCATION IN CYLINDERS?
+         BO    NV05                    IF SO, BRANCH
+         TM    DS1SCALO,X'40'          IS ALLOCATION IN BLOCKS? GP14140
+         BZ    NV10                    IF NOT, BRANCH
+         MVC   ALLTYPE,NEWBLKSZ                                 GP14137
+         B     NV30                    DONE                     GP14140
+NV05     M     R6,TRKPCYL              CONVERT TO TRACKS        GP14135
+NV10     L     R0,SRCBPT                                        GP14135
+         BCTR  R0,0                                             GP14135
+         M     R6,SRCBPT     CONVERT TO NUMBER OF BLOCKS        GP14135
+         SLR   R6,R6                   ZERO OUT R6 FOR DIVIDE
+         AR    R7,R0                   MAKE DIVIDE ROUND        GP14135
+         D     R6,NEWBPT     CONVERT TO TRACKS FOR NEW DEVICE   GP14135
+         TM    DS1SCALO,X'C0'          ALLOCATION IN CYLINDERS?
+         BNO   NV30                    IF NOT, ALL DONE
+         L     R0,TRKPCYL    GET TRACKS/CYLINDER                GP14135
+         BCTR  R0,0          DECREMENT                          GP14135
+         AR    R7,R0         SET DIVIDE TO ROUND, NOT TRUNCATE  GP14135
+         SLR   R6,R6                   ZERO OUT R6 FOR DIVIDE
+         D     R6,TRKPCYL    CONVERT TO CYLINDERS FOR NEW DEV   GP14135
+NV30     ST    R7,ALLSEC     NEW SECONDARY AMOUNT               GP14135
+*
+*  SET ALLOCATION TYPE                                          GP14137
+*
+CALCPRI  LA    R0,NEWDSO     POINT TO DSORG+DCB PARM FIELDS     GP14135
+         LA    R1,NEWDSORG   GET RETURNED WORK FIELD            GP14135
+         SUBCALL SUBDSATR    GET DATA SET ATTRIBUTES            GP14135
+         TM    DS1SCALO,X'C0'          IS ALLOCATION IN CYLINDERS?
+         BO    CONSTJCL                IF SO, BRANCH            GP14140
+         TM    DS1SCALO,X'40'          IS ALLOCATION IN BLOCKS?
+         BNO   CONSTJCL                  IF NOT, BRANCH         GP14137
+         MVC   ALLTYPE,NEWBLKSZ        GET BLOCK SIZE           GP14135
+         SPACE 1
+*
+*  CONSTRUCT JCL
+*
+CONSTJCL INCH  STEP#         INCREMENT SEQUENCE NUMBER          GP14135
+         ZI    PROFLAGS,FGPIN     RESET INPUT                   GP14140
+         PRTLIST STXNONVS,DEV=3   PRINT EXPORT JCL              GP14135
+         TM    PROFLAGS,FGD2D     DASD TO DASD ?                GP14135
+         BNZ   GENCLIST             YES; NO IMPORT FILE         GP14135
+         OI    PROFLAGS,FGPIN     SET INPUT JCL                 GP14140
+         PRTLIST STINONVS,DEV=4   PRINT IMPORT JCL              GP14135
+         B     GENCLIST                GO TO CREATE RECORD IN CLIST
+         SPACE 1
+STXNONVS FDPRT '//*',NL                                         GP14138
+         FDPRT '//STEP',NL                                      GP14135
+         FDPRT STEP#,I,DEBR,PADR,LEN=4                          GP14135
+         FDPRT 'EXEC  PGM='            CONSIDER WYLCOPY         GP14135
+         FDPRT PROGRAM,DEBR            CONSIDER WYLCOPY         GP14135
+         FDPRT '//SYSPRINT DD  SYSOUT=*',NL                     GP14135
+         FDTM  PROFLAGS,FGD2D,BNZ=STXNOTPO                      GP14135
+         FDEXEC STTPOUT,STTPCOMX  CREATE TAPE JCL               GP14135
+STXNOTPO FDPRT '//SYSUT1   DD  DISP=SHR,DSN=',NL                GP14135
+         FDPRT DS1DSNAM,DEBR                                    GP14135
+         FDPRT ','                                              GP14135
+         FDPRT '//',NL,LEN=15                                   GP14135
+         FDPRT 'UNIT=SYSALLDA,VOL=SER='                         GP14135
+         FDPRT SRCVOL,DEBR                                      GP14135
+         FDTM  PROFLAGS,FGD2D,BNZ=STIUT2                        GP14135
+         FDTM  DS1DSORG,DS1DSGPO,BZ=STXCOMVS                    GP14135
+         FDPRT '//SYSUT3   DD  UNIT=SYSDA,SPACE=(CYL,(5,1))',NL GP14135
+         FDPRT '//SYSUT4   DD  UNIT=SYSDA,SPACE=(CYL,(5,1))',NL GP14135
+STXCOMVS FDPRT '//SYSIN    DD  DUMMY',NL                        GP14135
+         FDPRT *END
+         SPACE 1
+STTPOUT  FDPRT '//SYSUT2   DD  DISP=(,PASS),DSN=',NL            GP14135
+         FDGOTO STTPCOM
+STTPINP  FDPRT '//SYSUT1   DD  DISP=(OLD,PASS),DSN=',NL         GP14140
+STTPCOM  FDPRT TAPDSNAM,DEBR                                    GP14135
+         FDPRT ','                                              GP14135
+         FDPRT '//',NL,LEN=15                                   GP14135
+         FDPRT 'UNIT='                                          GP14135
+         FDPRT TAPUNIT,DEBR                                     GP14135
+         FDPRT ',LABEL='                                        GP14135
+         FDPRT STEP#,I,DEBL                                     GP14135
+         FDPRT ','                                              GP14135
+         FDPRT '//',NL,LEN=15                                   GP14135
+         FDCLC STEP#,H1,BNE=STTPCOMR                            GP14135
+         FDPRT 'VOL=(PRIVATE,RETAIN,SER='                       GP14135
+         FDTM  PROFLAGS,FGPIN,BZ=STTPOUTV   OUTPUT PROCESSING   GP14140
+         FDCLI TAPVOL,C' ',BH=STTPOUTV      USER SERIAL         GP14140
+         FDPRT 'EXPVOL),'                   FAKE IT             GP14140
+         FDGOTO STTPCOMD                                        GP14140
+STTPOUTV FDPRT TAPVOL,DEBR                                      GP14135
+         FDPRT '),'                                             GP14140
+         FDGOTO STTPCOMD                                        GP14135
+STTPCOMR FDPRT 'VOL=(PRIVATE,RETAIN,REF=*.STEP1.SYSUT2),'       GP14140
+STTPCOMD FDPRT '//',NL,LEN=15                                   GP14135
+         FDTM  DS1DSORG+1,DS1ACBM,BNZ=STVSTPD                   GP14140
+         FDPRT 'DCB=(RECFM='                                    GP14135
+         FDPRT TPRECFM,DEBR                                     GP14135
+         FDPRT ',LRECL='                                        GP14135
+         FDPRT TPLRECL,DEB                                      GP14135
+         FDPRT ',BLKSIZE='                                      GP14135
+         FDPRT TPBLK,I,DEB                                      GP14135
+         FDPRT ')'                                              GP14135
+         FDGOTO STTPCOMX                                        GP14135
+STVSTPD  FDPRT 'DCB=BLKSIZE=32760'                              GP14135
+         FDPRT ')'                                              GP14135
+STTPCOMX FDOPT NL                                               GP14135
+         FD    *END          (NOT NEEDED)                       GP14140
+         SPACE 1
+STINONVS FDPRT '//*',NL                                         GP14138
+         FDPRT '//STEP',NL                                      GP14135
+         FDPRT STEP#,I,DEBL,PADR,LEN=4                          GP14135
+         FDPRT 'EXEC  PGM='            CONSIDER WYLCOPY         GP14135
+         FDPRT PROGRAM,DEBR            CONSIDER WYLCOPY         GP14135
+         FDPRT '//SYSPRINT DD  SYSOUT=*',NL                     GP14135
+         FDEXEC STTPINP,STTPCOMX  CREATE TAPE JCL               GP14135
+STIUT2   FDPRT '//SYSUT2   DD  DISP=',NL                        GP14135
+         FDPRT NEWDSP,DEBR                                      GP14135
+         FDPRT ','                                              GP14135
+         FDPRT '//',NL,LEN=15                                   GP14135
+         FDPRT 'DSN='                                           GP14135
+         FDPRT NEWDSNAM,DEBR                                    GP14135
+         FDPRT ','                                              GP14135
+         FDPRT '//',NL,LEN=15                                   GP14135
+         FDPRT 'UNIT='                                          GP14135
+         FDPRT 'SYSALLDA'    AVOID SPECIFIC UNIT                GP14138
+         FDPRT ',VOL=SER='                                      GP14135
+         FDPRT NEWVOL,DEBR                                      GP14135
+         FDPRT ','                                              GP14135
+         FDPRT '//',NL,LEN=15                                   GP14135
+         FDPRT 'SPACE=('                                        GP14135
+         FDPRT ALLTYPE,DEB                                      GP14135
+         FDPRT ',('                                             GP14135
+         FDPRT ALLPRI,I,DEBL                                    GP14135
+         FDPRT ','                                              GP14135
+         FDPRT ALLSEC,I,DEBL                                    GP14135
+         FDTM  DS1DSORG,DS1DSGPO,BZ=STINPDS PDS ?               GP14135
+         FDPRT ','                                              GP14135
+         FDPRT ALLDIR,I,DEB                                     GP14135
+STINPDS  FDPRT ')),'                                            GP14135
+         FDPRT '//',NL,LEN=15                                   GP14135
+         FDPRT 'DCB=(RECFM='                                    GP14135
+         FDPRT NEWRECFM,DEBR                                    GP14135
+         FDPRT ',LRECL='                                        GP14135
+         FDPRT NEWLRECL,DEB                                     GP14135
+         FDPRT ',BLKSIZE='                                      GP14135
+         FDPRT NEWBLK,I,DEB                                     GP14135
+         FDPRT ')'                                              GP14135
+         FDTM  DS1DSORG,DS1DSGPO,BZ=STICOMVS                    GP14135
+         FDPRT '//SYSUT3   DD  UNIT=SYSDA,SPACE=(CYL,(5,1))',NL GP14135
+         FDPRT '//SYSUT4   DD  UNIT=SYSDA,SPACE=(CYL,(5,1))',NL GP14135
+STICOMVS FDPRT '//SYSIN    DD  DUMMY',NL                        GP14135
+         FDPRT *END
+         SPACE 2
+*  GENERATE OUTPUT RECORDS FOR VSAM FILES.
+*
+VSAM     PRTDATA 'PROCESSING',(DS1DSNAM,PAD),                          *
+               (DSORG,PAD),RECFM,(LRECL,PAD),BLKSIZE,(OPTCD,PAD)
+         INCH  STEP#         INCREMENT SEQUENCE NUMBER          GP14135
+         MVC   TPBLK+L'TPBLK-2(2),=H'32760'  SET MAX            GP14140
+         MVC   TPRECFM,BLANKS                                   GP14140
+         MVC   TPLRECL,BLANKS                                   GP14140
+         ZI    PROFLAGS,FGPIN     RESET INPUT PROCESSING        GP14140
+         PRTLIST VSXVSAM,DEV=3    PRINT EXPORT JCL              GP14135
+         OI    PROFLAGS,FGPIN     SET INPUT PROCESSING          GP14140
+         PRTLIST VSIVSAM,DEV=4    PRINT IMPORT JCL              GP14135
+*  CREATE RECORD FOR CLIST
+*
+GENCLIST AP    LINP,=P'100'  INCREMENT LINE NUMBER              GP14135
+         PRTLIST STDELETE,DEV=2   BUILD DELETE STATEMENT        GP14135
+         B     READIT
+         SPACE 1
+STDELETE FDPRT LINP,DZ,NL,RADJ,LEN=6                            GP14135
+         FDPRT 'DELETE'                                         GP14135
+         FDPRT DS1DSNAM,PAD,DEBR                                GP14135
+*OLD*    FDPRT 'NOSCRATCH'                                      GP14135
+         FDPRT 'PURGE'                                          GP14135
+         FDPRT *END                                             GP14135
+         SPACE 2
+VSXVSAM  FDPRT '//STEP',NL                                      GP14135
+         FDPRT STEP#,I,DEBL,PADR,LEN=4                          GP14135
+         FDPRT 'EXEC  PGM=IDCAMS'      CONSIDER WYLCOPY         GP14135
+         FDPRT '//SYSPRINT DD  SYSOUT=*',NL                     GP14135
+         FDEXEC STTPOUT,STTPCOMX  CREATE TAPE JCL               GP14140
+         FDPRT '//SYSUT1   DD  DISP=SHR,DSN=',NL                GP14135
+         FDPRT DS1DSNAM,DEBR                                    GP14135
+         FDPRT '//SYSIN    DD  *',NL                            GP14135
+         FDPRT '   EXPORT OUTFILE(DD1) ',NL                     GP14135
+         FDPRT *END
+         SPACE 1
+VSIVSAM  FDPRT '//STEP',NL                                      GP14135
+         FDPRT STEP#,I,DEBL,PADR,LEN=4                          GP14135
+         FDPRT 'EXEC  PGM=IDCAMS'                               GP14135
+         FDPRT '//SYSPRINT DD  SYSOUT=*',NL                     GP14135
+         FDEXEC STTPINP,STTPCOMX  CREATE TAPE JCL               GP14140
+         FDCLI NEWVOL,C' ',BL=VSTV1,BE=VSTV1                    GP14135
+         FDPRT '//DD2      DD  DISP=OLD,UNIT=',NL               GP14135
+         FDPRT NEWUNIT,DEBR                                     GP14135
+         FDPRT ',VOL=SER='                                      GP14135
+         FDPRT NEWVOL,DEBR                                      GP14135
+VSTV1    FDPRT '//SYSIN    DD  *',NL                            GP14135
+         FDPRT ' IMPORT OUTDATASET(',NL                         GP14135
+         FDPRT NEWDSNAM,DEBR                                    GP14135
+         FDPRT ') INFILE(DD1)'                                  GP14135
+         FDCLI NEWVOL,C' ',BL=VSTV2,BE=VSTV2                    GP14135
+         FDPRT '-',PADL                                         GP14135
+         FDPRT '  OBJECTS((',NL                                 GP14135
+         FDPRT NEWDSNAM,DEBR                                    GP14135
+         FDPRT 'VOLUMES(',PADL                                  GP14135
+         FDPRT NEWVOL,DEBR                                      GP14135
+         FDPRT ') FILE(DD2)))'                                  GP14135
+VSTV2    FDPRT *END                                             GP14135
+*
+*  CLOSE FILES AND TERMINATE PROGRAM.
+*
+CLOSE    CLIST CLISTL        PUT LAST LINE INTO CLIST           GP14135
+         SLR   R15,R15                                          GP14135
+CLOSEX   LR    R9,R15                  SAVE CONTENTS OF R15     GP14135
+         CLOSE (DCB1),MF=(E,OC1)                                GP14135
+RETURN   LTR   R9,R9         GOOD RETURN?                       GP14138
+         BNZ   RETURNCM        NO                               GP14138
+         PRTDATA '//',DEV=3                                     GP14138
+         TM    PROFLAGS,FGD2D     NO TAPE ?                     GP14136
+         BNZ   RETURNDD                                         GP14140
+         PRTDATA '//',DEV=4                                     GP14138
+RETURNDD PRTDATA ' '                                            GP14140
+         PRTDATA (STEP#,I,RADJ,PAD),'files processed'           GP14140
+RETURNCM SERVTERM ,                                             GP14135
+         PGMEXIT RC=(R9)     FREE AND RETURN                    GP14135
+         SPACE 3
+***********************************************************************
+*                                                                     *
+*                      SUBROUTINES                                    *
+*                                                                     *
+***********************************************************************
+USERINIT STM   R14,R12,REGSAVE    SAVE RETURN REGS              GP14135
+         OI    PAR$RQFG,PAR$COUP  UPPER-CASE ALL INPUT          GP14135
+         OI    PAR$RQFG,PAR$COUQ  UNQUOTE                       GP14135
+*NO,NO   OI    PAR$RQFG,PAR$COSP  SEPARATE (,) ITEMS            GP14135
+         OI    PAR$RQFG,PAR$PARK  () KEYWORD                    GP14135
+         PARSE (R8),(R9),OPT=KEYWORD                            GP14136
+         CH    R15,=H'8'     PROBLEM?                           GP14136
+         BL    PARSEOK         NO                               GP14136
+         BE    SINPUT          EMPTY RECORD?                    GP14136
+         PRTDATA 'Parse failed'                                 GP14135
+         ABEND 100,DUMP                                         GP14135
+         SPACE 1
+PARSEOK  LA    R3,PAR@TABL   POINT TO RESULT LIST               GP14135
+         USING PRSDSECT,R3   DECLARE ONE RETURN ENTRY           GP14135
+LOOPPARM ICM   R3,15,PRSLINK GET NEXT ENTRY                     GP14135
+         BZ    USERDONE             NO; GET OUT                 GP14135
+         TM    PRSTYPE,PRSPFKEY   USER SPECIFIED KEYWORD?       GP14135
+         BNZ   KEYWPARM             YES; CONTINUE               GP14135
+         PARFGSET FLAGSETP,ERR=FLAGBAD,DONE=LOOPPARM            GP14135
+         SPACE 1
+*---------------------------------------------------------------------*
+*    LOOK UP SELF-DEFINING KEYWORDS - RESET/SET APPROPRIATE FLAGS     *
+*---------------------------------------------------------------------*
+KEYWPARM LA    R0,PRSKEYWD   POINT TO INPUT                     GP14135
+         LA    R1,STRVARP    POINT TO TABLE                     GP14138
+         L     R2,PRS#TEXT   TEXT LENGTH                        GP14135
+         SUBCALL SUBVERB     PERFORM LOOKUP                     GP14135
+         LTR   R1,R15                                           GP14138
+         BZ    KEYWBAD         NO MATCH; FAIL IT                GP14135
+         SPACE 1
+STRMOVE  OC    PRS$TEXT,BLANKS    UPPER CASE                    GP14136
+STRMOVEL ICM   R2,15,PRS#TEXT   LOAD LENGTH                     GP14136
+         BNP   LOOPPARM        IGNORE NULL; MAY HAVE BEEN SUBST GP14136
+         MVC   DB(2),=X'4140'     LA R4,...                     GP14138
+         MVC   DB+2(2),OFO$ADD(R1)      var                     GP14138
+         EX    0,DB          LOAD R4                            GP14138
+         SLR   R5,R5                                            GP14138
+         IC    R5,OFO$LEN(,R1)    MAX LENGTH OF VARIABLE        GP14138
+         CR    R2,R5           VALID LENGTH ?                   GP14136
+         BH    KEYWLEN              NO; FAIL                    GP14136
+         SH    R5,=H'1'        ADJUST FOR EX                    GP14136
+         BM    LOOPPARM        IGOPRE NULLed VALUE              GP14136
+         EX    R5,EXMVCSTR     MOVE VALUE AND CLEAR REST        GP14136
+         B     LOOPPARM        YES; LOOK FOR SOMETHING ELSE     GP14136
+EXMVCSTR MVC   0(*-*,R4),PRS$TEXT  MOVE STRING                  GP14136
+         SPACE 1
+*---------------------------------------------------------------------*
+*   GENERAL STRING MOVER DEFINITIONS                                  *
+*---------------------------------------------------------------------*
+         PARKEYBX STRVAR     BXLE FOR KEYWORD=TEXT              GP14138
+         PARKEYBX FLAGSET    BXLE FOR FLAGS                     GP14135
+         SPACE 1
+FLAGBAD  PRTDATA 'Unknown option',(PRS$TEXT,DEBR,PADL)          GP14135
+         B     EXIT16                                           GP14135
+KEYWBAD  PRTDATA 'Unknown keyword',(PRSKEYWD,DEBR,PADL)         GP14135
+         B     EXIT16                                           GP14135
+KEYWLEN  PRTDATA 'Value has invalid length',(0(R4),8,DEBR,PADL) GP14135
+EXIT16   LA    R9,16         BAD PARM                           GP14135
+         B     CLOSEX                                           GP14135
+         DROP  R3                                               GP14135
+USERDONE PARSE *END          RELEASE PARSE BUFFER               GP14135
+         LM    R14,R12,REGSAVE    RESTORE REGS                  GP14135
+         BR    R14                                              GP14135
+         SPACE 1
+*  SUBROUTINE TO PRINT THE CLIST
+*
+PRINTC   STM   R14,R5,REGSAVE     PRESERVE SOME REGISTERS       GP14135
+         AP    LINP,=P'100'  INCREMENT LINE NUMBER              GP14135
+         LR    R3,R15        COPY LENGTH                        GP14135
+         LR    R2,R1         COPY ADDRESS                       GP14135
+         PRTLIST STCLIST,DEV=2    WRITE RECORD                  GP14135
+         LM    R14,R5,REGSAVE     RESTORE SOME REGISTERS        GP14135
+         BR    R14                     RETURN                   GP14135
+STCLIST  FDPRT LINP,DZ,NL,RADJ,LEN=6                            GP14135
+         FDPRT 0(R2),(R3),DEBR                                  GP14135
+         FDPRT *END                                             GP14135
+         SPACE 2
+*  SUBROUTINE TO POINT TO THE NEXT DATA POSITION IN THE OUTPUT LINE.
+*    R1  - START POSITION
+*    R15 - ITEM LENGTH
+*    R14 - RETURN ADDRESS
+*
+*    SETS SPACE/NULL POSITION IN R1, RETURNS 4(R14)
+*    IF NONE, RETURNS TO R14
+*
+FSTOP    STM   R2,R3,28(R13) SAVE A LITTLE                      GP14135
+         LR    R3,R1         COPY START                         GP14135
+         AR    R1,R15        SET END IF NO MATCH                GP14135
+         BCTR  R15,0         SET EXECUTE LENGTH                 GP14135
+         EX    R15,EXFNDBLK  LOOK FOR TERMINATOR                GP14135
+         BC    2+1,FSTOPEND  BRANCH IF NONE FOUND               GP14135
+         LM    R2,R3,28(R13) RESTORE                            GP14135
+         B     4(,R14)       FOUND RETURN                       GP14135
+FSTOPEND LM    R2,R3,28(R13) RESTORE                            GP14135
+         BR    R14           UNMATCHED RETURN                   GP14135
+EXFNDBLK TRT   0(*-*,R3),TRTBLANK      FIND SPACE/NULL          GP14135
+         SPACE 2
+CLCMASK  CMASK ,             EXPAND STRING COMPARE              GP14135
+         SPACE 2
+*   SUBROUTINE TO COPY DS NAME WITH NEW PREFIX                  GP14135
+*   OLD (PATTERN) NAME IS IN DS1DSNAM                           GP14135
+*   R1 HAS DESTINATION NAME                                     GP14135
+*   R2 HAS NEW INDEX                                            GP14135
+*
+MAKEDSN  STM   R14,R12,REGSAVE
+         LR    R4,R1         SAVE DESTINATION                   GP14135
+         MVC   0(L'NEWDSNAM,R4),BLANKS                          GP14135
+         MVC   0(8,R4),0(R2) START WITH NEW INDEX               GP14135
+         GETSPC 0(R4),L'NEWDSNAM  FIND END                      GP14135
+         LA    R15,L'NEWDSNAM(,R4)                              GP14135
+         SR    R15,R1        MAKE NEW LENGTH                    GP14135
+         LR    R14,R1        SET FOR MVCL TO                    GP14135
+         MVI   TRTBLANK+C'.',C'.' PREFERRED STOPPER             GP14135
+         TRT   DS1DSNAM(9),TRTBLANK   FIND END OR .             GP14135
+         LR    R0,R1         SET FROM ADDRESS                   GP14135
+         LA    R1,DS1DSNAM+L'DS1DSNAM                           GP14135
+         SR    R1,R0         LENGTH                             GP14135
+         ICM   R1,8,BLANKS   PAD WITH SPACES                    GP14135
+         MVCL  R14,R0        BUILD DS NAME                      GP14135
+         MVI   TRTBLANK+C'.',0    RESET                         GP14135
+MAKEDSNX LM    R14,R12,REGSAVE                                  GP14135
+         BR    R14                                              GP14135
+         SPACE 3
+         LTORG ,
+         SPACE 1
+***********************************************************************
+*                                                                     *
+*                     CONSTANT DATA                                   *
+*                                                                     *
+***********************************************************************
+         PRINT &PRTSYS                                          GP14135
+         SPACE 1
+SYSPRINT PRTWORK SYSPRINT,SYSTSPRT,TITLE=5  DEV=1               GP14135
+CLIST    PUNWORK CLIST                      DEV=2               GP14135
+EXPORT   PUNWORK EXPORT,SYSPUNCH            DEV=3               GP14135
+IMPORT   PUNWORK IMPORT,SYSPUN              DEV=4               GP14135
+SYSIN    INPWORK SYSIN,PARMDD,EDIT=128                          GP14136
+TITLE3   FDPRT ' ',NL,LEN=16                                    GP14135
+         FDPRT 'Data Set Name',LEN=40                           GP14135
+         FDPRT 'DSO RecFm  LRecL BlkSz OptCd'                   GP14135
+         FDPRT *END                                             GP14135
+*
+*
+*  MISCELLANEOUS CONSTANTS
+*
+BLANKS   DC    CL64' '       CONSTANT FOR BLANKING AND UPPER    GP14135
+H1       DC    H'1'          FOR FDCLC LABEL # COMPARE          GP14135
+UNITDE   DC    X'0,9,64,16,45,0,16,26,17,28,16,36,43,28,46,45'  GP14135
+*INE7A   DC    C'OUTFILE(DD1) PURGE PERMANENT'
+CLIST1   DC    C'PROC 0'
+CLIST2   DC    C'CONTROL LIST NOFLUSH PROMPT MSG'
+CLISTL   DC    C'END'
+         SPACE 1
+ALLTAB   DC    CL5'TRK'      00...... ABSTRK                    GP14140
+         DC    CL5'   '      01...... BLOCKS                    GP14140
+         DC    CL5'TRK'      10...... TRACKS                    GP14140
+         DC    CL5'CYL'      11...... CYLINDERS                 GP14140
+         SPACE 1
+*   TABLE OF DATA SET NAMES/MASKS NEVER TO BE USED, EVEN WHEN SELECTED.
+*   TO ADD NAME, INSERT PRIOR TO NEVERDSN. IF LONGER THAN 12, CHANGE
+*   ALL LENGTHS TO THE LONGEST (ASM WILL RESOLVE)
+*
+NEVERBX  PARKEYBX NEVERDS    LIST OF UNWANTED DATA SETS         GP14135
+         SPACE 1
+***********************************************************************
+*                                                                     *
+*                    DSECTS FOR GETMAIN'ED AREA                       *
+*                                                                     *
+***********************************************************************
+SAVE     DSECT ,                                                GP14135
+DB       DS    D             WORK SPACE                         GP14135
+REGSAVE  DS    16A           SUBROUTINE SAVER                   GP14135
+ZEROES   DS    F                                                GP14138
+         SERVDEFS ,          SERVICE ROUTINE SUPPORT            GP14135
+         PRINT &PRTMAC                                          GP14135
+DYNDATA  COMDEF PFX=         DEFINE MF=L FOR RENT MACROS        GP14135
+@DEB     DS    A                                                GP14135
+DEVBUF   DS    5F
+IDEAL#   DS    1F            DIRECTORY ENTRIES PER TRACK
+ALLPRI   DS    F     1/3     PRIMARY ALLOCATION AMOUNT          GP14135
+ALLSEC   DS    F     2/3     SECONDARY ALLOCATION               GP14135
+ALLDIR   DS    F     3/3     DIRECTORY BLOCKS                   GP14135
+SRCBPT   DS    F             BLOCKS PER TRACK ON SOURCE         GP14135
+NEWBPT   DS    F             BLOCKS PER TRACK ON DESTINATION    GP14135
+NEWCAP   DS    F             NEW TRACK CAPACITY                 GP14135
+SRCCAP   DS    F             OLD TRACK CAPACITY                 GP14135
+SRCPRI   DS    F             SOURCE PRIMARY ALLOCATION          GP14135
+EX1      DS    A             EXIT LIST FOR DCB1                 GP14135
+EX2      DS    A             EXIT LIST FOR DCB6                 GP14135
+OC1      DS    A             OPEN/CLOSE FOR DCB1                GP14135
+OC2      DS    A             OPEN/CLOSE FOR DCB6                GP14135
+TPBLK    DS    F             TAPE BLOCK SIZE                    GP14135
+TRKPCYL  DS    F             COMBINED HALF AND FULL WORD VALUES GP14135
+NEWTPC   DS    F             NEW TRACKS PER CYLINDER            GP14135
+NEWDSO   DS    XL2     1/6   NEW DATA SET ORGANIZATION          GP14135
+NEWRCF   DS    XL1                 RECORD FORMAT                GP14135
+NEWOPT   DS    XL1                 OPTION CODE                  GP14135
+NEWBLK   DS    XL2                 BLOCK LENGTH                 GP14135
+NEWLRL   DS    XL2                 RECORD LENGTH                GP14135
+NEWKYL   DS    XL1                 KEY LENGTH                   GP14135
+         SPACE 1
+STEP#    DS    H             STEP AND FILE NUMBER 1-9999        GP14135
+NEWDEV   DS    X             OUTPUT DASD DEVICE SUBTYPE
+SRCDEV   DS    X             INPUT DASD DEVICE SUBTYPE          GP14135
+PRNTDEV  DS    B             OUTPUT SELECT 4-EXPORT 8-IMPORT 12-BOTH
+OPTFLAGS DS    X             RUN OPTIONS                        GP14135
+FGVSAM   EQU   X'80'           VSAM FILES ONLY                  GP14135
+FGPSPO   EQU   X'40'           NON-VSAM FILES ONLY              GP14135
+FGDUMP   EQU   X'10'           ABEND/DUMP ON ERROR              GP14135
+FGDEBUG  EQU   X'08'           DEBUG MESSAGES                   GP14135
+FGTEST   EQU   X'04'           DISPLAY SELECTABLE DS NAMES ONLY GP14135
+FGQUIET  EQU   X'02'           SKIP UNWANTED MESSAGES           GP14135
+FGLOTS   EQU   X'01'           PRINT LOTS OF INFORMATION        GP14135
+PROFLAGS DS    X             RESERVED                           GP14135
+FGRBLK   EQU   X'80'           REBLOCK                          GP14137
+FGDEFIL  EQU   X'40'           EXPAND DIRECTORY ENTRIES FULL TRK  14137
+FGD2D    EQU   X'20'           GO DISK TO DISK ('EXPORT' ONLY)  GP14135
+FGPIN    EQU   X'01'           PROCESSING IMPORT JCL            GP14140
+         SPACE 1
+         PRINT &PRTSYS                                          GP14135
+*   RETURN DATA FROM SUBDSATR:                                  GP14135
+*      CL3 DSORG CL6 RECFM CL8 OPTCD CL5 BLKL CL5 LRECL         GP14135
+*
+DSORG    DS    CL3     1/5                                      GP14135
+RECFM    DS    CL6     2/5                                      GP14135
+OPTCD    DS    CL8     3/5                                      GP14135
+BLKSIZE  DS    CL5     4/5                                      GP14135
+LRECL    DS    CL5     5/5                                      GP14135
+RETDSATR EQU   DSORG,*-DSORG,C'C'      DECLARE RETURN AREA      GP14135
+         SPACE 1
+NEWDSORG DS    CL3     1/5                                      GP14135
+NEWRECFM DS    CL6     2/5                                      GP14135
+NEWOPTCD DS    CL8     3/5                                      GP14135
+NEWBLKSZ DS    CL5     4/5                                      GP14135
+NEWLRECL DS    CL5     5/5                                      GP14135
+         SPACE 1
+ALLTYPE  DS    CL5           CYL, TRK, OR BLOCK SIZE            GP14135
+ACCT     DS    CL21          ACCOUNT FIELD                      GP14136
+DATE     DS    CL5
+SRCUNIT  DS    CL8                                              GP14135
+SRCVOL   DS    CL6                                              GP14135
+JCLASS   DS    C             JOB CLASS                          GP14136
+MASKDSN  DS    CL44          DS COMPARE MASK                    GP14135
+MCLASS   DS    C             MESSAGE CLASS                      GP14136
+*              (NEW,DELETE,DELETE) = 19
+NEWDSP   DS    CL19          OUTPUT DISPOSITION                 GP14136
+NEWDSNAM DS    CL44
+NEWHIX   DS    CL8           OPTIONAL NEW HIGH LEVEL INDEX      GP14135
+NEWUNIT  DS    CL8                                              GP14135
+NEWVOL   DS    CL6
+PGMR     DS    CL22          PROGRAMMER NAME FIELD              GP14136
+PROGRAM  DS    CL8           EXECUTED PGM=                      GP14135
+RCODE    DS    CL1           CVAF RETURN CODE
+REASON   DS    CL8                                              GP14135
+TAPDSNAM DS    CL44                                             GP14135
+TAPHIX   DS    CL8           HIGH LEVEL INDEX ON TAPE           GP14135
+TAPUNIT  DS    CL8                                              GP14135
+TAPVOL   DS    CL6                                              GP14135
+TPRECFM  DS    CL5           RECFM ON TAPE                      GP14135
+TPLRECL  DS    CL5           LRECL ON TAPE                      GP14135
+*PBLKSIZ DS    CL5           BLKSZ ON TAPE - SEE TPBLK          GP14135
+PDSDE    DS    XL(256+8)     ROOM FOR DIRECTORY ENTRY           GP14135
+         AIF   (NOT &MVSXA).SKPPAT3                             GP14135
+BUFLIST  ICVAFBFL DSECT=NO
+BUFLEN   EQU   *-BUFLIST
+.SKPPAT3 SPACE 1
+MYJFCB   DS    0D                                               GP14135
+         IEFJFCBN LIST=NO                                       GP14135
+MYDSCB1  DS    0D                                               GP14135
+         IECSDSL1 1                                             GP14135
+DSCBLTH  EQU   *-MYDSCB1-L'DS1DSNAM                             GP14135
+         SPACE 1
+TRTBLANK DS    XL256         DYNAMIC TRT TABLE (BLANK, PERIOD)  GP14135
+         SPACE 1
+         MAPPARSE DSECT=NO                                      GP14135
+         SPACE 1
+SAVEEND  EQU   *                                                GP14135
+         SPACE 1
+         MAPPARST ,                                             GP14135
+         SPACE 1
+DCBSECT  DSECT
+         DCBD  DSORG=PS,DEVD=DA
+         IEFUCBOB ,                                             GP14135
+         IEZDEB ,            FOR SUBPDCNT                       GP14140
+         SPACE 2
+*   DATA WITHOUT ADDRESSABILITY                                 GP14136
+*                                                               GP14136
+EXIMPORT CSECT ,             RESUME MAIN                        GP14136
+NEVERDS  DC    CL12'SYS1.VVDS*'  NAME OF UNWANTED DATA SET      GP14135
+NEVERDS2 DC    CL12'SYS1.VTOCIX*'                               GP14135
+         DC    CL12'SYSCTLG* '                                  GP14135
+         DC    CL12'CATALOG* '                                  GP14135
+         DC    CL12'FDRABR.V*'                                  GP14135
+         DC    CL12'PASSWORD '                                  GP14135
+         DC    CL12'FDRABR.V*'                                  GP14135
+NEVERDSN DC    CL12'CATINDEX*'                                  GP14135
+         SPACE 1
+PATDATA  COMDEF PFX=PAT      DEFINE PATTERN FOR RENT MACROS     GP14135
+         SPACE 1
+FLAGSET  PARKEYFG 'QUIET',OPTFLAGS,FGLOTS,FGQUIET               GP14135
+FLAGSET2 PARKEYFG 'LOTS',OPTFLAGS,FGQUIET,FGLOTS                GP14135
+         PARKEYFG 'NONVSAM',OPTFLAGS,FGVSAM,FGPSPO  PS/PO ONLY  GP14135
+         PARKEYFG 'NOVSAM',OPTFLAGS,FGVSAM,FGPSPO   PS/PO ONLY  GP14135
+         PARKEYFG 'VSAMONLY',OPTFLAGS,FGPSPO,FGVSAM  VSAM ONLY  GP14135
+         PARKEYFG 'NOTAPE',PROFLAGS,0,FGD2D DASD TO DASD        GP14135
+         PARKEYFG 'DEFILL',PROFLAGS,0,FGDEFIL  FILL TRACKS/DE   GP14135
+         PARKEYFG 'ABEND',OPTFLAGS,0,FGDUMP                     GP14135
+         PARKEYFG 'DUMP',OPTFLAGS,0,FGDUMP                      GP14135
+         PARKEYFG 'TEST',OPTFLAGS,0,FGTEST                      GP14135
+FLAGSETN PARKEYFG 'DEBUG',OPTFLAGS,0,FGDEBUG                    GP14135
+         SPACE 1
+STRVAR   PARKEYST ACCOUNT,ACCT                                  GP14138
+STRVAR2  PARKEYST ACCT,ACCT                                     GP14138
+         PARKEYST PGMNAME,PGMR                                  GP14138
+         PARKEYST PGMR,PGMR                                     GP14138
+         PARKEYST JOBCLASS,JCLASS                               GP14138
+         PARKEYST JCLASS,JCLASS                                 GP14138
+         PARKEYST MSGCLASS,MCLASS                               GP14138
+         PARKEYST MCLASS,MCLASS                                 GP14138
+         PARKEYST DSNMASK,MASKDSN                               GP14138
+         PARKEYST MASKDSN,MASKDSN                               GP14138
+         PARKEYST NEWDISP,NEWDSP,MIN=4                          GP14138
+         PARKEYST NEWHIX,NEWHIX,MIN=4                           GP14138
+         PARKEYST HIX,NEWHIX                                    GP14138
+         PARKEYST NEWUNIT,NEWUNIT,MIN=4                         GP14138
+         PARKEYST NEWVOLUM,NEWVOL,MIN=4                         GP14138
+         PARKEYST NUDISP,NEWDSP                                 GP14138
+         PARKEYST NUINDEX,NEWHIX                                GP14138
+         PARKEYST NUUNIT,NEWUNIT                                GP14138
+         PARKEYST UNIT,NEWUNIT                                  GP14138
+         PARKEYST NUVOLUME,NEWVOL                               GP14138
+         PARKEYST VOLUME,NEWVOL                                 GP14138
+         PARKEYST TAPEUNIT,TAPUNIT,MIN=5                        GP14138
+         PARKEYST TAPUNIT,TAPUNIT,MIN=4                         GP14138
+         PARKEYST TPUNIT,TAPUNIT                                GP14138
+         PARKEYST TAPEVOL,TAPVOL,MIN=5                          GP14138
+         PARKEYST TAPVOLUM,TAPVOL,MIN=4                         GP14138
+STRVARN  PARKEYST TPVOLUME,TAPVOL                               GP14138
+         SPACE 1
+FDOLDIE  FDPRT '  Old characteristics:',NL                      GP14135
+         FD    'Blksize',PAD                                    GP14135
+         FD    DS1BLKL,I,RADJ,LEN=5                             GP14135
+         FD    ' Blocks per track',PAD                          GP14135
+         FD    SRCBPT,I,RADJ,LEN=3                              GP14135
+         FD    ' Primary tracks',PAD                            GP14135
+         FD    SRCPRI,I,RADJ                                    GP14135
+         SPACE 1
+FDNEWIE  FDPRT '  New characteristics:',NL                      GP14135
+         FD    'Blksize',PAD                                    GP14135
+         FD    NEWBLK,I,RADJ,LEN=5                              GP14135
+         FD    ' Blocks per track',PAD                          GP14135
+         FD    NEWBPT,I,RADJ,LEN=3                              GP14135
+         FD    ' Primary tracks',PAD                            GP14135
+         FD    DB,4,I,RADJ                                      GP14135
+         FD    *END
+         SPACE 1
+OPTSHO1  FLGTAB FGVSAM,'VSAM only',MLEN=1                       GP14138
+         FLGTAB FGPSPO,'NonVSAM (PS/PO) only'                   GP14138
+         FLGTAB FGDUMP,'Dump on error'                          GP14138
+         FLGTAB FGDEBUG,'Debug-mode'                            GP14138
+         FLGTAB FGTEST,'Test-mode'                              GP14138
+         FLGTAB FGLOTS,'All messages'                           GP14138
+         FLGTAB FGQUIET,'Critical messages'                     GP14138
+         FLGTAB *END                                            GP14138
+         SPACE 1
+OPTSHO2  FLGTAB FGRBLK,'Reblock',MLEN=1                         GP14138
+         FLGTAB FGDEFIL,'DEs to fill track'                     GP14140
+         FLGTAB FGD2D,'Disk to disk copy'                       GP14138
+         FLGTAB *END                                            GP14138
+         END   ,

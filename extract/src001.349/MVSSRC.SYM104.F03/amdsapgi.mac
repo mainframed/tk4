@@ -1,0 +1,1406 @@
+         TITLE 'AMDSAPGI  PROGRAM INTERRUPT HANDLER                    *
+                       '
+AMDSAPGI CSECT
+         STM   R0,R15,PGISAVE          SAVE REGISTERS IN LOW CORE
+         BALR  BASEREG,0               SET UP BASE REGISTER
+         USING *,BASEREG
+*   VCCTREG = CTVCCT;               /* SET UP ADDRESSABILITY TO VCCT */
+         LH    @10,@CH00724                                        0190
+         L     VCCTREG,CTVCCT(,@10)                                0190
+*   R13 = ADDR(PGINAME);            /* POINT TO MODULE ID            */
+         LA    R13,PGINAME                                         0191
+*   VCTAUDIT = FLCPICOD;            /* ERROR CODE TO INTERRUPT CODE  */
+         MVC   VCTAUDIT(2,VCCTREG),FLCPICOD                        0192
+*                                                                  0193
+*   /*****************************************************************/
+*   /*                                                               */
+*   /* CHECK FOR INVALID PROGRAM INTERRUPT RECURSIONS                */
+*   /*                                                               */
+*   /*****************************************************************/
+*/* D (NO,,YES,PGIERROR) VCTPGIR ON (RECURSION)                      */
+*/* P SET VCTPGIR TO PREVENT RECURSION                               */
+*/* D (NO,,YES,PGIERROR) VCTUPDR ON (RECURSION)                      */
+*                                                                  0193
+*   IF VCTPGIR = ON THEN            /* RECURSION THROUGH AMDSAPGI    */
+         TM    VCTPGIR(VCCTREG),B'10000000'                        0193
+         BO    @RT00193                                            0193
+*     GO TO PGIERROR;               /* YES - ERROR                   */
+*   VCTPGIR = ON;                   /* SET RECURSION FLAG            */
+         OI    VCTPGIR(VCCTREG),B'10000000'                        0195
+*   IF VCTUPDR = ON THEN            /* RECURSION THROUGH AMDSAUPD    */
+         TM    VCTUPDR(VCCTREG),B'01000000'                        0196
+         BO    @RT00196                                            0196
+*     GO TO PGIERROR;               /* YES - ERROR                   */
+*                                                                  0198
+*   /*****************************************************************/
+*   /*                                                               */
+*   /* CHECK INTERRUPT CODE. IF NOT SEGMENT (X'10') OR PAGE (X'11')  */
+*   /* EXCEPTION, CALL AMDSAAUD TO RECOVER FROM ERROR. OTHERWISE     */
+*   /* OBTAIN AND INITIALIZE AN MDCB TO SAVE THE STATUS OF THE       */
+*   /* INTERRUPTED PROGRAM DURING PAGING.                            */
+*   /*                                                               */
+*   /*****************************************************************/
+*/* D (YES,,NO,%PGICODE) FLCPICOD = X'12'                            */
+*/*%PGITREX: P (,PGIAUD) TURN VCTSADMP OFF                           */
+*/*%PGICODE: D (YES,,NO,%PGITREX) USING PTRT FOR PICOD X'10'         */
+*/* D (YES,,NO,PGIAUD) FLCPICOD = X'10' OR X'11'                     */
+*/* P OBTAIN MDCE ADDR FROM VCTMDCE                                  */
+*/* D (NO,,YES,PGIERROR) MDCEAVIL = 0                                */
+*/* P DEQUEUE AN MDCB FROM AVAILABLE QUEUE                           */
+*/* P ENQUEUE MDCB ON ACTIVE QUEUE                                   */
+*/* P MOVE REGS FROM PGISAVE TO MDCBGRS                              */
+*/* P STORE CONTROL REG 1 IN MDCBSTOR                                */
+*/* P SAVE FLCPOPSW IN MDCBPSW                                       */
+*/* P SAVE FLCPICOD IN MDCBPI                                        */
+*/* P ZERO MDCB FLAGS                                                */
+*/* D (NO,%PGIASM1,YES,) VCTASMIC ON                                 */
+*/* P SET MDCBASMI TO 1                                              */
+*/*%PGIASM1: P TURN OFF VCTASMIC                                     */
+*/* D (NO,%PGIASM2,YES,) VCTSADMP OFF                               */
+*/* P SET MDCBDUMP TO 1                                              */
+*/* P TURN VCTSADMP ON                                               */
+*                                                                  0198
+*   GENERATE REFS(R1) SETS(WORK1) (STCTL R1,R1,WORK1); /* GET SEGMENT
+*                                      TABLE ORIGIN                  */
+         STCTL R1,R1,WORK1
+*   IF (FLCPICOD = XLATEXCP) ×        /* TRANSLATION-SPEC EXCEPTION  */
+*      (FLCPICOD = SEGFAULT & WORKPTR ^= ADDR(PTRTRS(1))) THEN /*  0199
+*                                      SEGMENT EXCEPTION--ENSURE PTRT
+*                                      IS THE CURRENT SEGMENT TABLE  */
+         LH    @10,FLCPICOD                                        0199
+         CH    @10,@CH00911                                        0199
+         BE    @RT00199                                            0199
+         CH    @10,@CH00915                                        0199
+         BNE   @RF00199                                            0199
+         LH    @10,@CH00584                                        0199
+         LA    @10,PTRTRS(,@10)                                    0199
+         SR    @03,@03                                             0199
+         ICM   @03,7,WORKPTR                                       0199
+         CR    @10,@03                                             0199
+         BE    @RF00199                                            0199
+@RT00199 DS    0H                                                  0200
+*     DO;                           /* NO DUMP SHOULD BE TAKEN       */
+*       VCTSADMP = OFF;             /* INDICATE NO DUMP              */
+         NI    VCTSADMP(VCCTREG),B'01111111'                       0201
+*       GO TO PGIAUD;               /* EXIT TO AMDSAAUD              */
+         B     PGIAUD                                              0202
+*     END;                                                         0203
+*   IF FLCPICOD ^= PGEFAULT & FLCPICOD ^= SEGFAULT THEN /* NON-PAGING
+*                                      INTERRUPT                     */
+@RF00199 LH    @10,FLCPICOD                                        0204
+         CH    @10,@CH00913                                        0204
+         BE    @RF00204                                            0204
+         CH    @10,@CH00915                                        0204
+         BNE   @RT00204                                            0204
+*     GO TO PGIAUD;                 /* YES - ERROR                   */
+*   IF MDCEAVIL = 0 THEN            /* IS AN MDCB AVAILABLE          */
+@RF00204 L     @10,VCTMDCE(,VCCTREG)                               0206
+         L     @03,MDCEAVIL(,@10)                                  0206
+         LTR   @03,@03                                             0206
+         BZ    @RT00206                                            0206
+*     GO TO PGIERROR;               /* NO - ERROR                    */
+*   MDCBPTR = MDCEAVIL;             /* PICK UP FIRST AVAILABLE MDCB  */
+         LR    MDCBPTR,@03                                         0208
+*   MDCEAVIL = MDCBNEXT;            /* MAKE NEXT MDCB AVAILABLE      */
+         MVC   MDCEAVIL(4,@10),MDCBNEXT(MDCBPTR)                   0209
+*   MDCBNEXT = MDCEACTV;            /* QUEUE MDCB TO ACTIVE QUEUE    */
+         MVC   MDCBNEXT(4,MDCBPTR),MDCEACTV(@10)                   0210
+*   MDCEACTV = MDCBPTR;             /* MAKE MDCB ACTIVE              */
+         ST    MDCBPTR,MDCEACTV(,@10)                              0211
+*   MDCBGRS = PGISAVE;              /* MOVE REGISTERS TO MDCB        */
+         MVC   MDCBGRS(64,MDCBPTR),PGISAVE                         0212
+*   MDCBSTOR = WORK1;               /* SAVE SEGMENT TABLE ORIGIN IN
+*                                      MDCB                          */
+         MVC   MDCBSTOR(4,MDCBPTR),WORK1                           0213
+*   MDCBPSW = FLCPOPSW;             /* SAVE INTERRUPT PSW            */
+         MVC   MDCBPSW(8,MDCBPTR),FLCPOPSW                         0214
+*   MDCBPI = FLCPICOD;              /* SAVE INTERRUPT CODE           */
+         MVC   MDCBPI(2,MDCBPTR),FLCPICOD                          0215
+*   MDCBFLGS = OFF;                 /* RESET ALL MDCB FLAGS          */
+         MVI   MDCBFLGS(MDCBPTR),B'00000000'                       0216
+*   IF VCTASMIC = ON THEN           /* ASM FUNCTION IN CONTROL       */
+         TM    VCTASMIC(VCCTREG),B'00100000'                       0217
+         BNO   @RF00217                                            0217
+*     DO;                           /* YES                           */
+*       MDCBASMI = ON;              /* INDCIATE MDCB FOR ASM         */
+         OI    MDCBASMI(MDCBPTR),B'10000000'                       0219
+*       VCTASMIC = OFF;             /* RESET ASM IN CONTROL          */
+         NI    VCTASMIC(VCCTREG),B'11011111'                       0220
+*     END;                                                         0221
+*   IF VCTSADMP = OFF THEN          /* DUMP REQUEST FLAG ON          */
+@RF00217 TM    VCTSADMP(VCCTREG),B'10000000'                       0222
+         BNZ   @RF00222                                            0222
+*     DO;                           /* NO                            */
+*       MDCBDUMP = ON;              /* INDICATE NO DUMP IN MDCB      */
+         OI    MDCBDUMP(MDCBPTR),B'01000000'                       0224
+*       VCTSADMP = ON;              /* TURN DUMP REQUEST FLAG ON     */
+         OI    VCTSADMP(VCCTREG),B'10000000'                       0225
+*     END;                                                         0226
+*                                                                  0227
+*   /*****************************************************************/
+*   /*                                                               */
+*   /* OBTAIN AND INITIALIZE SAVE AREA                               */
+*   /*                                                               */
+*   /*****************************************************************/
+*/*%PGIASM2: L AMDSAGTM: ISSUE SVC 4 TO OBTAIN SAVE AREA             */
+*/* D (YES,,NO,PGIERR2) STORAGE OBTAINED   (RC = 0)                  */
+*/* P (NORM,,RCB,PGIERR1) QUEUE RCB TO RCB QUEUE                     */
+*/* P INITIALIZE SAVE AREA                                           */
+*                                                                  0227
+*   SVC(GTMSVC);                    /* CALL AMDSAGTM TO OBTAIN     0227
+*                                      STORAGE                       */
+@RF00222 SVC   4                                                   0227
+*   RESPECIFY (RETCODE,R1,R8) RESTRICTED;                          0228
+*   IF RETCODE ^= 0 THEN            /* STORAGE OBTAINED              */
+         LTR   RETCODE,RETCODE                                     0229
+         BNZ   @RT00229                                            0229
+*     GO TO PGIERR2;                /* NO - ERROR                    */
+*   R8 = R1;                        /* SAVE ADDRESS OF WORK AREA     */
+         LR    R8,R1                                               0231
+*   GENERATE REFS(R8) (USING @DATD,R8); /* MAKE WORK AREA ADDRESSABLE*/
+         USING @DATD,R8
+*   GENERATE SETS(R13) (LA    R13,@SA00001); /* POINT TO SAVE AREA   */
+         LA    R13,@SA00001
+*   RESPECIFY RCB BASED(ADDR(WORKRCB));                            0234
+*   RCBSAVE = R13;                  /* SAVE AREA ADDRESS TO RCB      */
+         LA    @14,WORKRCB                                         0235
+         ST    R13,RCBSAVE(,@14)                                   0235
+*   RCBEXIT = ADDR(PGIERR1);        /* EXIT ADDRESS (FREE MDCB AND SAVE
+*                                      AREA)                         */
+         LA    @10,PGIERR1                                         0236
+         ST    @10,RCBEXIT(,@14)                                   0236
+*   RCBBASE = BASEREG;              /* BASE REGISTER FOR EXIT        */
+         ST    BASEREG,RCBBASE(,@14)                               0237
+*   RCBNEXT = VCTRCB;               /* LINK RCB TO ACTIVE RCB QUEUE  */
+         MVC   RCBNEXT(4,@14),VCTRCB(VCCTREG)                      0238
+*   VCTRCB = ADDR(RCB);             /* MAKE RCB CURRENT ONE          */
+         ST    @14,VCTRCB(,VCCTREG)                                0239
+*   SAVENAME = PGINAME(2:4);        /* MOVE EBCDIC MODULE ID TO SAVE
+*                                      AREA                          */
+         MVC   SAVENAME(3,R13),PGINAME+1                           0240
+*   RESPECIFY (RETCODE,R1) UNRESTRICTED;                           0241
+*                                                                  0242
+*   /*****************************************************************/
+*   /*                                                               */
+*   /* DETERMINE IF PAGE IS ON WORKFILE OR IN PAGE DATA SET. SET UP  */
+*   /* IODB AND FLAGS.                                               */
+*   /*                                                               */
+*   /*****************************************************************/
+*/* P SAVE CTIOTYPE IN WORK AREA                                     */
+*/* P ROUND FLCTEA DOWN TO PAGE BOUNDARY                             */
+*/* P SAVE CTBUFTYP IN SAVE/ WORK AREA                               */
+*/* D (NO,%PGIWK1,YES,) ADDR > CTLWKAD                               */
+*/* D (NO,,YES,PGIERR1) ADDRESS OVERLAID                             */
+*/* P (,%PGICTIO) SET CTIODA IN CTIOTYPE                             */
+*/*%PGIWK1: P SET CTIOWK IN CTIOTYPE                                 */
+*/* P SET CTWKFLE IN CTBUFTYP                                        */
+*/* P SET WORKFILE IODBCCHH TO VBN OF FLCTEA                         */
+*/*%PGICTIO: P SAVE CTIOTYPE IN SAVE/ WORK AREA                      */
+*                                                                  0242
+*   WORKCTI2 = CTIOTYPE;            /* SAVE CTIOTYPE IN WORK AREA    */
+         LH    @10,@CH00724                                        0242
+         MVC   WORKCTI2(1),CTIOTYPE(@10)                           0242
+*   FLCTEA = FLCTEA & PGEROUND;     /* ROUND INTERRUPT ADDRESS DOWN
+*                                      TO PAGE BOUNDARY              */
+         L     @09,FLCTEA                                          0243
+         N     @09,@CF00917                                        0243
+         ST    @09,FLCTEA                                          0243
+*   WORKCTBU = CTBUFTYP;            /* SAVE ORIGINAL BUFFER REQUEST  */
+         MVC   WORKCTBU(1),CTBUFTYP(@10)                           0244
+*   CTIOTYPE = 0;                   /* RESET I/O REQUEST FLAGS       */
+         MVI   CTIOTYPE(@10),X'00'                                 0245
+*   IF FLCTEA > CTLWKAD THEN        /* PAGE ON WORKFILE              */
+         C     @09,CTLWKAD(,@10)                                   0246
+         BNH   @RF00246                                            0246
+*     DO;                           /* NO -                          */
+*       IF FLCTEA < SEGSIZE + VCTEXTRA * PAGESIZE THEN /* WAS ADDRESS
+*                                      OVERLAID BY CODE OR BUFFERS   */
+         LH    @03,VCTEXTRA(,VCCTREG)                              0248
+         SLA   @03,12                                              0248
+         A     @03,@CF00921                                        0248
+         CR    @09,@03                                             0248
+         BL    @RT00248                                            0248
+*         GO TO PGIERR1;            /* YES - ADDRESS UNAVAILABLE     */
+*       CTIODA = ON;                /* NO - PAGE IN PAGE DATA SET    */
+         OI    CTIODA(@10),B'00100000'                             0250
+*     END;                                                         0251
+*   ELSE                                                           0252
+*     DO;                                                          0252
+         B     @RC00246                                            0252
+@RF00246 DS    0H                                                  0253
+*       CTIOWK = ON;                /* I/O TO WORKFILE               */
+         LH    @10,@CH00724                                        0253
+         OI    CTIOWK(@10),B'00010000'                             0253
+*       CTBUFTYP = 0;               /* RESET BUFFER REQUEST FLAGS    */
+         MVI   CTBUFTYP(@10),X'00'                                 0254
+*       CTWKFLE = ON;               /* REQUEST WORKFILE BUFFER       */
+         OI    CTWKFLE(@10),B'01000000'                            0255
+*       RESPECIFY IODB BASED(ADDR(IODBWORK));                      0256
+*       IODBR = FLCTEA / PAGESIZE;  /* GET VBN OF DESIRED PAGE       */
+         L     @10,@CA00908                                        0257
+         L     @09,FLCTEA                                          0257
+         SRL   @09,12                                              0257
+         STC   @09,IODBR(,@10)                                     0257
+*     END;                                                         0258
+*   WORKCTIO = CTIOTYPE;            /* SAVE I/O REQUEST TYPE IN WORK
+*                                      AREA                          */
+@RC00246 LH    @10,@CH00724                                        0259
+         MVC   WORKCTIO(1),CTIOTYPE(@10)                           0259
+*                                                                  0260
+*   /*****************************************************************/
+*   /*                                                               */
+*   /* GET BUFFER FOR PAGING. IF ADDRESS EXISTS IN A BUFFER, SKIP I/O*/
+*   /* PROCESSING. IF NO BUFFER IS AVAILABLE, HANDLE AS ERROR.       */
+*   /*                                                               */
+*   /*****************************************************************/
+*/* L AMDSABUF: OBTAIN BUFFER FOR PAGING                             */
+*/* P RESTORE ORIGINAL BUFFER REQUEST TYPE                           */
+*/* D (NO,,YES,PGIUPD) ADDR IN BUFFER RC = 8                         */
+*/* D (YES,,NO,PGIERR1) RC = 0                                       */
+*/* P RESET VCTPGIR                                                  */
+*                                                                  0260
+*   SVC(BUFSVC);                    /* CALL AMDSABUF TO OBTAIN A   0260
+*                                      BUFFER                        */
+         SVC   14                                                  0260
+*   RESPECIFY RETCODE RESTRICTED;                                  0261
+*   CTBUFTYP = WORKCTBU;            /* RESTORE ORIGINAL BUFFER REQ.  */
+         LH    @14,@CH00724                                        0262
+         MVC   CTBUFTYP(1,@14),WORKCTBU                            0262
+*   IF RETCODE = 8 THEN             /* ADDRESS ALREADY IN A BUFFER   */
+         CH    RETCODE,@CH00037                                    0263
+         BE    @RT00263                                            0263
+*     GO TO PGIUPD;                 /* YES - BYPASS I/O              */
+*   IF RETCODE ^= 0 THEN            /* BUFFER OBTAINED               */
+         LTR   RETCODE,RETCODE                                     0265
+         BNZ   @RT00265                                            0265
+*     GO TO PGIERR1;                /* NO - ERROR                    */
+*   VCTPGIR = OFF;                  /* RESET RECURSION BIT IN ORDER
+*                                      TO BE ABLE TO HANDLE PAGE   0267
+*                                      FAULTS DURING PAGE-IN       0267
+*                                      PROCESSING                    */
+         NI    VCTPGIR(VCCTREG),B'01111111'                        0267
+*                                                                  0268
+*   /*****************************************************************/
+*   /*                                                               */
+*   /* IF PAGING FROM PAGE DATA SETS, GET LPID AND CONVERT IT TO A   */
+*   /* SEEK AND DEVICE ADDRESS. IF PAGING FROM WORKFILE, BEGIN I/O   */
+*   /* PROCESSING.                                                   */
+*   /*                                                               */
+*   /*****************************************************************/
+*/* D (NO,,YES,PGISIO) WORKFILE PAGING                               */
+*/* P SET VCTSTOR TO MDCBSTOR                                        */
+*/* L AMDSARSM: OBTAIN LPID OF PAGE                                  */
+*/* D (NO,,YES,PGIUPD) RC=8 (RECLAIMED PAGE)                         */
+*/* D (YES,,NO,PGIERR1) RC = 0                                       */
+*/* P SET VCTSTOR TO PSASTOR                                         */
+*/* L AMDSAASM: OBTAIN MBBCCHHR, CPU ADDR, & DEV ADDR                */
+*/* D (YES,,NO,PGIERR1) RC = 0                                       */
+*                                                                  0268
+*   CTIOTYPE = WORKCTIO;            /* RESTORE I/O REQUEST           */
+         MVC   CTIOTYPE(1,@14),WORKCTIO                            0268
+*   IF CTIODA = ON THEN             /* PAGING FROM PAGE DATA SETS    */
+         TM    CTIODA(@14),B'00100000'                             0269
+         BNO   @RF00269                                            0269
+*     DO;                           /* YES -                         */
+*       VCTSTOR = MDCBSTOR;         /* REQUEST SWITCH INTO LOCAL   0271
+*                                      MEMORY                        */
+         MVC   VCTSTOR(4,VCCTREG),MDCBSTOR(MDCBPTR)                0271
+*       SVC(RSMSVC);                /* CALL AMDSARSM TO OBTAIN LPID  */
+         SVC   18                                                  0272
+*       IF RETCODE = 8 THEN         /* PAGE TO BE RECLIAMED          */
+         CH    RETCODE,@CH00037                                    0273
+         BE    @RT00273                                            0273
+*         GO TO PGIUPD;             /* YES - NO I/O NEEDED           */
+*       IF RETCODE ^= 0 THEN        /* LPID OBTAINED SUCCESSFULLY    */
+         LTR   RETCODE,RETCODE                                     0275
+         BNZ   @RT00275                                            0275
+*         GO TO PGIERR1;            /* NO - ERROR                    */
+*       VCTSTOR = PSASTOR;          /* REQUEST SWITCH INTO MASTER  0277
+*                                      MEMORY                        */
+         MVC   VCTSTOR(4,VCCTREG),PSASTOR                          0277
+*       SVC(ASMSVC);                /* CALL AMDSAASM TO GET SEEK AND
+*                                      DEVICE ADDRESS                */
+         SVC   6                                                   0278
+*       IF RETCODE ^= 0 THEN        /* OPERATION SUCCESSFUL          */
+         LTR   RETCODE,RETCODE                                     0279
+         BNZ   @RT00279                                            0279
+*         GO TO PGIERR1;            /* NO - ERROR                    */
+*     END;                                                         0281
+*                                                                  0282
+*   /*****************************************************************/
+*   /*                                                               */
+*   /* I/O PROCESSING - WAIT FOR I/O TO COMPLETE                     */
+*   /*                                                               */
+*   /*****************************************************************/
+*/*PGISIO: P RESTORE CTIOTYPE FROM WORK AREA                         */
+*/* L AMDSASIO: INITIATE I/O FOR PAGING                              */
+*/* D (YES,,NO,PGIERR1) RC = 0                                       */
+*/* P RESTORE CTIOTYPE FROM WORK AREA                                */
+*/* L AMDSAWAT: WAIT FOR I/O TO COMPLETE                             */
+*/* D (YES,,NO,PGIERR1) RC = 0                                       */
+*                                                                  0282
+*   CTIOTYPE = WORKCTIO;            /* RESTORE I/O REQUEST           */
+@RF00269 LH    @14,@CH00724                                        0282
+         MVC   CTIOTYPE(1,@14),WORKCTIO                            0282
+*   SVC(SIOSVC);                    /* CALL AMDSASIO TO INITIATE I/O */
+         SVC   0                                                   0283
+*   IF RETCODE ^= 0 THEN            /* I/O INITIATED SUCCESSFULLY    */
+         LTR   RETCODE,RETCODE                                     0284
+         BNZ   @RT00284                                            0284
+*     GO TO PGIERR1;                /* NO - ERROR                    */
+*   CTIOTYPE = WORKCTIO;            /* RESTORE I/O REQUEST           */
+         LH    @14,@CH00724                                        0286
+         MVC   CTIOTYPE(1,@14),WORKCTIO                            0286
+*   SVC(WATSVC);                    /* CALL AMDSAWAT TO WAIT FOR I/O
+*                                      COMPLETION                    */
+         SVC   1                                                   0287
+*   IF RETCODE ^= 0 THEN            /* I/O COMPLETED SUCCESSFULLY    */
+         LTR   RETCODE,RETCODE                                     0288
+         BNZ   @RT00288                                            0288
+*     GO TO PGIERR1;                /* NO - ERROR                    */
+*                                                                  0290
+*   /*****************************************************************/
+*   /*                                                               */
+*   /* UPDATE PAGE TABLES AND I/O REQUEST QUEUES                     */
+*   /*                                                               */
+*   /*****************************************************************/
+*/*PGIUPD: P SET VCTUPDR FOR RECURSION                               */
+*/* P RESTORE CTIOTYPE FROM WORK AREA                                */
+*/* L AMDSAUPD: UPDATE I/O QUEUES                                    */
+*/* D (YES,,NO,PGIERR1) RC = 0                                       */
+*                                                                  0290
+*                                                                  0290
+*PGIUPD:                                                           0290
+*   VCTUPDR = ON;                   /* SET AMDSAUPD RECURSION BIT    */
+PGIUPD   OI    VCTUPDR(VCCTREG),B'01000000'                        0290
+*   CTIOTYPE = WORKCTIO;            /* RESTORE I/O REQUEST TYPE      */
+         LH    @14,@CH00724                                        0291
+         MVC   CTIOTYPE(1,@14),WORKCTIO                            0291
+*   SVC(UPDSVC);                    /* CALL AMDSAUPD TO UPDATE PAGE
+*                                      TABLES AND I/O QUEUES         */
+         SVC   9                                                   0292
+*   IF RETCODE ^= 0 THEN            /* OPERATION SUCCESSFUL          */
+         LTR   RETCODE,RETCODE                                     0293
+         BNZ   @RT00293                                            0293
+*     GO TO PGIERR1;                /* NO - ERROR                    */
+*   RESPECIFY RETCODE UNRESTRICTED;                                0295
+*                                                                  0296
+*   /*****************************************************************/
+*   /*                                                               */
+*   /* CLEAN UP - RETURN MDCB TO AVAILABLE QUEUE, FREE SAVE AREA,    */
+*   /* RESTORE REGISTERS, AND RETURN                                 */
+*   /*                                                               */
+*   /*****************************************************************/
+*/*PGICLEAN: P SET VCTPGIR RECURSION BIT                             */
+*/* P RESET RECURSION BITS VCTUPDR                                   */
+*/* P SET CTPGEFLT                                                   */
+*/* P SET FLCPOPSW TO MDCBPSW                                        */
+*/* P SET CONTROL REG 1 TO MDCBSTOR                                  */
+*/* P PURGE HARDWARE TABLE LOOK- ASIDE BUFFER                        */
+*/* P DEQUEUE MDCB FROM ACTIVE QUEUE                                 */
+*/* P ENQUEUE MDCB ON AVAILABLE QUEUE                                */
+*/* P DEQUEUE RCB FROM RCB QUEUE                                     */
+*/* P RESTORE ORIGINAL CTIOTYPE FROM WORK AREA                       */
+*/* L AMDSAFRM: FREE SAVE AREA                                       */
+*/* D (NO,%PGIASM4,YES,) MDCBASMI ON                                 */
+*/* P SET VCTASMIC TO 1                                              */
+*/* D (NO,%PGIASM5,YES) MDCBDUMP ON                                  */
+*/* P TURN VCTSADMP OFF                                              */
+*/*%PGIASM5: P RESET VCTPGIR RECURSION BIT                           */
+*/* P RESTORE REGISTERS FROM MDCB                                    */
+*/* N CONTROL IS RETURNED BY LOADING FLCPOPSW                        */
+*/* R LPSW FLCPOPSW                                                  */
+*                                                                  0296
+*                                                                  0296
+*PGICLEAN:                                                         0296
+*   VCTPGIR = ON;                   /* SET RECURSION FLAG            */
+PGICLEAN DS    0H                                                  0297
+*   VCTUPDR = OFF;                  /* RESET RECURSION FLAG          */
+         OI    VCTPGIR(VCCTREG),B'10000000'                        0297
+         NI    VCTUPDR(VCCTREG),B'10111111'                        0297
+*   CTPGEFLT = ON;                  /* INDICATE PAGING HANDLED     0298
+*                                      SUCCESSFULLY                  */
+         LH    @10,@CH00724                                        0298
+         OI    CTPGEFLT(@10),B'00100000'                           0298
+*   FLCPOPSW = MDCBPSW;             /* RESTORE RESUME PSW            */
+         MVC   FLCPOPSW(8),MDCBPSW(MDCBPTR)                        0299
+*   WORK1 = MDCBSTOR;               /* SEGMENT TABLE ORIGIN          */
+         MVC   WORK1(4),MDCBSTOR(MDCBPTR)                          0300
+*   GENERATE REFS(WORK1) SETS(R1) (LCTL R1,R1,WORK1); /* LOAD      0301
+*                                      ORIGINAL SEGMENT TABLE ORIGIN */
+         LCTL R1,R1,WORK1
+*   GENERATE (PTLB);                /* PURGE HARDWARE TABLE        0302
+*                                      LOOK-ASIDE BUFFER             */
+         PTLB
+*   MDCEACTV = MDCBNEXT;            /* DEQUEUE MDCB FROM ACTIVE QUEUE*/
+         L     @10,VCTMDCE(,VCCTREG)                               0303
+         MVC   MDCEACTV(4,@10),MDCBNEXT(MDCBPTR)                   0303
+*   MDCBNEXT = MDCEAVIL;            /* QUEUE MDCB TO AVAILABLE QUEUE */
+         MVC   MDCBNEXT(4,MDCBPTR),MDCEAVIL(@10)                   0304
+*   MDCEAVIL = MDCBPTR;             /* MAKE MDCB AVAILABLE           */
+         ST    MDCBPTR,MDCEAVIL(,@10)                              0305
+*   RESPECIFY RCB BASED(ADDR(WORKRCB));                            0306
+*   VCTRCB = RCBNEXT;               /* DEQUEUE RCB FROM RCB QUEUE    */
+         LA    @10,WORKRCB                                         0307
+         MVC   VCTRCB(4,VCCTREG),RCBNEXT(@10)                      0307
+*   CTIOTYPE = WORKCTI2;            /* RESTORE ORIGINAL CTIOTYPE     */
+         LH    @10,@CH00724                                        0308
+         MVC   CTIOTYPE(1,@10),WORKCTI2                            0308
+*   RESPECIFY R1 RESTRICTED;                                       0309
+*   R1 = R8;                        /* ADDRESS OF AREA TO BE FREED   */
+         LR    R1,R8                                               0310
+*   SVC(FRMSVC);                    /* CALL AMDSAFRM TO FREE STORAGE */
+         SVC   5                                                   0311
+*   RESPECIFY R1 UNRESTRICTED;                                     0312
+*   IF MDCBASMI = ON THEN           /* DID ASM FUNCTION GET INTERRUPT*/
+         TM    MDCBASMI(MDCBPTR),B'10000000'                       0313
+         BNO   @RF00313                                            0313
+*     VCTASMIC = ON;                /* YES - INDICATE ASM IN CONTROL
+*                                      AGAIN                         */
+         OI    VCTASMIC(VCCTREG),B'00100000'                       0314
+*   IF MDCBDUMP = ON THEN           /* NO DUMP FOR MODULE THAT GOT 0315
+*                                      PROGRAM CHECK                 */
+@RF00313 TM    MDCBDUMP(MDCBPTR),B'01000000'                       0315
+         BNO   @RF00315                                            0315
+*     VCTSADMP = OFF;               /* YES - RESET DUMP REQUEST FLAG */
+         NI    VCTSADMP(VCCTREG),B'01111111'                       0316
+*   VCTPGIR = OFF;                  /* RESET RECURSION BIT           */
+@RF00315 NI    VCTPGIR(VCCTREG),B'01111111'                        0317
+*   GEN(LM    R0,R15,MDCBGRS(MDCBPTR)); /* RESTORE REGISTERS         */
+         LM    R0,R15,MDCBGRS(MDCBPTR)
+*   LPSW (FLCPOPSW);                /* RESTART INTERRUPTED PROGRAM   */
+         LPSW  FLCPOPSW                                            0319
+*                                                                  0320
+*   /*****************************************************************/
+*   /*                                                               */
+*   /* ERROR DURING PROCESSING - FREE SAVE AREA IF ONE HAS BEEN      */
+*   /* OBTAINED. RETURN MDCB TO AVAILABLE QUEUE AND GO TO PURGE      */
+*   /* WORKFILE AND PAGE DATA SET I/O REQUEST QUEUES.                */
+*   /*                                                               */
+*   /*****************************************************************/
+*/*PGIERR1: P DEQUEUE RCB FROM RCB QUEUE                             */
+*/* P RESTORE ORIGINAL CTIOTYPE                                      */
+*/* L AMDSAFRM: FREE SAVE AREA                                       */
+*/*PGIERR2: P DEQUEUE MDCB FROM ACTIVE QUEUE                         */
+*/* P ENQUEUE MDCB ON AVAILABLE QUEUE                                */
+*/* P MOVE REGS FROM MDCB TO LOW CORE                                */
+*/* P (,PGIPURGE) RESET CTPGEFLT                                     */
+*                                                                  0320
+*   RESPECIFY R1 RESTRICTED;                                       0320
+*                                                                  0320
+*PGIERR1:                                                          0321
+*   RESPECIFY RCB BASED(ADDR(WORKRCB));                            0321
+PGIERR1  DS    0H                                                  0322
+*   VCTRCB = RCBNEXT;               /* DEQUEUE RCB FROM RCB QUEUE    */
+         LA    @10,WORKRCB                                         0322
+         MVC   VCTRCB(4,VCCTREG),RCBNEXT(@10)                      0322
+*   CTIOTYPE = WORKCTI2;            /* RESTORE ORIGINAL CTIOTYPE     */
+         LH    @10,@CH00724                                        0323
+         MVC   CTIOTYPE(1,@10),WORKCTI2                            0323
+*   R1 = R8;                        /* ADDRESS OF AREA TO BE FREED   */
+         LR    R1,R8                                               0324
+*   SVC(FRMSVC);                    /* CALL AMDSAFRM TO FREE STORAGE */
+         SVC   5                                                   0325
+*   RESPECIFY R1 UNRESTRICTED;                                     0326
+*                                                                  0326
+*PGIERR2:                                                          0327
+*   MDCEACTV = MDCBNEXT;            /* DEQUEUE MDCB FROM ACTIVE QUEUE*/
+PGIERR2  L     @10,VCTMDCE(,VCCTREG)                               0327
+         MVC   MDCEACTV(4,@10),MDCBNEXT(MDCBPTR)                   0327
+*   MDCBNEXT = MDCEAVIL;            /* QUEUE MDCB TO AVAILABLE QUEUE */
+         MVC   MDCBNEXT(4,MDCBPTR),MDCEAVIL(@10)                   0328
+*   MDCEAVIL = MDCBPTR;             /* MAKE MDCB AVAILABLE           */
+         ST    MDCBPTR,MDCEAVIL(,@10)                              0329
+*   CTPGEFLT = OFF;                 /* RESET PAGE-FAULT PROCESSED BIT*/
+         LH    @10,@CH00724                                        0330
+         NI    CTPGEFLT(@10),B'11011111'                           0330
+*   PGISAVE(1:64) = MDCBGRS;        /* RESTORE INTERRUPTED PROGRAM 0331
+*                                      REGISTERS                     */
+         MVC   PGISAVE(64),MDCBGRS(MDCBPTR)                        0331
+*   GO TO PGIPURGE;                 /* GO TO PURGE I/O REQUEST QUEUES*/
+         B     PGIPURGE                                            0332
+*                                                                  0333
+*   /*****************************************************************/
+*   /*                                                               */
+*   /* HANDLE INVALID RECURSIONS THROUGH AMDSAPGI OR CASE WHERE THERE*/
+*   /* IS NO MDCB AVAILABLE. INVOKE AMDSAAUD TO TAKE A DUMP.         */
+*   /*                                                               */
+*   /*****************************************************************/
+*/*PGIERROR: N HANDLES INVALID RECURSIONS                            */
+*/* P ENQUEUE RCB TO VCTRCB                                          */
+*/* P SET VCTSADMP                                                   */
+*/* P TURN OFF VCTASMIC                                              */
+*/* P SET ERROR CODE FOR RECURSION                                   */
+*/* L AMDSAAUD: TAKE DUMP                                            */
+*                                                                  0333
+*                                                                  0333
+*PGIERROR:                                                         0333
+*   RESPECIFY RCB BASED(ADDR(PGIRCB));                             0333
+PGIERROR DS    0H                                                  0334
+*   RCBNEXT = VCTRCB;               /* ENQUEUE RCB FOR ERROR RECOVERY*/
+         LA    @10,PGIRCB                                          0334
+         MVC   RCBNEXT(4,@10),VCTRCB(VCCTREG)                      0334
+*   RCBBASE = BASEREG;              /* SAVE BASE REGISTER VALUE      */
+         ST    BASEREG,RCBBASE(,@10)                               0335
+*   VCTRCB = ADDR(PGIRCB);          /* MAKE RCB CURRENT              */
+         ST    @10,VCTRCB(,VCCTREG)                                0336
+*   VCTSADMP = ON;                  /* REQUEST DUMP TO BE TAKEN      */
+*   VCTASMIC = OFF;                 /* RESET ASM IN CONTROL FLAG     */
+         OI    VCTSADMP(VCCTREG),B'10000000'                       0338
+         NI    VCTASMIC(VCCTREG),B'11011111'                       0338
+*   VCTAUDIT = PGIRECSN;            /* SET PGI RECURSION CODE        */
+         MVC   VCTAUDIT(2,VCCTREG),@CH00923                        0339
+*   SVC(AUDSVC);                    /* CALL AMDSAAUD TO TAKE DUMP    */
+         SVC   13                                                  0340
+*                                                                  0341
+*   /*****************************************************************/
+*   /*                                                               */
+*   /* RCB EXIT - RECEIVES CONTROL FROM AMDSAAUD FOLLOWING DUMP.     */
+*   /* DEQUEUE RCB AND PURGE WORKFILE AND PAGE DATA SET I/O REQUEST  */
+*   /* QUEUES. CALL AMDSAAUD TO RETURN CONTROL TO NEXT RCB EXIT      */
+*   /* WITHOUT ANOTHER DUMP.                                         */
+*   /*                                                               */
+*   /*****************************************************************/
+*/* N RCB EXIT RECEIVES CONTROL FROM AMDSAAUD                        */
+*/* P DEQUEUE RCB                                                    */
+*/* P SAVE CTIOTYPE REQUESTED                                        */
+*/*PGIPURGE: P SET VCTUPDR FOR RECURSION                             */
+*/*PGIDPRG: P SET CTIOTYPE TO CTIODA                                 */
+*/* L AMDSAUPD: PURGE DIRECT ACCESS QUEUE                            */
+*/* D (YES,,NO,PGIDPRG) RC = 8 QUEUE EMPTY                           */
+*/*PGIWPRG: P SET CTIOTYPE TO CTIOWK                                 */
+*/* L AMDSAUPD: PURGE WORKFILE QUEUE                                 */
+*/* D (YES,,NO,PGIWPRG) RC = 8 QUEUE EMPTY                           */
+*/* P RESTORE ORIGINAL CTIOTYPE                                      */
+*/* P TURN OFF VCTSADMP                                              */
+*                                                                  0341
+*                                                                  0341
+*PGIEXIT:                                                          0341
+*   VCTRCB = RCBNEXT;               /* DEQUEUE RCB FROM RCB QUEUE    */
+*                                                                  0341
+PGIEXIT  LA    @10,PGIRCB                                          0341
+         MVC   VCTRCB(4,VCCTREG),RCBNEXT(@10)                      0341
+*PGIPURGE:                                                         0342
+*   VCTUPDR = ON;                   /* SET AMDSAUPD RECURSION BIT TO
+*                                      HANDLE RECURSIONS DURING ERROR
+*                                      RECOVERY                      */
+PGIPURGE OI    VCTUPDR(VCCTREG),B'01000000'                        0342
+*   WORK1 = CTIOTYPE;               /* SAVE REQUESTED CTIOTYPE       */
+         LH    @10,@CH00724                                        0343
+         SR    @09,@09                                             0343
+         IC    @09,CTIOTYPE(,@10)                                  0343
+         ST    @09,WORK1                                           0343
+*   CTIOTYPE = 0;                   /* RESET I/O REQUEST FLAGS       */
+         MVI   CTIOTYPE(@10),X'00'                                 0344
+*   RESPECIFY RETCODE RESTRICTED;                                  0345
+*   RETCODE = 0;                    /* SET UP 0 COUNTER              */
+         SR    RETCODE,RETCODE                                     0346
+*   DO WHILE RETCODE ^= 8;          /* PURGE PAGE DATA SET I/O     0347
+*                                      REQUEST QUEUE                 */
+         B     @DE00347                                            0347
+@DL00347 DS    0H                                                  0348
+*     CTIODA = ON;                  /* REQUEST PAGE DATA SET I/O   0348
+*                                      QUEUE                         */
+         LH    @14,@CH00724                                        0348
+         OI    CTIODA(@14),B'00100000'                             0348
+*     SVC(UPDSVC);                  /* CALL AMDSAUPD TO UPDATE I/O 0349
+*                                      QUEUE                         */
+         SVC   9                                                   0349
+*   END;                                                           0350
+@DE00347 CH    RETCODE,@CH00037                                    0350
+         BNE   @DL00347                                            0350
+*   CTIODA = OFF;                   /* RESET PAGE DATA SET REQUEST 0351
+*                                      FLAG                          */
+         LH    @14,@CH00724                                        0351
+         NI    CTIODA(@14),B'11011111'                             0351
+*   RETCODE = 0;                    /* SET UP 0 COUNTER              */
+         SR    RETCODE,RETCODE                                     0352
+*   DO WHILE RETCODE ^= 8;          /* PURGE WORKFILE I/O REQUEST  0353
+*                                      QUEUE                         */
+         B     @DE00353                                            0353
+@DL00353 DS    0H                                                  0354
+*     CTIOWK = ON;                  /* REQUEST WORKFILE I/O QUEUE    */
+         LH    @14,@CH00724                                        0354
+         OI    CTIOWK(@14),B'00010000'                             0354
+*     SVC(UPDSVC);                  /* CALL AMDSAUPD TO UPDATE I/O 0355
+*                                      QUEUE                         */
+         SVC   9                                                   0355
+*   END;                                                           0356
+@DE00353 CH    RETCODE,@CH00037                                    0356
+         BNE   @DL00353                                            0356
+*   VCTSADMP = OFF;                 /* INDICATE NO DUMP TO BE TAKEN  */
+         NI    VCTSADMP(VCCTREG),B'01111111'                       0357
+*   CTIOTYPE = WORK1;               /* RESTORE REQUESTED CTIOTYPE    */
+         LH    @14,@CH00724                                        0358
+         MVC   CTIOTYPE(1,@14),WORK1+3                             0358
+*                                                                  0359
+*   /*****************************************************************/
+*   /*                                                               */
+*   /* NON-PAGING PROGRAM INTERRUPT.  GO TO AMDSAAUD TO PERFORM      */
+*   /* ERROR RECOVERY AND GET TO FIRST RCB EXIT.                     */
+*   /*                                                               */
+*   /*****************************************************************/
+*/*PGIAUD: P RESET RECURSION BITS VCTPGIR, VCTUPDR, VCTRSMR          */
+*/* P RESTORE REGISTERS FROM PGISAVE                                 */
+*/* P TURN OFF VCTASMIC                                              */
+*/* N CALL AMDSAAUD. CONTROL WILL GO TO 1ST RCB EXIT.                */
+*/* R AMDSAAUD: HANDLE ERROR RECOVERY                                */
+*/*AMDSAPGI: END                                                     */
+*                                                                  0359
+*                                                                  0359
+*PGIAUD:                                                           0359
+*   VCTPGIR = OFF;                  /* RESET RECURSION FLAG          */
+PGIAUD   DS    0H                                                  0360
+*   VCTUPDR = OFF;                  /* RESET RECURSION FLAG          */
+*   VCTRSMR = OFF;                  /* RESET RECURSION FLAG          */
+         NI    VCTPGIR(VCCTREG),B'00101111'                        0361
+*   VCTASMIC = OFF;                 /* INDICATE ASM NOT IN CONTROL   */
+         NI    VCTASMIC(VCCTREG),B'11011111'                       0362
+*   GEN(LM    R0,R15,PGISAVE);      /* RESTORE REGISTERS             */
+         LM    R0,R15,PGISAVE
+*   SVC(AUDSVC);                    /* CALL AMDSAAUD - CONTROL WILL
+*                                      BE PASSED TO NEXT HIGHER RCB
+*                                      EXIT                          */
+         SVC   13                                                  0364
+*   END AMDSAPGI                                                   0365
+*/* THE FOLLOWING INCLUDE STATEMENTS WERE FOUND IN THIS PROGRAM.      *
+*/*%INCLUDE SYSLIB  (IHAPSA  )                                        *
+*/*%INCLUDE SYSLIB  (AMDSARMK)                                        *
+*;                                                                 0365
+@DATA    DS    0H
+@CH00037 DC    H'8'
+@CH00724 DC    H'28672'
+@CH00584 DC    H'30712'
+@CH00911 DC    XL2'0012'
+@CH00913 DC    XL2'0011'
+@CH00915 DC    XL2'0010'
+@CH00923 DC    XL2'F000'
+@DATD    DSECT
+         DS    0F
+@SA00001 DS    18F
+AMDSAPGI CSECT
+         DS    0F
+@CF00921 DC    F'65536'
+@CF00917 DC    XL4'FFFFF000'
+@DATD    DSECT
+         DS    0D
+WORKCTIO DS    CL1
+WORKCTI2 DS    CL1
+WORKCTBU DS    CL1
+         DS    CL1
+WORKRCB  DS    CL20
+         ORG   *+1-(*-@DATD)/(*-@DATD) INSURE DSECT DATA
+@ENDDATD EQU   *
+AMDSAPGI CSECT
+         NOPR  ((@ENDDATD-@DATD)/257*16)
+         DS    0F
+@SIZDATD DC    AL1(0)
+         DC    AL3(@ENDDATD-@DATD)
+@CA00908 DC    A(IODBWORK)
+         DS    0D
+WORK1    DC    A(0)
+PGIRCB   DS    CL20
+         ORG   PGIRCB
+@NM00055 DC    2A(0)
+@NM00056 DC    AL4(PGINAME)
+@NM00057 DC    AL4(PGIEXIT)
+@NM00058 DC    A(0)
+         ORG   PGIRCB+20
+PGIPATCH DC    15F'0'
+@00      EQU   00                      EQUATES FOR REGISTERS 0-15
+@01      EQU   01
+@02      EQU   02
+@03      EQU   03
+@04      EQU   04
+@05      EQU   05
+@06      EQU   06
+@07      EQU   07
+@08      EQU   08
+@09      EQU   09
+@10      EQU   10
+@11      EQU   11
+@12      EQU   12
+@13      EQU   13
+@14      EQU   14
+@15      EQU   15
+VCCTREG  EQU   @12
+RETCODE  EQU   @15
+BASEREG  EQU   @11
+R0       EQU   @00
+R1       EQU   @01
+R8       EQU   @08
+R13      EQU   @13
+R15      EQU   @15
+MDCBPTR  EQU   @02
+RETREG   EQU   @14
+R10      EQU   @10
+R11      EQU   @11
+R12      EQU   @12
+R14      EQU   @14
+R2       EQU   @02
+R3       EQU   @03
+R4       EQU   @04
+R5       EQU   @05
+R6       EQU   @06
+R7       EQU   @07
+R9       EQU   @09
+         EXTRN IODBWORK
+PSA      EQU   0
+FLCRNPSW EQU   PSA
+FLCROPSW EQU   PSA+8
+FLCICCW2 EQU   PSA+16
+FLCPOPSW EQU   PSA+40
+PSAEEPSW EQU   PSA+132
+PSAESPSW EQU   PSA+136
+FLCSVILC EQU   PSAESPSW+1
+PSAEPPSW EQU   PSA+140
+FLCPIILC EQU   PSAEPPSW+1
+FLCPICOD EQU   PSAEPPSW+2
+PSAPICOD EQU   FLCPICOD+1
+FLCTEA   EQU   PSAEPPSW+4
+FLCPER   EQU   PSA+152
+FLCMCLA  EQU   PSA+168
+FLCIOEL  EQU   FLCMCLA+4
+FLCIOA   EQU   FLCMCLA+16
+FLCFSA   EQU   FLCMCLA+80
+PSASUPER EQU   PSA+552
+PSASUP1  EQU   PSASUPER
+PSASUP2  EQU   PSASUPER+1
+PSASUP3  EQU   PSASUPER+2
+PSASUP4  EQU   PSASUPER+3
+PSACLHT  EQU   PSA+640
+PSALKSA  EQU   PSA+696
+PSAHLHI  EQU   PSA+760
+PSASTOR  EQU   PSA+796
+PSADSSFL EQU   PSA+836
+PSADSSF1 EQU   PSADSSFL
+PSADSSF3 EQU   PSADSSFL+2
+PSADSSF4 EQU   PSADSSFL+3
+PSARSVT  EQU   PSA+896
+SADMPLSD EQU   3312
+PGINAME  EQU   SADMPLSD+264
+PGISAVE  EQU   SADMPLSD+268
+ARB      EQU   0
+BCTH     EQU   0
+BCT      EQU   0
+BCTLPID  EQU   BCT+28
+BCTFLGT  EQU   BCT+44
+BCTFLGI  EQU   BCT+45
+CCT      EQU   0
+CTFLG1   EQU   CCT+1
+CTFLG2   EQU   CCT+2
+CTPGEFLT EQU   CTFLG2
+CTLOWFLG EQU   CCT+48
+CTDMPTYP EQU   CCT+52
+CTIOTYPE EQU   CTDMPTYP
+CTIODA   EQU   CTIOTYPE
+CTIOWK   EQU   CTIOTYPE
+CTCONFLG EQU   CTDMPTYP+2
+CTBUFTYP EQU   CTDMPTYP+3
+CTWKFLE  EQU   CTBUFTYP
+CTLWKAD  EQU   CTDMPTYP+8
+CTVCCT   EQU   CTDMPTYP+20
+CTPRMT1  EQU   CTDMPTYP+24
+CTPRMT2  EQU   CTDMPTYP+26
+CCW      EQU   0
+CCWFLAGS EQU   CCW+4
+CSW      EQU   0
+CSWKEY00 EQU   CSW
+CSWUSTAT EQU   CSW+4
+CSWCSTAT EQU   CSW+5
+DSCE     EQU   0
+IODB     EQU   0
+IODBFLAG EQU   IODB+8
+IODBCCHH EQU   IODB+32
+IODBSRCH EQU   IODBCCHH+3
+IODBR    EQU   IODBCCHH+7
+MDCE     EQU   0
+MDCEACTV EQU   MDCE+4
+MDCEAVIL EQU   MDCE+8
+MDCB     EQU   0
+MDCBNEXT EQU   MDCB+4
+MDCBPSW  EQU   MDCB+8
+MDCBGRS  EQU   MDCB+16
+MDCBSTOR EQU   MDCB+80
+MDCBPI   EQU   MDCB+84
+MDCBFLGS EQU   MDCB+86
+MDCBASMI EQU   MDCBFLGS
+MDCBDUMP EQU   MDCBFLGS
+PSW      EQU   0
+PSWSM    EQU   PSW
+@NM00047 EQU   PSW+1
+PSWCCPM  EQU   PSW+2
+@NM00050 EQU   PSW+3
+PTRT     EQU   0
+PTRTRS   EQU   PTRT+8
+PTRTRSA  EQU   0
+RCB      EQU   0
+RCBNEXT  EQU   RCB
+RCBSAVE  EQU   RCB+8
+RCBEXIT  EQU   RCB+12
+RCBBASE  EQU   RCB+16
+VCCT     EQU   0
+VCTRCB   EQU   VCCT+4
+VCTRECSN EQU   VCCT+8
+VCTPGIR  EQU   VCTRECSN
+VCTUPDR  EQU   VCTRECSN
+VCTRSMR  EQU   VCTRECSN
+VCTFLGS  EQU   VCCT+9
+VCTSADMP EQU   VCTFLGS
+VCTASMIC EQU   VCTFLGS
+VCTMDCE  EQU   VCCT+12
+VCTSTOR  EQU   VCCT+16
+VCTDSCE  EQU   VCCT+20
+VCTBCTH  EQU   VCCT+24
+VCTAUDIT EQU   VCCT+62
+VCTCBID  EQU   VCCT+64
+VCTEXTRA EQU   VCCT+100
+SDL      EQU   0
+REGLOCAL EQU   0
+SAVEFORM EQU   0
+SAVENAME EQU   SAVEFORM+1
+PTRTVSA  EQU   0
+PSARSVTE EQU   PSARSVT
+CTLOWDMP EQU   CTDMPTYP
+WORKPTR  EQU   WORK1+1
+FLC      EQU   PSA
+         AGO   .@UNREFD                START UNREFERENCED COMPONENTS
+CTADDRE  EQU   CTLOWDMP+4
+CTADDRS  EQU   CTLOWDMP
+PSARSAV  EQU   PSARSVTE+60
+PSARSTK  EQU   PSARSVTE+56
+PSAESAV3 EQU   PSARSVTE+52
+PSAESTK3 EQU   PSARSVTE+48
+PSAESAV2 EQU   PSARSVTE+44
+PSAESTK2 EQU   PSARSVTE+40
+PSAESAV1 EQU   PSARSVTE+36
+PSAESTK1 EQU   PSARSVTE+32
+PSAPSAV  EQU   PSARSVTE+28
+PSAPSTK  EQU   PSARSVTE+24
+PSAMSAV  EQU   PSARSVTE+20
+PSAMSTK  EQU   PSARSVTE+16
+PSASSAV  EQU   PSARSVTE+12
+PSASSTK  EQU   PSARSVTE+8
+PSANSTK  EQU   PSARSVTE+4
+PSACSTK  EQU   PSARSVTE
+SAVER12  EQU   SAVEFORM+68
+SAVER11  EQU   SAVEFORM+64
+SAVER10  EQU   SAVEFORM+60
+SAVER9   EQU   SAVEFORM+56
+SAVER8   EQU   SAVEFORM+52
+SAVER7   EQU   SAVEFORM+48
+SAVER6   EQU   SAVEFORM+44
+SAVER5   EQU   SAVEFORM+40
+SAVER4   EQU   SAVEFORM+36
+SAVER3   EQU   SAVEFORM+32
+SAVER2   EQU   SAVEFORM+28
+SAVER1   EQU   SAVEFORM+24
+SAVER0   EQU   SAVEFORM+20
+SAVER15  EQU   SAVEFORM+16
+SAVER14  EQU   SAVEFORM+12
+SAVENEXT EQU   SAVEFORM+8
+SAVEBACK EQU   SAVEFORM+4
+SAVEID   EQU   SAVEFORM
+REGL15   EQU   REGLOCAL+60
+REGL14   EQU   REGLOCAL+56
+REGL13   EQU   REGLOCAL+52
+REGL12   EQU   REGLOCAL+48
+REGL11   EQU   REGLOCAL+44
+REGL10   EQU   REGLOCAL+40
+REGL9    EQU   REGLOCAL+36
+REGL8    EQU   REGLOCAL+32
+REGL7    EQU   REGLOCAL+28
+REGL6    EQU   REGLOCAL+24
+REGL5    EQU   REGLOCAL+20
+REGL4    EQU   REGLOCAL+16
+REGL3    EQU   REGLOCAL+12
+REGL2    EQU   REGLOCAL+8
+REGL1    EQU   REGLOCAL+4
+REGL0    EQU   REGLOCAL
+SDLSPN   EQU   SDL+1
+SDLNUM   EQU   SDL
+VCTVCCTV EQU   VCCT+108
+VCTCCTV  EQU   VCCT+104
+@NM00054 EQU   VCCT+102
+VCTCPOUT EQU   VCCT+96
+VCTSVCTB EQU   VCCT+92
+VCTPGT   EQU   VCCT+88
+VCTLPA   EQU   VCCT+84
+VCTCBADR EQU   VCCT+80
+VCTJBNME EQU   VCCT+72
+VCTCBIDN EQU   VCTCBID+7
+@NM00053 EQU   VCTCBID
+VCTASID  EQU   VCCT+60
+VCTPTRT  EQU   VCCT+56
+VCTMASCB EQU   VCCT+52
+VCTASCB  EQU   VCCT+48
+VCTCPUC  EQU   VCCT+46
+VCTWKC   EQU   VCCT+45
+VCTWKHI  EQU   VCCT+44
+VCTSUBPL EQU   VCCT+40
+VCTARB   EQU   VCCT+36
+VCTIODB  EQU   VCCT+32
+VCTBCTC  EQU   VCCT+28
+VCTRECVA EQU   VCCT+10
+@NM00052 EQU   VCTFLGS
+VCTLRCLM EQU   VCTFLGS
+VCTARCLM EQU   VCTFLGS
+VCTMEMIN EQU   VCTFLGS
+@NM00051 EQU   VCTRECSN
+VCTEXIR  EQU   VCTRECSN
+VCTVCT   EQU   VCCT
+RCBSTOR  EQU   RCB+4
+PTRTVS   EQU   PTRT+1032
+PTRTLGID EQU   PTRT+4
+PTRTPTRT EQU   PTRT
+PSWEND   EQU   PSW+8
+PSWIA    EQU   PSW+4
+PSWSP    EQU   @NM00050
+PSWSIG   EQU   PSWCCPM
+PSWEU    EQU   PSWCCPM
+PSWDO    EQU   PSWCCPM
+PSWFPO   EQU   PSWCCPM
+@NM00049 EQU   PSWCCPM
+@NM00048 EQU   PSWCCPM
+PSWPRBLM EQU   @NM00047
+PSWAIT   EQU   @NM00047
+PSWMCH   EQU   @NM00047
+PSWMODE  EQU   @NM00047
+PSWKEY   EQU   @NM00047
+PSWXTRNL EQU   PSWSM
+PSWIO    EQU   PSWSM
+PSWDAT   EQU   PSWSM
+@NM00046 EQU   PSWSM
+@NM00045 EQU   PSWSM
+@NM00044 EQU   PSWSM
+PSWPER   EQU   PSWSM
+@NM00043 EQU   PSWSM
+@NM00042 EQU   MDCB+87
+@NM00041 EQU   MDCBFLGS
+MDCBGR15 EQU   MDCBGRS+60
+MDCBGR14 EQU   MDCBGRS+56
+MDCBGR13 EQU   MDCBGRS+52
+MDCBGR12 EQU   MDCBGRS+48
+MDCBGR11 EQU   MDCBGRS+44
+MDCBGR10 EQU   MDCBGRS+40
+MDCBGR9  EQU   MDCBGRS+36
+MDCBGR8  EQU   MDCBGRS+32
+MDCBGR7  EQU   MDCBGRS+28
+MDCBGR6  EQU   MDCBGRS+24
+MDCBGR5  EQU   MDCBGRS+20
+MDCBGR4  EQU   MDCBGRS+16
+MDCBGR3  EQU   MDCBGRS+12
+MDCBGR2  EQU   MDCBGRS+8
+MDCBGR1  EQU   MDCBGRS+4
+MDCBGR0  EQU   MDCBGRS
+MDCBMDCB EQU   MDCB
+MDCEMDCE EQU   MDCE
+IODBSENS EQU   IODB+40
+IODBHH   EQU   IODBSRCH+2
+IODBCC   EQU   IODBSRCH
+IODBSEEK EQU   IODBCCHH+1
+IODBM    EQU   IODBCCHH
+IODBCSW  EQU   IODB+24
+IODBCAW  EQU   IODB+20
+IODBBCT  EQU   IODB+16
+IODBCPU  EQU   IODB+14
+IODBTYPE EQU   IODB+13
+IODBCLAS EQU   IODB+12
+IODBDEV  EQU   IODB+10
+@NM00040 EQU   IODBFLAG+1
+IODBSTRT EQU   IODBFLAG
+IODBCONW EQU   IODBFLAG
+IODBACTV EQU   IODBFLAG
+IODBHALT EQU   IODBFLAG
+IODBIOC  EQU   IODBFLAG
+IODBINT  EQU   IODBFLAG
+IODBPTRM EQU   IODBFLAG
+IODBTERM EQU   IODBFLAG
+IODBIDEN EQU   IODB+4
+IODBIODB EQU   IODB
+DSCETEND EQU   DSCE+20
+DSCETCUR EQU   DSCE+16
+DSCETBEG EQU   DSCE+12
+DSCENEXT EQU   DSCE+8
+DSCEBEGN EQU   DSCE+4
+DSCEDSCE EQU   DSCE
+CSWCNT   EQU   CSW+6
+CSWCHC   EQU   CSWCSTAT
+CSWICC   EQU   CSWCSTAT
+CSWCCC   EQU   CSWCSTAT
+CSWCDC   EQU   CSWCSTAT
+CSWPTC   EQU   CSWCSTAT
+CSWPGC   EQU   CSWCSTAT
+CSWIL    EQU   CSWCSTAT
+CSWPCI   EQU   CSWCSTAT
+CSWUE    EQU   CSWUSTAT
+CSWUC    EQU   CSWUSTAT
+CSWDE    EQU   CSWUSTAT
+CSWCE    EQU   CSWUSTAT
+CSWBUSY  EQU   CSWUSTAT
+CSWCUE   EQU   CSWUSTAT
+CSWSTMOD EQU   CSWUSTAT
+CSWATTN  EQU   CSWUSTAT
+CSWCADDR EQU   CSW+1
+@NM00039 EQU   CSWKEY00
+CSWKEY   EQU   CSWKEY00
+CCWCNT   EQU   CCW+6
+@NM00038 EQU   CCW+5
+@NM00037 EQU   CCWFLAGS
+CCWIDA   EQU   CCWFLAGS
+CCWPCI   EQU   CCWFLAGS
+CCWSKIP  EQU   CCWFLAGS
+CCWSLI   EQU   CCWFLAGS
+CCWCC    EQU   CCWFLAGS
+CCWDC    EQU   CCWFLAGS
+CCWDADDR EQU   CCW+1
+CCWCMD   EQU   CCW
+CTHWMAX  EQU   CTDMPTYP+29
+CTHWM    EQU   CTDMPTYP+28
+CTPRMT2X EQU   CTPRMT2+1
+CTPRMT2Y EQU   CTPRMT2
+CTPRMT1X EQU   CTPRMT1+1
+CTPRMT1Y EQU   CTPRMT1
+CTEOR    EQU   CTDMPTYP+16
+CTCOMMIO EQU   CTDMPTYP+12
+CTCONSOL EQU   CTDMPTYP+4
+@NM00036 EQU   CTBUFTYP
+CTDUMP   EQU   CTBUFTYP
+CTLSQA   EQU   CTBUFTYP
+CTASM    EQU   CTBUFTYP
+CTPGT    EQU   CTBUFTYP
+@NM00035 EQU   CTBUFTYP
+@NM00034 EQU   CTCONFLG
+CTREAD   EQU   CTCONFLG
+CTMSGOUT EQU   CTCONFLG
+@NM00033 EQU   CTDMPTYP+1
+@NM00032 EQU   CTIOTYPE
+CTIORSET EQU   CTIOTYPE
+CTIOINT  EQU   CTIOTYPE
+CTIOCON  EQU   CTIOTYPE
+CTIOOUT  EQU   CTIOTYPE
+CTIOTERM EQU   CTIOTYPE
+CTEBCOPR EQU   CCT+49
+@NM00031 EQU   CTLOWFLG
+CTWKSTUS EQU   CTLOWFLG
+CTINIT   EQU   CTLOWFLG
+CTFP     EQU   CTLOWFLG
+CTVIRTD  EQU   CTLOWFLG
+CTEBCOPD EQU   CCT+45
+CTCONTYP EQU   CCT+44
+CTOUTAD  EQU   CCT+42
+CTCPUI   EQU   CCT+40
+CTERBCON EQU   CCT+36
+CTERBTPE EQU   CCT+32
+CTERBDA  EQU   CCT+28
+CTCCHHW  EQU   CCT+24
+CTCCHHE  EQU   CCT+20
+CTCCHHS  EQU   CCT+16
+CTPGECNT EQU   CCT+15
+CTCCHHR  EQU   CCT+8
+CTINADDR EQU   CCT+6
+CTSENSE  EQU   CCT+4
+CTDEVTYP EQU   CCT+3
+@NM00030 EQU   CTFLG2
+CTALTCON EQU   CTFLG2
+CTWKDONE EQU   CTFLG2
+CTVIRTR  EQU   CTFLG2
+CTNOSTAT EQU   CTFLG2
+CTSTOR   EQU   CTFLG2
+CTDUPSW  EQU   CTFLG2
+CTERREC  EQU   CTFLG1
+CTMP     EQU   CTFLG1
+@NM00029 EQU   CTFLG1
+CTDEFO   EQU   CTFLG1
+CTWORK   EQU   CTFLG1
+CTMORTPE EQU   CTFLG1
+CTDEVICE EQU   CTFLG1
+CTERROR  EQU   CTFLG1
+CTWAIT   EQU   CCT
+@NM00028 EQU   BCT+46
+BCTRECLM EQU   BCTFLGI
+BCTIOERR EQU   BCTFLGI
+BCTALLOC EQU   BCTFLGI
+BCTCOMP  EQU   BCTFLGI
+@NM00027 EQU   BCTFLGT
+BCTPGTF  EQU   BCTFLGT
+BCTDUMP  EQU   BCTFLGT
+BCTLSQA  EQU   BCTFLGT
+BCTASM   EQU   BCTFLGT
+BCTPGT   EQU   BCTFLGT
+BCTWKFLE EQU   BCTFLGT
+@NM00026 EQU   BCTFLGT
+BCTRBA   EQU   BCT+40
+BCTAMB   EQU   BCT+36
+@NM00025 EQU   BCTLPID+4
+BCTLGN   EQU   BCTLPID
+BCTMDCB  EQU   BCT+24
+BCTPGTE  EQU   BCT+20
+BCTRADDR EQU   BCT+16
+BCTVADDR EQU   BCT+12
+BCTASID  EQU   BCT+10
+BCTKEY2  EQU   BCT+9
+BCTKEY1  EQU   BCT+8
+BCTNEXT  EQU   BCT+4
+BCTBCT   EQU   BCT
+BCTHLAST EQU   BCTH+8
+BCTHFRST EQU   BCTH+4
+BCTHBCTH EQU   BCTH
+ARBADDRE EQU   ARB+4
+ARBADDRB EQU   ARB
+GTMSAVE  EQU   SADMPLSD+684
+GTMNAME  EQU   SADMPLSD+680
+FRMSAVE  EQU   SADMPLSD+580
+FRMNAME  EQU   SADMPLSD+576
+AUDSAVE  EQU   SADMPLSD+476
+AUDNAME  EQU   SADMPLSD+472
+IOISAVE  EQU   SADMPLSD+372
+IOINAME  EQU   SADMPLSD+368
+SVISAVE  EQU   SADMPLSD+164
+SVINAME  EQU   SADMPLSD+160
+LOWCRS   EQU   SADMPLSD+96
+LOWGRS   EQU   SADMPLSD+32
+SAVEDUMP EQU   SADMPLSD+24
+AUDPSW   EQU   SADMPLSD+16
+SVIRPSW  EQU   SADMPLSD+8
+PSWSADMP EQU   SADMPLSD
+@NM00024 EQU   PSA+3412
+PSASTAK  EQU   PSA+3072
+@NM00023 EQU   PSA+1024
+PSAUSEND EQU   PSA+1024
+PSARV060 EQU   PSA+1020
+PSARV059 EQU   PSA+1018
+PSASVC13 EQU   PSA+1016
+PSALSFCC EQU   PSA+1012
+PSASFACC EQU   PSA+1008
+PSASTOP  EQU   PSA+992
+PSASTART EQU   PSA+976
+PSARSPSW EQU   PSA+968
+PSASRPSW EQU   PSA+960
+PSARV045 EQU   PSA+892
+PSARV044 EQU   PSA+888
+PSARV043 EQU   PSA+884
+PSARV042 EQU   PSA+880
+PSARV041 EQU   PSA+876
+PSARV040 EQU   PSA+872
+PSARV025 EQU   PSA+868
+PSADSSED EQU   PSA+868
+PSADSSPR EQU   PSA+864
+PSADSSFW EQU   PSA+860
+PSADSS14 EQU   PSA+856
+PSADSSPP EQU   PSA+848
+PSADSSRP EQU   PSA+840
+PSADSS05 EQU   PSADSSF4
+PSADSS10 EQU   PSADSSF4
+PSADSSVE EQU   PSADSSF4
+PSADSSDE EQU   PSADSSF4
+PSADSSC0 EQU   PSADSSF4
+PSADSSIE EQU   PSADSSF4
+PSADSS12 EQU   PSADSSF4
+PSADSSRC EQU   PSADSSF4
+PSARV057 EQU   PSADSSF3
+PSARV056 EQU   PSADSSF3
+PSARV055 EQU   PSADSSF3
+PSARV054 EQU   PSADSSF3
+PSADSSRW EQU   PSADSSF3
+PSADSSNM EQU   PSADSSF3
+PSADSSES EQU   PSADSSF3
+PSADSSGP EQU   PSADSSF3
+PSADSSF2 EQU   PSADSSFL+1
+PSADSSPI EQU   PSADSSF1
+PSADSSOI EQU   PSADSSF1
+PSADSSSP EQU   PSADSSF1
+PSADSSTP EQU   PSADSSF1
+PSADSSDW EQU   PSADSSF1
+PSADSSDD EQU   PSADSSF1
+PSADSSDM EQU   PSADSSF1
+PSADSSMV EQU   PSADSSF1
+PSADSSTS EQU   PSA+816
+PSADSSWK EQU   PSA+812
+PSADSSR3 EQU   PSA+808
+PSADSSR2 EQU   PSA+804
+PSADSSRS EQU   PSA+800
+PSARV058 EQU   PSA+794
+PSAVSTAP EQU   PSA+792
+PSAWKVAP EQU   PSA+788
+PSAWKRAP EQU   PSA+784
+PSAMCHIC EQU   PSA+783
+PSAMODE  EQU   PSA+782
+PSASYMSK EQU   PSA+781
+PSAMCHFL EQU   PSA+780
+PSACR0   EQU   PSA+776
+PSAPSWSV EQU   PSA+768
+PSALITA  EQU   PSA+764
+PSACLHS  EQU   PSAHLHI
+PSALKR15 EQU   PSALKSA+60
+PSALKR14 EQU   PSALKSA+56
+PSALKR13 EQU   PSALKSA+52
+PSALKR12 EQU   PSALKSA+48
+PSALKR11 EQU   PSALKSA+44
+PSALKR10 EQU   PSALKSA+40
+PSALKR9  EQU   PSALKSA+36
+PSALKR8  EQU   PSALKSA+32
+PSALKR7  EQU   PSALKSA+28
+PSALKR6  EQU   PSALKSA+24
+PSALKR5  EQU   PSALKSA+20
+PSALKR4  EQU   PSALKSA+16
+PSALKR3  EQU   PSALKSA+12
+PSALKR2  EQU   PSALKSA+8
+PSALKR1  EQU   PSALKSA+4
+PSALKR0  EQU   PSALKSA
+PSARV023 EQU   PSACLHT+52
+PSALOCAL EQU   PSACLHT+48
+PSACMSL  EQU   PSACLHT+44
+PSAOPTL  EQU   PSACLHT+40
+PSATPACL EQU   PSACLHT+36
+PSATPDNL EQU   PSACLHT+32
+PSATPNCL EQU   PSACLHT+28
+PSAIOSLL EQU   PSACLHT+24
+PSAIOSUL EQU   PSACLHT+20
+PSAIOSCL EQU   PSACLHT+16
+PSAIOSSL EQU   PSACLHT+12
+PSASALCL EQU   PSACLHT+8
+PSAASML  EQU   PSACLHT+4
+PSADISPL EQU   PSACLHT
+PSASRSA  EQU   PSA+636
+PSARV050 EQU   PSA+634
+PSADSSGO EQU   PSA+633
+PSARECUR EQU   PSA+632
+PSAHLHIS EQU   PSA+628
+PSAIPCSA EQU   PSA+624
+@NM00022 EQU   PSA+621
+PSAIPCDM EQU   PSA+620
+PSAIPCD  EQU   PSA+616
+@NM00021 EQU   PSA+613
+PSAIPCRM EQU   PSA+612
+PSAIPCR  EQU   PSA+608
+PSAMCHEX EQU   PSA+600
+PSAMPSW  EQU   PSA+592
+PSAEXPS2 EQU   PSA+584
+PSAEXPS1 EQU   PSA+576
+PSAPIREG EQU   PSA+572
+PSARSREG EQU   PSA+568
+PSAGPREG EQU   PSA+556
+PSARV022 EQU   PSASUP4
+PSARV021 EQU   PSASUP4
+PSARV020 EQU   PSASUP4
+PSARV019 EQU   PSASUP4
+PSARV018 EQU   PSASUP4
+PSARV017 EQU   PSASUP4
+PSARV016 EQU   PSASUP4
+PSARV015 EQU   PSASUP4
+PSARV014 EQU   PSASUP3
+PSARV013 EQU   PSASUP3
+PSARV012 EQU   PSASUP3
+PSARV011 EQU   PSASUP3
+PSARV010 EQU   PSASUP3
+PSARV009 EQU   PSASUP3
+PSARV008 EQU   PSASUP3
+PSAIOSUP EQU   PSASUP3
+PSALCR   EQU   PSASUP2
+PSARTM   EQU   PSASUP2
+PSAACR   EQU   PSASUP2
+PSAIPCE2 EQU   PSASUP2
+PSAIPCES EQU   PSASUP2
+PSAIPCEC EQU   PSASUP2
+PSAGTF   EQU   PSASUP2
+PSAIPCRI EQU   PSASUP2
+PSAIPCRP EQU   PSASUP1
+PSAIPCDR EQU   PSASUP1
+PSADISP  EQU   PSASUP1
+PSALOCK  EQU   PSASUP1
+PSAPI    EQU   PSASUP1
+PSAEXT   EQU   PSASUP1
+PSASVC   EQU   PSASUP1
+PSAIO    EQU   PSASUP1
+PSAAOLD  EQU   PSA+548
+PSAANEW  EQU   PSA+544
+PSATOLD  EQU   PSA+540
+PSATNEW  EQU   PSA+536
+PSALCCAR EQU   PSA+532
+PSALCCAV EQU   PSA+528
+PSAPCCAR EQU   PSA+524
+PSAPCCAV EQU   PSA+520
+PSACPULA EQU   PSA+518
+PSACPUPA EQU   PSA+516
+PSAPSA   EQU   PSA+512
+FLCHDEND EQU   PSA+512
+FLCCRSAV EQU   FLCMCLA+280
+FLCGRSAV EQU   FLCMCLA+216
+FLCFPSAV EQU   FLCMCLA+184
+FLCFLA   EQU   FLCMCLA+88
+FLCRGNCD EQU   FLCMCLA+84
+FLCFSAA  EQU   FLCFSA+1
+@NM00020 EQU   FLCFSA
+@NM00019 EQU   FLCMCLA+72
+FLCMCIC  EQU   FLCMCLA+64
+@NM00018 EQU   FLCMCLA+20
+FLCIOAA  EQU   FLCIOA+1
+@NM00017 EQU   FLCIOA
+@NM00016 EQU   FLCMCLA+15
+@NM00015 EQU   FLCMCLA+14
+@NM00014 EQU   FLCMCLA+12
+FLCLCL   EQU   FLCMCLA+8
+FLCIOELA EQU   FLCIOEL+1
+@NM00013 EQU   FLCIOEL
+FLCCHNID EQU   FLCMCLA
+@NM00012 EQU   PSA+160
+FLCMTRCD EQU   PSA+157
+@NM00011 EQU   PSA+156
+FLCPERA  EQU   FLCPER+1
+@NM00010 EQU   FLCPER
+@NM00009 EQU   PSA+151
+FLCPERCD EQU   PSA+150
+FLCMCNUM EQU   PSA+149
+@NM00008 EQU   PSA+148
+FLCTEAA  EQU   FLCTEA+1
+@NM00007 EQU   FLCTEA
+PSAPIPC  EQU   PSAPICOD
+PSAPIMC  EQU   PSAPICOD
+PSAPIPER EQU   PSAPICOD
+PSARV049 EQU   FLCPICOD
+FLCPILCB EQU   FLCPIILC
+@NM00006 EQU   FLCPIILC
+@NM00005 EQU   PSAEPPSW
+FLCSVCN  EQU   PSAESPSW+2
+FLCSILCB EQU   FLCSVILC
+@NM00004 EQU   FLCSVILC
+@NM00003 EQU   PSAESPSW
+FLCEICOD EQU   PSAEEPSW+2
+PSASPAD  EQU   PSAEEPSW
+@NM00002 EQU   PSA+128
+FLCINPSW EQU   PSA+120
+FLCMNPSW EQU   PSA+112
+FLCPNPSW EQU   PSA+104
+FLCSNPSW EQU   PSA+96
+FLCENPSW EQU   PSA+88
+FLCTRACE EQU   PSA+84
+FLCTIMER EQU   PSA+80
+FLCCVT2  EQU   PSA+76
+FLCCAW   EQU   PSA+72
+FLCCSW   EQU   PSA+64
+FLCIOPSW EQU   PSA+56
+FLCMOPSW EQU   PSA+48
+FLCSOPSW EQU   PSA+32
+FLCEOPSW EQU   PSA+24
+@NM00001 EQU   FLCICCW2+4
+FLCCVT   EQU   FLCICCW2
+FLCICCW1 EQU   FLCROPSW
+FLCIPPSW EQU   FLCRNPSW
+.@UNREFD ANOP                          END UNREFERENCED COMPONENTS
+@RT00193 EQU   PGIERROR
+@RT00196 EQU   PGIERROR
+@RT00204 EQU   PGIAUD
+@RT00206 EQU   PGIERROR
+@RT00229 EQU   PGIERR2
+@RT00248 EQU   PGIERR1
+@RT00263 EQU   PGIUPD
+@RT00265 EQU   PGIERR1
+@RT00273 EQU   PGIUPD
+@RT00275 EQU   PGIERR1
+@RT00279 EQU   PGIERR1
+@RT00284 EQU   PGIERR1
+@RT00288 EQU   PGIERR1
+@RT00293 EQU   PGIERR1
+@ENDDATA EQU   *
+         END   AMDSAPGI,(C'PL/S-II',0502,73234)

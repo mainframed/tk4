@@ -1,0 +1,1219 @@
+         PRINT NOGEN
+RSVT     TITLE 'TRACE ACTIVE RESERVES'
+RSVTRACE CSECT
+*---------------------------------------------------------------------*
+*                                                                     *
+*        THIS PROGRAM WILL SAMPLE UCB'S AND QCB'S IN AN MVS           *
+*        ENVIRONMENT AND KEEP TRACK OF THE NUMBER OF RESERVES,        *
+*        THE HIGH WATER MARK AND THE TOTAL TIME OF THE                *
+*        RESERVES FOR EACH DEVICE AND QNAME.                          *
+*        IT HAS BEEN EXPANDED TO INCLUDE RESERVED NOT BUSY TIME AND   *
+*        LOCKOUT TIME WHICH CAN BE CAUSED BY A RESERVE FROM ANOTHER   *
+*        CPU OR THE HEAD OF STRING BUSY.                              *
+*                                                                     *
+*        OPTIONALLY IT WILL LIST THE JOBNAMES OF MAJOR AND MINOR      *
+*        QNAMES. THIS CAN BE STARTED THRU PARM INPUT OR THE           *
+*        OUTSTANDING WTOR.                                            *
+*                                                                     *
+*        THIS PROGRAM ISSUES A WTOR. THE REPLIES ALLOWED ARE:         *
+*        'RESET' TO CLEAR ALL THE ACCUMULATED DATA AND START OVER.    *
+*        'END' TO END THIS RUN,                                       *
+*        'TRACE OFF' TO STOP CURRENT TRACING OUTPUT                   *
+*        'TRACE ON,XXXX,XXXXX,XXX,...'  TO START TRACING SPECIFIED    *
+*            QNAMES, XXXX = QNAME OR 'ALL' (IF ALL QNAMES WANTED)     *
+*                                                                     *
+*        THE CONSTANT 'MINIMAL' IS THE RESERVE THRESHOLD TIME.        *
+*        RESERVES SMALLER THAN THIS INTERVAL WILL BE IGNORED.         *
+*                                                                     *
+*        THE SAMPLING INTERVAL VARIES FROM A MINIMUM OF 'INTVLOW' TO  *
+*        A MAXIMUM OF 'INTVLHI' BY ' INTVLRTE'. THESE ARE ALL         *
+*        ADJUSTABLE VALUES. THE QCB CHAIN IS ONLY SAMPLED WHEN        *
+*        'QCBINTVL' IS GREATER THAN OR EQUAL TO 'BINTVL'.             *
+*                                                                     *
+*        JCL REQUIRED:                                                *
+*        //RSVTRACE EXEC PGM=RSVTRACE,DPRTY=(15,15)                   *
+*        //STEPLIB  DD  DSN= < OPTIONAL DD STATEMENT >                *
+*        //UCBPRINT DD  SYSOUT=A                                      *
+*        //QCBPRINT DD  SYSOUT=A                                      *
+*        //QNMTRACE DD  SYSOUT=A                                      *
+*        //SYSABEND DD  SYSOUT=A                                      *
+*                                                                     *
+*                                                                     *
+*                                                                     *
+*                                                                     *
+*                                                                     *
+*        LAST UPDATE:  MAY, 1980                                      *
+*        BY:                                                          *
+*             KEN RASMUSSEN                                           *
+*             ROCKWELL INTERNATIONAL                                  *
+*             INFORMATION SYSTEMS CENTER                              *
+*             2201 SEAL BEACH BLVD                                    *
+*             BOX 2515  MC 041/SH28                                   *
+*             SEAL BEACH,CA 90740                                     *
+*             (213) 594-2540                                          *
+*                                                                     *
+*                                                                     *
+*---------------------------------------------------------------------*
+         EJECT
+*---------------------------------------------------------------------*
+*         GET SAVE AND QLINE AREAS; LOAD LOOP COUNTER FOR PRINTING;   *
+*         PREPARE FOR TABLE INITIALIZATION.                           *
+*---------------------------------------------------------------------*
+*
+         SAVE  (14,12),,*          SAVE CALLERS REGISTERS.
+*
+         LR    R12,R15             ESTABLISH BASE REGISTER.
+         USING RSVTRACE,R12
+         L     R3,0(,R1)           SAVE PARM FIELD
+         LA    R1,SAVEAREA
+         ST    R1,8(,R13)          OS
+         ST    R13,4(,R1)            LINKAGE
+         LA    R13,SAVEAREA            CONVENTIONS.
+         USING SAVEAREA,R13
+         LH    R4,0(R3)            GET PARM LENGTH
+         LA    R3,2(,R3)           POINT AT DATA
+         LTR   R4,R4               ANY PARM SPECIFIED ?
+         BZ    SETSPIE             NO, BRANCH
+         BAL   R11,QNMSCAN
+*
+SETSPIE  EQU   *
+         SPIE  SPIEEXT,(4)
+*
+         L     R3,CVTPTR           GET CVT ADDRESS.
+         L     R3,CVTILK2(,R3)     GET UCB LOOKUP TABLE ADDRESS.
+         L     R10,SPIELMT         SET SPIE LOOP LIMIT.
+*
+         TIME  DEC                 GET THE PGM START TIME.
+         ST    R1,DBLWORD          STORE DATE.
+         UNPK  DBLWORD(5),DBLWORD+1(3) EDIT DATE.
+         MVC   SIDTIME+09(2),DBLWORD STORE HOUR OF DAY.
+         MVC   SIDTIME+12(3),DBLWORD+2 STORE MINUTE OF DAY.
+         ST    R0,DBLWORD          STORE DECIMAL TIME.
+         UNPK  DBLWORD(7),DBLWORD(4) UNPACK DECIMAL TIME.
+         MVC   SIDTIME+17(2),DBLWORD STORE HOUR OF DAY.
+         MVC   SIDTIME+20(2),DBLWORD+2 STORE MINUTE OF DAY.
+         MVC   SIDTIME+23(2),DBLWORD+4 STORE SECOND OF DAY.
+         L     R2,CVTPTR           GET CVT ADDRESS
+         L     R2,CVTSMCA(,R2)     GET SMCA ADDRESS
+         MVC   SIDTIME+3(4),16(R2) SAVE SMF SYSTEM ID
+         OPEN  (QNMTRACE,OUTPUT)
+         EJECT
+*---------------------------------------------------------------------*
+*         CALCULATE SIZE OF TABLE NEEDED; OBTAIN STORAGE FOR TABLE;   *
+*         INITIALIZE TABLE WITH NECESSARY INFORMATION FOR MONITORING; *
+*         ATTACH QCB RESERVE PROGRAM.                                 *
+*---------------------------------------------------------------------*
+*
+         LA    R5,8                BEGIN GETMAIN SIZE CALCULATION.
+         USING RTABLE,R5
+         BAL   R11,UCBSCAN         BRANCH TO UCB SCAN RTN.
+         B     TBLSIZE             RETURN ON R11 FOR END OF UCB'S.
+*
+         LA    R5,RTSIZE           RETURN ON R11+4; INCR CNTR.
+         B     UCBNEXT             RETURN TO UCB SCAN RTN.
+*
+TBLSIZE  EQU   *
+         MH    R5,QCBCNT           GET SPACE FOR QCB'S-1
+         LR    R0,R5               LOAD GETMAIN SIZE CALCULATED.
+         ST    R0,RTGTMAIN         SAVE GETMAIN SIZE.
+         GETMAIN R,LV=(0)          GET REQUIRED STORAGE.
+         ST    R1,RTBEGIN
+         LR    R5,R1               LOAD TABLE ENTRY POINTER.
+*
+         BAL   R11,UCBSCAN         BRANCH AND LINK TO UCB SCAN RTN.
+         B     STRTEND             RETURN ON R11 FOR END OF UCBS.
+*
+         LH    R1,QCBCNT           SET FOR LOOP TO INIT RESERVE TABLE
+         MVC   RTQCBNM,TOTAL       FIRST ENTRY OF UCB IS FOR TOTALS
+         USING UCBOB,R2
+TBLINIT  STH   R2,RTUCB            RETURN R11+4 FOR D.A. UCB FOUND.
+         MVC   RTVOL,UCBVOLI       SET VOLSER
+         LA    R5,RTSIZE           GET NEXT SUB ENRTY
+         BCT   R1,TBLINIT           AND LOOP THRU SUB ENTRIES.
+         MVI   RTUCB,X'FF'         MARK NEXT ENTRY AS LAST ENTRY.
+         B     UCBNEXT             RETURN TO SCAN UCB RTN.
+*
+STRTEND  ST    R5,RTEND            SAVE THE LAST ENTRY ADDRESS
+         L     R5,RTBEGIN          GET START OF TABLE.
+         LR    R1,R5               SAVE START ADDRESS
+         LA    R5,RTSIZE           POINT AT NEXT SUB-ENTRY.
+         SR    R5,R1               FIND LENGTH OF SUB-ENTRY.
+         MH    R5,QCBCNT           TIMES NUMBER OF ENTRIES PER UCB
+         STH   R5,RTUCBSZ          YIELDS THE UCB TABLE SIZE.
+WTOR     EQU   *
+         XC    ECBAD,ECBAD         CLEAR WTOR ECB.
+         MVC   REPLY,BLANKS        CLEAR REPLY AREA.
+         WTOR  'RSVTRACE - ENTER OPTION OR "END" TO EXIT PROGRAM',     X
+               REPLY,54,ECBAD,ROUTCDE=(2,11)
+         EJECT
+*---------------------------------------------------------------------*
+*         SAMPLE DIRECT ACCESS UCB ADDRESSES STORED IN TABLE;         *
+*         CALCULATE DESIRED RESERVE INFORMATION.                      *
+*---------------------------------------------------------------------*
+UCBSAMPL EQU   *
+         L     R1,BINTVL           LOAD CURRENT INTERVAL
+         A     R1,INTVLRTE         ADD INCRIMENT
+         C     R1,INTVLHI          NEW INTERVAL WITHIN RANGE?
+         BNH   *+8                 NOT HIGH, BRANCH AROUND
+         L     R1,INTVLLOW         RESET INVERVAL
+         ST    R1,BINTVL           SAVE NEW INTERVAL
+*
+         STIMER WAIT,BINTVL=BINTVL WAIT FOR DESIGNATED INTERVAL.
+*
+         TM    ECBAD,X'40'         TEST TO SEE IF REPLIED TO
+         BO    POSTED
+         L     R1,PRTLPCNT         GET QTY LEFT BEFORE TABLE PRINT
+         BCT   R1,LOADTBL          BRANCH AROUND IF NOT ZERO.
+         BAL   R11,UPRINT          IF R1 = ZERO, PRINT REPORT,
+         L     R1,PRTLPMAX          AND RELOAD R1 FOR BCT.
+*
+LOADTBL  ST    R1,PRTLPCNT         SAVE QTY LEFT BEFORE PRINTING TABLE
+         L     R5,RTBEGIN          RELOAD MY TABLE ORIGIN POINTER.
+         TIME  BIN                 GET CRTTENT TIME FOR THIS SAMPLE.
+         ST    R0,CURNTIME          AND SAVE IT.
+*
+TBLLOOP  EQU   *
+         LH    R2,RTUCB            GET UCB ADDRESS FROM MY TABLE.
+         N     R2,FFFF             RESET IF UCB ADDR > 32K
+         TM    UCBFLB,UCBRESVH     IS THERE A RESERVE ON THIS DEV?
+         BNO   NORESV              NO. FIND IF RESERVE WAS ACTIVE.
+         OC    RTRSVST,RTRSVST     DID RESERVE EXIST BEFORE?
+         BNZ   UCBBUSY             YES. TEST FOR DEVICE BUSY.
+         OC    RTLCKST,RTLCKST     DID LOCKOUT EXIST?
+         BZ    SETRSVST            NO. BRANCH
+         L     R0,CURNTIME         LOAD CURRENT TIME.
+         C     R0,RTLCKST          SAME DAY?
+         BH    *+8                 YES. BRANCH
+         A     R0,ONEDAY           ADD ONE DAY
+         S     R0,RTLCKST          CURRENT TIME MINUS START TIME.
+         C     R0,MINIMAL          IS RESERVE TIME MINIMAL?
+         BL    CLRLCKST            YES. DON'T RECORD INFO.
+         L     R1,RTLCKCNT         ADD ONE
+         LA    R1,1(,R1)            TO NUMBER OF
+         ST    R1,RTLCKCNT             UNIQUE RESERVES.
+         C     R0,RTLCKHWM         IS THIS HIGHWATER MARK?
+         BL    *+8                  NO. LEAVE AS IS.
+         ST    R0,RTLCKHWM          YES. STORE NEW HIGHWATER MARK.
+         A     R0,RTLCKTL          ADD PREVIOUS TOTAL LOCKOUT TIME.
+         ST    R0,RTLCKTL          SAVE NEW TOTAL LOCKOUT TIME.
+CLRLCKST XC    RTLCKST,RTLCKST     RESET LOCKOUT TIME.
+SETRSVST EQU   *
+         L     R0,CURNTIME         LOAD CURRENT TIME.
+         ST    R0,RTRSVST          MARK START OF RESERVE TIME.
+         EJECT
+*---------------------------------------------------------------------*
+*        TEST UCB BUSY STATUS                                         *
+*---------------------------------------------------------------------*
+UCBBUSY  EQU   *
+         TM    UCBFLA,UCBBSY       IS THE DEVICE BUSY?
+         BNO   NOTBUSY             NOT BUSY. SEE IF IT WAS BUSY.
+*        DEVICE IS BUSY
+         OC    RTRNBST,RTRNBST     WAS THE DEVICE BUSY BEFORE?
+         BZ    CHKVOL              ZERO = BUSY, THEN BRANCH
+         L     R0,CURNTIME         NOT ZERO = LOAD CURRENT TIME.
+         C     R0,RTRNBST          SAME DAY?
+         BH    *+8                 YES. BRANCH AROUND
+         A     R0,ONEDAY           ADD ONE DAY TO TIME
+         S     R0,RTRNBST          GET TOTAL TIME
+         C     R0,MINIMAL          IS IT TOO SMALL A TIME?
+         BNH   CLRRNBST            YES. GO CLEAR START TIME
+         L     R1,RTRNBCNT         ADD ONE
+         LA    R1,1(,R1)            TO NUMBER OF
+         ST    R1,RTRNBCNT             UNIQUE RESERVES.
+         C     R0,RTRNBHWM            IS THIS HIGHWATER MARK?
+         BL    *+8                 NO. LEAVE AS IS.
+         ST    R0,RTRNBHWM            YES. STORE NEW HIGHWATER MARK.
+         A     R0,RTRNBTL          ADD TOTAL TIME
+         ST    R0,RTRNBTL          AND SAVE TOTAL TIME
+CLRRNBST XC    RTRNBST,RTRNBST     RESET RTRNBST
+         B     CHKVOL              GO CHECK THE VOLSER
+NOTBUSY  EQU   *
+         OC    RTRNBST,RTRNBST     WAS THE DEVICE BUSY BUSY?
+         BNZ   CHKVOL              NOT BUSY. GO TO CHK VOLSER
+         L     R0,CURNTIME         LOAD CURRENT TIME.
+         ST    R0,RTRNBST          SAVE THE START TIME
+*
+CHKVOL   CLC   RTVOL,UCBVOLI       IS SAME VOLUME MOUNTED?
+         BE    NEXTVOL              YES. LEAVE VSN AS IS.
+*        LR    R3,R5               SAVE TABLE ENTRY POINTER.
+*        BAL   R11,UPRINT          GO WRITE OUT GATHERED INFO.
+*        LR    R5,R3               RESTORE TABLE ENTRY PTR.
+         LH    R2,RTUCB            RESTORE UCB POINTER.
+         N     R2,FFFF             RESET IF UCB ADDR > 32K
+         XC    RTRSVST(48),RTRSVST CLEAR THIS ENTRY.
+         MVC   RTVOL,UCBVOLI       PLACE NEW VOL SER IN ENTRY.
+*
+NEXTVOL  EQU   *
+         LA    R5,RTSIZE           GET SIZE OF TABLE ENTRY
+         CLI   RTUCB,X'FF'         END OF TABLE?
+         BE    QCBSAMPL            YES. GO CHECK QCB'S
+         CLC   RTQCBNM,TOTAL TABLE ENTRY CORRECT?
+         BE    TBLLOOP             YES. TEST NEXT UCB.
+         B     NEXTVOL             GET NEXT UCB
+         EJECT
+*---------------------------------------------------------------------*
+*        NO RESERVE ON DEVICE NOW                                     *
+*---------------------------------------------------------------------*
+NORESV EQU   *
+         OC    RTRSVST,RTRSVST     RESERVE ACTIVE LAST TIME THRU?
+         BZ    LOCKOUT             IF ZERO THEN BRANCH
+         L     R0,CURNTIME         LOAD CURRENT TIME.
+         LR    R9,R0               SAVE TIME FOR LOCKOUT
+         C     R0,RTRSVST          CURRENT TIME IN SAME DAY AS START?
+         BH    *+8                 YES. BRANCH AROUND.
+         A     R0,ONEDAY           ADD 24 HOURS FOR CALCULATIONS.
+         S     R0,RTRSVST          CURRENT TIME MINUS START TIME.
+         C     R0,MINIMAL          IS RESERVE TIME MINIMAL?
+         BL    CALRNBTM            YES. DON'T RECORD INFO.
+         L     R1,RTRSVCNT         ADD ONE
+         LA    R1,1(,R1)            TO NUMBER OF
+         ST    R1,RTRSVCNT             UNIQUE RESERVES.
+         C     R0,RTRSVHWM            IS THIS HIGHWATER MARK?
+         BL    *+8                 NO. LEAVE AS IS.
+         ST    R0,RTRSVHWM            YES. STORE NEW HIGHWATER MARK.
+         A     R0,RTRSVTL          ADD PREVIOUS TOTAL RESERVE TIME.
+         ST    R0,RTRSVTL          SAVE NEW TOTAL RESERVE TIME.
+*
+CALRNBTM OC    RTRNBST,RTRNBST     RESERVE NOT BUSY ACTIVE BEFORE?
+         BZ    CLRRSVST            NO. RESET START TIMES.
+         LR    R0,R9               GET TIME.
+         C     R0,RTRNBST          CURRENT TIME IN SAME DAY AS START?
+         BH    *+8                 YES. BRANCH AROUND.
+         A     R0,ONEDAY           ADD 24 HOURS FOR CALCULATIONS.
+         S     R0,RTRNBST          CURRENT TIME MINUS START TIME.
+         C     R0,MINIMAL          IS RESERVE TIME MINIMAL?
+         BL    CLRRSVST            YES. DON'T RECORD INFO.
+         L     R1,RTRNBCNT         ADD ONE
+         LA    R1,1(,R1)            TO NUMBER OF
+         ST    R1,RTRNBCNT             UNIQUE RESERVES.
+         C     R0,RTRNBHWM            IS THIS HIGHWATER MARK?
+         BL    *+8                 NO. LEAVE AS IS.
+         ST    R0,RTRNBHWM            YES. STORE NEW HIGHWATER MARK.
+         A     R0,RTRNBTL          ADD PREVIOUS TOTAL RESERVE TIME.
+         ST    R0,RTRNBTL          SAVE NEW TOTAL RESERVE TIME.
+CLRRSVST EQU   *
+         XC    RTRSVST,RTRSVST     CLEAR RESERVE START TIME.
+         XC    RTRNBST,RTRNBST     CLEAR RESERVE START TIME.
+         EJECT
+*---------------------------------------------------------------------*
+*        TEST UCB LOCKOUT STATUS                                      *
+*---------------------------------------------------------------------*
+LOCKOUT  EQU   *
+         TM    UCBFLA,UCBBSY+UCBCUB UCB BUSY AND CNTL UNIT BUSY?
+         BNO   NOLOCKOT            NO. SEE IF IT WAS
+         OC    RTLCKST,RTLCKST     WAS THERE A LOCKOUT BEFORE?
+         BNZ   CHKVOL              YES. GET THE NEXT UCB
+         L     R0,CURNTIME         LOAD CURRENT TIME.
+         ST    R0,RTLCKST          SAVE LOCKOUT START TIME
+         B     CHKVOL              GET THE NEXT UCB
+NOLOCKOT OC    RTLCKST,RTLCKST     LOCKOUT ACTIVE LAST TIME THRU?
+         BZ    CHKVOL              NO. GET THE NEXT UCB
+         L     R0,CURNTIME         LOAD CURRENT TIME.
+         C     R0,RTLCKST          CURRENT TIME IN SAME DAY AS START?
+         BH    *+8                 YES. BRANCH AROUND.
+         A     R0,ONEDAY           ADD 24 HOURS FOR CALCULATIONS.
+         S     R0,RTLCKST          CURRENT TIME MINUS START TIME.
+         C     R0,MINIMAL          IS TIME MINIMAL?
+         BL    CLLCKST             YES. DON'T RECORD INFO.
+         C     R0,RTLCKHWM            IS THIS HIGHWATER MARK?
+         BL    *+8                 NO. LEAVE AS IS.
+         ST    R0,RTLCKHWM            YES. STORE NEW HIGHWATER MARK.
+         L     R1,RTLCKCNT         ADD ONE
+         LA    R1,1(,R1)            TO NUMBER OF
+         ST    R1,RTLCKCNT             UNIQUE RESERVES.
+         A     R0,RTLCKTL         ADD PREVIOUS TOTAL LOCKOUT TIME.
+         ST    R0,RTLCKTL         SAVE NEW TOTAL LOCKOUT TIME.
+CLLCKST  EQU   *
+         XC    RTLCKST,RTLCKST     CLEAR RESERVE START TIME.
+         B     CHKVOL              GET NEXT UCB.
+         EJECT
+*---------------------------------------------------------------------*
+*        QCB SAMPLING ROUTINE                                         *
+*---------------------------------------------------------------------*
+QCBSAMPL EQU   *
+         CLC   BINTVL,QCBINTVL     TIME TO SAMPLE QCB'S
+         BL    UCBSAMPL             NO, INTVL TO LOW, BRANCH
+GETMAJ   EQU   *
+         L     R4,CVTPTR           GET CVT POINTER
+         L     R4,CVTFQCB(,R4)     LOAD QCB POINTER
+         USING MAJ,R4
+         B     GETMIN
+*
+NEXTMAJ  ICM   R15,15,MAJNMAJ      LOAD NEXT QCB ADD.
+         BZ    QCBEND              END OF QCB'S
+         C     R4,4(R15)           CHAIN VALID ?
+         BNE   QCBEND              NO, EXIT
+         LR    R4,R15              LOAD QCB
+*
+GETMIN   ICM   R3,15,MAJFMIN       GET ADD. OF MINOR QCB
+         BZ    NEXTMAJ             ZERO. BRANCH
+         B     GETQEL
+         USING MIN,R3
+*
+NEXTMIN  ICM   R3,15,MINNMIN       GET NEXT MINOR QCB
+         BZ    NEXTMAJ             NO MORE MINOR QCB'S
+*
+GETQEL   ICM   R6,15,MINFQEL       LOAD QEL ADD.
+         BZ    NEXTMIN             LAST QEL
+         USING QEL,R6
+*
+GOTQEL   TM    QELQFLGS,QELRESV    TEST FOR RESERVE BIT ON
+         BZ    NEXTMIN             NO. GET NEXT MINOR.
+         ICM   R2,15,QEL+24        GET UCB ADDRESS.
+         BZ    NEXTMIN             BRANCH IF ZERO.
+         TM    UCBID,UCBSTND       IS THIS A UCB?
+         BNO   NEXTMIN              NO. GET NEXT MINOR
+         TM    UCBTBYT3,UCB3DACC   IS THIS A DASD UCB?
+         BNO   NEXTMIN              NO. GET NEXT MINOR
+         TM    UCBFLB,UCBRESVH     IS THERE A RESERVE ON THIS DEV?
+         BNO   NEXTMIN              NO. GET NEXT MINOR
+*---------------------------------------------------------------------*
+*        SEARCH FOR PROPER UCB ENTRY IN THE RESERVE TABLE             *
+*---------------------------------------------------------------------*
+         MVC   RTLOW,RTBEGIN       SAVE BEGIN ADDRESS
+         L     R1,RTEND            GET END ADDRESS
+         AH    R1,RTUCBSZ           ADD ONE UCB ENTRY
+         ST    R1,RTHIGH             AND SAVE
+*
+RTSEARCH L     R1,RTHIGH           GET HIGH ADDRESS
+         S     R1,RTLOW            MINUS LOW ADDRESS
+         SR    R0,R0               CLEAR R0 FOR DIVIDE
+         LH    R9,RTUCBSZ          LOAD UCB ENTRY SIZE
+         DR    R0,R9               CAL NUMBER OF ENTRIES
+         SRA   R1,1                GET HALF THIS NUMBER
+         MH    R1,RTUCBSZ          TIMES THE SIZE OF EACH UCB ENTRY
+         L     R5,RTLOW            GET LOW ADDRESS
+         AR    R5,R1                ADD TO THE START OF SEARCH ADDR
+         CLM   R2,3,RTUCB          UCB ADDRESSES MACTH?
+         BE    QCHKNM              YES. BRANCH AND CHECK FURTHER
+         BL    INCRHIGH             LOW. BRANCH
+         ST    R5,RTLOW             HIGH. SAVE IN LOW ADDRESS
+         B     *+12                BRANCH AROUND
+INCRHIGH ST    R5,RTHIGH           SAVE HIGH ADDRESS
+         L     R5,RTLOW            GET NEW LOW ADDRESS
+         AH    R5,RTUCBSZ          ADD UCB ENTRY SIZE
+         C     R5,RTHIGH           ADDRESS EQUAL (END OF SEARCH)?
+         BL    RTSEARCH             LOW. BRANCH
+         SH    R5,RTUCBSZ          GET NEXT LOWER ENTRY
+         CLM   R2,3,RTUCB          UCB ADDRESSES EQUAL?
+         BE    QCHKTBL              YES. BRANCH
+         B     GETMAJ               NO, MUST BE AN INVALID UCB, BRANCH
+*
+QCHKFLG  CLM   R2,3,RTUCB          IS THIS THE CORRECT TABLE ENTRY
+         BE    QCHKTBL              EQUAL. CHECK FURTHER
+         B     NEXTMIN
+*        DC    H'00'                ABEND  IF QCBCNT IS TO SMALL
+QCHKNM   CLC   RTQCBNM,TOTAL        AT START OF UCB ENTRY?
+         BE    QCHKTBL               YES. BRANCH
+         DC    H'00'                ABEND INVALID UCB ENTRY
+QCHKTBL  CLC   RTQCBNM,BZERO        SEE IF FIRST OR LAST QCHKFLG
+         BE    QSETIME               YES   GO ENTER NEW QCHKFLG
+         CLC   RTQCBNM,MAJNAME      SEE IF QCB IS ALREADY IN TABLE
+         BNE   QNEXTRT               NO.  GO GET NEXT QCHKFLG.
+         CLM   R3,7,RTMINADD        IS MINOR QCB ADDRESS THE SAME?
+         BNE   QCHKMIN              NO. CHECK IF ZEROES.
+         CLM   R6,7,RTQELADD        IS QEL ADDRESS THE SAME?
+         BE    QRSTFLG               YES. TURN ON RTFLG.
+*
+QCHKMIN  EQU   *
+         OC    RTMINADD(7),RTMINADD QCB-QEL ADDRRESSES PRESENT?
+         BZ    QSETIME             NO. USE THIS TABLE ENTRY
+QNEXTRT  EQU   *
+         LA    R5,RTSIZE           GET OFF SET OF NEXT ENTRY
+         C     R5,RTBEGIN          IN TABLE LOW BOUNDS?
+         BH    *+6                  YES
+         DC    H'00'                NO. ABEND IF NOT IN TABLE
+         C     R5,RTEND            END OF TABLE?
+         BL    QCHKFLG              NO. GET NEXT ENTRY.
+         DC    H'00'                ABEND ON TABLE OVERFLOW.
+QSETIME  EQU   *
+         L     R0,CURNTIME         LOAD CURRENT TIME.
+         ST    R0,RTRSVST          STORE RESERVE START TIME.
+         MVC   RTQCBNM,MAJNAME     MOVE QCB NAME INTO TABLE
+         STCM  R3,7,RTMINADD       STORE MINOR QCB ADDRESS.
+         STCM  R6,7,RTQELADD       STORE QEL ADDRESS.
+         TM    QNMSW,TRCON+ALLQNM  IS QNAME TRACING REQUESTED?
+         BZ    QRSTFLG             NO, BRANCH AROUND
+         BO    GETASID             NO, BRANCH AROUND
+         LA    R7,QNMTABLE         POINT AT TRACE TABLE
+CHKQNAME CLC   MAJNAME,0(R7)       QNAME MATCH TABLE ?
+         BE    GETASID             YES, BRANCH
+         CLI   0(R7),C' '          END OF TABLE ?
+         BE    QRSTFLG             YES, BRANCH
+         LA    R7,8(,R7)           POINT AT NEXT IN TABLE
+         B     CHKQNAME
+GETASID  L     R7,CVTPTR           LOAD CVT PTR
+         L     R7,556(,7)          LOAD ASVT
+         LA    R7,524(,R7)         LOAD START OF ASCB LIST
+         LH    R8,QELASID          LOAD ASID
+         SLA   R8,2                ASID * 4
+         LA    R8,0(R8,R7)         ASID'S ASCB PTR
+         ICM   R7,15,0(R8)         ASCB PTR VALID ?
+         BM    QRSTFLG             NO, BRANCH
+         CLC   36(2,R7),QELASID    ASID'S EQUAL ?
+         BNE   QRSTFLG             NO, BRANCH
+         ICM   R8,15,172(R7)       JOBNAME PTR
+         BZ    NOTJOB              ZERO, BRANCH
+         B     SAVENAME
+NOTJOB   ICM   R8,15,176(R7)       LOGON PTR
+SAVENAME MVC   TJOBNM,0(R8)        SAVE JOBNAME
+         MVC   TSTEPNM,56(R8)      SAVE STEPNAME
+         MVC   TQNAME,MAJNAME      SAVE MAJOR NAME
+         MVC   TRNAME,TRNAME-1      TRNAME
+         SR    R8,R8               CLEAR REG 8
+         IC    R8,MINNAMEL         LOAD MINOR NAME LENGTH
+         LTR   R8,R8               REG 8 ZERO?
+         BZ    QRSTFLG             YES, BRANCH
+         LA    R7,44               SET TO 44
+         CR    R8,R7               REG 8 TOO HIGH ?
+         BNH   *+6                 NO, GO AROUND
+         LR    R8,R7               YES, SET R8 TO 44
+         BCTR  R8,0                SUB 1 FOR MVC
+         EX    R8,MVCRNAME         SAVE RNAME
+         CP    TLINECNT,TLINEMAX   PAGE SIZE EXCEEDED ?
+         BL    PUTTLNE
+         ZAP   TLINECNT,P4         RESET LINE COUNTER
+         MVC   THTIME(26),SIDTIME  EDIT SID AND TIME
+         PUT   QNMTRACE,THDG1
+         PUT   QNMTRACE,THDG2
+PUTTLNE  PUT   QNMTRACE,TLINE
+         AP    TLINECNT,P1          ADD TO LINE COUNTER
+*
+QRSTFLG  EQU   *
+         OI    RTFLG,CURNTRSV        TURN RTFLG BIT ON
+         B     NEXTMIN             GO GET NEXT MINOR
+*
+QCBEND   L     R5,RTBEGIN          LOAD START OF TEBLE
+*
+QCBRTEND CLC   RTQCBNM,BZERO       SEE IF FIRST OR LAST ENTRY
+         BE    QCBNEXT              NO. GO BACK TO BEGINNING
+         CLC   RTQCBNM,TOTAL       IS IT THE UCB TOTAL ENTRY?
+         BE    QCBNEXT              YES. SKIP IT
+         TM    RTFLG,CURNTRSV+PREVRSV TEST FOR WHAT BITS ARE ON
+         BZ    QCBNEXT             IF NONE GO GET NEXT ENTRY
+         BO    QCBRESET             BOTH BITS ARE ON
+         TM    RTFLG,CURNTRSV        SEE IF RTFLG EQUAL CURNTRSV
+         BO    QCBSETP              YES  GO DO REQUIRED ACTION
+*
+         XC    RTMINADD(7),RTMINADD CLEAR QCB-QEL ADDRESSES.
+QCBRTFLG NI    RTFLG,255-CURNTRSV-PREVRSV TURN OFF CORRECT RTFLG BITS
+         L     R0,CURNTIME         LOAD CURRENT TIME.
+         S     R0,RTRSVST          SUB. START TIME FROM NOW.
+         BNM   *+8                 DAY DID NOT CHANGE
+         A     R0,ONEDAY           DAY CHANGED ADD 24 HOURS
+*
+         C     R0,MINIMAL          INSIGNIFICANT RESERVE TIME?
+         BL    QCBNEXT             NO. GET NEXT ENTRY.
+*
+         C     R0,RTRSVHWM          IS THIS GREATEST RESV TIME?
+         BNH   *+8                   NO, LEAVE ALONE
+         ST    R0,RTRSVHWM           YES, SAVE HI-TIME MARK
+*
+         LA    R9,1                 INCRIMENT
+         A     R9,RTRSVCNT           RESERVE
+         ST    R9,RTRSVCNT            COUNT
+         A     R0,RTRSVTL          ADD TOTAL TIME
+         ST    R0,RTRSVTL          SAVE NEW TOTAL
+*
+QCBNEXT  EQU   *
+         LA    R5,RTSIZE           GET NEW OFFSET
+         C     R5,RTEND            END OF TABLE?
+         BL    QCBRTEND             NO. GET NEXT ENTRY.
+         B     UCBSAMPL            LOOP THROUGH AGAIN
+*
+QCBSETP  EQU   *
+         OI    RTFLG,PREVRSV               TURN PREVRSV ON
+*
+QCBRESET EQU   *
+         NI    RTFLG,255-CURNTRSV         TURN CURNTRSV OFF
+         B     QCBNEXT                 GO GET NEXT TABLE ENTRY.
+         EJECT
+*---------------------------------------------------------------------*
+*        PRINT ACCUMULATED UCB INFORMATION                            *
+*---------------------------------------------------------------------*
+UPRINT   EQU *
+         STM   R10,R11,SAVE1011    SAVE REGS 10-11
+         OPEN  (UCBPRT,(OUTPUT,LEAVE))  OPEN REPORT FILE.
+         L     R5,RTBEGIN          LOAD START OF TABLE ADDRESS.
+         SR    R6,R6               CLEAR FOR TOTAL RESERVE COUNT
+         SR    R7,R7               CLEAR FOR TOTAL RESERVE TIME.
+         SR    R8,R8               CLEAR FOR TOTAL RSV NOT BUSY COUNT.
+         SR    R9,R9               CLEAR FOR TOTAL RSV NOT BUSY TIME.
+         SR    R10,R10             CLEAR FOR TOTAL LOCKOUT COUNT.
+         SR    R11,R11             CLEAR FOR TOTAL LOCKOUT TIME.
+*
+         TIME  DEC                 GET THE TIME.
+         ST    R0,DBLWORD          STORE DECIMAL TIME.
+         UNPK  DBLWORD+1(7),DBLWORD(4) UNPACK DECIMAL TIME.
+         MVC   SIDTIME+31(2),DBLWORD+1 STORE HOUR OF DAY.
+         MVC   SIDTIME+34(2),DBLWORD+3 STORE MINUTE OF DAY.
+         MVC   SIDTIME+37(2),DBLWORD+5 STORE SECOND OF DAY.
+         MVC   UHTIME(40),SIDTIME  MOVE
+         PUT   UCBPRT,UHDG1            PRINT
+         PUT   UCBPRT,UHDG2              REPORT
+         PUT   UCBPRT,UHDG3                 HEADING.
+         MVI   ULINE,C'0'         DOUBLE SPACE.
+UPRLOOP  MVI   ULINE+1,C' '       CLEAR
+         MVC   ULINE+2(131),ULINE+1   ULINE AREA.
+         CLC   RTQCBNM,TOTAL FIND UCB DATA IN TABLE
+         BNE   UPRNEXT             BRANCH IF NOT FOUND
+         OC    RTRSVCNT,RTRSVCNT   DEVICE HAVE COUNTS?
+         BNZ   UEDIT               NO. GET NEXT TABLE ENTRY.
+         OC    RTRNBCNT,RTRNBCNT   DEVICE HAVE COUNTS?
+         BNZ   UEDIT               NO. GET NEXT TABLE ENTRY.
+         OC    RTLCKCNT,RTLCKCNT   DEVICE HAVE COUNTS?
+         BNZ   UEDIT               NO. GET NEXT TABLE ENTRY.
+         B     UPRNEXT             NO DATA TO EDIT
+*
+UEDIT    LH    R2,RTUCB            GET UCB ADDRESS.
+         N     R2,FFFF             RESET IF UCB ADDR > 32K
+         MVC   ULDEV,UCBNAME       GET DEVICE ADDR. FROM UCB.
+         MVC   ULVOL,RTVOL         GET VOL SER FROM TABLE.
+*
+         L     R1,RTRSVHWM         GET HIGHWATER MARK.
+         BAL   R14,CONVERT         CONVERT TO HH:MM:SS.TH.
+         MVC   ULRSVHWM,MINUTES      MOVE TO ULINE.
+*
+         L     R1,RTRSVCNT         GET TOTAL NO. OF RESERVES.
+         AR    R6,R1               ACCUMULATE TOTAL RESERVE NUMBER.
+         CVD   R1,DBLWORD          CONVERT TO DECIMAL.
+         OI    DBLWORD+7,X'0F'     MAKE UNSIGNED.
+         MVC   ULRSVCNT,EDPATRN    EDIT
+         ED    ULRSVCNT,DBLWORD+4   RESERVE COUNT.
+*
+         L     R1,RTRSVTL         GET TOTAL RESERVE TIME.
+         AR    R7,R1               ACCUMULATE TOTAL RESERVE TIME.
+         BAL   R14,CONVERT         CONVERT TO HH:MM:SS.TH.
+         MVC   ULRSVTL,MINUTES      MOVE TO ULINE.
+*
+         SR    R0,R0               CLEAR FOR DIVIDE.
+         L     R1,RTRSVTL         LOAD TOTAL RESERVE TIME.
+         L     R14,RTRSVCNT         GET COUNT
+         LTR   R14,R14              IS IT ZERO?
+         BNZ   *+8                  NO. BRANCH
+         LA    R14,1(,R14)         YES. ADD ONE TO COUNT
+         DR    R0,R14              CALULATE AVERAGE
+         BAL   R14,CONVERT         CONVERT AVERAGE RESERVE TIME.
+         MVC   ULRSVAVG,MINUTES      MOVE TO ULINE.
+*
+         L     R1,RTRNBCNT         GET TOTAL NO. OF RESERVES.
+         AR    R8,R1               ACCUMULATE COUNT
+         CVD   R1,DBLWORD          CONVERT TO DECIMAL.
+         OI    DBLWORD+7,X'0F'     MAKE UNSIGNED.
+         MVC   ULRNBCNT,EDPATRN    EDIT
+         ED    ULRNBCNT,DBLWORD+4   RESERVE COUNT.
+*
+         L     R1,RTRNBHWM         GET HIGHWATER MARK.
+         BAL   R14,CONVERT         CONVERT TO HH:MM:SS.TH.
+         MVC   ULRNBHWM,MINUTES      MOVE TO ULINE.
+*
+         L     R1,RTRNBTL         GET TOTAL RSV NOT BUSY TIME.
+         AR    R9,R1              ACCUMULATE TOTAL COUNT.
+         BAL   R14,CONVERT         CONVERT TO HH:MM:SS.TH.
+         MVC   ULRNBTL,MINUTES      MOVE TO ULINE.
+*
+         SR    R0,R0               CLEAR FOR DIVIDE.
+         L     R1,RTRNBTL         LOAD TOTAL RESERVE TIME.
+         L     R14,RTRNBCNT         GET COUNT
+         LTR   R14,R14              IS IT ZERO?
+         BNZ   *+8                  NO. BRANCH
+         LA    R14,1(,R14)         YES. ADD ONE TO COUNT
+         DR    R0,R14              CALULATE AVERAGE
+         BAL   R14,CONVERT         CONVERT AVERAGE RESERVE TIME.
+         MVC   ULRNBAVG,MINUTES      MOVE TO ULINE.
+*
+         L     R1,RTLCKCNT         GET TOTAL NO. OF RESERVES.
+         AR    R10,R1              ACCUMULATE COUNT.
+         CVD   R1,DBLWORD          CONVERT TO DECIMAL.
+         OI    DBLWORD+7,X'0F'     MAKE UNSIGNED.
+         MVC   ULLCKCNT,EDPATRN    EDIT
+         ED    ULLCKCNT,DBLWORD+4   RESERVE COUNT.
+*
+         L     R1,RTLCKHWM         GET HIGHWATER MARK.
+         BAL   R14,CONVERT         CONVERT TO HH:MM:SS.TH.
+         MVC   ULLCKHWM,MINUTES      MOVE TO ULINE.
+*
+         L     R1,RTLCKTL         GET TOTAL RESERVE TIME.
+         AR    R11,R1              ACCUMULATE TOTAL RESERVE TIME.
+         BAL   R14,CONVERT         CONVERT TO HH:MM:SS.TH.
+         MVC   ULLCKTL,MINUTES      MOVE TO ULINE.
+*
+         SR    R0,R0               CLEAR FOR DIVIDE.
+         L     R1,RTLCKTL         LOAD TOTAL RESERVE TIME.
+         L     R14,RTLCKCNT         GET COUNT
+         LTR   R14,R14             IS IT ZERO?
+         BNZ   *+8                  NO. BRANCH
+         LA    R14,1(,R14)         YES. ADD ONE TO COUNT
+         DR    R0,R14              CALULATE AVERAGE
+         BAL   R14,CONVERT         CONVERT AVERAGE RESERVE TIME.
+         MVC   ULLCKAVG,MINUTES    MOVE TO ULINE.
+*
+         PUT   UCBPRT,ULINE        WRITE OUT RECORD.
+         MVI   ULINE,C' '          CLEAR CARRAGE CONTROL.
+*
+UPRNEXT  EQU   *
+         LA    R5,RTSIZE           GET NEXT TABLE ENTRY.
+         CLI   RTUCB,X'FF'         END OF TABLE?
+         BNE   UPRLOOP             NO. PRINT NEXT TABLE ENTRY.
+         EJECT
+         MVI   ULINE,C'0'         DOUBLE SPACE.
+         MVI   ULINE+1,C' '       CLEAR
+         MVC   ULINE+2(131),ULINE+1   ULINE AREA.
+*
+         CVD   R6,DBLWORD          TOTAL RESERVES TO DECIMAL.
+         OI    DBLWORD+7,X'0F'     MAKE UNSIGNED.
+         MVC   UTRSVCNT,EDPATRN    EDIT
+         ED    UTRSVCNT,DBLWORD+4  RESERVE COUNT.
+*
+         LR    R1,R7               LOAD ACCUMULATED TOTAL TIME.
+         BAL   R14,CONVERT         CONVERT AVERAGE RESERVE TIME.
+         MVC   UTRSVTL,MINUTES      MOVE TO ULINE.
+*
+         SR    R0,R0               CLEAR FOR DIVIDE.
+         LR    R1,R7               LOAD ACCUMULATED TOTAL TIME.
+         LTR   R6,R6               SEE IF COUNT IS ZERO
+         BNE   *+8                 IF NOT GO AROUND
+         LA    R6,1                SET COUNT TO 1.
+         DR    R0,R6               DIVIDE BY TOTAL RESERVES.
+         BAL   R14,CONVERT         CONVERT AVERAGE RESERVE TIME.
+         MVC   UTRSVAVG,MINUTES      MOVE TO ULINE.
+*
+         CVD   R8,DBLWORD          TOTAL RNB TO DECIMAL.
+         OI    DBLWORD+7,X'0F'     MAKE UNSIGNED.
+         MVC   UTRNBCNT,EDPATRN    EDIT
+         ED    UTRNBCNT,DBLWORD+4  RSV NOT BUSY COUNT.
+*
+         LR    R1,R9               LOAD ACCUMULATED TOTAL RNB TIME.
+         BAL   R14,CONVERT         CONVERT AVERAGE RESERVE TIME.
+         MVC   UTRNBTL,MINUTES      MOVE TO ULINE.
+*
+         SR    R0,R0               CLEAR FOR DIVIDE.
+         LR    R1,R9               LOAD ACCUMULATED TOTAL TIME.
+         LTR   R8,R8               SEE IF COUNT IS ZERO
+         BNE   *+8                 IF NOT GO AROUND
+         LA    R8,1                SET COUNT TO 1.
+         DR    R0,R8               DIVIDE BY TOTAL RESERVES.
+         BAL   R14,CONVERT         CONVERT AVERAGE RSV NOT BUSY TIME.
+         MVC   UTRNBAVG,MINUTES      MOVE TO ULINE.
+*
+         CVD   R10,DBLWORD         TOTAL RESERVES TO DECIMAL.
+         OI    DBLWORD+7,X'0F'     MAKE UNSIGNED.
+         MVC   UTLCKCNT,EDPATRN    EDIT
+         ED    UTLCKCNT,DBLWORD+4  LOCKOUT COUNT.
+*
+         LR    R1,R11              LOAD ACCUMULATED TOTAL TIME.
+         BAL   R14,CONVERT         CONVERT AVERAGE RESERVE TIME.
+         MVC   UTLCKTL,MINUTES      MOVE TO ULINE.
+*
+         SR    R0,R0               CLEAR FOR DIVIDE.
+         LR    R1,R11              LOAD ACCUMULATED TOTAL TIME.
+         LTR   R10,R10             SEE IF COUNT IS ZERO
+         BNE   *+8                 IF NOT GO AROUND
+         LA    R10,1               SET COUNT TO 1.
+         DR    R0,R10              DIVIDE BY TOTAL RESERVES.
+         BAL   R14,CONVERT         CONVERT AVERAGE RESERVE TIME.
+         MVC   UTLCKAVG,MINUTES      MOVE TO ULINE.
+*
+         PUT   UCBPRT,UTLINE         PRINT TOTAL LINE.
+*
+         CLOSE (UCBPRT,LEAVE)        YES. CLOSE FILE .
+         EJECT
+*---------------------------------------------------------------------*
+*        PRINT ACCUMULATED QCB INFORMATION                            *
+*---------------------------------------------------------------------*
+QPRINT   OPEN  (QCBPRT,OUTPUT)
+*
+*
+         TIME  DEC                 GET THE TIME.
+         ST    R0,DBLWORD          STORE DECIMAL TIME.
+         UNPK  DBLWORD+1(7),DBLWORD(4) UNPACK DECIMAL TIME.
+         MVC   SIDTIME+31(2),DBLWORD+1 STORE HOUR OF DAY.
+         MVC   SIDTIME+34(2),DBLWORD+3 STORE MINUTE OF DAY.
+         MVC   SIDTIME+37(2),DBLWORD+5 STORE SECOND OF DAY.
+         MVC   QHTIME(40),SIDTIME  MOVE
+         PUT   QCBPRT,QHDG1         WRITE REPORT HEADING.
+*
+         PUT   QCBPRT,QHDG2         WRITE LABEL LINE ONE.
+*
+         PUT   QCBPRT,QHDG3         WRITE LABEL LINE TWO.
+*
+         L     R5,RTBEGIN
+         SR    R6,R6               CLEAR FOR RESERVE TOTAL
+         SR    R7,R7               CLEAR FOR RESERVE COUNT
+         MVI   QLINE,C'0'         DOUBLE SPACE.
+QPRLOOP  MVI   QLINE+1,C' '       CLEAR
+         MVC   QLINE+2(119),QLINE+1   ULINE AREA.
+         CLC   RTQCBNM,TOTAL IS THIS A QCB ENTRY?
+         BE    QPRNEXT              NO. GET THE NEXT ENTRY
+         CLC   RTQCBNM,BZERO       NULL ENTRY?
+         BE    QPRNEXT              YES. GET THE NEXT ENTRY
+         OC    RTRSVCNT,RTRSVCNT   NO RESERVES COMPLETED YET?
+         BZ    QPRNEXT              YES. BYPASS THIS ENTRY.
+         MVC   QLQCBNM,RTQCBNM     EDIT QCB NAME
+         MVC   QLVOL,RTVOL         EDIT VOLSER
+         LH    R2,RTUCB            LOAD UCB ADDRESS
+         N     R2,FFFF             RESET IF UCB ADDR > 32K
+         MVC   QLDEV,UCBNAME       EDIT DEVICE ADDRESS
+*
+         L     R1,RTRSVCNT         GET TOTAL NO. OF RESERVES.
+         AR    R6,R1               ACCUMULATE TOTAL RESERVE NUMBER.
+         CVD   R1,DBLWORD          CONVERT TO DECIMAL.
+         OI    DBLWORD+7,X'0F'     MAKE UNSIGNED.
+         MVC   QLRSVCNT,EDPATRN    MOVE IN EDIT PATTERN.
+         ED    QLRSVCNT,DBLWORD+4  EDIT TOTAL RESERVES.
+*
+         L     R1,RTRSVTL
+         AR    R7,R1               ACCUMULATE RSV TOTAL TIME
+         BAL   R14,CONVERT         CONVERT TO HH.MM.SS.TH.
+         MVC   QLRSVTL,MINUTES      MOVE TIME TO QCBPRT.
+*
+         L     R1,RTRSVHWM                 *GET HIGHWATER MARK*
+         BAL   R14,CONVERT         CONVERT TO HH.MM.SS.TH.
+         MVC   QLRSVHWM,MINUTES      MOVE HOUR TO PRINT.
+*
+         SR    R0,R0               CLEAR FOR DIVIDE.
+         L     R1,RTRSVTL          LOAD TOTAL RESERVE TIME.
+         D     R0,RTRSVCNT         DIVIDE BY NO. OF RESERVES.
+         BAL   R14,CONVERT         CONVERT TO HH.MM.SS.TH.
+         MVC   QLRSVAVG,MINUTES      MOVE TO QLINE.
+*
+         PUT   QCBPRT,QLINE
+*
+QPRNEXT  EQU   *
+         MVI   QLINE,C' '          SET CARRIAGE CONTROL
+         LA    R5,RTSIZE
+         C     R5,RTEND            END OF TABLE?
+         BL    QPRLOOP              NO. GET NEXT ENTRY.
+*
+         MVI   QLINE,C'0'         DOUBLE SPACE.
+         MVI   QLINE+1,C' '       CLEAR
+         MVC   QLINE+2(119),QLINE+1   QLINE AREA.
+         CVD   R6,DBLWORD          TOTAL RESERVES TO DECIMAL.
+         OI    DBLWORD+7,X'0F'     MAKE UNSIGNED.
+         MVC   QTRSVCNT,EDPATRN    EDIT
+         ED    QTRSVCNT,DBLWORD+4  RESERVE COUNT.
+*
+         LR    R1,R7               LOAD ACCUMULATED TOTAL TIME.
+         BAL   R14,CONVERT         CONVERT AVERAGE RESERVE TIME.
+         MVC   QTRSVTL,MINUTES      MOVE TO ULINE.
+*
+         SR    R0,R0               CLEAR FOR DIVIDE.
+         LR    R1,R7               LOAD ACCUMULATED TOTAL TIME.
+         LTR   R6,R6               SEE IF COUNT IS ZERO
+         BNE   *+8                 IF NOT GO AROUND
+         LA    R6,1                SET COUNT TO 1.
+         DR    R0,R6               DIVIDE BY TOTAL RESERVES.
+         BAL   R14,CONVERT         CONVERT AVERAGE RESERVE TIME.
+         MVC   QTRSVAVG,MINUTES      MOVE TO ULINE.
+         PUT   QCBPRT,QTLINE
+*
+QPREND   CLOSE QCBPRT
+         LM    R10,R11,SAVE1011    RELOAD RESISTERS
+         BR    R11                 RETURN TO CALLER.
+         EJECT
+*---------------------------------------------------------------------*
+*         UCB SCAN SUBROUTINE - GOES THRU UCB LOOKUP TABLE LOOKING    *
+*         FOR DIRECT ACCESS UCB'S.  RETURN VIA REGISTER 11            *
+*         PLUS DISPLACEMENT OF 4 FOR D.A. UCB FOUND; RETURN VIA       *
+*         REG. 11 FOR END OF UCB LOOKUP TABLE.                        *
+*---------------------------------------------------------------------*
+*
+UCBSCAN  EQU   *
+         LR    R4,R3               LOAD BEGINNING OF UCB LOOKUP TABLE.
+         SR    R7,R7               CLEAR REGISTER 7.
+UCBLOOP  EQU   *
+         TM    0(R4),X'FF'        TEST UCB LOOKUP TABLE ENTRY.
+         BZ    UCBNEXT             NULL ENTRY; GET NEXT ENTRY.
+         BOR   R11                 END OF TABLE; RETURN ON R11.
+         LH    R2,0(R4)           POINT TO UCB.
+         N     R2,FFFF            RESET IF NEGATIVE.
+         CR    R2,R7               IF CURRENT UCB ADDRESS IS
+         BL    UCBNEXT             LESS THAN PREVIOUT, BYPASS.
+         LR    R7,R2               SAVE FOR PREVIOUS UCB ADDRESS.
+         TM    UCBTBYT3,UCB3DACC   DIRECT ACCESS UCB?
+         BZ    UCBNEXT              NO, BRANCH TO GET NEXT UCB
+         TM    UCBSTAT,UCBONLI     DEVICE ONLINE?
+         BO    4(,R11)              YES. RETURN VIA R11 +4.
+*
+UCBNEXT  EQU   *
+         LA    R4,2(,R4)          GET NEXT UCB ENTRY.
+         B     UCBLOOP             TEST NEXT ENTRY.
+         EJECT
+*---------------------------------------------------------------------*
+*        EDIT TIME ROUTINE
+*---------------------------------------------------------------------*
+CONVERT  EQU   *
+         SR    R0,R0               CLEAR FOR DIVIDE.
+         D     R0,HOUR             GET NO. OF HOURS.
+         CVD   R1,DBLWORD          CONVERT HOURS TO DECIMAL.
+         OI    DBLWORD+7,X'0F'     MAKE UNSIGNED.
+         UNPK  HOURS,DBLWORD       STORE HOURS FOR PRINTING.
+*
+         LR    R1,R0               REMAINDER = NEW DIVIDEND.
+         SR    R0,R0               CLEAR FOR DIVIDE.
+         D     R0,MINUTE           GET NO. OF MINUTES.
+         CVD   R1,DBLWORD          CONVERT SECONDS TO DECIMAL.
+         OI    DBLWORD+7,X'0F'     MAKE UNSIGNED.
+         UNPK  MINUTES,DBLWORD     STORE MINUTES FOR PRINTING.
+*
+         LR    R1,R0               REMAINDER = NEW DIVIDEND.
+         SR    R0,R0               CLEAR FOR DIVIDE.
+         D     R0,SECOND           GET NO. OF SECONDS.
+         CVD   R1,DBLWORD          CONVERT SECONDS TO DECIMAL.
+         OI    DBLWORD+7,X'0F'     MAKE UNSIGNED.
+         UNPK  SECONDS,DBLWORD     STORE FOR PRINTING.
+*
+         CVD   R0,DBLWORD          CONVERT HUNDREDTHS TO DECIMAL.
+         OI    DBLWORD+7,X'0F'     MAKE UNSIGNED.
+         UNPK  TH,DBLWORD          STORE FOR PRINTING.
+         BR    R14                 RETURN TO PRINT ROUTINE.
+         EJECT
+*
+SPIEEXT  EQU   *
+         ST    R1,PIESAVE              STORE PIE ADD.
+         MVC   PIESAVE+4(32),0(R1)    SAVE PIE AREA
+         MVC   8(4,R1),GETMAJA    STORE RETURN ADDRESS.
+         BCTR  R10,R14             NORMAL RETURN TIL ZERO.
+         LA    R11,ABEND001        ABEND AFTER PRINTING.
+         B     UPRINT              PRINT STATISTICS.
+*
+ABEND001 EQU   *
+         DC    H'00'               ABEND. SPIE ENTERED TOO MANY TIMES
+*
+POSTED   EQU   *
+         XC    ECBAD,ECBAD         CLEAR ECB.
+         LA    R11,RESETTME        POINT TO SECOND ABEND RTN.
+         OC    REPLY,BLANKS        SET TO UPPER CASE.
+         CLC   RESET,REPLY         REPLY EQUAL RESET?
+         BE    UPRINT              YES. PRINT REPORT AND ABEND.
+         LA    R11,ENDJOB          POINT TO EOJ RETURN.
+         CLC   END,REPLY           REPLY EQUAL END?
+         BE    UPRINT              YES. PRINT REPORT AND TERMINATE.
+         CLC   TRACEON,REPLY       REPLY EQUAL TRACE ON ?
+         BNE   CHKTROFF            NO, BRANCH
+         LA    R4,54               SET LENGTH
+         LA    R3,REPLY+9          POINT AT DATA
+         XC    QNMSW,QNMSW         RESET SWITCH
+         BAL   R11,QNMSCAN         PROCESS INFO
+         LA    R11,RESETTME        SET RETURN
+         B     UPRINT
+CHKTROFF CLC   TRACEOFF,REPLY      REPLY = TRACE OFF ?
+         BNE   ERRWTO              NO, BRANCH
+         XC    QNMSW,QNMSW         RESET SWITCH
+         MVC   QNMTABLE,BLANKS     RESET TRACE TABLE
+         WTO   'RSVTRACE - QNAME TRACEING STOPPED',ROUTCDE=(2,11)
+         B     WTOR
+*
+ERRWTO   WTO   'RSVTRACE - INVALID REPLY, REENTER',ROUTCDE=(2,11)
+         B     WTOR
+*
+RESETTME EQU   *
+         L     R5,RTBEGIN
+RESETLP  CLI   0(R5),X'FF'         END OF TABLE?
+         BE    RESETST
+         XC    RTRSVST(48),RTRSVST RESET TABLE ENTRY
+         LA    R5,RTSIZE           GET NEXT ENTRY
+         B     RESETLP
+RESETST  EQU   *
+         MVC   PRTLPCNT,PRTLPMAX   RESET PRINT COUNTER.
+         TIME  DEC
+         ST    R0,DBLWORD          STORE DECIMAL TIME.
+         UNPK  DBLWORD+1(7),DBLWORD(4) UNPACK DECIMAL TIME.
+         MVC   SIDTIME+17(2),DBLWORD+1 STORE HOUR OF DAY.
+         MVC   SIDTIME+20(2),DBLWORD+3 STORE MINUTE OF DAY.
+         MVC   SIDTIME+23(2),DBLWORD+5 STORE SECOND OF DAY.
+         B     WTOR                ISSUE WTOR
+         SPACE 2
+QNMSCAN  EQU   *
+         LA    R7,QNMTABLE         POINT AT START OF TABLE
+         MVC   0(8,R7),BLANKS      CLEAR QNMTABLE
+CLRLEN   SR    R6,R6               CLEAR LENGTH COUNTER
+         LR    R5,R3               POINT AT START OF DATA
+FNDCOMMA CLI   0(R5),C','          END OF NEW QNAME ?
+         BE    SAVEQNM             YES, BRANCH
+         CLI   0(R5),C' '          END OF NEW QNAME ?
+         BE    SAVEQNM             YES, BRANCH
+INCREGS  LA    R5,1(,R5)           INCR DATA POINTER
+         LA    R6,1(,R6)           INCR LENGTH COUNTER
+         BCT   R4,FNDCOMMA         DECR TOTAL LENGTH
+SAVEQNM  CH    R6,H8               NAME LE 8 ?
+         BH    ERRWTO              NO, BRANCH
+         CLC   ALL,0(R3)           ALL SPECIFIED ?
+         BNE   *+8                 NO, GO AROUND
+         OI    QNMSW,ALLQNM        YES, SET SWITCH
+         OI    QNMSW,TRCON         SET SWITCH
+         BCTR  R6,0                DECR FOR EXECUTE
+         EX    R6,MVCQNM           STORE QNAME IN TABLE
+         LA    R3,1(,R5)           POINT AT NEXT CHAR IN INPUT
+         MVC   QNMWTO+19(8),0(R7)  EDIT QNAME
+QNMWTO   WTO   'RSVTRACE -          QNAME TRACE ACTIVE',ROUTCDE=(2,11)
+         LA    R7,8(,R7)           POINT AT NEXT TABLE ENTRY
+         MVC   0(8,R7),BLANKS      CLEAR QNMTABLE
+         LTR   R4,R4               END OF DATA
+         BZR   R11
+         CLI   0(R5),C' '          END OF DATA
+         BER   R11
+         B     CLRLEN              BRANCH THRU INPUT DATA
+MVCQNM   MVC   0(*-*,R7),0(R3)     MOVE QNAME TO TABLE
+         EJECT
+*---------------------------------------------------------------------*
+*         END OF JOB                                                  *
+*---------------------------------------------------------------------*
+         SPACE 2
+*
+ENDJOB   EQU   *
+         CLOSE QNMTRACE
+         L     R2,RTGTMAIN
+         FREEMAIN R,LV=(R2),A=RTBEGIN FREE RSV TABLE
+         L     R13,4(R13)          LOAD PREVIOUS SAVE AREA
+         RETURN (14,12),RC=0
+         EJECT
+*****
+*****     DEFINED CONSTANTS AND DEFINED STORAGE.
+*****
+SAVEAREA DC  18F'0'
+         SPACE 2
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2                   UCB
+R3       EQU   3                   MIN
+R4       EQU   4                   MAJ
+R5       EQU   5                   RTABLE
+R6       EQU   6                   QEL
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10                  SPIELMT COUNTER
+R11      EQU   11                  BALR
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+CVTPTR   EQU   16
+CVTILK2  EQU   40
+CVTSMCA  EQU   196
+CVTFQCB  EQU   640
+PREVRSV  EQU   X'01'               PREVIOUSLY RESERVED
+CURNTRSV EQU   X'02'               CURRENT RESERVE (FIRST TIME)
+DBLWORD  DS    D
+MVCRNAME MVC   TRNAME(*-*),MINNAME  SAVE RNAME
+BZERO    DC    D'0'
+PIESAVE  DC   9F'0'                   SPIE SAVE AREA
+SAVE1011 DC   2F'0'
+ECBAD    DC    F'0'
+SPIELMT  DC    F'1000'
+GETMAJA  DC    A(GETMAJ)
+RTBEGIN  DC    F'0'
+RTEND    DC    F'0'
+RTLOW    DC    F'0'
+RTHIGH   DC    F'0'
+RTGTMAIN DC    F'0'
+CURNTIME DC    F'0'
+FFFF     DC    X'0000FFFF'
+RTUCBSZ  DC    H'0'
+TOTAL    DC    CL8'TOTAL'
+PRTLPMAX DC    A(03*60*15)
+PRTLPCNT DC    A(03*60*15)         PRINT ACCUMULATED DATA WHEN ZERO
+*
+BINTVL   DC    A(030)              INITIAL/CURRENT INTERVAL
+INTVLLOW DC    A(030)              LOW     INTERVAL
+INTVLHI  DC    A(035)              HIGH    INTERVAL
+INTVLRTE DC    A(005)              INTERVAL INCRIMENT
+QCBINTVL DC    A(035)              QCB SAMPLING INTERVAL
+MINIMAL  DC    A(100)              IGNORE RESERVE IF LESS THAN 1 SEC
+*
+ONEDAY   DC    A(24*60*60*100)
+HOUR     DC    A(60*60*100)
+MINUTE   DC    A(60*100)
+SECOND   DC    A(100)
+REPLY    DC    CL54' '
+QCBCNT   DC    H'11'               NO OF ENTRYS IN TABLE FOR QCB'S
+TRACEON  DC    CL9'TRACE ON,'
+TRACEOFF DC    CL9'TRACE OFF'
+RESET    DC    CL5'RESET'
+END      DC    CL3'END'
+TLINECNT DC    PL2'99'
+TLINEMAX DC    PL2'44'              QNMTRACE LINE/PAGE
+H8       DC    H'8'
+P4       DC    P'4'
+P1       DC    P'1'
+ALL      DC    CL3'ALL'
+QNMSW    DC    X'0'
+TRCON    EQU   X'80'
+ALLQNM   EQU   X'40'
+HOURS    DC    CL2'HH'
+         DC    C':'
+MINUTES  DC    CL2'MM'
+         DC    C':'
+SECONDS  DC    CL2'SS'
+         DC    C'.'
+TH       DC    CL2'TH'
+SIDTIME  DC    CL40'ON       YY.JJJ  HH.MM.SS  TO  HH.MM.SS '
+EDPATRN  DC    XL8'4020202020202021'
+UHDG1    DC    CL1'1'
+         DC    CL40' '
+         DC    CL40'U C B   R E S E R V E   S U M M A R Y   '
+UHTIME   DC    CL40' '
+         DC    CL12' '
+UHDG2    DC    CL1'0'
+         DC    CL40'----DEVICE--     -------------RESERVE---'
+         DC    CL40'------------     -------RESERVE NOT BUSY'
+         DC    CL40'------------     -------------LOCKOUT---'
+         DC    CL12'------------'
+UHDG3    DC    CL1' '
+         DC    CL40'ADDR  VOLSER     COUNT    HWMARK     TOT'
+         DC    CL40'AL   AVERAGE     COUNT    HWMARK     TOT'
+         DC    CL40'AL   AVERAGE     COUNT    HWMARK     TOT'
+         DC    CL12'AL   AVERAGE'
+ULINE    DS    0CL133
+         DC    CL2' '
+ULDEV    DC    CL3' '
+         DC    CL2' '
+ULVOL    DC    CL6' '
+         DC    CL2' '
+ULRSVCNT DC    CL8' '
+         DC    CL2' '
+ULRSVHWM DC    CL8' '
+         DC    CL2' '
+ULRSVTL  DC    CL8' '
+         DC    CL2' '
+ULRSVAVG DC    CL8' '
+         DC    CL2' '
+ULRNBCNT DC    CL8' '
+         DC    CL2' '
+ULRNBHWM DC    CL8' '
+         DC    CL2' '
+ULRNBTL  DC    CL8' '
+         DC    CL2' '
+ULRNBAVG DC    CL8' '
+         DC    CL2' '
+ULLCKCNT DC    CL8' '
+         DC    CL2' '
+ULLCKHWM DC    CL8' '
+         DC    CL2' '
+ULLCKTL  DC    CL8' '
+         DC    CL2' '
+ULLCKAVG DC    CL8' '
+         ORG   ULINE
+UTLINE   DS    0CL133
+         DC    CL15'0 '
+UTRSVCNT DC    CL8' '
+         DC    CL12' '
+UTRSVTL  DC    CL8' '
+         DC    CL2' '
+UTRSVAVG DC    CL8' '
+         DC    CL2' '
+UTRNBCNT DC    CL8' '
+         DC    CL12' '
+UTRNBTL  DC    CL8' '
+         DC    CL2' '
+UTRNBAVG DC    CL8' '
+         DC    CL2' '
+UTLCKCNT DC    CL8' '
+         DC    CL12' '
+UTLCKTL  DC    CL8' '
+         DC    CL2' '
+UTLCKAVG DC    CL8' '
+         DC    CL6' '
+QHDG1    DC    CL1'1'
+         DC    CL40'Q C B   R E S E R V E   S U M M A R Y   '
+QHTIME   DC    CL40' '
+         DC    CL40' '
+QHDG2    DC    CL1'0'
+         DC    CL40'---QCB--                ----------------'
+         DC    CL40'RESERVE---------------                  '
+         DC    CL40'                                        '
+QHDG3    DC    CL1' '
+         DC    CL40'  NAME   ADDR  VOLSER   COUNT     HWMARK'
+         DC    CL40'      TOTAL    AVERAGE                  '
+         DC    CL40'                                        '
+QLINE    DS    0CL121
+         DC    C' '
+QLQCBNM  DC    CL8' '
+         DC    CL2' '
+QLDEV    DC    CL3' '
+         DC    CL2' '
+QLVOL    DC    CL6' '
+QLRSVCNT DC    CL8' '
+         DC    CL3' '
+QLRSVHWM DC    CL8' '
+         DC    CL3' '
+QLRSVTL  DC    CL8' '
+         DC    CL3' '
+QLRSVAVG DC    CL8' '
+         DC    CL58' '
+         ORG   QLINE
+QTLINE   DS    0CL121
+         DC    CL22'0 '
+QTRSVCNT DC    CL8' '
+         DC    CL14' '
+QTRSVTL  DC    CL8' '
+         DC    CL3' '
+QTRSVAVG DC    CL8' '
+         DC    CL58' '
+THDG1    DC    CL1'1'
+         DC    CL40'        T R A C E   Q N A M E   L O G   '
+THTIME   DC    CL40' '
+         DC    CL40' '
+THDG2    DC    CL1'0'
+         DC    CL40'---JOB--  --STEP--  --QNAME-  ----------'
+         DC    CL40'RNAME-----------------------------      '
+         DC    CL40'                                        '
+TLINE    DS    0CL121
+         DC    C' '
+TJOBNM   DC    CL8' '
+         DC    CL2' '
+TSTEPNM  DC    CL8' '
+         DC    CL2' '
+TQNAME   DC    CL8' '
+         DC    CL2' '
+TRNAME   DC    CL44' '
+         DC    CL6' '
+BLANKS   DC    CL54' '
+QNMTABLE DC    20CL8' '
+*
+         EJECT
+*
+UCBPRT   DCB   MACRF=(PM),DSORG=PS,DDNAME=UCBPRINT,                    X
+               RECFM=FBA,LRECL=133,BLKSIZE=13300
+         EJECT
+QCBPRT   DCB   DDNAME=QCBPRINT,DSORG=PS,MACRF=PM,                      X
+               RECFM=FBA,LRECL=121,BLKSIZE=12100
+         EJECT
+QNMTRACE DCB   DDNAME=QNMTRACE,DSORG=PS,MACRF=PM,                      X
+               RECFM=FBA,LRECL=81,BLKSIZE=8100
+         EJECT
+*****
+*****     DSECTS DEFINING RESERVE TABEL AREA.
+*****
+RTABLE   DSECT
+RTUCB    DS    H                   UCB ADDRESS.
+RTVOL    DS    CL6                 VOLUME SERIAL.
+RTQCBNM  DS    CL8            NAME OF MAJOR QCB
+RTRSVST  DS    F                   TIME CURRENT RESERVE STARTED.
+RTRSVHWM DS    F                   HIGHWATER MARK.
+RTRSVTL  DS    F                   TOTAL RESERVE TIME.
+RTRSVCNT DS    F                   TOTAL NUMBER OF RESERVES.
+RTRNBST  DS    F                   RESERVE NOT BUSY START TIME.
+RTRNBHWM DS    F                   HIGHWATER MARK.
+RTRNBTL  DS    F                   TOTAL RESERVE NOT BUSY TIME.
+RTRNBCNT DS    F                   TOTAL NUMBER OF RESERVE NOT BUSY.
+RTLCKST  DS    F                   LOCKOUT START TIME.
+RTLCKHWM DS    F                   HIGHWATER MARK.
+RTLCKTL  DS    F                   TOTAL LOCKOUT TIME.
+RTLCKCNT DS    F                   TOTAL NUMBER OF LOCKOUTS.
+         DS    0D
+RTSIZE   EQU   *
+         ORG   RTRNBST
+RTFLG    DS    C                   RTFLG BYTE.
+RTMINADD DS    AL3                 MINOR QCB ADDRESS.
+         DS    C
+RTQELADD DS    AL3                 QEL ADDRESS.
+         EJECT
+         IHAQCB
+         EJECT
+         IHAQEL
+         EJECT
+         DSECT
+         IEFUCBOB LIST=YES
+         END

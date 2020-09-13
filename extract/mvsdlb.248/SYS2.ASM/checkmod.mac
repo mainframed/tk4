@@ -1,0 +1,652 @@
+CHECKMOD TITLE 'Check for presence of a load module'
+CHECKMOD CSECT ,
+***********************************************************************
+*                                                                     *
+* Title       - CHECKMOD                                              *
+*                                                                     *
+* Description - Check for presence of a load module                   *
+*                                                                     *
+* )F FUNCTION -                                                       *
+*   The CHECKMOD command checks whether a load module is available    *
+*   to the current TSO session by searching JOBLIB, STEPLIB, link     *
+*   list and link pack area.                                          *
+* )X SYNTAX   -                                                       *
+*               CHECKMOD 'LOADMOD' VERBOSE/QUIET NOLOAD/LOAD          *
+* )O OPERANDS -                                                       *
+* ))'LOADMOD' -  'LOADMOD' is the name of the load module to check.   *
+* ))VERBOSE   -  specifies that the result is to be communicated to   *
+*                the terminal. This is the default.                   *
+* ))QUIET     -  specifies that the result message is to be           *
+*                suppressed. This switch is intended to support using *
+*                CHECKMOD in a CLIST which will just need the return  *
+*                code from variable &LASTCC for conditional           *
+*                processing.                                          *
+* ))NOLOAD    -  specifies that the LOADability of the module in      *
+*                the current environment is not to be verified.       *
+*                This is the default.                                 *
+* ))LOAD      -  specifies that CHECKMOD shall try to load the        *
+*                module after it has been found. Depending on the     *
+*                setting of the VERBOSE switch the result of the load *
+*                operation is communicated to the terminal.           *
+* ))NOTES     -                                                       *
+*    Return codes: CHECKMOD uses the following return codes:          *
+*                         0 - the load module was found               *
+*                         4 - the load module was found but           *
+*                             CHECKMOD wasn't able to load it         *
+*                         8 - the load module wasn't found            *
+*                        12 - invalid syntax and prompting            *
+*                             not suscessful                          *
+*                                                                     *
+* OPERATION   - CHECKMOD is a reentrant command processor that        *
+*               performs the following processing:                    *
+*                                                                     *
+*               1. Issue a BLDL to find out if the load module is     *
+*                  in the JOBLIB, the STEPLIB or the link list.       *
+*               2. If the BLDL doesn't succeed scan the CDE chain     *
+*                  to find out if the load module is an active        *
+*                  link pack area module.                             *
+*               3. If the CDE chain scan doesn't succeed scan the     *
+*                  LPDE chain to find out if the load module is in    *
+*                  the pageable link pack area.                       *
+*               4. If the VERBOSE switch was used or defaulted to     *
+*                  communicate the search result through a terminal   *
+*                  message.                                           *
+*               5. If the module exists and the LOAD switch was       *
+*                  used issue a LOAD macro and report the result if   *
+*                  VERBOSE was also used or defaulted to. If the LOAD *
+*                  was successful issue a DELETE to allow MVS to      *
+*                  remove the module from virtual storage if it isn't *
+*                  in use elsewhere.                                  *
+*               6. Set the return code and exit.                      *
+*                                                                     *
+* This command processor has been created by modifying the sample     *
+* command processor found in IBM's TSO/E Programming Guide.           *
+*                                                                     *
+* 2012/09/21 - initial implementation, version 1.0                 JW *
+* 2012/10/02 - LOAD operand added                                  JW *
+*            - explicit CDE and LPDE chain loops replaced by calls JW *
+*              to IEAQCDSR and IEAVVMSR                               *
+*            - enhanced VERBOSE mode to report original module     JW *
+*              name for an alias                                      *
+*            - enhanced VERBOSE mode to report the amount of       JW *
+*              contiguous storage needed to load the module (case     *
+*              JOBLIB/STEPLIB/link list) or the size of the           *
+*              module's first extent (case link pack area)            *
+*            - changed terminal messages from TPUT to PUTLINE to   JW *
+*              enable batch usage                                     *
+*                                                                     *
+* Author: Juergen Winkelmann, ETH Zuerich                             *
+*                                                                     *
+***********************************************************************
+*
+CHECKMOD CSECT
+         STM   R14,R12,12(R13)       save caller's registers
+         LR    R12,R15               establish addressability within
+         USING CHECKMOD,R12          this CSECT
+         LR    R2,R1                 save the pointer to the CPPL
+*                                    around the GETMAIN
+         GETMAIN RU,LV=LSAVEA        obtain a dynamic save area
+         USING SAVEAREA,R1           and establish addressability
+         ST    R1,8(R13)             put the address of CHECKMOD's save
+*                                    area into the caller's save area
+         ST    R13,BPTR              put the address of CHECKMOD's save
+*                                    area into its own save area
+         LR    R13,R1                load GETMAINed area address
+         USING SAVEA,R13             point to the dynamic save area
+         DROP  R1                    don't use R1 any more
+         GETMAIN RU,LV=LWORKA        obtain a dynamic work area
+         USING WORKA,R1              and establish addressability to
+*                                    the dynamic work area
+         STM   R0,R1,WORKAGML        save length and addr of
+*                                    dynamic area
+         LR    R10,R1                get ready to use R10 as the
+         USING WORKA,R10             data area segment base register
+         DROP  R1                    don't use R1 any more
+         ST    R2,CPPLP              save the pointer to the CPPL
+*
+***********************************************************************
+*                                                                     *
+*    Parse command syntax                                             *
+*                                                                     *
+***********************************************************************
+*
+         XC    RETCODE,RETCODE      initialize the return code
+         GETMAIN RU,LV=LPPL         obtain a dynamic PPL work area
+         STM   R0,R1,PPLLNG         save length and addr of dynamic PPL
+         GETMAIN RU,LV=LANSWER      obtain a dynamic PPL answer area
+         STM   R0,R1,ANSWERLN       save length and addr of dynamic PPL
+*                                   answer area
+         L    R2,PPLP               get the address of the PPL
+         USING PPL,R2               and establish addressability
+         L    R1,CPPLP              get address of CPPL
+         USING CPPL,R1              and establish addressability
+         MVC  PPLUPT,CPPLUPT        put in the UPT address from CPPL
+         MVC  PPLECT,CPPLECT        put in the ECT address from CPPL
+         MVC  PPLCBUF,CPPLCBUF      put in the command buffer address
+*                                   from the CPPL
+         LA   R3,PUTLIOPL           get PUTLINE IOPL address
+         MVC  0(4,R3),CPPLUPT       put UPT address into PUTLINE IOPL
+         MVC  4(4,R3),CPPLECT       put ECT address into PUTLINE IOPL
+         L    R1,WORKAGMP           get the address of the command
+*                                   processor's dynamic work area to
+         ST   R1,PPLUWA             be passed to the validity check
+*                                   routine
+         DROP R1                    don't use R1 any more
+         L    R1,ANSWERPT           get the address of the parse
+*                                   answer area and
+         ST   R1,PPLANS             store it in the PPL
+         XC   ECB,ECB               clear command processor's
+*                                   event control block (ECB)
+         LA   R1,ECB                get the address of the command
+*                                   processor's ECB and
+         ST   R1,PPLECB             put it in the PPL
+         ST   R1,PUTLIOPL+8         put it in the PUTLINE IOPL
+         L    R1,PCLADCON           get the address of the PCL and
+         ST   R1,PPLPCL             put it in the PPL for parse
+         CALLTSSR EP=IKJPARS,MF=(E,PPL) invoke parse
+         DROP R2                    don't use R2 any more
+         LTR  R15,R15               if parse return code is zero
+         BZ   MODCHECK              perform processing for the command
+         MVC  RETCODE(4),ERROR      set CP return code to 12
+         B    CLEANUP               prepare to return to the TMP
+*
+***********************************************************************
+*                                                                     *
+*    Mainline processing                                              *
+*                                                                     *
+***********************************************************************
+*
+GETNAME  MVC  PDS2NAME(1),0(R7)     get load module name (EXecuted)
+MODCHECK L    R2,ANSWERPT           get answer pointer
+         L    R2,0(,R2)             get answer address
+         USING CHKDSECT,R2          establish answer addressability
+         LA   R8,LMOD               get address of load module name PDE
+         USING LMODPDE,R8           establish PDE addressability
+         MVC  BLDL(LBLDLSK),BLDLSKEL initialize BLDL name list
+         L    R7,LMODPTR            get load module name address
+         LH   R3,LMODLNG            get load module name length
+         DROP R8                    don't use R8 any more
+         BCTR R3,0                  decrement for EXecute
+         EX   R3,GETNAME            copy module name into BLDL list
+         LR   R7,R3                 current length in R7 from now on
+         L    R3,CVTPTR             IEAVVMSR expects R3 to point to CVT
+         MVC  VERBMSG(8),PDS2NAME   copy module name into terminal msg
+         LA   R5,VERBMSG            address of terminal message
+         AR   R5,R7                 point after load module name
+         LR   R4,R5                 remember location for 'not found'
+         MVC  1(10,R5),=C' found in ' assume we're going to find it
+         LA   R5,11(,R5)            point after
+         LA   R7,11(,R7)            new length
+*
+* Search JOBLIB, STEPLIB and link list
+*
+         BLDL 0,BLDL                check for load module
+         LTR  R15,R15               found it?
+         BNZ  TRYLPA                no, try active LPA using CDE chain
+*
+* Module found JOBLIB, STEPLIB or link list
+*
+         CLI  QUIET+1,X'01'         quiet mode selected?
+         BE   CHKLOAD               yes, check for LOAD operand
+         CLI  PDS2LIBF,X'01'        found it in link list?
+         BNE  *+22                  no, skip link list
+         MVC  0(9,R5),=C'link list' set location
+         LA   R7,9(,R7)             new length
+         LA   R5,9(,R5)             point after
+         B    LNKALIAS              get attributes
+         MVC  0(17,R5),=C'joblib or steplib' set location
+         LA   R7,17(,R7)            new length
+         LA   R5,17(,R5)            point after
+LNKALIAS TM   PDS2INDC,PDS2ALIS     is it an alias?
+         BNO  LNKSIZE               no, go report size
+         MVC  0(11,R5),=C', alias of ' yes, report original member name
+         LA   R5,11(,R5)            point after
+         LA   R6,PDSS01             address first optional section
+         TM   PDS2ATR1,PDS2SCTR     module in scatter load format?
+         BNO  *+8                   no, alias section already in R6
+         LA   R6,PDSS01LN(,R6)      yes, skip scatter load section
+         LA   R6,PDS2MNM-PDSS02(,R6) address of original member name
+         MVC  0(8,R5),0(R6)         get original member name
+         LA   R7,19(,R7)            new length
+         LA   R5,8(,R5)             point after
+         LR   R6,R5                 copy position
+         BCTR R6,0                  decrement
+         CLI  0(R6),C' '            is it a blank?
+         BNE  LNKSIZE               no, length and position are correct
+         BCTR R7,0                  yes, decrement length ..
+         BCTR R5,0                   .. and position
+         B    *-14                  check again for blank
+LNKSIZE  MVC  0(9,R5),=C', size = ' report size of load module
+         LA   R5,9(,R5)             point after
+         UNPK 0(7,R5),PDS2STOR(4)   unpack size from directory entry
+         TR   0(6,R5),MAKEHEX       translate to hex characters
+         LA   R7,15(,R7)            new length
+         LA   R5,6(,R5)             point after
+         B    TELLUSER              tell user
+*
+* Search link pack area
+*
+TRYLPA   L    R8,CVTQLPAQ-CVTMAP(,R3) start of CDE chain
+         LA   R9,PDS2NAME           address of load module name
+         L    R15,CVTQCDSR-CVTMAP(,R3) active LPA search routine
+         BALR R14,R15               search for it
+         B    FOUNDCDE              found it
+CONTPLPA STM  R6,R9,LPDESAVE        save IEAVVMSR work registers
+         L    R15,CVTLPDSR-CVTMAP(,R3) LPD search routine
+         BALR R14,R15               search for it
+         B    FOUNLPDE              found it
+         LM   R6,R9,LPDESAVE        restore IEAVVMSR work registers
+*
+* Module not found
+*
+         LA   R15,8                 set return code
+         ST   R15,RETCODE           remember return code
+         CLI  QUIET+1,X'01'         quiet mode selected?
+         BE   CLEANUP               yes, cleanup and exit
+         MVC  1(10,R4),=C' not found' change message to 'not found'
+         B    TELLUSER              tell user
+*
+* Module found in CDE chain (active link pack area)
+*
+         USING CDENTRY,R11          addressability of CDE
+FOUNDCDE TM   CDATTR,CDNIP          really found an active LPA module?
+         BNO  CONTPLPA              no, continue with PLPA
+         CLI  QUIET+1,X'01'         quiet mode selected?
+         BE   CHKLOAD               yes, check for LOAD operand
+         MVC  0(14,R5),=C'link pack area' set location
+         LA   R7,14(,R7)            new length
+         LA   R5,14(,R5)            point after
+         TM   CDATTR,CDMIN          is this a minor CDE?
+         BNO  CDESIZE               no, go report size
+         L    R11,CDXLMJP           yes, address major CDE and ..
+         MVC  0(11,R5),=C', alias of ' .. report original module name
+         LA   R5,11(,R5)            point after
+         MVC  0(8,R5),CDNAME        get original module name
+         LA   R7,19(,R7)            new length
+         LA   R5,8(,R5)             point after
+         LR   R6,R5                 copy position
+         BCTR R6,0                  decrement
+         CLI  0(R6),C' '            is it a blank?
+         BNE  CDESIZE               no, length and position are correct
+         BCTR R7,0                  yes, decrement length ..
+         BCTR R5,0                   .. and position
+         B    *-14                  check again for blank
+CDESIZE  MVC  0(9,R5),=C', size = ' report size of load module
+         LA   R5,9(,R5)             point after
+         L    R6,CDXLMJP            get extent list address
+         USING XTLST,R6             addressability of extent list
+         UNPK 0(7,R5),XTLMSBLN(4)   unpack size from extent list
+         TR   0(6,R5),MAKEHEX       translate to hex characters
+         LA   R7,15(,R7)            new length
+         LA   R5,6(,R5)             point after
+         B    TELLUSER              tell user
+         DROP R6                    don't use R6 any more
+         DROP R11                   don't use R11 any more
+*
+* Module found in LPDE chain (pageable link pack area)
+*
+FOUNLPDE LM   R6,R9,LPDESAVE        restore IEAVVMSR work registers
+         LR   R11,R0                copy LPDE address into R11
+         USING LPDE,R11             addressability of LPDE
+         CLI  QUIET+1,X'01'         quiet mode selected?
+         BE   CHKLOAD               yes, check for LOAD operand
+         MVC  0(14,R5),=C'link pack area' set location
+         LA   R7,14(,R7)            new length
+         LA   R5,14(,R5)            point after
+         TM   LPDEATTR,LPDEMIN      is this a minor LPDE?
+         BNO  LPDESIZE              no, go report size
+         MVC  0(11,R5),=C', alias of ' report original module name
+         LA   R5,11(,R5)            point after
+         MVC  0(8,R5),LPDEMJNM      get original module name
+         LA   R7,19(,R7)            new length
+         LA   R5,8(,R5)             point after
+         LR   R6,R5                 copy position
+         BCTR R6,0                  decrement
+         CLI  0(R6),C' '            is it a blank?
+         BNE  LPFINDMJ              no, length and position are correct
+         BCTR R7,0                  yes, decrement length ..
+         BCTR R5,0                   .. and position
+         B    *-14                  check again for blank
+LPFINDMJ L    R0,LPDEMJNM           get 1st four bytes of major LPDE
+         L    R1,LPDEMJNM+4         get 2nd four bytes of major LPDE
+         BALR R14,R15               search for it
+         B    *+8                   found it, go report size
+         B    TELLUSER              didn't find it... shouldn't happen
+         LR   R11,R0                copy LPDE address into R11
+LPDESIZE MVC  0(9,R5),=C', size = ' report size of load module
+         LA   R5,9(,R5)             point after
+         UNPK 0(7,R5),LPDEXTLN+1(4) unpack size from LPDE
+         TR   0(6,R5),MAKEHEX       translate to hex characters
+         LA   R7,15(,R7)            new length
+         LA   R5,6(,R5)             point after
+         B    TELLUSER              tell user
+         DROP R11                   don't use R11 any more
+*
+* Report search result
+*
+TELLUSER LA   R14,PUTLINE           get address of PUTLINE parameters
+         ST   R14,PUTLIOPL+12       put it in the PUTLINE IOPL
+         MVC  PUTLINE(LPUTLSKL),PUTLSKL initialize PUTLINE plist
+         LA   R7,4(,R7)             add header length to message length
+         STH  R7,VERBMSGL           store length in header
+         XC   VERBMSGO,VERBMSGO     clear offset in message header
+         XC   ECB,ECB               clear command processor's ECB
+         PUTLINE OUTPUT=(VERBMSGL,DATA),MF=(E,PUTLIOPL) send message
+         CLI  RETCODE+3,X'00'       RC=0?
+         BNE  CLEANUP               no, cleanup and exit
+*
+* Try to load the module if the LOAD operand was specified
+*
+CHKLOAD  CLI  LOAD+1,X'01'          LOAD requested?
+         BNE  CLEANUP               no, cleanup and exit
+         LA   R4,PDS2NAME           address of module name
+         LOAD EPLOC=(R4),ERRET=LOADERR load the module
+         DELETE EPLOC=(R4)          decrement module's use count
+         CLI  QUIET+1,X'01'         quiet mode selected?
+         BE   CLEANUP               yes, cleanup and exit
+*
+* Report successful LOAD
+*
+         XC   ECB,ECB               clear command processor's ECB
+         PUTLINE OUTPUT=(LSUCCESS,DATA),MF=(E,PUTLIOPL) send message
+         B    CLEANUP               cleanup and exit
+*
+* Report LOAD failure
+*
+LOADERR  LA   R4,4                  set return code
+         ST   R4,RETCODE            remember return code
+         CLI  QUIET+1,X'01'         quiet mode selected?
+         BE   CLEANUP               yes, cleanup and exit
+         MVC  LFAIL(LLFAIL),LFAILSKL copy message skeleton
+         ST   R1,LPDESAVE           store abend code
+         UNPK LFAILABN(4),LPDESAVE+1(4) unpack abend code
+         TR   LFAILABN(3),MAKEHEX   translate to hex characters
+         MVI  LFAILABN+3,C'-'       separator
+         ST   R15,LPDESAVE          store return code
+         UNPK LFAILRC(3),LPDESAVE+1(4) unpack return code
+         TR   LFAILRC(2),MAKEHEX    translate to hex characters
+         LA   R7,LLFAIL+4           add header length to message length
+         STH  R7,LFAILL             store length in header
+         XC   LFAILO,LFAILO         clear offset in message header
+         XC   ECB,ECB               clear command processor's ECB
+         PUTLINE OUTPUT=(LFAILL,DATA),MF=(E,PUTLIOPL) send message
+         DROP R2                    don't use R2 any more
+*
+***********************************************************************
+*                                                                     *
+*  Cleanup and termination processing                                 *
+*                                                                     *
+***********************************************************************
+*
+CLEANUP  DS   0H
+         L    R1,PPLP                point to PPL in dynamic work area
+         FREEMAIN RU,LV=LPPL,A=(1)   free the storage for the PPL
+         L    R1,ANSWERPT            point to the answer place
+         IKJRLSA (R1)                free storage that parse allocated
+*                                    for the PDL
+         L    R1,ANSWERPT            point to the answer place
+         FREEMAIN RU,LV=LANSWER,A=(1) free the storage for the
+*                                    answer word
+         L     R5,RETCODE            save return code around FREEMAIN
+         L     R1,WORKAGMP           point to module workarea
+         FREEMAIN RU,LV=LWORKA,A=(1) free the module workarea
+         LR    R1,R13                load process's save area address
+         L     R13,BPTR              chain to previous save area
+         DROP  R13                   don't use R13 any more
+         FREEMAIN RU,LV=LSAVEA,A=(1) free the module savearea
+         L     R14,12(R13)           here's our return address
+         LR    R15,R5                here's the return code
+         LM    R0,R12,20(R13)        restore regs 0-12
+         BR    R14                   return to the TMP
+*                                                                     *
+***********************************************************************
+*                                                                     *
+* LMODCHK - IKJIDENT validity checking routine                        *
+*                                                                     *
+* If the load module name is longer than 8 characters the validity    *
+* checking routine returns a code of 4 to parse.  This return         *
+* code indicates to parse that it should issue a message to the       *
+* terminal and prompt the user to re-enter the load module name.      *
+*                                                                     *
+* In all other cases this routine returns a code of 0 to parse.       *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+         DROP  R10                  we will reuse register 10
+LMODCHK  STM   R14,R12,12(R13)      save parse's registers
+         LR    R9,R15               entry address
+         USING LMODCHK,R9           establish addressability
+         LR    R2,R1                save the validity check parameter
+*                                   list parse passed to us
+         GETMAIN RU,LV=LSAVEA       obtain a dynamic save area for
+*                                   the LMODCHK routine
+         USING SAVEAREA,R1          and establish addressability
+         ST    R1,8(R13)            put the address of this routine's
+*                                   save area into parse's save area
+         ST    R13,BPTR             put the address of this routine's
+*                                   save area into its own save area
+*                                   for calling
+         LR    R13,R1               load address of GETMAINed area
+         USING SAVEAREA,R13         and establish addressability
+         L     R10,4(R2)            point to the command processor's
+*                                   original dynamic work area
+         USING WORKA,R10            data area segment base register
+         ST    R2,VCHKPLP           save the address of the validity
+*                                   check parameter list
+         LM    R1,R3,0(R2)          get the address of the PDE
+         STM   R1,R3,VCHKPL         save contents of parameter list
+         XC    LMDCHKRC,LMDCHKRC    make sure we start with a zero
+*                                   return code
+         L     R2,PDEADR            get the address of the PDE
+         USING LMODPDE,R2           and establish addressability to
+*                                   our mapping of the PDE
+         CLC   LMODLNG(2),EIGHT+2   length of loadmod name greater 8?
+         BNH   LMODOK               no  - this loadmod name is ok
+         LA    R5,LMODMSG           yes - get error message address
+         L     R6,VCHKPLP           get parameter list address
+         ST    R5,8(,R6)            store message address in plist
+         L     R5,FOUR              set RC=4
+         ST    R5,LMDCHKRC          save the return code
+LMODOK   LR    R1,R13               load routine's save area address
+         L     R13,BPTR             chain to previous save area
+         L     R5,LMDCHKRC          load the return code
+         FREEMAIN RU,LV=LSAVEA,A=(1) free workarea
+         L     R14,12(R13)          here's our return address
+         LR    R15,R5               here's the return code
+         LM    R0,R12,20(R13)       restore regs 0-12
+         BR    R14                  return to parse
+         DROP  R9                   don't use R9 any more
+         DROP  R10                  don't use R10 any more
+         DROP  R13                  don't use R13 any more
+*
+***********************************************************************
+*                                                                     *
+* Declares for constants                                              *
+*                                                                     *
+***********************************************************************
+*
+PCLADCON DC    A(PCLDEFS)           address of PCL
+FOUR     DC    F'4'                 used to set/test return code
+EIGHT    DC    F'8'                 used to set/test return code
+ERROR    DC    F'12'                used to set/test return code
+LMODMSG  DC    AL2(LLMODMSG)        second level help message
+         DC    AL2(0)
+         DC    C' Load module name must be one to eight characters in l+
+               ength'
+LLMODMSG EQU   *-LMODMSG            length of second level help message
+BLDLSKEL DC    H'1'                 skeleton for single entry name list
+         DC    AL2(LPDS2)           length of list entry
+         DC    CL8' '               empty member name
+LBLDLSK  EQU   *-BLDLSKEL           length of skeleton
+PUTLSKL  PUTLINE MF=L               PUTLINE parameter list
+LPUTLSKL EQU   *-PUTLSKL            length of PUTLINE parameter list
+         ORG   *-240                don't care about previous 240 bytes
+MAKEHEX  DS    0C                   translate table for zoned to hex
+         ORG   ,                    skip first 240 bytes of table
+         DC    C'0123456789ABCDEF'  hex character set
+LSUCCESS DS    0F                   LOAD successfull message
+         DC    AL2(LLSUCCSS)        length of message
+         DC    AL2(0)               no offset
+         DC    C'Module loaded successfully' LOAD was successful
+LLSUCCSS EQU   *-LSUCCESS           length of message
+LFAILSKL DC    C'Load failed, abend S' skeleton for LOAD failed message
+LFAILABO EQU   *-LFAILSKL           offset to abend code
+         DC    C'xxx'               abend code goes here
+         DC    C'-'                 separator for return code
+LFAILRCO EQU   *-LFAILSKL           offset to return code
+         DC    C'yy'                return code goes here
+LLFAIL   EQU   *-LFAILSKL           length of message
+         LTORG ,                    all literals go here
+*
+***********************************************************************
+*                                                                     *
+* PARSE macros used to describe the command operands                  *
+*                                                                     *
+***********************************************************************
+*
+PCLSTART DS    0H
+PCLDEFS  IKJPARM  DSECT=CHKDSECT    begin of syntax definition
+LMOD     IKJIDENT 'LOAD MODULE',                                       +
+               PROMPT='the name of the load module to search for, ''?''+
+                for help',                                             +
+               HELP=('up to eight alphanumeric characters beginning wit+
+               h an alphabetic'),                                      +
+               FIRST=ALPHA,OTHER=ALPHANUM,                             +
+               VALIDCK=LMODCHK
+QUIET    IKJKEYWD DEFAULT='VERBOSE'
+         IKJNAME 'QUIET'
+         IKJNAME 'VERBOSE'
+LOAD     IKJKEYWD DEFAULT='NOLOAD'
+         IKJNAME 'LOAD'
+         IKJNAME 'NOLOAD'
+         IKJENDP ,                  end of syntax definition
+LPCL     EQU   *-PCLSTART           length of the PCL
+*
+***********************************************************************
+*                                                                     *
+* Declares for dynamic variables                                      *
+*                                                                     *
+***********************************************************************
+*
+WORKAREA DSECT
+WORKA    DS    0F                   start of dynamic work area
+WORKAGML DS    F                    length of workarea
+WORKAGMP DS    F                    address of workarea
+PPLLNG   DS    F                    length of PPL
+PPLP     DS    F                    address of PPL
+ANSWERLN DS    F                    length of PPL answer area
+ANSWERPT DS    F                    address of PPL answer area
+CPPLP    DS    F                    address of the CPPL from TMP
+RETCODE  DS    F                    the return code
+PARSERC  DS    F                    the return code from parse
+LMDCHKRC DS    F                    the return code from the LMODCHK
+*                                   validation exit
+ECB      DS    F                    CP'S event control block
+VCHKPLP  DS    F                    pointer to the validity check
+*                                   parameter list
+VCHKPL   DS    0F                   validity check parameter list
+PDEADR   DS    F                    address of the PDE from PARSE
+USERWORD DS    F                    address of the work area we gave
+*                                   to PARSE
+VALMSG   DS    F                    address of a second-level message
+*                                   we can give back to PARSE
+LPDESAVE DS    4F                   save area for IEAVVMSR
+BLDL     DS    0F                   name list for BLDL
+FF       DS    H                    number of entries in list
+LL       DS    H                    length of a list entry
+         IHAPDS DSECT=NO            map a PDS directory entry
+LPDS2    EQU   *-PDS2               length of directory entry
+         DS    0F                   full word alignment for PUTLINE
+VERBMSGL DS    H                    length of message
+VERBMSGO DS    H                    offset
+VERBMSG  DS    CL70                 message area
+         DS    0F                   full word alignment for PUTLINE
+LFAILL   DS    H                    length of message
+LFAILO   DS    H                    offset
+LFAIL    DS    0C                   LOAD failed message
+         ORG   LFAIL+LFAILABO       offset to abend code
+LFAILABN DS    0C                   abend code goes here
+         ORG   LFAIL+LFAILRCO       offset to return code
+LFAILRC  DS    0C                   return code goes here
+         ORG   LFAIL+LLFAIL+1       end of message + one byte for UNPK
+PUTLIOPL DS    4F                   IOPL for PUTLINE
+PUTLINE  DS    0F                   PUTLINE parameter list goes here
+         ORG   *+LPUTLSKL           PUTLINE parameter list ends here
+LWORKA   EQU   *-WORKAREA           length of dynamic work area
+*
+***********************************************************************
+*                                                                     *
+* Declares for the save area                                          *
+*                                                                     *
+***********************************************************************
+*
+SAVEA    DSECT
+SAVEAREA DS    0CL72                standard save area
+         DS    F                    unused
+BPTR     DS    F                    backward save area pointer
+FPTR     DS    F                    forward save area pointer
+REG14    DS    F                    contents of register 14
+REG15    DS    F                    contents of register 15
+REG0     DS    F                    contents of register 0
+REG1     DS    F                    contents of register 1
+REG2     DS    F                    contents of register 2
+REG3     DS    F                    contents of register 3
+REG4     DS    F                    contents of register 4
+REG5     DS    F                    contents of register 5
+REG6     DS    F                    contents of register 6
+REG7     DS    F                    contents of register 7
+REG8     DS    F                    contents of register 8
+REG9     DS    F                    contents of register 9
+REG10    DS    F                    contents of register 10
+REG11    DS    F                    contents of register 11
+REG12    DS    F                    contents of register 12
+LSAVEA   EQU   *-SAVEA              length of save area
+*
+***********************************************************************
+*                                                                     *
+*  Control block mappings                                             *
+*                                                                     *
+***********************************************************************
+*
+LMODPDE  DSECT                      PDE mapping for the loadmod name
+LMODPTR  DS    F                    pointer to loadmod name
+LMODLNG  DS    H                    length of loadmod name
+LMODFLGS DS    CL1                  flags byte
+         DS    CL1                  reserved
+LLMODPDE EQU   *-LMODPDE            length of PDE
+         IKJPPL                     parse parameter list
+LPPL     EQU   *-PPL                length of PPL
+         IKJCPPL                    command processor parameter list
+LCPPL    EQU   *-CPPL               length of CPPL
+ANSWER   DSECT                      parse answer
+         DS    F                    parse answer place
+LANSWER  EQU   *-ANSWER             length of answer place
+         CVT   DSECT=YES            CVT mapping needed for CALLTSSR
+         IHACDE ,                   map a contents directory entry
+         IHALPDE ,                  map a link pack directory entry
+         IHAXTLST ,                 map a CDE extent list
+*
+***********************************************************************
+*                                                                     *
+*   Equates                                                           *
+*                                                                     *
+***********************************************************************
+*
+R0       EQU   0                    LPDE pointer output from IEAVVMSR
+R1       EQU   1                    R0/R1: name output from IEAQCDSR
+*                                   R0/R1: name input for IEAVVMSR
+R2       EQU   2                    answer area from parse
+R3       EQU   3                    CVT pointer for IEAVVMSR
+R4       EQU   4                    \
+R5       EQU   5                     \ work ..
+R6       EQU   6                     /        .. registers
+R7       EQU   7                    /
+R8       EQU   8                    CDE chain pointer for IEAQCDSR
+R9       EQU   9                    module name pointer for IEAQCDSR
+R10      EQU   10                   work area pointer
+R11      EQU   11                   CDE pointer output from IEAQCDSR
+R12      EQU   12                   base register
+R13      EQU   13                   data register
+R14      EQU   14                   return address
+R15      EQU   15                   return code
+         END   CHECKMOD

@@ -1,0 +1,1242 @@
+         TITLE 'ACF2/TSO PRODUCTION JOB SUBMISSION COMMAND PROCESSOR'
+*
+* FUNCTION:
+*        THIS MODULE ACCEPTS AS INPUT A LIST OF MEMBER NAMES AND
+*        OPTIONALLY A PDS IDENTIFIER.  AFTER VALIDATION OF A USERS
+*        PERMISSION TO ISSUE A JOB SUBMISSION REQUEST FROM THE PDS
+*        SPECIFIED THIS PROGRAM WILL DYNAMICALLY ALLOCATE THE PDS
+*        AND THE INTERNAL READER AND THEN SUBMIT THE JOB(S).  THE SUB-
+*        MITTED JOB NUMBER(S) ARE DISPLAYED AND THE DATASET AND THE
+*        INTERNAL READER ARE THEN DEALLOCATED.  SEE THE DOCUMENTATION
+*        AT LABEL PDSLIST TO DEFINE APPLICABLE DATASET NAMES AND
+*        PERMISSION VALUES.
+*
+* INSTALLATION MODIFIABLE ROUTINES:
+*        THIS MODULE WILL CREATE A //*LOGONID CARD THAT WILL BE SUB-
+*        MITTED AT THE END OF EACH JOB.  SINCE THIS WILL FOLLOW ANY
+*        OTHER //*LOGONID CARDS OR USER= PARAMETERS, THIS WILL NOT
+*        HAVE ANY EFFECTS ON JOBS THAT ALREADY HAVE A LOGONID SPEC-
+*        IFIED.  THE LOGONID GENERATED WILL BE THE FIRST PARAMETER
+*        OF THE JOBCARD ACCOUNTING FIELD.  TO MODIFY THIS OPERATION,
+*        SEE THE DOCUMENTATION AT THE BEGINNING OF THE GETLID SUBROUTIN
+*        IN THIS ASSEMBLY.  NOTE THAT THERE IS A METHOD TO DISABLE THIS
+*        OPERATION DOCUMENTED.  OTHER POSSIBLE GENERATED LOGONIDS
+*        COULD BE SOME PORTION OF THE JOBNAME, ETC..
+*
+* SYNTAX:  ACFSUB 'MEMBER-LIST' LIB('PDS-ID')  TERMINAL/INTRDR
+*
+* DEFAULTS:
+*        LIB - THE FIRST LIBRARY DEFINED AT LABEL PDSLIST
+*        TERMINAL/INTRDR - INTRDR (JOB SUBMISSION)
+*
+*
+* AUTHORIZATION:
+*        THIS COMMAND MUST BE LINK-EDITED AS APF AUTHORIZED INTO
+*        AN AUTHORIZED LIBRARY AND THE COMMAND NAME MUST BE
+*        ADDED TO THE AUTHORIZED COMMANDS LIST IN THE TMP (ACFEFTE2).
+*
+*        LOGONIDS SUBMITTED BY THIS COMMAND PROCESSOR SHOULD BE
+*        DEFINED WITH THE FOLLOWING ATTRIBUTES:
+*
+*              RESTRICT SUBAUTH PROGRAM(ACFSUB)
+*
+* ATTRIBUTES: RE-ENTRANT, TSO COMMAND PROCESSOR CONVENTIONS
+*
+*
+*        THIS MODULE IS PART OF THE ACF2 SYSTEM,                ACF 310
+*        A LICENSED PROGRAM PRODUCT OF SKK, INC.                ACF 310
+*
+*              M A I N T E N A N C E   L O G
+*              ---------------------   -----
+*
+*  TS74014  05/20/81                                            TS74014
+*                                                               TS74014
+         TITLE 'LOCAL MACROS'
+         MACRO
+&LABEL   DEFLIB &KEY,&DSN,&UID=
+         LCLA  &LEN
+&LEN     SETA  K'&DSN
+&LABEL   DC    CL8'&KEY'               PDS-ID KEY
+         DC    AL2(&LEN)               DSNAME LENGTH
+         DC    CL44'&DSN'              PDS DATASET NAME
+         DC    CL10'&UID'              UID AUTHORIZATION MASK
+         MEND
+         EJECT
+         GBLC &PFX,&SKK
+         SPACE 1
+*
+*        DEFINE PDS-ID MAPPING DSECT
+*
+PDSDSECT DSECT
+PDSDKEY  DS    CL8                     PDS-ID KEY
+PDSDSNL  DS    AL2                     DSNAME LENGTH
+PDSDSN   DS    CL44                    DSNAME, BLANK FILLED
+PDSUID   DS    CL10                    UID AUTHORIZED FOR USE
+PDSDLEN  EQU   *-PDSDSECT              LENGTH OF PDS-ID ENTRY
+*
+         TITLE 'GLOBAL MACROS'
+*
+*        DEFINE MVS CONTROL BLOCKS
+*
+         PRINT NOGEN
+         IKJCPPL
+         IKJECT
+         IKJUPT
+         IKJIOPL
+         IKJPGPB
+         IKJDAPL
+         IKJEFFGF GFDSECT=YES
+         CVT   DSECT=YES
+         IHAASCB
+         IHAPSA
+         IHADCB DSORG=PS,DEVD=DA
+         IFGACB
+         IFGRPL
+         PRINT GEN
+*
+*        DEFINE DYNAMIC ALLOCATION PARAMETER LISTS
+*
+         PRINT NOGEN
+         IKJPPL
+         IKJDAP08
+         IKJDAP18
+         IKJDAP30
+         IKJEFFDF DFDSECT=YES
+         IEFZB4D0
+         IEFZB4D2
+         PRINT GEN
+*
+*        DEFINE ACF2 CONTROL BLOCKS
+*
+         PRINT NOGEN
+         ACFREGS LINK=R8,PREFIX=ACF51
+         USING PSA,R0
+         ACCVT
+         ACFASVT
+         ACUCB
+         LIDREC
+         PRINT GEN
+*
+*        DEFINE WORK/SAVE AREAS
+*
+WORKAREA DSECT
+SAVEAREA DS    9D                      SAVE AREA
+ENTRYPT  DS    2A                      BASE REGISTERS
+MEMBUF   DS    A                       MEMBER BUFFER ADDRESS
+MEMCNT   DS    F                       CURRENT MEMBER COUNT
+MEMMAX   EQU   8192                    MAXIMUM MEMBER COUNT
+DWORK    DS    D                       DOUBLEWORD WORK AREA
+SLINK    DS    A                       LINK SAVE AREA
+SCPTR    DS    A                       CARD LOCATION SAVE WORD
+CARDCNT  DS    F                       COUNT OF CARDS SUBMITTED
+SERVECB  DS    F                       ECB FOR SERVICE RTNS
+IOPLCB   DS    4A                      INPUT/OUTPUT PARM LIST
+DAPLCB   DS    5A                      DYNAMIC ALLOC PARM LIST
+PUTLNCB  DS    3A                      PUTLINE PARM LIST
+PUTMSGC  DS    2A                      OUTPUT CONTROL BLOCK
+PPLCB    DS    7A                      PARSE PARM LIST
+PARSANS  DS    A                       PARSE ANSWER ADDRESS
+GFAILP   DS    A                       ADDR OF GFAIL PARM LIST
+GFAIL    DS    10A                     GNRFAIL PARM LIST
+XWORK    DS    CL256                   WORK AREA
+CWORK    DS    CL256                   WORK AREA
+WORK08   DS    XL96                    DA08 PARM LIST AREA
+WORK18   DS    XL40                    DA18 PARM LIST AREA
+WORK99RB DS    XL20                    SVC 99 REQUEST BLOCK AREA
+PDSADR   DS    A                       ADDR OF SELECTED PDS ENTRY
+WORKDCB  DS    XL96                    DCB AREA
+JOBNAME  DS    CL8                     CURRENT JOB BEING SUBMITTED
+TJOBNAME DS    CL8                     STAGING AREA FOR JOBNAME
+XLIDCARD DS    CL80                    //*LOGONID CARD
+XLIDLID  EQU   XLIDCARD+12,8           LOGONID LOCATION
+XLIDKEY  EQU   XLIDCARD,10             C'//*LOGONID'
+CARD     DS    CL80                    CARD IMAGE TO BE SUBMITTED
+FLAGS    DS    X                       FLAG BYTE
+FLERR    EQU   X'04'                   ERROR DURING JOB SUBMISSION
+FLINJOB  EQU   X'02'                   CURRENTLY WITHIN A JOB
+FLTERM   EQU   X'01'                   OUTPUT TO TERMINAL
+SUBPADR  DS    A                       ADDR OF CURRENT MEM BEING PROC
+SUBPEND  DS    A                       ADDR OF END OF MEMBER LIST
+SUBMEM   DS    A                       ADDRESS OF SUBMITTED MEMBER BUFF
+SUBMEMC  EQU   512                     MAXIMUM NUMBER OF MEMBERS
+TBLDLM   DS    XL256                   XLATE TABLE TO FIND DELIMITER
+TBLNBLNK DS    XL256                   XLATE TABLE TO FIND NON-BLANK
+         PRINT NOGEN
+INTACB   ACB   DDNAME=XXXXXXXX         ESTABLISH AREA FOR ACB
+INTACBL  EQU   *-INTACB                DEFINE ACB LENGTH
+INTRPL   RPL   ACB=INTACB              ESTABLISH AREA FOR RPL
+INTRPLL  EQU   *-INTRPL                DEFINE RPL LENGTH
+         PRINT GEN
+WORKLEN  EQU   *-WORKAREA              WORK AREA LENGTH
+         EJECT
+*
+*        SET UP SAVE/WORK AREAS AND INITIALIZE PARM LISTS
+*
+         TITLE 'ACF2/TSO PRODUCTION JOB SUBMISSION COMMAND PROCESSOR'
+ACFSCMD  CSECT
+         @ID   C=NO
+         SAVE  (14,12),,&SKK              SAVE REGISTERS
+         LR    R11,R15                 COPY ENTRY POINT
+         LA    R12,4095(,R11)          SET UP SECOND BASE
+         LA    R12,1(,R12)
+         USING ACFSCMD,R11,R12         ADDRESS IT
+         LR    R10,R1                  COPY CPPL ADDRESS
+         GETMAIN RU,LV=WORKLEN         GETMAIN WORK AREA
+         LR    R2,R1                   COPY ADDRESS
+         LR    R0,R1                   GET STARTING ADDRESS
+         LA    R1,WORKLEN              WORK AREA LENGTH
+         SR    R14,R14                 CLEAR R14
+         LR    R15,R14                 AND R15
+         MVCL  R0,R14                  ZERO WORK/SAVE AREA
+         ST    R2,8(,R13)              FORWARD CHAIN SAVEAREA
+         ST    R13,4(,R2)              BACKWARD CHAIN SAVEAREA
+         LR    R13,R2                  SET UP NEW SAVE AREA
+         USING WORKAREA,R13            ADDRESS WORKAREA
+         STM   R11,R12,ENTRYPT         SAVE BASE REGISTERS
+*
+*        GETMAIN MEMBER BUFFERS
+*
+         GETMAIN RU,LV=MEMMAX*8        GET MEMBER BUFFER
+         ST    R1,MEMBUF               AND SAVE ADDRESS
+         GETMAIN RU,LV=SUBMEMC*8       SUBMITTED MEMBER BUFFER
+         ST    R1,SUBMEM               SAVE ADDRESS
+*
+*        SELECT FIRST LISTED PDS ENTRY AS THE DEFAULT
+*
+         LA    R0,PDSLIST              GET DEFAULT PDS-ID
+         ST    R0,PDSADR               AND SET INTO FIELD
+*
+*        SET UP TSO CONTROL BLOCKS
+*
+         USING CPPL,R10                ADDRESS CPPL
+         LA    R1,IOPLCB               ADDRESS IOPL
+         USING IOPL,R1
+         LA    R2,DAPLCB               ADDRESS DAPL
+         USING DAPL,R2
+         LA    R3,PPLCB                ADDRESS PPL
+         USING PPL,R3
+         LA    R4,GFAIL                ADDRESS GFAIL
+         USING GFDSECTD,R4
+         SPACE 2
+         L     R0,CPPLUPT              GET UPT ADDRESS
+         ST    R0,IOPLUPT
+         ST    R0,DAPLUPT
+         ST    R0,PPLUPT
+         L     R0,CPPLECT              GET ECT ADDRESS
+         ST    R0,IOPLECT
+         ST    R0,DAPLECT
+         ST    R0,PPLECT
+         LA    R0,SERVECB              GET SERVICE RTN ECB ADDR
+         ST    R0,IOPLECB
+         ST    R0,DAPLECB
+         ST    R0,PPLECB
+         ST    R0,GFECBP
+         L     R0,CPPLPSCB             GET PSCB ADDRESS
+         ST    R0,DAPLPSCB
+         L     R0,CPPLCBUF             GET COMMAND BUFFER ADDR
+         ST    R0,PPLCBUF
+         L     R0,=A(ACFSCMDP)          PARSE PARM BLOCK
+         ST    R0,PPLPCL
+         LA    R0,PARSANS              PARSE ANSWER ADDRESS
+         ST    R0,PPLANS               STORE INTO PARM LIST
+         ST    R13,PPLUWA              STORE WORK AREA INTO PARM LIST
+         LA    R0,CPPL                 CPPL ADDRESS
+         ST    R0,GFCPPLP
+         LA    R0,GFAIL                GET FAIL PARM LIST
+         ST    R0,GFAILP               AND STORE
+         LA    R0,1                    GET CONSTANT 1
+         ST    R0,PUTMSGC              STORE SEGMENT COUNT
+         LA    R0,GFPARSE              SET FAIL ID TO PARSE
+         STH   R0,GFCALLID             AND STORE INTO PARM LIST
+         DROP  R1,R2,R3,R4             DROP ALL REGISTERS
+*
+*        INITIALIZE INTERNAL WORK AREAS
+*
+         MVI   XLIDCARD,C' '           BLANK LOGONID CARD
+         MVC   XLIDCARD+1(L'XLIDCARD-1),XLIDCARD
+         MVC   XLIDKEY,=CL10'//*LOGONID'  CARD KEY
+         SPACE 2
+         MVI   TBLDLM+C'''',4          QUOTE
+         MVI   TBLDLM+C',',4           COMMA
+         MVI   TBLDLM+C'-',4           DASH
+         MVI   TBLDLM+C')',4           RIGHT PAREN
+         MVI   TBLDLM+C' ',4           BLANK
+         SPACE 1
+         MVI   TBLNBLNK,4              STOP AT ALL
+         MVC   TBLNBLNK+1(L'TBLNBLNK-1),TBLNBLNK  CHARACTERS
+         MVI   TBLNBLNK+C' ',0         BUT BLANKS
+         EJECT
+*
+*        CALL PARSE SERVICE ROUTINE AND PROCESS ANY ERRORS
+*
+         CALLTSSR EP=IKJPARS,MF=(E,PPLCB)   CALL SERVICE RTN
+         LTR   R15,R15                 TEST RETURN CODE
+         BZ    PARSOK                  OK, CONTINUE
+         ST    R15,GFRCODE-GFDSECTD+GFAIL   SAVE RETURN CODE
+         LA    R15,12                  SET CP RETURN CODE
+         LA    R0,4                    CHECK FOR RC = 4
+         C     R0,GFRCODE-GFDSECTD+GFAIL
+         BE    RETURN                  IF RC = 4 THEN MSG SENT
+         LA    R0,20                   CHECK FOR RC = 20
+         C     R0,GFRCODE-GFDSECTD+GFAIL
+         BE    RETURN                  IF RC = 20 THEN MSG SENT
+         LINK  EP=IKJEFF19,MF=(E,GFAILP)  CALL FAILURE
+         LTR   R15,R15                 DID IT WORK?
+         BNZ   *+12                    NO, WE MUST WRITE A MESSAGE
+         LA    R15,12                  IF IT WORKED, TERMINATE NOW
+         B     RETURN                  SET CP RETURN CODE AND RETURN
+         CVD   R15,DWORK               CONVERT RTN CODE TO DEC
+         MVC   CWORK(GFAILL),GFAILM    MSG PROTOTYPE
+         ED    GFAILK-GFAILM+CWORK,DWORK+6  EDIT MESSAGE
+         LA    R1,CWORK                POINT TO OUTPUT LINE     TS75516
+         TPUT  (1),GFAILL              DON'T EVEN TRY PUTLINE   TS75516
+         LA    R15,16                  SET VERY BAD RETURN CODE
+         B     RETURN                  AND RETURN TO TMP
+         EJECT
+*
+*        PARSE VALIDITY CHECK ROUTINE FOR VERIFICATION OF THE
+*        PDS-ID ENTERED.  NOTE THIS ROUTINE IS CALLED AS A
+*        SUBROUTINE OF IKJPARSE WHEN THE LIB KEYWORD IS ENCOUNTERED.
+*
+         PUSH  USING
+CHECKLIB STM   R14,R12,12(R13)         SAVE INPUT REGISTERS
+         DROP  R13                     DROP OLD WORK AREA
+         LM    R2,R3,0(R1)             GET PARAMETERS
+         USING WORKAREA,R3             ADDRESS WORK AREA
+         LM    R11,R12,ENTRYPT         GET BASE REGISTERS
+         LR    R4,R1                   SAVE PARM LIST ADDRESS
+         ICM   R1,15,0(R2)             GET STRING ADDRESS
+         BZ    CHECKRT0                IF NONE --> NOT SPECIFIED
+         SR    R15,R15                 CLEAR R15
+         ICM   R15,3,4(R2)             GET LENGTH OF STRING
+         BZ    CHECKRT0                IF ZERO --> NOT SPECIFIED
+         LA    R0,8                    GET MAX LENGTH
+         CR    R15,R0                  COMPARE TO SIZE
+         BH    CHECKRTN                NO GOOD, TOO LONG
+         BCTR  R15,0                   GET 360 LENGTH
+         SR    R14,R14                 CLEAR FOUND INDICATOR
+         LA    R5,PDSLIST              POINT TO FIRST ENTRY
+         LA    R6,PDSCOUNT             GET COUNT OF ENTRIES
+         USING PDSDSECT,R5             ADDRESS PDS DSECT
+CHECKLP  EX    R15,CHECKCLC            COMPARE
+         BNE   CHECKNXT                IF NOT EQUAL, TRY NEXT
+         LTR   R14,R14                 IS THERE ALREADY A MATCH?
+         BNZ   CHECKRTA                YES, AMBIGUOUS SPEC
+         LR    R14,R5                  SET ENTRY ID ADDRESS
+CHECKNXT LA    R5,PDSDLEN(,R5)         INC TO NEXT ENTRY
+         BCT   R6,CHECKLP              AND GO COMPARE IT
+         LTR   R14,R14                 DID WE GET ANY MATCH?
+         BZ    CHECKRTN                NO, ERROR
+         ST    R14,PDSADR              SAVE ADDRESS FOR LATER
+         SPACE 1
+CHECKRT0 LM    R14,R12,12(R13)         RESTORE REGISTERS
+         SR    R15,R15                 ZERO RETURN CODE
+         BR    R14                     AND RETURN TO PARSE
+         SPACE 1
+CHECKRTN LA    R0,CHECKMN              MESSAGE ADDRESS
+         ST    R0,8(,R4)               STORE IN PARM LIST
+         B     CHECKRT4                AND RETURN TO PARSE
+         SPACE 1
+CHECKRTA LA    R0,CHECKMA              MESSAGE ADDRESS
+         ST    R0,8(,R4)               STORE IN PARM LIST
+         SPACE 1
+CHECKRT4 LM    R14,R12,12(R13)         RESTORE REGISTERS
+         LA    R15,4                   SET RETURN CODE TO PARSE
+         BR    R14                     AND RETURN TO PARSE
+         SPACE 2
+CHECKCLC CLC   0(0,R1),PDSDKEY         *** EXECUTED INSTRUCTION ***
+         SPACE 1
+CHECKMN  DC    AL2(CHECKMNE-*),AL1(1)  HELP LENGTH AND SEG COUNT
+         DC    AL2(CHECKMNE-*,0)       PUTLINE HEADER
+         DC    C'&PFX.101 PDS-ID SPECIFIED DOES NOT MATCH ANY DEFINITIOX
+               N'
+CHECKMNE EQU   *
+         SPACE 1
+CHECKMA  DC    AL2(CHECKMAE-*),AL1(1)  HELP LENGTH AND SEG COUNT
+         DC    AL2(CHECKMAE-*,0)       PUTLINE HEADER
+         DC    C'&PFX.102 PDS-ID SPECIFIED MATCHES MORE THAN ONE DEFINIX
+               TION'
+CHECKMAE EQU   *
+         DROP  R3,R5
+         POP   USING
+         EJECT
+*
+*        PARSE HAS COMPLETED - CHECK USER'S AUTHORIZATION TO
+*        SPECIFIED (OR DEFAULTED) PDS LIBRARY
+*
+PARSOK   L     R9,PDSADR               GET SPEC PDS-ID ENTRY
+         USING PDSDSECT,R9             ADDRESS ENTRY
+         L     R1,PARSANS              GET PARSE ANSWER ADDRESS
+         CLI   POUTPUT+1-IKJPARMD(R1),2  WAS TERMINAL SPECIFIED AS KEYW
+         BNE   *+8                     NO, WANTS INTRDR
+         OI    FLAGS,FLTERM            SET TERMINAL OUTPUT
+         ACFINCVT R4,NONE=AUTHOK       GET ACF2 CVT
+         USING ACCVT,R4                ADDRESS IT
+         ACFGUCB R3,NONE=AUTHOK        GET USER'S ACUCB ADDR
+         USING ACUCB,R3                ADDRESS IT
+         DROP  R4                      DROP ADDRESSABILITY
+         L     R4,ACUUIDP              LOAD ADDRESS OF UID STRING
+         DROP  R3                      DROP ADDRESSABILITY
+         LA    R5,PDSUID               LOAD ADDRESS OF UID MASK
+         CLC   0(10,R4),0(R5)          CHECK AUTHORIZATION
+         BE    AUTHOK                  AUTHORIZATION OK
+NOTAUTH  MVC   CWORK(AUTHM1E-AUTHM1),AUTHM1  MSG PROTOTYPE
+         MVC   AUTHM1P-AUTHM1+CWORK,PDSDKEY  PDS ID
+         LA    R1,CWORK                POINT TO MESSAGE
+         BAL   LINK,PUTLINE            WRITE IT OUT
+         LA    R15,12                  SET CP RETURN CODE
+         B     RETURN                  AND RETURN
+         SPACE 1
+AUTHTM   TM    0(R2),0                 *** EXECUTED INSTRUCTION ***
+         SPACE 2
+AUTHM1   DC    AL2(AUTHM1E-*,0)        MESSAGE HEADER
+         DC    C'&PFX.180 YOU ARE NOT AUTHORIZED TO USE THE PDS-ID - '
+AUTHM1P  DC    CL8'XXXXXXXX'
+AUTHM1E  EQU   *
+         EJECT
+*
+*        USER IS AUTHORIZED TO SUBMIT FROM THE PDS-ID SPECIFIED.
+*        THE FUNCTIONS TO BE PERFORMED NEXT ARE TO:
+*
+*        1.  FREE THE DATASET BY DSNAME TO MAKE SURE IT HAS NOT
+*            BEEN PREVIOUSLY ALLOCATED TO FOOL US.
+*        2.  ALLOCATE THE DATASET
+*        3.  OPEN THE DATASET FOR INPUT
+*        4.  READ THE DIRECTORY AND BUILD A MEMBER BUFFER
+*        5.  CLOSE THE DATASET
+*        6.  DEALLOCATE THE DATASET BY DDNAME (REMAINS ALLOCATED
+*            BY THE TMP).
+*
+*        FREE THE DATASET BY DSNAME
+*
+AUTHOK   XC    WORK18,WORK18           CLEAR WORK AREA
+         LA    R4,WORK18               POINT TO WORK AREA
+         USING DAPB18,R4               ADDRESS IT
+         LA    R0,X'18'                DAIR BLOCK TYPE
+         STH   R0,DA18CD               SET INTO BLOCK
+         LA    R0,PDSDSNL              GET DSNAME LENGTH ADDRESS
+         ST    R0,DA18PDSN             STORE INTO BLOCK
+         MVC   DA18DDN,BLANKS          BLANK DDNAME
+         MVC   DA18MNM,BLANKS                AND MEMBER NAME
+         MVI   DA18CTL,DA18PERM        FORCE DEALLOCATION
+         ST    R4,DAPLDAPB-DAPL+DAPLCB STORE ADDR IN DAIR PARM LIST
+         CALLTSSR EP=IKJDAIR,MF=(E,DAPLCB)  CALL DAIR SERVICE RTN
+*                                      AND IGNORE RETURN CODES
+         DROP  R4                      DROP BLOCK ADDRESSABILITY
+*
+*        ALLOCATE THE DATASET
+*
+ALLOC    XC    WORK08,WORK08           CLEAR WORK AREA
+         LA    R4,WORK08               POINT TO WORK AREA
+         USING DAPB08,R4               ADDRESS BLOCK
+         LA    R0,X'08'                GET BLOCK TYPE
+         STH   R0,DA08CD               STORE IN BLOCK
+         LA    R0,PDSDSNL              POINT TO DSNAME LENGTH
+         ST    R0,DA08PDSN             STORE INTO BLOCK
+         MVC   DA08DDN,BLANKS          BLANK DDNAME
+         MVC   DA08UNIT,BLANKS               AND UNIT
+         MVC   DA08SER,BLANKS                AND VOLSER
+         MVC   DA08MNM,BLANKS                AND MEMBER NAME
+         MVC   DA08PSWD,BLANKS               AND PASSWORD
+         MVI   DA08DSP1,DA08SHR        SET DISP=SHR
+         MVI   DA08DPS2,DA08KEEP                AND KEEP
+         LA    R1,WORK08               POINT TO PARM LIST
+         BAL   LINK,CALLDAIR           GO TO SERVICE ROUTINE
+         TM    DA08DSO,X'02'           DSORG = PO  (PDS) ?
+         BO    ALLOK                   YES, CONTINUE
+         MVC   CWORK+4(L'ALLOCM1A),ALLOCM1A   CONSTRUCT ERROR MSG
+         MVC   CWORK+4+L'ALLOCM1A(L'PDSDSN),PDSDSN    COPY DSNAME
+         LA    R1,CWORK+4+L'ALLOCM1A   START OF DSNAME
+         AH    R1,PDSDSNL              ADD IN DSNAME LENGTH
+         MVC   0(L'ALLOCM1B,R1),ALLOCM1B ADD REST OF MESSAGE
+         LA    R0,L'ALLOCM1B(,R1)      NEXT AVAIL CHAR OF MSG
+         LA    R1,CWORK                FIRST CHARACTER OF MSG
+         SR    R0,R1                   COMPUTE MESSAGE LENGTH
+         SLL   R0,16                   SHOVE LEFT
+         ST    R0,CWORK                STORE IN MESSAGE HEADER
+         BAL   LINK,PUTLINE            WRITE MESSAGE OUT
+         LA    R15,12                  SET CP RETURN CODE
+         B     RETURN                  AND RETURN TO TMP
+*
+*        OPEN THE DATASET
+*
+ALLOK    MVC   WORKDCB,PDSDCB          COPY DCB PROTOTYPE
+         MVC   DCBDDNAM-IHADCB+WORKDCB,DA08DDN  COPY DDNAME
+         SR    R0,R0                   CLEAR R0
+         ST    R0,DWORK                CLEAR FIRST WORD OF DWORK
+         MVI   DWORK,X'80'             SET END OF LIST FLAG
+         OPEN  (WORKDCB,INPUT),MF=(E,DWORK)   OPEN IT
+         LTR   R15,R15                 TEST RETURN CODE
+         BZ    OPENOK                  OK, CONTINUE
+         LA    R1,DA08DDN              POINT TO DDNAME
+         BAL   LINK,DEALLOC            AND DEALLOCATE IT
+         MVC   CWORK+4(L'ALLOCM2),ALLOCM2  COPY MESSAGE PROT
+         MVC   CWORK+L'ALLOCM2+4(L'PDSDSN),PDSDSN  COPY DSNAME
+         LA    R0,CWORK+4+L'ALLOCM2    BASE MSG LENGTH
+         AH    R0,PDSDSNL              DSNAME LENGTH
+         LA    R1,CWORK                START OF MESSAGE BUFFER
+         SR    R0,R1                   COMPUTE MESSAGE LENGTH
+         SLL   R0,16                   SHOVE LEFT
+         ST    R0,CWORK                STORE IN MESSAGE HEADER
+         BAL   LINK,PUTLINE            WRITE IT OUT
+         LA    R15,12                  SET CP RETURN CODE
+         B     RETURN                  AND RETURN TO TMP
+         SPACE 1
+ALLOCM1A DC    C'&PFX.181 '
+ALLOCM1B DC    C' IS NOT A PARTITIONED DATASET'
+         SPACE 1
+ALLOCM2  DC    C'&PFX.182 UNABLE TO OPEN '
+         SPACE 2
+*
+*        READ THE PDS DIRECTORY
+*
+         SPACE 2
+OPENOK   L     R1,MEMBUF               GET ADDRESS OF BUFFER
+         LR    R2,R1                   COPY ADDRESS
+         SR    R3,R3                   ZERO MEMBER COUNT
+RPDSGET  GET   WORKDCB                 GET INPUT BLOCK
+         CLC   =H'12',0(R1)            SEE IF BLOCK IS USED
+         BNL   RPDSEOF                 NO, TREAT IT AS EOF
+         LA    R15,2(,R1)              POINT TO FIRST MEMBER
+         LH    R14,0(,R1)              GET LENGTH THAT IS USED
+         LA    R14,0(R1,R14)           GET LAST BYTE + 1 ADDR
+         BCTR  R14,0                   GET LAST BYTE USED
+RPDSLOOP CLI   0(R15),X'FF'            LAST MEMBER?
+         BE    RPDSEOF                 YES, TREAT AS EOF
+         MVC   0(8,R2),0(R15)          COPY MEMBER NAME TO BUFFER
+         LA    R2,8(,R2)               INC TO NEXT ENTRY
+         LA    R3,1(,R3)               INC MEMBER COUNT
+         C     R3,=A(MEMMAX)           DID WE HIT LIMIT?
+         BNL   RPDSNRM                 OUT OF ROOM
+         SR    R1,R1                   CLEAR R1
+         IC    R1,11(,R15)             GET LENGTH FIELD
+         SLL   R1,27                   SHOVE LEFT
+         SRL   R1,26                   AND RIGHT
+         LA    R1,12(,R1)              INCREMENT BY BASE LENGTH
+         AR    R15,R1                  INCREMENT POINTER IN BLOCK
+         CR    R15,R14                 END OF BLOCK?
+         BL    RPDSLOOP                NO, CONTINUE
+         B     RPDSGET                 OTHERWISE GET NEXT BLOCK
+         SPACE 1
+RPDSEOF  ST    R3,MEMCNT               STORE USED MEMBER COUNT
+         BAL   LINK,CLOSEDCB           CLOSE DCB AND DEALLOC DDNAME
+         B     RPDSOK                  AND CONTINUE
+         SPACE 2
+RPDSNRM  MVC   CWORK(RPDSNRM2-RPDSNRM1),RPDSNRM1  MSG PROTOTYPE
+         MVC   CWORK+RPDSNRM2-RPDSNRM1(L'PDSDSN),PDSDSN  DSNAME
+         LA    R0,RPDSNRM2-RPDSNRM1    BASE MSG LENGTH
+         AH    R0,PDSDSNL              ADD IN DSNAME LENGTH
+         SLL   R0,16                   SHOVE LEFT
+         ST    R0,CWORK                STORE IN MSG HEADER
+         LA    R1,CWORK                POINT TO ERROR MESSAGE
+         BAL   LINK,PUTLINE            WRITE IT OUT
+         LA    R15,12                  SET CP RETURN CODE
+         B     RETURN                  AND RETURN TO TMP
+         SPACE 2
+RPDSNRM1 DC    AL2(RPDSNRM2-*,0)       MESSAGE HEADER
+         DC    C'&PFX.184 TOO MANY MEMBERS IN PDS '
+RPDSNRM2 EQU   *
+         EJECT
+*
+*  FOR EACH MEMBER SPECIFIED:
+*
+*        1.  MAKE SURE IT IS ACTUALLY IN THE PDS
+*        2.  IF NOT, GIVE ERROR MSG AND REPROMPT
+*        3.  BUILD A LIST OF VALID MEMBER NAMES FOR PROCESSING
+*
+RPDSOK   L     R1,PARSANS              GET PARSE ANSWER ADDR
+         LA    R2,PMEMBER-IKJPARMD(R1) POINT TO FIRST PDE
+         L     R3,SUBMEM               FIRST MEMBER ENTRY
+         LA    R4,SUBMEMC*8-8(,R3)     LAST AVAILABLE MEMBER ENTRY
+CHKMLP1  ICM   R1,15,0(R2)             GET MEMBER TEXT
+         BZ    CHKMNEXT                IF NULL, THEN SKIP
+         SR    R15,R15                 CLEAR R15
+         ICM   R15,3,4(R2)             GET MEMBER TEXT LENGTH
+         BZ    CHKMNEXT                IF NULL, THEN SKIP
+         SPACE 1
+CHKPMEM  MVC   0(8,R3),0(R1)           PRESET MEMBER NAME
+         LA    R0,8                    GET MAX TEXT LENGTH
+         CR    R15,R0                  COMPARE TO ACTUAL LENGTH
+         BH    CHKMERR                 ERROR IF TOO LONG
+         BCTR  R15,0                   GET 360 LENGTH
+         MVC   0(8,R3),BLANKS          BLANK MEMBER LOCATION
+         EX    R15,CHKMOVE             COPY MEMBER NAME
+         L     R1,MEMBUF               GET MEMBER BUFFER START
+         L     R15,MEMCNT              GET MEMBER COUNT
+         B     *+8                     SKIP FIRST INCREMENT
+         SPACE 1
+CHKMLP2  LA    R1,8(,R1)               INCREMENT TO NEXT MEMBER
+         CLC   0(8,R3),0(R1)           IS THIS THE SAME NAME?
+         BE    CHKMGD                  YES, MEMBER IS GOOD
+         BL    CHKMERR                 IF LOW, NOT IN ALPHABETICAL LIST
+         BCT   R15,CHKMLP2             TRY NEXT ENTRY
+         B     CHKMERR                 NOT IN LIST, ERROR
+         SPACE 1
+CHKMGD   LA    R3,8(,R3)               INC TO NEXT SUBMEM ENTRY
+         CR    R3,R4                   STILL ROOM?
+         BH    CHKMNRM                 NO - TOO MANY SPECIFIED
+         SPACE 1
+CHKMNEXT CLC   =XL4'FF000000',8(R2)    END-OF-LIST
+         BE    CHKMEND                 YES
+         L     R2,8(,R2)               GO TO NEXT ELEMENT
+         B     CHKMLP1                 AND GET MEMBER
+         SPACE 2
+CHKMERR  MVC   CWORK(CHKMERML),CHKMERM MSG PROTOTYPE
+         MVC   CHKMERMN-CHKMERM+CWORK,0(R3)  MEMBER NAME
+         MVC   XWORK(CPTGTCBL),CPTGTCB PUTGET PROTOTYPE
+         LA    R1,CWORK                OUTPUT MESSAGE
+         ST    R1,PUTMSGC+4            STORE IN OUTPUT LINE DESC
+         LA    R1,PUTMSGC              ADDR OF OLD
+         ST    R1,XWORK+4              STORE IN BLOCK
+         PUTGET PARM=XWORK,MF=(E,IOPLCB)  ISSUE PUTGET
+         LA    R0,8                    CONSTANT 8
+         CR    R15,R0                  COMPARE FOR ATTN
+         BE    RETURN                  YES, RETURN WITH CP RC = 8
+         BL    CHKMERC                 RC = 0 AND 4 ARE OK
+         CVD   R15,DWORK               CONVERT RC TO DECIMAL
+         MVC   CWORK(PTFAILL),PTFAILM  MESSAGE PROTOTYPE
+         ED    PTFAILK-PTFAILM+CWORK,DWORK+6  PUT IN RETURN CODE
+         LA    R1,CWORK                POINT TO OUTPUT LINE     TS75516
+         TPUT  (1),PTFAILL             AND WRITE IT OUT         TS75516
+         LA    R15,16                  SET CP RC = 16
+         B     RETURN                  AND RETURN
+         SPACE 1
+CHKMERC  L     R1,PGPBIBUF-PGPB+XWORK  INPUT BUFFER ADDRESS
+         LH    R15,0(,R1)              INPUT BUFFER LENGTH
+         LA    R0,4                    LENGTH OF NULL BUFFER
+         SR    R15,R0                  ACTUAL LENGTH OF TEXT
+         BNP   CHKMNEXT                SKIP IF NULL
+         AR    R1,R0                   POINT TO FIRST CHARACTER
+         B     CHKPMEM                 AND GO PROCESS THIS MEMBER
+         SPACE 1
+CHKMEND  L     R0,SUBMEM               FIRST TABLE ENTRY
+         ST    R3,SUBPEND              END OF USED TABLE
+         SR    R3,R0                   DIFFERENCE
+         BNP   CHKMNONE                IF ZERO, THEN ERROR
+         B     CHKMOK                  OTHERWISE, CONTINUE
+         SPACE 1
+CHKMNONE LA    R1,CHKMNONM             POINT TO ERROR MESSAGE
+         BAL   LINK,PUTLINE            WRITE IT OUT
+         LA    R15,12                  SET RETURN CODE
+         B     RETURN                  AND RETURN
+         SPACE 1
+CHKMNRM  LA    R1,CHKMNRMM             POINT TO ERROR MESSAGE
+         BAL   LINK,PUTLINE            WRITE IT OUT
+         LA    R15,12                  SET RETURN CODE
+         B     RETURN                  AND RETURN
+         SPACE 1
+CHKMOVE  OC    0(0,R3),0(R1)           COPY AND CAP MEMBER NAME
+         SPACE 2
+CHKMERM  DC    AL2(CHKMERML,0)         MESSAGE HEADER
+         DC    C'&PFX.170 INCORRECT MEMBER NAME '
+CHKMERMN DC    CL8'XXXXXXXX'
+         DC    C' RESPECIFY - '
+CHKMERML EQU   *-CHKMERM               LENGTH OF MESSAGE
+         SPACE 1
+CHKMNONM DC    AL2(CHKMNONL,0)         MESSAGE HEADER
+         DC    C'&PFX.185 NO MEMBERS SPECIFIED TO SUBMIT'
+CHKMNONL EQU   *-CHKMNONM              LENGTH OF MESSAGE
+         SPACE 1
+CHKMNRMM DC    AL2(CHKMNRML,0)         MESSAGE HEADER
+         DC    C'&PFX.186 TOO MANY MEMBER NAMES SPECIFIED'
+CHKMNRML EQU   *-CHKMNRMM              LENGTH OF MESSAGE
+         EJECT
+*
+* PROCESS THE INPUT STREAM AS IF ALL THE SPECIFIED MEMBERS WERE
+* CONCATENATED TOGETHER.
+*
+CHKMOK   L     R0,SUBMEM               FUDGE LOOP START
+         LA    R15,8                   CONSTANT 8
+         SR    R0,R15                  MOVE TO PREVIOUS ENTRY
+         ST    R0,SUBPADR              STORE AS CURRENT MEMBER
+         MVC   WORKDCB,MEMDCB          INITIALIZE MEMBER DCB
+         TM    FLAGS,FLTERM            TERMINAL OUTPUT?
+         BO    OPENMEM                 YES, CONTINUE
+*
+*        DEFER ATTENTIONS
+*
+         STAX  DEFER=YES               DEFER THEM
+*
+*        ALLOCATE THE INTERNAL READER
+*
+         LA    R4,WORK99RB             POINT TO SVC 99 RB AREA
+         USING S99RB,R4                ADDRESS IT
+         MVI   S99RBLN,20              BLOCK LENGTH
+         MVI   S99VERB,S99VRBAL        DSNAME ALLOCATION
+         LA    R0,XWORK                TEXT POINTER ADDRESS
+         ST    R0,S99TXTPP             STORE IN REQUEST BLOCK
+         SPACE 1
+         LA    R2,XWORK                TEXT POINTER BASE
+         LA    R3,CWORK                TEXT UNIT BASE
+         XC    XWORK,XWORK             ZERO WORK AREAS
+         XC    CWORK,CWORK             ZERO WAORK AREA
+         USING S99TUNIT,R3             ADDRESS IT
+*
+*        RETURN DDNAME TEXT UNIT
+*
+         ST    R3,0(,R2)               TEXT POINTER
+         LA    R0,DALRTDDN             RTN DDN TEXT UNIT KEY
+         STH   R0,S99TUKEY             STORE
+         LA    R0,1                    1 PARAMETER
+         STH   R0,S99TUNUM             STORE IN TEXT UNIT
+         LA    R0,8                    LENGTH OF PARMATER
+         STH   R0,S99TULNG             STORE
+         LA    R3,S99TUNIT+14          INCREMENT PAST TEXT UNIT
+         LA    R2,4(,R2)               INCREMENT TEXT PTR PTR
+*
+*        CLOSE=FREE TEXT UNIT
+*
+         ST    R3,0(,R2)               TEXT POINTER
+         LA    R0,DALCLOSE             CLOSE=FREE KEY
+         STH   R0,S99TUKEY             STORE IN TEXT UNIT
+         LA    R0,0                    ZERO PARMS
+         STH   R0,S99TUNUM             STORE IN TEXT UNIT
+         LA    R3,S99TUNIT+4           INCREMENT PAST TEXT UNIT
+         LA    R2,4(,R2)               INCREMENT TEXT PTR PTR
+*
+*        SYSOUT TEXT UNIT
+*
+         ST    R3,0(,R2)               POINTER
+         LA    R0,DALSYSOU             SYSOUT
+         STH   R0,S99TUKEY             SET TEXT UNIT KEY
+         LA    R0,1                    1 PARM
+         STH   R0,S99TUNUM             STORE PARM COUNT
+         STH   R0,S99TULNG             STORE LENGTH ALSO
+         MVI   S99TUPAR,C'A'           SYOUT=A
+         LA    R3,S99TUNIT+7           INCREMENT TEXT UNIT PTR
+         LA    R2,4(,R2)               AND TEXT PTR PTR
+*
+*        SYSOUT PGM NAME PTR
+*
+         ST    R3,0(,R2)               POINTER
+         LA    R0,DALSPGNM             PROGRAM NAME KEY
+         STH   R0,S99TUKEY             STORE
+         LA    R0,1                    1 PARM
+         STH   R0,S99TUNUM             STORE IN TEXT UNIT
+         LA    R0,6                    TEXT PARM LENGTH
+         STH   R0,S99TULNG             STORE IN TEXT UNIT
+         MVC   S99TUPAR(6),=CL6'INTRDR'  SYSOUT=(A,,INTRDR)
+*
+*        FINISHED, SET PARM LISTS AND CALL DYNAMIC ALLOCATION
+*
+         OI    0(R2),X'80'             END OF LIST FLAG
+         LA    R0,S99RB                ADDR OF REQUEST BLOCK
+         ST    R0,DWORK                STORE POINTER
+         OI    DWORK,X'80'             END OF LIST FLAG
+         LA    R1,DWORK                POINT TO PARM LIST
+         SVC   99                      ISSUE SVC
+         LTR   R15,R15                 DID IT WORK?
+         BNZ   SVC99ERR                NO, TOO BAD
+         SPACE 1
+         DROP  R3,R4
+*
+*        BUILD THE ACB AND RPLS FOR THE INTERNAL READER
+*
+         LA    R4,CWORK                FIRST TEXT UNIT
+         USING S99TUNIT,R4             ADDRESS IT
+         MVC   DWORK,BLANKS            BLANK WORK AREA
+         LH    R15,S99TULNG            GET DDNAME LENGTH
+         BCTR  R15,0                   GET 360 LENGTH
+         EX    R15,MVCDDN              ** MVC DWORK(0),S99TUPAR **
+         B     GENACB                  GENERATE ACB AND RPL
+         SPACE 1
+MVCDDN   MVC   DWORK(0),S99TUPAR       *** EXECUTED INSTRUCTION ***
+MVCJOBN  MVC   TJOBNAME(0),2(R7)       *** EXECUTED INSTRUCTION ***
+TRTNBLNK TRT   0(0,R1),TBLNBLNK        *** EXECUTED INSTRUCTION ***
+         SPACE 1
+         DROP  R4
+         SPACE 2
+         PRINT NOGEN
+GENACB   GENCB BLK=ACB,DDNAME=(*,DWORK),LENGTH=INTACBL,                X
+               MACRF=(OUT,ADR,SEQ),WAREA=(S,INTACB),                   X
+               MF=(G,XWORK,GACBL)
+         LTR   R15,R15                 DID CB GET BUILT RIGHT?
+         BNZ   GACBERR                 NO
+         SPACE 1
+         GENCB BLK=RPL,ACB=(S,INTACB),AREA=(S,CARD),AREALEN=L'CARD,    X
+               LENGTH=INTRPLL,MSGAREA=(S,XWORK),MSGLEN=L'XWORK,        X
+               RECLEN=L'CARD,WAREA=(S,INTRPL),                         X
+               OPTCD=(ADR,SEQ,SYN,NUP),MF=(G,XWORK,GRPLL)
+         LTR   R15,R15                 DID IT WORK?
+         BNZ   GRPLERR                 NO
+         PRINT GEN
+*
+*        OPEN THE INTERNAL READER
+*
+         SR    R0,R0                   CLEAR R0
+         ST    R0,DWORK                TO ZERO DWORK
+         MVI   DWORK,X'80'             SET END OF LIST FLAG
+         OPEN  (INTACB,OUTPUT),MF=(E,DWORK)   OPEN IT
+         LTR   R15,R15                 DID IT WORK?
+         BZ    OPENMEM                 YES, CONTINUE
+         LA    R1,IRDROPN              POINT TO MESSAGE
+         BAL   LINK,PUTLINE            WRITE IT OUT
+         STAX  DEFER=NO                ALLOW ATTENTIONS
+         LA    R15,12                  SET CP RETURN CODE
+         B     RETURN                  AND RETURN
+         SPACE 2
+IRDROPN  DC    AL2(IRDROPNE,0)       MESSAGE HEADER
+         DC    C'&PFX.195 UNABLE TO OPEN INTERNAL READER'
+IRDROPNE EQU   *-IRDROPN               LENGTH OF TEXT
+         B     OPENMEM                 GO OPEN FIRST MEMBER
+         EJECT
+CLOSEMEM BAL   LINK,CLOSEDCB           CLOSE DCB AND DEALLOC DDNAME
+         SPACE 2
+OPENMEM  L     R1,SUBPADR              GET CURRENT MEMBER
+         LA    R1,8(,R1)               INC TO NEXT MEMBER
+         ST    R1,SUBPADR              STORE NEW POINTER
+         C     R1,SUBPEND              ARE WE FINISHED?
+         BNL   FINISH                  YES, FINISH UP
+         SPACE 1
+         MVC   DA08DDN-DAPB08+WORK08,BLANKS  BLANK DDNAME
+         MVC   DA08MNM-DAPB08+WORK08,0(R1)  COPY MEMBER NAME
+         LA    R1,WORK08               POINT TO BLOCK
+         BAL   LINK,CALLDAIR           CALL SERVICE RTN
+         SPACE 1
+         MVC   DCBDDNAM-IHADCB+WORKDCB,DA08DDN-DAPB08+WORK08
+         SR    R0,R0                   CLEAR R0
+         ST    R0,DWORK                TO ZERO DWORK
+         MVI   DWORK,X'80'             SET END OF LIST FLAG
+         OPEN  (WORKDCB,INPUT),MF=(E,DWORK)  OPEN UP NEW MEMBER
+         LTR   R15,R15                 DID IT WORK?
+         BZ    READMEM                 OK, CONTINUE
+         LA    R1,DCBDDNAM-IHADCB+WORKDCB  DDNAME LOCATION
+         BAL   LINK,DEALLOC            DE-ALLOCATE IT
+         MVC   CWORK(OPENMEL),OPENME1  COPY ERROR MSG
+         MVC   OPENMEN-OPENME1+CWORK,DA08MNM-DAPB08+WORK08 MEMBER
+         LA    R1,CWORK                POINT TO MSG
+         BAL   LINK,PUTLINE            WRITE IT OUT
+         OI    FLAGS,FLERR             TURN ON ERROR FLAG
+         B     FINISH                  AND FINISH UP PROCESSING
+         SPACE 2
+OPENME1  DC    AL2(OPENMEL,0)          MESSAGE HEADER
+         DC    C'&PFX.190 UNABLE TO OPEN MEMBER '
+OPENMEN  DC    CL8'XXXXXXXX'           ROOM FOR MEMBER NAME
+OPENMEL  EQU   *-OPENME1               MESSAGE LENGTH
+         SPACE 2
+READMEM  GET   WORKDCB                 GET NEXT INPUT CARD
+         LR    R7,R1                   COPY CARD ADDRESS
+         CLC   =CL5'/*EOF',0(R7)       /*EOF CARD?
+         BE    PROCEOF                 YES, PROCESS END OF JOB
+         CLC   =CL71'//',0(R7)         IS THIS A NULL CARD?     TS74014
+         BE    PROCEOF                 YES, PROCESS END OF JOB  TS74014
+         CLC   =CL2'//',0(R7)          JCL CARD?
+         BNE   PUTCARD                 NO, SEND IT DOWN
+         CLI   2(R7),C' '              CONTINUATION CARD
+         BE    PUTCARD                 YES, SEND IT DOWN
+         LA    R1,2(,R7)               FIRST CHAR OF POSSIBLE JOBNAME
+         TRT   0(68,R1),TBLDLM         FIND FIRST BLANK
+         BC    8,PUTCARD               NO BLANK, PUNT ON CARD
+         LR    R15,R1                  COPY ADDRESS OF BLANK
+         LA    R0,2(,R7)               FIRST CHARACTER OF JOBNAME
+         SR    R15,R0                  ACTUAL LENGTH
+         LA    R0,8                    MAXIMUM LENGTH
+         CR    R15,R0                  COMPARE
+         BH    PUTCARD                 TOOO BIG, PUNT
+         BCTR  R15,0                   GET 360 LENGTH OF JOBNAME
+         MVC   TJOBNAME,BLANKS         BLANK TEMP STORAGE AREA
+         EX    R15,MVCJOBN             ** MVC TJOBNAME(0),2(R7)
+         LA    R15,70(,R7)             LAST CHARACTER OF CARD
+         SR    R15,R1                  GET REMAINING LENGTH
+         EX    R15,TRTNBLNK            ** TRT 0(0,R1),TBLNBLNK
+         BC    10,PUTCARD              NO NON-BLANK, PUNT
+         CLC   =C'JOB ',0(R1)          "JOB" VERB?
+         BNE   PUTCARD                 NO, SEND IT DOWN
+         TM    FLAGS,FLINJOB           ARE WE IN A JOB NOW?
+         BZ    PROCJOB                 NO, PROCESS JOB CARD
+         ST    R1,SCPTR                SAVE COLUMN POINTER
+         BAL   LINK,FINJOB             FINISH OLD JOB
+         L     R1,SCPTR                AND RESTORE COLUMN POINTER
+         SPACE 2
+PROCJOB  MVC   JOBNAME,TJOBNAME        COPY OVER JOBNAME
+         OI    FLAGS,FLINJOB           SET "WITHIN JOB" FLAG
+         SR    R0,R0                   CLEAR R0
+         ST    R0,CARDCNT              TO ZERO CARD COUNT
+         BAL   LINK,GETLID             GO TO SUPPORT SUBROUTINE
+         B     PUTCARD                 PUT OUT CARD
+         SPACE 2
+PROCEOF  TM    FLAGS,FLINJOB           WITHIN JOB?
+         BZ    PUTCARD                 NO, JUST SEND CARD DOWN
+         BAL   LINK,FINJOB             FINISH UP OLD JOB
+*        B     PUTCARD                 AND SEND CARD DOWN
+         SPACE 2
+PUTCARD  LR    R1,R7                   COPY CARD ADDRESS
+         BAL   LINK,WRITCARD           AND WRITE CARD TO INTRDR
+         B     READMEM                 AND READ NEXT CARD FROM MEMBER
+         SPACE 2
+FINISH   TM    FLAGS,FLINJOB           WITHIN JOB?
+         BZ    FINCLOSE                NO, CLOSE IT UP
+         BAL   LINK,FINJOB             YES, FINISH UP JOB
+         SPACE 2
+FINCLOSE TM    FLAGS,FLTERM         TERMINAL OUTPUT?
+         BO    FINCLOSX                YES, CONTINUE
+*
+*        CLOSE THE INTERNAL READER, DEALLOCATION IS AUTOMATIC
+*
+         SR    R0,R0                   CLEAR R0
+         ST    R0,DWORK                TO ZERO DWORK
+         MVI   DWORK,X'80'             END-OF-LIST FLAG
+         CLOSE (INTACB),MF=(E,DWORK)   CLOSE IT
+         STAX  DEFER=NO                ALLOW ATTENTIONS
+FINCLOSX SR    R15,R15                 ZERO CP RETURN CODE
+         TM    FLAGS,FLERR             ERROR FLAG ON?
+         BZ    *+8                     NO, SKIP
+         LA    R15,12                  SET BAD CP RETURN CODE
+         B     RETURN                  AND RETURN
+         SPACE 2
+*
+*  FINISH JOB PROCESSING BY ADDING LOGONID CARD AND SENDING MESSAGE
+*  TO TERMINAL THAT JOB WAS SUBMITTED.
+*
+FINJOB   ST    LINK,SLINK              SAVE RETURN ADDRESS
+         CLI   XLIDLID,0               //*LOGONID CARD TO BE SENT?
+         BE    FINJOBX                 NO, SKIP IT
+         LA    R1,XLIDCARD             POINT AT CARD
+         BAL   LINK,WRITCARD           WRITE IT OUT
+FINJOBX  NI    FLAGS,255-FLINJOB       TURN OFF IN JOB FLAG
+         MVC   CWORK(FINMSGL),FINMSG   TERMINAL MSG PROTOTYPE
+         MVC   FINMSGJN-FINMSG+CWORK,JOBNAME  COPY JOBNAME
+         L     R0,CARDCNT              GET CARD COUNT FOR THIS JOB
+         CVD   R0,DWORK                CONVERT IT TO DECIMAL
+         ED    FINMSGCC-FINMSG+CWORK,DWORK+5  EDIT INTO MESSAGE
+         TM    FLAGS,FLTERM            TERMINAL OUTPUT?
+         BO    FINPUT                  YES, NO JOBNAME TO OUTPUT
+         ENDREQ RPL=INTRPL             ENDREQ THE RPL
+         LA    R1,=CL6'ENDREQ'         PRESET IN CASE OF ERROR
+         LTR   R15,R15                 DID IT WORK?
+         BNZ   XRPLERR                 NO, ERROR MESSAGE
+         MVC   FINMSGID-FINMSG+CWORK,RPLRBAR-IFGRPL+INTRPL   COPY JOBNA
+FINPUT   LA    R1,CWORK                POINT TO MESSAGE
+         BAL   LINK,PUTLINE            WRITE IT OUT
+         L     LINK,SLINK              RESTORE RETURN ADDRESS
+         BR    LINK                    AND RETURN TO CALLER
+         SPACE 2
+*
+*  WRITE A CARD - FOR TESTING, DO IT TO THE TERMINAL
+*  FOR PRODUCTION, SEND IT DOWN THE INTERNAL READER
+*
+WRITCARD LA    R0,1                    CONSTANT 1
+         A     R0,CARDCNT              ADD CURRENT CARD COUNT
+         ST    R0,CARDCNT              STORE BACK IN MEMORY
+         TM    FLAGS,FLTERM            TERMINAL OUTPUT?
+         BZ    WRITIRDR                NO, SEND DOWN INTRDR
+         MVC   CWORK+4(80),0(R1)       COPY CARD
+         LA    R1,CWORK+83             LAST COLUMN ON CARD
+         CLI   0(R1),C' '              FIND LAST NON-BLANK
+         BNE   *+8                     GOT A NON-BLANK
+         BCT   R1,*-8                  TRY PREVIOUS COLUMN
+         LA    R1,1(,R1)               INC TO FIRST BLANK
+         LA    R0,CWORK                BEGINNING OF BUFFER
+         SR    R1,R0                   LENGTH OF BUFFER
+         SLL   R1,16                   SHOVE LEFT
+         ST    R1,CWORK                SET IN BUFFER HEADER
+         ST    LINK,CWORK+88           SAVE RETURN ADDRESS
+         LA    R1,CWORK                POINT TO OUTPUT AREA
+         BAL   LINK,PUTDATA            OUTPUT CARD IMAGE        TS75516
+         L     LINK,CWORK+88           RESTORE RETURN ADDRESS
+         BR    LINK                    AND RETURN
+         SPACE 2
+WRITIRDR MVC   CARD,0(R1)              COPY CARD IMAGE
+         PUT   RPL=INTRPL              WRITE IT OUT
+         LTR   R15,R15                 DID IT WORK
+         BZR   LINK                    YES, RETURN
+         LA    R1,=CL6'PUT'            SET ERROR TYPE
+         B     XRPLERR                 AND GO TO ERROR ROUTINE
+         EJECT
+* GETLID SUBROUTINE
+*
+*        THE FOLLOWING SUBROUTINE SETS THE LOGONID TO BE PASSED
+*        TO THE VALUE 'PRODLID '.
+*
+*        INPUT PARAMETERS ARE:
+*              R1 -- > FIRST CHARACTER OF KEYWORD JOB
+*              R7 -- > FIRST CHARACTER OF CARD IMAGE
+*              LINK -- > RETURN ADDRESS
+*
+*        OUTPUT PARAMETERS ARE:
+*              XLIDLID - 8 CHARACTER VALUE TO BE SET
+*                  IF FIRST CHARACTER IS SET TO X'00' NO //*LOGONID
+*                  CARD WILL BE PRODUCED
+*
+GETLID   MVC   XLIDLID,=CL8'PRODLID '  SET LID = PRODLID
+         B     0(LINK)                 AND SEND IT DOWN
+         EJECT
+*
+*  RETURN - STANDARD RETURN SEQUENCE
+*
+RETURN   LR    R2,R15              SAVE RETURN CODE
+         TM    DCBOFLGS-IHADCB+WORKDCB,X'10'  IS DCB OPEN?
+         BZ    RETNCLSD            NO, ITS CLOSED
+         BAL   LINK,CLOSEDCB       CLOSE AND DEALLOC IT
+         SPACE 2
+RETNCLSD TM    ACBOFLGS-IFGACB+INTACB,X'10'   INTRDR STILL OPEN?
+         BZ    RETNCLSA                NO
+         SR    R0,R0                   CLEAR R0
+         ST    R0,DWORK                TO ZERO DWORK
+         MVI   DWORK,X'80'             SET END OF LIST FLAG
+         CLOSE (INTACB),MF=(E,DWORK)   CLOSE IT / DEALLOC AUTOMATIC
+         STAX  DEFER=NO                ALLOW ATTENTIONS
+         SPACE 1
+RETNCLSA L     R1,MEMBUF           GET MEMBER BUFFER ADDR
+         FREEMAIN RU,LV=MEMMAX*8,A=(1)   FREE IT
+         L     R1,SUBMEM               GET SUBMITTED MEMBER BUFFER
+         FREEMAIN RU,LV=SUBMEMC*8,A=(1)  FREE IT
+         LR    R1,R13              CURRENT SAVE/WORK AREA ADDR
+         L     R13,4(,R13)         OLD SAVE AREA ADDR
+         FREEMAIN RU,LV=WORKLEN,A=(1)  FREE WORK/SAVE AREA
+         LR    R15,R2              RESTORE RETURN CODE
+         RETURN (14,12),RC=(15)    RETURN
+         SPACE 3
+*
+*  PUTLINE - WRITE A LINE TO THE TERMINAL
+*
+PUTDATA  MVI   PUTLNCB+0,X'30'         OUTPUT=(,SINGLE,DATA)    TS75516
+         ST    R1,PUTLNCB+4            SET OUTPUT ADDR          TS75516
+         B     PUTOUT                  AND OUTPUT LINE          TS75516
+PUTLINE  ST    R1,PUTMSGC+4        SET ADDR IN PUTLINE LIST
+         LA    R1,PUTMSGC              GET OLD ADDR             TS75516
+         ST    R1,PUTLNCB+4            PUT IN PUTLINE CB        TS75516
+         MVI   PUTLNCB+0,X'12'         OUTPUT=(,SINGLE,INFOR)   TS75516
+PUTOUT   PUTLINE   PARM=PUTLNCB,       OUTPUT MSG/DATA LINE     TS75516X
+               MF=(E,IOPLCB)
+         LTR   R15,R15             CHECK RETURN CODE
+         BZR   LINK                RETURN IF OK
+         LA    R0,4                CONSTANT 4
+         CR    R15,R0              ATTN HIT?
+         BNE   *+12                NO, CONTINUE
+         LA    R15,8               SET CP RETURN CODE
+         B     RETURN              AND RETURN
+         SPACE 2
+         MVC   CWORK(PUTFAILL),PUTFAILM   MESSAGE PROTOTUYPE
+         CVD   R15,DWORK           CONVERT RETURN CODE
+         ED    PUTFAILR-PUTFAILM+CWORK,DWORK+6  EDIT INTO MSG
+         LA    R1,CWORK                START OF LINE            TS75516
+         TPUT  (1),PUTFAILL            AND OUTPUT IT            TS75516
+         LA    R15,16              SET RETURN CODE
+         B     RETURN              AND RETURN
+         SPACE 2
+PUTFAILM DC    C'&PFX.191 PUTLINE ERROR CODE'
+PUTFAILR DC    X'40202120'         ERROR CODE MASK
+PUTFAILL EQU   *-PUTFAILM          MESSAGE LENGTH
+         EJECT
+*
+* DCB AND DYNAMIC ALLOCATION SUPPORT ROUTINES
+*
+         SPACE 1
+*
+* CLOSEDCB - CLOSE AND DE-ALLOCATE DATASET
+*
+CLOSEDCB SR    R0,R0               FIX UP PARM LIST AREA
+         ST    R0,DWORK            CLEAR FIRST WORD
+         MVI   DWORK,X'80'         SET END-OF-LIST FLAG
+         CLOSE (WORKDCB),MF=(E,DWORK)  CLOSE IT
+         FREEPOOL WORKDCB          FREE BUFFER POOL
+         LA    R1,DCBDDNAM-IHADCB+WORKDCB  POINT TO DDNAME
+*        B     DEALLOC             AND DEALLOCATE IT
+         SPACE 2
+*
+*  DEALLOC - DEALLOCATE A DATASET BY DDNAME
+*
+DEALLOC  XC    WORK18,WORK18       CLEAR PARM LIST
+         LA    R15,WORK18          POINT TO IT
+         USING DA18CD,R15          ADDRESS IT
+         LA    R0,X'18'            ENTRY TYPE
+         STH   R0,DA18CD           SET INTO BLOCK
+         MVC   DA18DDN,0(R1)       COPY DDNAME
+         MVC   DA18MNM,BLANKS      BLANK MEMBER
+         LR    R1,R15              COPY ADDR OF PARM LIST
+*        B     CALLDAIR            AND ENTER DAIR CODE
+         DROP  R15
+         SPACE 2
+*
+*  CALLDAIR - DYNAMIC ALLOCATION INTERFACE ROUTINE
+*
+CALLDAIR ST    R1,DAPLDAPB-DAPL+DAPLCB  STORE ADDRESS
+         CALLTSSR EP=IKJDAIR,MF=(E,DAPLCB)  CALL SERVICE RTN
+         LTR   R15,R15             TEST RETURN CODE
+         BZR   LINK                IF OK, RETURN NOW
+         B     DAIRERR                 GO TO ERROR ROUTINE
+         SPACE 3
+*
+*        PROCESS DYNAMIC ALLOCATION ERRORS
+*
+SVC99ERR ST    R15,DWORK               SAVE RETURN CODE
+         LA    R0,X'32'                SVC 99 INDICATOR
+         STH   R0,DWORK+4              STORE
+         LA    R1,CWORK                WORK AREA
+         USING DFDSECTD,R1             ADDRESS IT
+         LA    R0,WORK99RB             SVC 99 REQUEST BLOCK
+         ST    R0,DFS99RBP             STORE
+         LA    R0,DWORK                ADDR OF RTN CODE
+         ST    R0,DFRCP                STORE
+         SR    R0,R0                   CLEAR R0
+         ST    R0,CWORK+252            ZER WORD
+         LA    R0,CWORK+252            POINT TO IT
+         ST    R0,DFJEFF02             STORE MSG RTN ADDR
+         LA    R0,DWORK+4              FLAG BYTE ADDR
+         ST    R0,DFIDP                STORE
+         LA    R0,CPPL                 CPPL ADDRESS
+         ST    R0,DFCPPLP              STORE
+         SR    R0,R0                   CLEAR R0
+         ST    R0,DFBUFP               STORE
+         B     DAIRLINK                CONTINUE WITH DAIR PROCESS
+         DROP  R1
+         SPACE 2
+*
+*  PROCESS DAIR ERRORS
+*
+DAIRERR  ST    R15,DWORK           SAVE RETURN CODE
+         LA    R0,1                CONSTANT 1
+         STH   R0,DWORK+4          SET DAIR ERROR
+         LA    R1,CWORK            WORK AREA
+         USING DFDSECTD,R1         ADDRESS PARM LIST
+         LA    R0,DAPLCB           ADDR OF DAIR PARM LIST
+         ST    R0,DFDAPLP          STORE IN PARM LIST
+         LA    R0,DWORK            ADDR OF RTN CODE
+         ST    R0,DFRCP            STORE IN PARM LIST
+         SR    R0,R0               CLEAR R0
+         ST    R0,CWORK+252        ZERO WORD
+         LA    R0,CWORK+252        POINT TO IT
+         ST    R0,DFJEFF02             STORE AS MSG RTN ADDR
+         LA    R0,DWORK+4              FLAG BYTE ADDRESS
+         ST    R0,DFIDP                STORE IN PARM LIST
+         LA    R0,CPPL                 CPPL ADDRESS
+         ST    R0,DFCPPLP              STORE IN PARM LIST
+         SR    R0,R0                   CLEAR R0
+         ST    R0,DFBUFP               ZERO BUFFER POINTER
+DAIRLINK LINK  EP=IKJEFF18             LINK TO SERVICE RTN
+         LTR   R15,R15                 DID IT WORK OK?
+         BNZ   *+12                    NO, WERE IN TROUBLE
+         LA    R15,16                  SET CP RETURN CODE
+         B     RETURN                  AND EXIT FROM CP
+         MVC   CWORK(DAIRFALL),DAIRFALM  COPY MESSAGE PROTOTYPE
+         CVD   R15,DWORK               CONVERT RTN CODE TO DECIMAL
+         ED    DAIRFALR-DAIRFALM+CWORK,DWORK+6  EDIT INTO MSG
+         LA    R1,CWORK                POINT TO OUTPUT LINE     TS75516
+         TPUT  (1),DAIRFALL            TPUT IT OUT              TS75516
+         LA    R15,16                  SET CP RETURN CODE
+         B     RETURN                  AND RETURN
+         SPACE 2
+DAIRFALM DC    C'&PFX.192 DYNAMIC ALLOCATION ERROR SERVICE ROUTINE ERROX
+               R CODE'
+DAIRFALR DC    X'40202120'             RETURN CODE EDIT MASK
+DAIRFALL EQU   *-DAIRFALM              MESSAGE LENGTH
+         SPACE 3
+*
+*   ERROR ROUTINE FOR ACB AND RPL BUILD ERRORS
+*
+GACBERR  LA    R1,=C'ACB'              CHARACTER CONSTANT FOR ACB
+         B     *+8                     CONTINUE
+GRPLERR  LA    R1,=C'RPL'              CHARACTER CONSTANT FOR RPL
+         MVC   CWORK(GXXXERRL),GXXXERR  MESSAGE PROTOTYPE
+         MVC   GXXXTYPE-GXXXERR+CWORK,0(R1)  COPY IN TYPE
+         LA    R1,CWORK                POINT TO MESSAGE
+         BAL   LINK,PUTLINE            WRITE IT OUT
+         STAX  DEFER=NO                ALLOW ATTENTIONS
+         LA    R15,16                  SET RETURN CODE
+         B     RETURN                  AND RETURN
+         SPACE 1
+GXXXERR  DC    AL2(GXXXERRL,0)         MESSAGE HEADER
+         DC    C'&PFX.196 UNABLE TO BUILD '
+GXXXTYPE DC    C'XXX'                  ACB OR RPL
+         DC    C' FOR INTERNAL READER'
+GXXXERRL EQU   *-GXXXERR               LENGTH OF MESSAGE
+         SPACE 3
+*
+*  ERROR ROUTINE FOR ENDREQ AND PUT ERRORS
+*
+XRPLERR  MVC   CWORK(XRPLERL),XRPLERM  PROTOTYPE
+         MVC   XRPLERT-XRPLERM+CWORK,0(R1)  COPY TYPE
+         CVD   R15,DWORK               CONVERT RETURN CODE TO DECIMAL
+         ED    XRPLERRC-XRPLERM+CWORK,DWORK+6   PUT INTO MESSAGE
+         MVI   XRPLERRC-XRPLERM+CWORK,C'='  ADD EQUAL SIGN
+         SR    R15,R15                 CLEAR R15 FOR FOLLOWING IC
+         IC    R15,RPLERRCD-IFGRPL+INTRPL   GET RPL ERROR CODE
+         CVD   R15,DWORK               CONVERT ERROR CODE TO DECIMAL
+         ED    XRPLEREC-XRPLERM+CWORK,DWORK+6   PUT INTO MESSAGE
+         MVI   XRPLEREC-XRPLERM+CWORK,C'='   ADD EQUAL SIGN
+         LA    R1,CWORK                POINT TO MESSAGE
+         BAL   LINK,PUTLINE            WRITE IT OUT
+         LA    R15,16                  SET CP RETURN CODE
+         B     RETURN                  AND RETURN
+         SPACE 2
+XRPLERM  DC    AL2(XRPLERL,0)          MESSAGE HEADER
+         DC    C'&PFX.199 ERROR PROCESSING INTERNAL READER '
+XRPLERT  DC    CL6'XXXXXX'
+         DC    C' - R15'
+XRPLERRC DC    X'40202120'             R15 MASK
+         DC    C'  ERROR CODE'
+XRPLEREC DC    X'40202120'             ERROR CODE MASK
+XRPLERL  EQU   *-XRPLERM               LENGTH OF MESSAGE
+         EJECT
+*
+*  CONSTANTS, ERROR MESSAGES, ETC.
+*
+BLANKS   DC    CL8' '                  BLANKS
+         SPACE 2
+GFAILM   DC    C'&PFX.193 GENERAL FAIL SERVICE ROUTINE ERROR'
+GFAILK   DC    X'40202120'             EDIT MASK FOR RETURN CODE
+GFAILL   EQU   *-GFAILM                LENGTH OF MESSAGE
+         SPACE 2
+PTFAILM  DC    C'&PFX.194 PUTGET SERVICE ROUTINE ERROR'
+PTFAILK  DC    X'40202120'             EDIT MASK FOR RETURN CODE
+PTFAILL  EQU   *-PTFAILM               LENGTH OF MESSAGE
+         SPACE 2
+FINMSG   DC    AL2(FINMSGL,0)          BUFFER HEADER
+         DC    C'&PFX.140 '            MESSAGE ID
+FINMSGID DC    CL8'JOB XXXX'           JOB ID
+         DC    C' '
+FINMSGJN DC    CL8'JOBNAME'            JOB NAME
+         DC    C' SUBMITTED'
+FINMSGCC DC    X'4020206B202120'       EDIT MASK FOR CARD COUNT
+         DC    C' CARDS'
+FINMSGL  EQU   *-FINMSG                MESSAGE LENGTH
+         SPACE 2
+*
+*  NOTE: AN MNOTE WILL BE GENERATED BY THE FOLLOWING MACRO EXPANSION
+*
+CPTGTCB  PUTGET MF=L,OUTPUT=(0,SINGLE,MODE),TERMPUT=ASIS
+CPTGTCBL EQU   *-CPTGTCB               LENGTH OF PUTGET BLOCK
+         SPACE 1
+         PRINT NOGEN
+MEMDCB   DCB   DDNAME=MEMBER,DSORG=PS,MACRF=(GL),EODAD=CLOSEMEM
+PDSDCB   DCB   DDNAME=DIRECT,DSORG=PS,MACRF=(GL),RECFM=U,              X
+               BLKSIZE=256,EODAD=RPDSEOF
+         PRINT GEN
+         LTORG
+         EJECT
+*
+*  TSO PARSE PARAMETER LIST DEFINITION MACROS
+*
+ACFSCMDP IKJPARM
+PMEMBER  IKJIDENT  'MEMBER',LIST,CHAR,MAXLNTH=8,FIRST=ALPHA,           X
+               OTHER=ALPHANUM,PROMPT='MEMBER NAME TO BE SUBMITTED'
+PLIBRARY IKJKEYWD
+         IKJNAME 'LIBRARY',SUBFLD=PLIBNAME
+POUTPUT  IKJKEYWD DEFAULT='INTRDR'
+         IKJNAME  'INTRDR'    # 1
+         IKJNAME  'TERMINAL'  # 2
+PLIBNAME IKJSUBF
+PLIBOD   IKJIDENT 'LIBRARY',CHAR,MAXLNTH=8,FIRST=ALPHA,                X
+               OTHER=ALPHANUM,PROMPT='LIBRARY IDENTIFIER',             X
+               HELP='PDS-ID OF DATASET CONTAINING JCL',                X
+               VALIDCK=CHECKLIB
+         IKJENDP
+*
+*        DEFINE VALID JCL LIBRARIES AND AUTHORIZATIONS
+*
+*  FORMAT IS:
+*     DEFLIB PDS-ID,DSN,UID=USERID-STRING
+*
+PDSLIST  DS    0D                      DEFINE LABEL
+**       INSERT ALL DEFINITIONS FOLLOWING
+         DEFLIB SUN,PROD.SUNJCL.CNTL,UID=120091001P
+         DEFLIB MON,PROD.MONJCL.CNTL,UID=120091001P
+         DEFLIB TUE,PROD.TUEJCL.CNTL,UID=120091001P
+         DEFLIB WED,PROD.WEDJCL.CNTL,UID=120091001P
+         DEFLIB THU,PROD.THUJCL.CNTL,UID=120091001P
+         DEFLIB FRI,PROD.FRIJCL.CNTL,UID=120091001P
+         DEFLIB SAT,PROD.SATJCL.CNTL,UID=120091001P
+**       ALL PDS-ID DEFINITIONS MUST PRECEED THIS
+PDSCOUNT EQU   (*-PDSLIST)/PDSDLEN     COUNT OF PDS-ID ENTRIES
+         END   ACFSCMD

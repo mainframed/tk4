@@ -1,0 +1,732 @@
+         TITLE 'IEAV2540 - AOS/2 - 2540 DEVICE SUPPORT PROCESSOR'
+***********************************************************************
+*
+*
+* NAME:        IEAV2540   COMMUNICATION TASK 2540 DEVICE SUPPORT
+*                         PROCESSOR.  ACCESS METHOD   BSAM (2540)
+*
+*
+* FUNCTION:    THIS ROUTINE IS THE DEVICE SUPPORT PROCESSOR(DSP)
+*              FOR CARD READERS USED AS THE INPUT PORTION OF A
+*              COMPOSITE CONSOLE.  THE PRIMARY SERVICES PERFORMED
+*              ARE:
+*
+*
+*                       1. WHEN A CARD READER IS TO BECOME PART OF A
+*                          COMPOSITE CONSOLE,  THIS ROUTINE WILL
+*                          GETMAIN & OPEN A DCB FOR INPUT BEFORE
+*                          DOING FUNCTION 2.
+*
+*                       2. WHEN AN ATTENTION IS PENDING FOR THE
+*                          OPENED DEVICE, THIS ROUTINE WILL GETMAIN
+*                          FOR A BUFFER AND ISSUE A READ MACRO
+*                          INSTRUCTION TO INITIATE I/O BEFORE
+*                          EXITING.
+*
+*                       3. WHEN THE I/O HAS COMPLETED, A CHECK MACRO
+*                          INSTRUCTION IS ISSUED TO TEST THE I/O
+*                          OPERATION.  IF AN I/O ERROR OCCURS, THE
+*                          RTN XCTL'S TO CONSOLE SWITCH.  IF READ IS
+*                          SUCCESSFUL, SVC 34 IS ISSUED TO PROCESS
+*                          THE COMMAND BEFORE FREEING THE BUFFER
+*                          AND EXITING.
+*
+*                       4. WHEN A CARD READER IS TO BE REMOVED FROM
+*                          CONSOLE STATUS, THIS ROUTINE QUIESCES THE
+*                          DEVICE BEFORE CLOSING AND FREEING THE DCB.
+*
+*
+* INPUT:       REG 1 POINTS TO PARAMETER LIST MAPPED BY CXSA.
+*              LIST INCLUDES POINTERS TO THE UCM MODULE, AND THE
+*              ACTIVE UCM ENTRY.
+*
+*              REG 14 CONTAINS THE RETURN ADDRESS
+*
+*
+* OUTPUT:      UNIT STATUS IN THE UCM ENTRY.
+*
+*
+* EXTERNAL REFERENCES:
+*              NONE
+*
+*
+* EXITS:       VIA BR 14 TO EXIT AFTER A CLOSE, READ, OR I/O
+*              COMPLETE PROCESSING IS DONE.
+*
+*              VIA BR 15 TO CONSOLE SWITCH RTN (IEAVSWCH) TO CAUSE
+*              DEVICE TO BE DEALLOCATED AS A CONSOLE AND ITS
+*              FUNCTIONS TO BE ASSIGNED TO ITS ALTERNATE.
+*
+*
+* TABLES:      CVT  - CVTTCBP   (REFERENCED)
+*              TCB  - TCBTIO    (REFERENCED/SET)
+*              CXSA - CSAXA     (SET)
+*                   - CSAUCM    (REFERENCED)
+*                   - CSACODE   (SET)
+*                        CSAOPEN
+*                        CSACLOSE
+*                        CSASWTCH
+*                   - CSACTLM   (REFERENCED)
+*                   - CSANAME   (SET)
+*              UCM  - UCMVEA    (REFERENCED)
+*                   - UCMVEZ    (REFERENCED)
+*                   - UCMLSTP   (REFERENCED)
+*                   - UCMIECBA  (REFERENCED)
+*              UCME - UCMDCB    (SET)
+*                   - UCMDEVC
+*                        UCMDEVE   (SET)
+*                   - UCMID     (REFERENCED)
+*                   - UCMUCB    (REFERENCED)
+*                   - UCMSTS
+*                        UCMAF     (SET)
+*                        UCMBF     (SET)
+*                        UCMCF     (SET)
+*                        UCMTA     (SET)
+*                   - UCMATR
+*                        UCMAT04   (SET)
+*                        UCMUF     (SET)
+*              UCB  - UCBSTAT
+*                        UCBALOC   (SET)
+*                        UCBCHGS   (SET)
+*                        UCBSYSR   (SET)
+*                        UCBDADI   (SET)
+*                        UCBONLI   (SET)
+*                   - UCBATI    (SET)
+*
+*
+* OPERATION:   1. IF CLOSE REQUEST NOT PENDING, TESTS BUSY.
+*                 TO CLOSE, CHECKS IF OPEN, THEN QUIESES I/O,
+*                 DISPOSES OF BUFFER, AND BR'S TO SUBRTN TO
+*                 CLOSE AND FREEMAIN DCB.
+*
+*              2. IF NOT BUSY, TESTS REQUEST FLAGS.
+*                 IF BUSY, CHECKS FOR I/O COMPLETE. IF NOT COMPLETE
+*                 RETURNS TO DEVICE SERVICE. IF COMPLETE, CHECKS
+*                 I/O OPERATION.  IF ERROR, BRANCH'S TO CONSOLE
+*                 SWITCH.  IF OK, PROCESSES COMMAND, FREES
+*                 BUFFER, AND TESTS REQUEST FLAGS.
+*
+*              3. IF REQUESTS FLAGS NOT PENDING, RETURNS TO DEVICE
+*                 SERVICE.  IF OPEN PENDING, BR'S TO OPEN
+*                 SUBRTN TO GETMAIN AND OPEN DCB FOR INPUT.
+*                 IF ALREADY OPEN, ACQUIRES BUFFER AND INITIATES
+*                 I/O.  THEN RETURNS TO DEVICE SERVICE.
+*
+*
+*              4. BUFFER HANDLING (2540, BSAM)
+*
+*                   BUFFERS ARE ACQUIRED AND FREED DYNAMICALLY.
+*                   THEY ARE SUBMITTED TO COMMAND SCHEDULERS FOR
+*                   PROCESSING WITH MGCR (SVC 34).
+*
+*              5. ERRORS.
+*                   UNCORRECTABLE I/O ERROR RESULT IN AN BRANCH TO
+*                   THE CONSOLE SWITCH ROUTINE.
+*
+*
+*
+* COMMENT:     THIS MODULE WILL SERVE AND INDEFINITE NUMBER OF
+*              UCM ENTRIES.
+*
+*              SYNCHRONIZATION, AS REQUIRED, IS IMPOSED BY USE OF
+*              THE GLOBAL CMS LOCK.  THIS ROUTINE RUNS IN SUPERVISOR
+*              STATE WITH PROTECTION KEY=0.
+*
+*
+***********************************************************************
+         EJECT
+IEAV2540 CSECT
+IGC0207B EQU   *                   EXTERNAL ENTRY POINT NAME     Y02752
+         ENTRY IGC0207B
+         SPACE
+* REGISTER EQUATES
+         SPACE
+X0       EQU   0                   .SYSTEM INTERFACING
+X1       EQU   1                   .SYSTEM INTERFACING, CXSA PTR
+X2       EQU   2                   .SCRATCH
+X3       EQU   3                   .SCRATCH
+X4       EQU   4                   .SCRATCH
+X5       EQU   5                   .SCRATCH
+X6       EQU   6                   .SCRATCH
+X7       EQU   7                   .SCRATCH
+X8       EQU   8                   .BASE FOR WQE
+X9       EQU   9                   .BASE FOR DCB
+XA       EQU   10                  .BASE FOR UCM ENTRY
+XB       EQU   11                  .PTR TO CXSA
+XC       EQU   12                  .MODULE BASE REGISTER
+XD       EQU   13                  .PTR TO REGISTER SAVE AREA
+XE       EQU   14                  .EXIT REGISTER
+RETURNRG EQU   14                  .RETURN REGISTER
+XF       EQU   15                  .SYSTEM INTERFACING
+         SPACE 3
+* MODULE EQUATES
+         SPACE
+ZERO     EQU   0                   .ZERO
+BLANK    EQU   X'40'               .USED TO BLANK OUT BUFFER AREA
+ONE      EQU   1                   .ONE
+TWO      EQU   2                   TWO                           Y02893
+THREE    EQU   3                   THREE                         Y02893
+FOUR     EQU   4                   FOUR                          Y02893
+FIVE     EQU   5                   FIVE                          Y02752
+C7       EQU   7                   .FOR STORING THREE BYTE ADDRESS
+C255     EQU   255                 .USED TO REVERSE MASKS
+D4       EQU   4                   DISPLACEMENTS OF 4            Y02752
+D5       EQU   5                   DISPLACEMENTS OF 5            Y02752
+D7       EQU   7                   DISPLACEMENT OF 7
+D8       EQU   8                   DISPLACEMENT OF 8
+F84      EQU   84                  .MGCR COUNT
+C34      EQU   34                  .FOR SVC 34 - GET COMMAND
+L3       EQU   3                   LENGTH OF 3
+L5       EQU   5                   LENGTH OF 5
+L36      EQU   36                  LENGTH OF 36
+LASTNTRY EQU   X'80'               FLAG FOR END OF PARM LIST     Y02711
+EXITJFCB EQU   X'07'               FLAGS EXIT AS JFCB TYPE       Y02711
+         EJECT
+         LR    XC,XF               .ESTABLISH ADDRESSABILITY     Y02893
+         USING IEAV2540,XC                                       Y02893
+         MODID                                                   Y02893
+         LR    XB,X1               .LOAD CXSA ADDR INTO REG 1    Y02893
+         USING CXSA,XB
+         ST    RETURNRG,CSAXA      .SAVE RETURN REG IN CXSA
+         L     XA,CSAUCM           .GET BASE FOR UCM ENTRY
+         USING UCMLIST,XA
+         L     X9,UCMDCB           .GET BASE FOR DCB
+         USING IHADCB,X9
+         GETMAIN R,SP=255,LV=72    .GETMAIN FOR REGISTER SAVE AREA
+         LR    XD,X1               .LOAD REG SAVE AREA ADDR INTO REG 13
+         ST    X1,CSAXD            SAVE A COPY OF SAVEAREA PTR   Y02751
+         BAL   XE,PGETLOCK         OBTAIN LOCAL AND CMS LOCKS    Y02751
+PMCF     EQU   *
+         TM    UCMSTS,UCMCF        .Q. IS IT A CLOSE REQUEST
+         BZ    PMBF                .NO - BR TO CHECK IF BUSY
+         SPACE
+* IT IS A CLOSE REQUEST.  THE 2540 WILL BE REMOVED FROM CONSOLE
+* STATUS IF THERE IS NO I/O OR AN OPEN PENDING FOR THE DEVICE.
+         SPACE
+         TM    UCMSTS,UCMBF+UCMAF  .Q. IS DEVICE BUSY OR ATTENTION
+*                                  PENDING
+         BNZ   PMBF                .YES - BR TO QUIESCE DEVICE
+         B     PMCLOSE             IF NOT, GO CLOSE              Y02893
+         SPACE 1                                                 Y02893
+PMEXIT   EQU   *
+         L     X7,CSAXA            .LOAD RETURN ADDR FROM CXSA
+         SPACE
+* FREE THE SAVE AREA AND EXIT ON REGISTER 14:
+*     TO ISSUER OF SVC 72
+*     TO OPEN SUBROUTINE
+*     TO CLOSE SUBROUTINE
+*     TO XCTL CODE FOR CONSOLE SWITCH
+         SPACE
+PMGONE   EQU   *
+         BAL   XE,PFRELOCK         RELEASE LOCAL AND CMS LOCKS   Y02751
+PMGONE1  DS    0H                                                Y02751
+         LR    X1,XD               .GET REG SAVE AREA ADDR IN REG 1
+         FREEMAIN R,SP=255,LV=72,A=(1) .FREE SAVE AREA
+         LR    RETURNRG,X7         .RESTORE RETURN REG
+         LR    X1,XB               .PASSING CXSA PTR
+         BR    RETURNRG            .RETURN
+         SPACE
+**************************************************************** Y02893
+* A CLOSE IS PENDING BUT NO OPEN, THE CONSOLE DCB WAS OPENED,
+* AND THERE WAS NO NEED TO QUIESCE WORK.  HENCE THE FOLLOWING
+* CODE WILL REMOVE THE DEVICE FROM CONSOLE STATUS BY
+* PREPARING TO LINK TO CLOSE SUBROUTINE.
+**************************************************************** Y02893
+         SPACE
+PMCLOSE  EQU   *
+         NI    UCMSTS,C255-UCMCF   .TURN OFF CLOSE PENDING FLAG
+         MVI   CSACODE,CSACLOSE    .LOCAL CLOSE CODE
+         B     PJSTART             GO TO CLOSE/OPEN SUBROUTINE   Y02893
+         EJECT
+**************************************************************** Y02893
+* PROCESSING CONTINUES HERE IF:
+*      THERE IS NO CLOSE PENDING OR
+*      THERE IS A CLOSE PENDING ALONG WITH EITHER A PENDING
+*      ATTENTION OR THE DEVICE IS BUSY.
+**************************************************************** Y02893
+         SPACE
+PMBF     EQU   *
+         TM    UCMSTS,UCMBF        .Q. IS DEVICE BUSY
+         BZ    PMAPF               .NO - BR TO CHECK IF ATTN OR
+*                                  OPEN PENDING
+         TM    UCMDEVC,UCMDEVE     .Q. IS I/O COMPLETE
+         BNO   PMEXIT              .NO - IGNORE THIS REQUEST
+         SPACE
+**************************************************************** Y02751
+*                                                                Y02751
+* IF THE DEVICE IS BUSY AND AN I/O COMPLETION HAS OCCURRED,
+* A CHECK MACRO WILL BE ISSUED.  IF AN ERROR OCCURS, EXIT IS
+* TO CONSOLE SWITCH.  IF O.K., AN SVC 34 IS ISSUED TO PROCESS
+* THE COMMAND AND THE BUFFER IS FREED BEFORE RETURNING.
+*
+* AFTER TURNING OFF THE I/O COMPLETE FLAG IN THE UCME, RELEASE   Y02751
+* THE LOCAL AND CMS LOCKS TO ISSUE THE CHECK MACRO.              Y02751
+*                                                                Y02751
+**************************************************************** Y02751
+         SPACE
+         NI    UCMDEVC,C255-UCMDEVE .YES - TURN OFF I/O COMPLETE FLAG
+         BAL   XE,PFRELOCK         RELEASE LOCAL AND CMS LOCKS   Y02751
+         L     X8,DMX              .GET ACTIVE BUFFER PTR
+         LA    X8,ZERO(X8)         .KILL HIGH BYTE
+         LA    X1,DMDECB           .CHECK PREVIOUS IOS OPERATION
+         SPACE 1                                                 Y02893
+         CHECK (1)
+         SPACE 1                                                 Y02893
+         XC    DMDECB,DMDECB       .CLEAR ECB
+         USING WQE,X8
+         LA    X1,F84              .GET MGCR COUNT
+         STH   X1,WQENBR           .STORE LENGTH INTO HEADER     Y02752
+         LA    X1,WQENBR           .GET ADDR OF COUNT FIELD      Y02752
+         SR    X0,X0               .CLEAR REGISTER
+         STH   X0,WQENBR+TWO       SET UNUSED FIELD TO ZERO      Y02752
+         IC    X0,UCMID            .GET UCM ID
+         SVC   C34                 .SVC 34 - MASTER SCHED - GET COMMAND
+         LA    X3,PMCF             SET UP RETURN ADR FOR PMFREEB Y02752
+PMFREEB  EQU   *
+         LR    X1,X8               .PTR TO DISCARDED BUFFER
+         FREEMAIN R,SP=255,LV=WQESIZE,A=(1) .FREE IT
+         SPACE 1                                                 Y02751
+         BAL   XE,PGETLOCK         OBTAIN LOCAL AND CMS LOCKS    Y02751
+         NI    UCMSTS,C255-UCMBF   .TURN OFF BUSY FLAG - NO LONGER BUSY
+         BR    X3                  .NO - RETURN TO CALLER(NSI OR ERR)
+         SPACE
+* THE DEVICE IS NOT BUSY.  IF AN OPEN IS PENDING, LINKAGE TO
+* OPEN SUBRTN IS ESTABLISHED.
+         SPACE
+PMAPF    EQU   *
+         TM    UCMSTS,UCMAF+UCMTA  .Q. IS AN ATTENTION OR OPEN PENDING
+         BZ    PMEXIT              .NO - BRANCH TO EXIT
+         TM    UCMSTS,UCMTA        .Q. IS AN OPEN STILL PENDING
+         BNO   PMAF                .NO - WE ARE OPEN - AN ATTENTION
+*                                  IS PENDING
+         MVI   CSACODE,CSAOPEN     .SET CODE TO OPEN
+         B     PJSTART             GO TO CLOSE/OPEN SUBROUTINE   Y02893
+         SPACE
+* THE DEVICE IS NOT BUSY, THE DCB IS ALREADY OPENED, AND THERE
+* IS AN ATTENTION PENDING. THE FOLLOWING CODE WILL GETMAIN
+* A BUFFER, AND ISSUE A READ BEFORE EXITING.
+         SPACE
+PMAF     EQU   *
+         NI    UCMSTS,C255-UCMAF   .ATTENTION SATISFIED - TURN OFF
+*                                  ATTENTION PENDING FLAG
+         SPACE 1                                                 Y02751
+*  GETMAIN A BUFFER FOR THE READ, USE THE BRANCH ENTRY TO        Y02751
+*  THE LOCKS ARE HELD AT THIS POINT.                             Y02751
+         SPACE 1                                                 Y02751
+         L     X4,CSACTLM          GET UCM BASE ADDRESS          Y02751
+         USING UCM,X4              BASE THE UCM                  Y02751
+         L     X7,UCMASCB          GET ASCB ADDR OF COMM TASK    Y02751
+         L     X4,UCMPXA           GET TCB ADDR OF COMM TASK     Y02751
+         DROP  X4                  RELEASE THE UCM BASE REG      Y02751
+         SPACE 1                                                 Y02893
+         GETMAIN RU,LV=WQESIZE,SP=255,BRANCH=YES                 Y02751
+         SPACE 1                                                 Y02751
+         LR    X8,X1               .LOAD BUFFER ADDRESS INTO REG 8
+         ST    X8,DMX              .STORE CURRENT BUFFER PTR
+         MVI   DMX,DMXR            .CURRENT OPERATION CODE - READ
+         LA    X2,WQENBR+D4        SET UP PTR TO BUF DATA AREA   Y02752
+         MVI   WQENBR+D4,BLANK     BLANK OUT BUFFER DATA AREA    Y02752
+         MVC   WQENBR+D5(F84-FIVE),WQENBR+D4                     Y02752
+         SPACE 1                                                 Y02752
+PMEXCP   EQU   *
+         OI    UCMSTS,UCMBF        .FLAG UCM ENTRY AS BUSY
+         BAL   XE,PFRELOCK         RELEASE LOCAL AND CMS LOCKS   Y02751
+         LA    X1,DMDECB           .ADDR OF DECB
+         READ  (1),SF,(9),(2),'S',MF=E .READ AN INPUT RECORD
+         SPACE 1                                                 Y02751
+         L     X7,CSAXA            LOAD RETURN ADDR FROM CXSA    Y02751
+         B     PMGONE1             GO EXIT WITH LOCKS RELEASED   Y02751
+*                                  TO ISSUER OF SVC 72
+         DROP  X8                  .WQE BASE
+         SPACE
+* THE FOLLOWING CODE IS ENTERED IF AN ERROR IS DETECTED AS A RESULT
+* OF THE CHECK MACRO. THE BUFFER IS FREED AND AN XCTL IS TAKEN TO
+* THE CONSOLE SWITCH ROUTINE.
+         SPACE
+PMERRCK  EQU   *
+         BAL   X3,PMFREEB          .BR TO FREE INPUT BUFFER
+         MVI   CSACODE,CSASWTCH    .INDICATE CONSOLE SWITCH
+         MVC   CSANAME,PMXTRNL     .NAME OF AUTO SW RTN
+         LA    X7,PMCEND2          .SET UP RETURN ADDRESS
+         B     PMGONE              .BR TO EXIT
+PMCEND2  EQU   *
+         L     RETURNRG,CSAXA      .RESTORE RETURN REG
+         L     XF,CSACTLM          GET ADDRESS OF UCM            Y02752
+         USING UCM,XF              TEMPORARY BASE FOR UCM        Y02752
+         L     XF,UCMSWCH          GET ADDRESS OF CONSOLE SWITCH Y02752
+         DROP  XF                  DROP TEMPORARY BASE           Y02752
+         BR    XF                  BRANCH TO CONSOLE SWITCH      Y02752
+         SPACE 3
+* CONSTANTS
+         SPACE
+PMXTRNL  DC    CL8'IGC0407B'       .NAME OF CONSOLE SWITCH RTN
+         EJECT
+*
+* OPEN/CLOSE SUBROUTINE *
+*
+* THIS SUBROUTINE WILL EITHER GETMAIN,FORMAT AND OPEN A BSAM DCB
+* FOR INPUT OR CLOSE AND FREEMAIN THE DCB.  IT IS INVOKED
+* ONCE(OPEN) WHEN A CARD READER DEVICE IS TO BE PART OF A CONSOLE
+* AND ONCE(CLOSE) WHEN THE DEVICE IS TO BE REMOVED FROM CONSOLE
+* STATUS.
+         SPACE 3
+PJSTART  EQU   *
+         L     X1,CSACTLM          GET ADDRESS OF UCM            Y02893
+         USING UCM,X1                                            Y02893
+         SPACE
+* GET PTR TO ENTRY IN EIL LIST FOR I/O ECBS.
+         SPACE
+         SR    X4,X4               ZERO OUT EVEN REGISTER        Y02893
+         LA    X5,UCMLIST          GET COPY OF UCME PTR          Y02893
+         S     X5,UCMVEA           SUBTRACT ADDR OF 1ST UCME     Y02893
+         D     X4,UCMVEZ           DIVIDE BY UCME LENGTH = INDEX Y02893
+         SLL   X5,TWO              INDEX TO EIL AND MULT BY 4    Y02893
+         L     X4,UCMLSTP          GET PTR TO EIL                Y02893
+         USING UCMEIL,X4           BASE THE EIL                  Y02893
+         LA    X5,UCMIECBA(X5)     ADDR OF ENTRY IN I/O ECB LIST Y02893
+         DROP  X4                  RELEASE BASE FOR EIL          Y02893
+         SR    XF,XF               ZERO THE REGISTER             Y02893
+         IC    XF,CSACODE          GET ENTRY CODE                Y02893
+         MVI   CSACODE,ZERO        .RESET CODE TO ZERO
+         B     BTABLE1(XF)         BRANCH TO OPEN OR CLOSE THRU  Y02893
+*                                  THE BRANCH TABLE USING ENTRY  Y02893
+*                                  CODE AS INDEX INTO TABLE.     Y02893
+BTABLE1  DS    0H                                                Y02893
+         B     PJOPEN              .OPEN FUNCTION
+         B     PJCLOSE             .CLOSE FUNCTION
+         EJECT
+*
+* CLOSE PROCEDURE
+*
+         SPACE
+PJCLOSE  EQU   *
+         L     X4,UCMUCB           SET UP BASE FOR UCB           Y02752
+         USING UCBOB,X4                                          Y02752
+         LTR   X9,X9               IF THERE A DCB                Y02893
+         BZ    PJSTATUS            .NO - DCB WAS NOT OPENED
+         BAL   XE,PFRELOCK         GO FREE LOCAL AND CMS LOCKS   Y02751
+         OI    DMXA,DMXCLOSE       .TURN ON CLOSE TERMINAL FLAG
+         LA    X1,DMXA             GET ADDR OF CLOSE PARM LIST   Y02893
+         SPACE 1                                                 Y02893
+         CLOSE ((X9)),MF=(E,(1))   CLOSE THE DCB                 Y02893
+         SPACE 1                                                 Y02893
+         LR    X1,X9               .Q. WAS DCB EVER OPENED       Y02751
+         FREEMAIN R,SP=255,LV=DMCORE,A=(1) .FREE DCB
+         SPACE 1                                                 Y02893
+         BAL   XE,PGETLOCK         GO OBTAIN LOCAL AND CMS LOCKS Y02751
+PJSTATUS EQU   *
+         TM    UCBSTAT,UCBCHGS     .Q. IS DEVICE CHANGING TO OFFLINE
+         BZ    PJDEVSTA            .NO - LEAVE ONLINE BIT ALONE
+         SPACE 1                                                 Y02751
+*  IF THE DEVICE IS GOING OFFLINE, TURN OFF THE FOLLOWING UCB    Y02751
+*  FLAGS--- ONLINE, CHANGING, ALLOCATED, SYSTEM CONSOLE, AND     Y02751
+*  'CONSOLE STATUS SWITCH'.                                      Y02751
+         SPACE 1                                                 Y02751
+         NIL   UCBSTAT,C255-UCBONLI-UCBCHGS-UCBALOC-UCBSYSR-UCBDADI,   *
+               REF=UCBOB                                         Y02751
+         SPACE 1                                                 Y02751
+         B     PJCONTIN            .CONTINUE PROCESSING
+         EJECT
+*  IF A DEVICE IS GOING OUT OF CONSOLE STATUS, BUT TO REMAIN     Y02751
+*  ONLINE, TURN OFF THE FOLLOWING UCB FLAGS---                   Y02751
+*  ALLOCATED, SYSTEM CONSOLE, AND 'CONSOLE STATUS SWITCH'.       Y02751
+         SPACE 1                                                 Y02751
+PJDEVSTA DS    0H                                                Y02751
+         NIL   UCBSTAT,C255-UCBALOC-UCBSYSR-UCBDADI,             Y02751C
+               REF=UCBOB                                         Y02751
+PJCONTIN NI    UCMATR,C255-UCMAT04 .TURN OFF DEVICE STATUS TO
+*                                  CHANGE FLAG
+         NI    UCMATR,C255-UCMUF   .TURN OFF DEVICE ACTIVE FLAG
+         LA    XF,UCMECB           GET ADDR OF ECB               Y02893
+         STCM  XF,C7,ONE(X5)       RESET EIL TO PT TO UCMECB     Y02893
+         L     XF,UCBEXTPT         GET PTR TO COMMON EXTENSION   Y02752
+         USING UCBCMEXT,XF         BASE EXTENSION                Y02752
+         MVI   UCBATI,ZERO         .ZERO OUT ATTENTION INDEX
+         XC    UCMECB,UCMECB       .RESET UCM ENTRY BY CLEARING ECB
+         XC    UCMDCB,UCMDCB       AND DCB PTR
+         NI    UCMSTS,C255-UCMBF-UCMCF .TURN OFF BUSY & CLOSE
+*                                  PENDING FLAGS
+         B     PMEXIT              GO EXIT FROM MODULE           Y02711
+         DROP  X4,XF               DROP UCB AND EXTENSION BASE   Y02752
+         EJECT
+*
+* OPEN PROCEDURE
+*
+         SPACE
+PJOPEN   EQU   *
+         L     X4,UCMUCB           GET UCB ADDR OF THIS DEVICE   Y02893
+         USING UCBOB,X4                                          Y02751
+         TM    UCBSTAT,UCBSYSR     IS THE DEVICE A CONSOLE NOW   Y02711
+         BNO   PMEXIT              IF NO, DONT PROCEED WITH OPEN Y02711
+         BAL   XE,PFRELOCK         GO FREE LOCKS BEFORE SVC'S    Y02751
+         SPACE 1                                                 Y02751
+*                                      SPACE FOR DATA BLOCKS.
+         GETMAIN R,SP=255,LV=DMCORE    GET AREA FOR DCB
+         LR    X9,X1               MOVE ADDR TO DCB BASE REG     Y02751
+         SPACE 1                                                 Y02751
+*  NOTE.  THE DCB BASE REG USING WAS DONE AT THE BEGINNING OF    Y02751
+*         OF THE MODULE.                                         Y02751
+         SPACE 1                                                 Y02751
+         MVC   ZERO(DMCORE,X9),DMDCB   MOVE IN FIXED AREAS       Y02751
+         SPACE 1                                                 Y02893
+         GETMAIN R,SP=255,LV=PNCORE
+         SPACE 1                                                 Y02893
+         LR    X6,X1               ESTABLISH BASE FOR JFCB CORE  Y02711
+         USING PNOPEN,X6                                         Y02711
+         XC    PNOPEN(PNCORE),PNOPEN  CLEAR THE JFCB AREA        Y02711
+         SPACE 1                                                 Y02711
+*  FORM THE DDNAME FOR THIS CONSOLE BY CONVERTING THE CONSOLE    Y02711
+*  ID TO EBCDIC (TO 3 DIGITS) AND CONCATENATING IT TO 'IEAVM'    Y02711
+         SPACE 1                                                 Y02711
+         SR    X1,X1               CLEAR REG FOR INSERT CHAR     Y02711
+         IC    X1,UCMID            GET THE CONSOLE ID            Y20711
+         CVD   X1,PNWORKD          CONVERT IT TO PACKED DECIMAL  Y02711
+         UNPK  PNWORKD(L5),PNWORKH4(L3)    UNPACK IT TO EBCDIC   Y02711
+         MVC   DCBDDNAM,BASENAM    MOVE THE 'IEAVM' BASE         Y02711
+         MVC   DCBDDNAM+L'BASENAM(L3),PNWORKD CONCATENATE THE ID Y02711
+         SPACE 1                                                 Y02711
+*  SET UP THE JFCB AND THE DCB AND OPEN EXIT LISTS               Y02711
+         SPACE 1                                                 Y02711
+         MVC   JFCBDSNM,PNDSN      MOVE IN A DSNAME FOR CONSOLE  Y02711
+         MVC   JFCBDSNM+D8(L36),JFCBDSNM+D7  SET THE REMAINDER   Y02711
+*                                            OF DSNAME FIELD TO  Y02711
+*                                            BLANKS.             Y02711
+         SPACE 1                                                 Y02711
+*  SET FIELDS IN THE JFCB TO PREVENT WRITE BACK OF THE JFCB.     Y02711
+         OI    JFCBTSDM,JFCTTR+JFCNWRIT+JFCNDSCB+JFCNDCB+JFCPAT  Y02711
+         LA    X3,JFCB             ADDR OF JFCB FOR EXIT LIST    Y02711
+         STCM  X3,C7,PNXLST+ONE    STORE IT IN THE EXIT LIST     Y02711
+         OI    PNXLST,LASTNTRY+EXITJFCB  MARK EXIT AS JFCB       Y02711
+         LA    X3,PNXLST           ADDR OF EXIT LIST             Y02711
+         STCM  X3,C7,DCBEXLST+ONE  STORE IT IN THE DCB           Y02711
+         OI    PNJEF,LASTNTRY      SET LAST IND.IN PARM         YM06163
+         EJECT
+         OPEN  ((X9),INPUT),TYPE=J,MF=(E,PNJEF)  OPEN CONSOLE    Y02751
+         SPACE
+         LR    X1,X6               JFCB AND TEMP WORK AREA ADDR  Y02893
+         SPACE 1                                                 Y02893
+         FREEMAIN R,SP=255,LV=PNCORE,A=(1)  FREE JFCB STORAGE    Y02893
+         XC    DCBEXLST+ONE(L3),DCBEXLST+ONE   ZERO FIELD
+         SPACE 1                                                 Y02751
+*  GO OBTAIN LOCKS AGAIN BEFORE UPDATING THE UCM AND UCME.       Y02751
+         SPACE 1                                                 Y02751
+         BAL   XE,PGETLOCK         GO TO LOCK ROUTINE            Y02751
+         ST    X9,UCMDCB           DCB PTR TO CONSOLES UCME      Y02751
+         NI    UCMATR,C255-UCMAT04  TURN OFF DEVICE STATUS BIT   Y02752
+         OI    UCMATR,UCMUF            TURN ON ACTIVE BIT           MCS
+         NI    UCMSTS,C255-UCMTA    TURN OFF OPEN PENDING        Y02893
+         SPACE
+         DROP  X6                                                Y02893
+         EJECT
+         LA    XF,DMDECB           ADDR OF I/O ECB FOR THIS UCME Y02893
+         STCM  XF,C7,ONE(X5)       STORE ECB ADDR IN EIL         Y02893
+*                            PT WAIT AT ECB THRU EIL.
+         L     XF,UCBEXTPT         GET PTR TO COMMON EXTENSION   Y02752
+         USING UCBCMEXT,XF         BASE THE COMMON EXTENSION     Y02752
+         MVI   UCBATI,FOUR          SET ATTN INDEX FOR CONSOLE   Y02893
+         B     PMCF                 RETURN TO MAIN PROGRAM       Y02711
+         DROP  X4,XF                BASE FOR UCB AND EXTENSION   Y02752
+         EJECT
+**************************************************************** Y02751
+*                                                                Y02751
+*                       COMMON SETLOCK OBTAIN ROUTINE            Y02751
+*                                                                Y02751
+*  THIS ROUTINE WILL OBTAIN THE LOCAL AND CMS LOCKS, AND THEN    Y02751
+*  ISSUE THE SETFRR.THE ADDRESS OF THE FRR TO BE PLACED ON THE   Y02751
+*  STACK IS CONTAINED IN FIELD CSAXB OF THE SVRB EXTENDED SAVE.  Y02751
+*                                                                Y02751
+*  ENTRY POINT:    PGETLOCK, VIA 'BAL   14,PGETLOCK'             Y02751
+*                                                                Y02751
+*  CALLED FROM:    1.  INITIAL MODULE ENTRY ROUTINE (PROLOGUE).  Y02751
+*                  2.  AFTER RETURN FROM SVC 34 (IF MORE WORK)   Y02751
+*                  3.  DEVICE CLOSE ROUTINE                      Y02751
+*                  4.  DEVICE OPEN ROUTINE                       Y02751
+*                                                                Y02751
+**************************************************************** Y02751
+         SPACE 1                                                 Y02751
+PGETLOCK DS    0H                                                Y02751
+         ST    XE,CSAXE            SAVE RETURN REG               Y02751
+         LR    XA,XB               USE THIS AS A TEMP CXSA BASE  Y02751
+         LR    XF,XC               USE THIS AS A TEMP MOD BASE   Y02751
+         DROP  XA,XB,XC                                          Y02751
+         USING CXSA,XA             TEMPORARY CXSA BASE           Y02751
+         USING IEAV2540,XF         TEMPORARY MODULE BASE         Y02751
+         SPACE 3                                                 Y02751
+*  GET THE LOCAL LOCK.                                           Y02751
+         SPACE 1                                                 Y02751
+         SETLOCK OBTAIN,TYPE=LOCAL,MODE=UNCOND,                  Y02751*
+               RELATED=(UCM,IEAV2540(PFRELOCK))                  Y02751
+         SPACE 3                                                 Y02751
+*  GET THE CMS GLOBAL LOCK.  (UNCONDITIONAL REQUEST)             Y02751
+         SPACE 1                                                 Y02751
+         SETLOCK OBTAIN,TYPE=CMS,MODE=UNCOND,                    Y02751*
+               RELATED=(UCM,IEAV2540(PFRELOCK),IEAVSWCH(FRR))    Y02751
+         SPACE 2                                                 Y02751
+*  SET FUNCTIONAL RECOVERY ROUTINE IN PLACE.                     Y02753
+         SPACE 1                                                 Y02753
+         L     XB,UCMFRRAD         PTR TO COMMON RECOVERY RTN    Y02753
+         USING PSA,X0              BASE THE PSA (ADDR IS 0)      Y02753
+         SETFRR A,FRRAD=(11),PARMAD=(13),WRKREGS=(12,13),        Y02753C
+               RELATED=(CMS-LOCK,IEAV2540(PFRELOCK))             Y02753
+         DROP  X0                                                Y02753
+         SPACE 2                                                 Y02753
+         ST    XD,CSADCBP          SAVE FRR WORKAREA ADDR        Y02753
+         USING PARMLIST,XD         BASE RECOVERY PARMLIST        Y02753
+         MVC   PARMID,SVC72ID      MOVE IN RECOVERY IDENTIFIER   Y02753
+         DROP  XA,XD,XF            RELEASE TEMP BASE REGS        Y02751
+         LR    XB,XA               RESTORE CXSA BASE             Y02751
+         LR    XC,XF               RESTORE MODULES BASE          Y02751
+         USING CXSA,XB                                           Y20751
+         USING IEAV2540,XC         RESTORE PROGRAM PASE REG      Y02751
+         L     XA,CSAUCM           RESTORE UCME BASE REG         Y02751
+         USING UCMLIST,XA                                        Y02751
+         L     XD,CSAXD            REFRESH PTR TO REG SAVE AREA  Y02751
+         L     XE,CSAXE            RESTORE RETURN REG            Y02751
+         BR    XE                  RETURN TO SUBROUTINE CALLER   Y02751
+         EJECT
+**************************************************************** Y02751
+*                                                                Y02751
+*                       COMMON SETLOCK RELEASE ROUTINE           Y02751
+*                                                                Y02751
+*  THIS ROUTINE WILL REMOVE THE CURRENT FRR FROM THE STACK AND   Y02751
+*  THEN FREE THE CMS AND LOCAL LOCKS (IN THE ORDER NAMED).       Y02751
+*                                                                Y02751
+*  ENTRY POINT:    PFRELOCK, VIA 'BAL  14,PFRELOCK'              Y02751
+*                                                                Y02751
+*  CALLED FROM:                                                  Y02751
+*              1.  PMCF WHEN CLOSE PENDING SATISFIED             Y02751
+*              2.  PMBKS WHEN I/O COMPLETE ON A READ             Y02751
+*              3.  PMEXCP BEFORE ISSUING EXCP MACRO              Y02751
+*              4.  PJCLOSE TO ISSUE CLOSE MACRO                  Y02751
+*              5.  PJOPEN TO ISSUE OPEN MACRO                    Y02751
+*                                                                Y02751
+**************************************************************** Y02751
+         SPACE 1                                                 Y02751
+PFRELOCK DS    0H                                                Y02751
+         ST    XE,CSAXE            SAVE RETURN REG               Y02751
+         LR    XA,XB               USE THIS AS A TEMP CXSA BASE  Y02751
+         LR    XF,XC               USE THIS AS A TEMP MOD BASE   Y02751
+         DROP  XA,XB,XC                                          Y02751
+         USING CXSA,XA             TEMPORARY CXSA BASE           Y02751
+         USING IEAV2540,XF         TEMPORARY MODULE BASE         Y02751
+         SPACE 3                                                 Y02751
+*  REMOVE THIS MODULES FRR FROM THE STACK.                       Y02753
+         SPACE 1                                                 Y02753
+         USING PSA,X0              BASE THE PSA (ADDR IS 0)      Y02753
+         SETFRR D,WRKREGS=(12,13),                               Y20753C
+               RELATED=(CMS-LOCK,IEAV2540(PGETLOCK))             Y02753
+         DROP  X0                                                Y02753
+         SR    XC,XC               CLEAR A REGISTER              Y02753
+         ST    XC,CSADCBP          CLEAR RECOVERY AREA PTR       Y02753
+         SPACE 2                                                 Y02751
+*  ISSUE SETLOCK RELEASE TO RELEASE THE CMS LOCK                 Y02751
+         SPACE 1                                                 Y02751
+         SETLOCK RELEASE,TYPE=CMS,                               Y02751*
+               RELATED=(UCM,IEAV2540(PGETLOCK))                  Y02751
+         SPACE 2                                                 Y02751
+*  ISSUE SETLOCK RELEASE TO RELEASE THE LOCAL LOCK               Y02751
+         SPACE 1                                                 Y02751
+         SETLOCK RELEASE,TYPE=LOCAL,                             Y02751*
+               RELATED=(UCM,IEAV2540(PGETLOCK))                  Y02751
+         SPACE 2                                                 Y02751
+*  LOCKS HAVE NOW BEEN FREED, RESTORE REGS AND                   Y02751
+*  RETURN TO THE SUBROUTINE CALLER.                              Y02751
+         SPACE 1                                                 Y02751
+         LR    XB,XA               RESTORE CXSA BASE             Y02751
+         LR    XC,XF               RESTORE MODULES BASE          Y02751
+         DROP  XA,XF               RELEASE TEMP BASE REGS        Y02751
+         USING CXSA,XB                                           Y02751
+         USING IEAV2540,XC         RESTORE PROGRAM BASE REG      Y02751
+         L     XA,CSAUCM           RESTORE UCME BASE REG         Y02751
+         USING UCMLIST,XA                                        Y02751
+         L     XD,CSAXD            REFRESH PTR TO REG SAVE AREA  Y02751
+         L     XE,CSAXE            RESTORE RETURN REG            Y02751
+         BR    XE                  RETURN TO SUBROUTINE CALLER   Y02751
+         TITLE 'IEAV2540 - CONSTANTS AND MAPPING MACROS'         Y02752
+SVC72ID  DC    C'VCTR'             IDENTIFIER FOR RECOVERY RTN   Y02753
+BASENAM  DC    C'IEAVM'            PREFIX PART OF DDNAME         Y02711
+PNDSN    DC    C'CONSOLE '         DSNAME FOR CONSOLE            Y02711
+         DS    0D                  ALIGN MODULE PATCH AREA       Y02752
+PATCH    DC    50X'00'             MODULE PATCH AREA             Y02752
+         SPACE 3
+**************************************************************** Y02711
+*                                                                Y02711
+*  THE FOLLOWING SEGMENT CONTAINS THE FORM FOR THE DCB, AND THE  Y02711
+*  EXECUTABLE MACRO LIST FORMS.  THE SEGMENT IS MOVED INTO       Y02711
+*  DYNAMIC STORAGE AT CONSOLE OPEN TIME TO MAKE THE MODULE       Y02711
+*  REENTRANT.                                                    Y02711
+*                                                                Y02711
+**************************************************************** Y02711
+         SPACE 1                                                 Y02711
+DMDCB    DCB   DDNAME=IEAVMXXX,                                  Y02711C
+               MACRF=(R),                                        Y02711C
+               EODAD=PMFREEB,                                    Y02711C
+               SYNAD=PMERRCK,                                    Y02711C
+               DSORG=PS,                                         Y02711C
+               DEVD=RD,MODE=E,STACK=1,NCP=1,                     Y02711C
+               RECFM=FS,                                         Y02711C
+               BUFNO=0,                                          Y02711C
+               BLKSIZE=80                                        Y02711
+         SPACE 1                                                 Y02711
+DMXX     DC    D'0'                FORM FOR MODULE I/O WORKAREA  Y02711
+DMREADX  READ  DMDECBX,SF,0,0,'S',MF=L   LIST FORM OF WRITE      Y02711
+         SPACE 1                                                 Y02711
+DMCORE   EQU   *-DMDCB             LENGTH FOR GETMAIN            Y02711
+         EJECT
+**************************************************************** Y02711
+*                                                                Y02711
+*  NOTE:  THE DSECT MAPPED BY IHADCB INCLUDES THE LIST FORM OF   Y02711
+*         THE WRITE MACRO, AND A DOUBLE WORD OF WORK AREA USED   Y02711
+*         IN CONNECTION WITH THE I/O OPERATIONS OF THIS MODULE.  Y02711
+*                                                                Y02711
+**************************************************************** Y02711
+         SPACE 3                                                 Y02711
+DMDCB    IHADCB DSORG=BS,DEVD=RD   DCB MAPPING MACRO             Y02711
+         SPACE 2                                                 Y02711
+DMX      DC    D'0'                I/O WORK AREA                 Y02711
+DMXA     EQU   DMX+4               SECOND WORD OF WORK AREA      Y02711
+DMXCLOSE EQU   128                 CLOSE TERMINAL FLAG          YM05450
+DMXR     EQU   0                   CODE FOR READ                 Y02711
+         SPACE 1                                                 Y02711
+DMREAD   READ  DMDECB,SF,DMX,DMX,'S',MF=L  READ MACRO            Y02711
+         EJECT
+PNOPEN   DSECT                                                   Y02711
+JFCB     DS    0D                                                Y02711
+         IEFJFCBN ,                                              Y02711
+         SPACE 2                                                 Y02711
+*  OPEN EXIT LIST FOR TYPE=J (SET UP BY THE OPEN MACRO)          Y02711
+         SPACE 1                                                 Y02711
+PNJEF    DC    X'80'               INDICATE END OF LIST          Y02711
+         DC    AL3(0)              SPACE FOR ADDRESS             Y02711
+         SPACE 2                                                 Y02711
+PNXLST   DC    X'87'               END OF LIST AND JFCB EXIT     Y02711
+         DC    AL3(0)              ADDRESS OF JFCB               Y02711
+         SPACE 2                                                 Y02711
+*  TEMPORARY WORK AREA USED DURING PREPARATION FOR OPEN          Y02711
+         SPACE 1                                                 Y02711
+PNWORKD  DC    D'0'                DOUBLE WORD FOR CVD INSTR     Y02711
+         ORG   PNWORKD+6           BACK UP TO LAST HALF WORD     Y02711
+PNWORKH4 DC    H'0'                LAST HALF WORD OF PNWORKD     Y02711
+PNWORKX  DC    X'00'               EXTRA BYTE USED DURING UNPK   Y02711
+         SPACE 1                                                 Y02711
+PNCORE   EQU   *-PNOPEN            SYMBOLIC FOR LENGTH OF DSCET  Y02711
+         TITLE 'IEAV2540 - COMMUNICATIONS VECTOR TABLE - CVT'
+         CVT   DSECT=YES                                         Y02752
+         TITLE 'IEAV2540 - INPUT/OUTPUT BLOCK - IOB'
+         IEZIOB
+         TITLE 'IEAV2540 - FTPT RECOVERY PARAMETER TABLE'        Y02753
+         IHACTM FTPT                                             Y02753
+         TITLE 'IEAV2540 - UNIT CONTROL MODULE - U.C.M.'
+         IEECUCM FORMAT=NEW                                      Y02752
+         TITLE 'IEAV2540 - UNIT CONTROL BLOCK - U.C.B.'
+UCBSECT  DSECT
+         IEFUCBOB
+         TITLE 'IEAV2540 - CXSA'
+         IHACTM CXSA
+         TITLE 'IEAV2540 - WRITE-TO-OPERATOR QUEUE ELEMENT - W.Q.E.'
+         IHAWQE
+         TITLE 'IEAV2540 - FRRS MAPPING MACRO'
+         IHAFRRS                   USED BY SETFRR MACRO          Y02751
+         TITLE 'IEAV2540 - PSA MAPPING MACRO'
+         IHAPSA                    USED BY SETFRR AND SETLOCK    Y02751
+         END

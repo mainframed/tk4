@@ -1,0 +1,636 @@
+AWEE     TITLE 'INTERNAL SORT - EXECUTOR'
+***********************************************************************
+*                                                                     *
+*        ROUTINE NAME - INTERNAL SORT                                 *
+*                DATE - 06/12/74                                      *
+*                                                                     *
+***********************************************************************
+         SPACE 4
+***********************************************************************
+*                                                                     *
+*        THIS ROUTINE SORTS AN ARRAY INTERNALLY IN "MINIMAL" STORAGE. *
+*        IT MAY BE CALLED FROM AN OS/360 PROGRAM WRITTEN IN           *
+*        ASSEMBLY LANGUAGE, COBOL, FORTRAN, OR PL/I.                  *
+*                                                                     *
+*        THIS ROUTINE CONSISTS OF TWO CONTROL SECTIONS:  A SMALL      *
+*        EXECUTIVE ROUTINE, SORTQ, AND AN INITIALIZATION ROUTINE,     *
+*        SORTBQ.                                                      *
+*                                                                     *
+*        SORTQ EXAMINES THE ARGUMENT LIST TO INSURE THAT A MULTIPLE OF*
+*        FOUR ARGUMENTS HAS BEEN SUPPLIED, AND THAT AT LEAST EIGHT    *
+*        ARGUMENTS ARE PRESENT.  IT THEN OBTAINS STORAGE FOR SORTBQ,  *
+*        AND CALLS SORTBQ.  IF EITHER SORTQ OR SORTBQ FINDS AN ERROR, *
+*        ARGUMENT IERR IS SET AND IMMEDIATE RETURN IS MADE TO THE     *
+*        CALLER.  IF NO ERRORS HAVE BEEN FOUND, SORTQ THEN CALLS      *
+*        SORTAQ TO DO THE ACTUAL SORTING. UPON RETURN FROM SORTAQ,    *
+*        MAIN STORAGE IS FREED, AND RETURN IS MADE TO THE CALLER.     *
+*                                                                     *
+*        SORTBQ CONSTRUCTS SUBROUTINES TO EXCHANGE ELEMENTS AND TO    *
+*        COMPARE CONTROL FIELDS.  THESE ROUTINES ARE REQUIRED BY      *
+*        SORTAQ, AND ARE BUILT IN THE STORAGE OBTAINED BY SORTQ.      *
+*        SEE SORTAQ FOR LINKAGE CONVENTIONS.  THE EXCHANGE ROUTINE IS *
+*        BUILT TO USE REGISTERS IF POSSIBLE.  OTHERWISE, STORAGE-TO-  *
+*        STORAGE "EXCLUSIVE OR" (XC) INSTRUCTIONS ARE USED TO EXCHANGE*
+*        ELEMENTS.  THUS NO WORKING STORAGE IS NEEDED DURING THE      *
+*        EXCHANGE PROCESS.  THE COMPARISON ROUTINE COMPARES CONTROL   *
+*        FIELDS IN PLACE WHEN POSSIBLE FROM LEFT TO RIGHT, TERMINATING*
+*        AS SOON AS AN UNEQUAL COMPARISON OCCURS.  COMPARE            *
+*        INSTRUCTIONS APPROPRIATE TO THE TYPE OF DATA ARE USED.       *
+*        IF A FRACTION OF A BYTE OCCURS AT THE BEGINNING OR END OF A  *
+*        BIT STRING, THE FRACTION IS MOVED TO WORKING STORAGE FOR THE *
+*        COMPARISON.  THE MAIN BODY OF A BIT STRING IS COMPARED IN    *
+*        PLACE.  ZONED DECIMAL DATA ARE PACKED INTO WORKING STORAGE   *
+*        AND COMPARED IN PACKED DECIMAL FORM.                         *
+*        FAIRLY EXHAUSTIVE ERROR CHECKING IS PERFORMED THROUGHOUT TO  *
+*        INSURE THAT IMPLEMENTATION RESTRICTIONS ARE NOT VIOLATED.    *
+*                                                                     *
+*        USAGE:                                                       *
+*        CALL SORTQ (A,N,L,IERR(,P,M,F,S)...)                         *
+*        A IS THE ARRAY TO BE SORTED.  WHEN CALLED FROM A PL/I PROGRAM*
+*              THE EXPRESSION "ADDR(A)" MUST BE PASSED INSTEAD OF A.  *
+*        N (FULL-WORD INTEGER) IS THE NUMBER OF ELEMENTS IN A.        *
+*        L (FULL-WORD INTEGER) IS THE LENGTH OF EACH ELEMENT IN BYTES.*
+*        IERR IS AN ERROR INDICATOR.  IERR = 0 FOR NO ERRORS.         *
+*              IERR = THE NUMBER OF THE FIRST ARGUMENT OF A GROUP IF  *
+*              AN ERROR IS FOUND IN THAT GROUP.  ARGUMENTS OCCUR IN   *
+*              GROUPS OF FOUR.                                        *
+*        P (FULL-WORD INTEGER) IS THE POSITION OF A CONTROL FIELD     *
+*              WITHIN AN ELEMENT.  1 = START OF ELEMENT.              *
+*        M (FULL-WORD INTEGER) IS THE LENGTH OF THE CONTROL FIELD.    *
+*        F IS THE FORMAT OF THE CONTROL FIELD:                        *
+*              'BI' = BIT STRING                                      *
+*              'CH' = CHARACTER STRING                                *
+*              'FI' = FIXED POINT                                     *
+*              'FL' = FLOATING POINT                                  *
+*              'PD' = PACKED DECIMAL                                  *
+*              'ZD' = ZONED DECIMAL.                                  *
+*        S SPECIFIES THE SEQUNCING OF THIS CONTROL FIELD:             *
+*              'A' = ASCENDING SEQUENCE                               *
+*              'D' = DESCENDING SEQUENCE.                             *
+*        AS MANY CONTROL FIELDS AS DESIRED MAY BE SPECIFIED.          *
+*                                                                     *
+*        THIS MODULE IS REENTRANT.                                    *
+*                                                                     *
+***********************************************************************
+         EJECT
+***********************************************************************
+*                                                                     *
+*              ENTRY POINTS                                           *
+*                                                                     *
+SORTQ    CSECT
+***********************************************************************
+         EJECT
+***********************************************************************
+*                                                                     *
+*              EQUATE STATEMENTS                                      *
+*                                                                     *
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+E0       EQU   0
+E2       EQU   2
+E4       EQU   4
+E6       EQU   6
+D0       EQU   0
+D2       EQU   2
+D4       EQU   4
+D6       EQU   6
+BASE     EQU   R11                 BASE REGISTER
+DC       EQU   D0                  DOUBLE FLOATING COMPARISON REGISTER
+EC       EQU   E0                  FLOATING POINT COMPARISON REGISTER
+NE       EQU   7                   NOT EQUAL
+R        EQU   R5                  GENERAL PURPOSE REGISTER
+RA       EQU   R1                  POINTER TO ITEM "A"
+RB       EQU   R2                  POINTER TO ITEM "B"
+RC       EQU   R0                  COMPARISON REGISTER
+RD       EQU   R7                  CONTROL FIELD DISPLACEMENT
+RL       EQU   R8                  CONTROL FIELD LENGTH
+RM       EQU   R4                  CONTROL FIELD MASK
+RS       EQU   R6                  NEXT AVAILABLE BYTE IN SUBR
+RS1      EQU   R2                  BASE-DISPLACEMENT FOR ITEM "A"
+RS2      EQU   R3                  BASE-DISPLACEMENT FOR ITEM "B"
+RT       EQU   R13                 POINTER TO WORK AREA
+VL       EQU   X'80'               VARIABLE LENGTH ARG LIST FLAG
+***********************************************************************
+         EJECT
+***********************************************************************
+*                                                                     *
+*        EXECUTOR                                                     *
+*                                                                     *
+***********************************************************************
+         SAVE  (14,12),T,*
+         LR    BASE,R15
+         USING SORTQ,BASE
+***********************************************************************
+*        TEST FOR VALID ARGUMENT LIST                                 *
+***********************************************************************
+         LA    R1,0(R1)            CLEAR HIGH ORDER BYTE OF R1
+         USING ARGLIST,R1
+         L     R8,AIERR            R8 = A(IERR)
+         USING IERR,R8
+         SR    R3,R3               R3 = 0
+         ST    R3,IERR             IERR = 0
+         LA    R5,4                R5 = LENGTH OF AN ADCON
+         LR    R3,R1               R3 = A(ARGLIST)
+TESTLAST TM    0(R3),VL            TEST FOR LAST ARGUMENT
+         BO    TESTCNT               BRANCH IF FOUND
+         BXH   R3,R5,TESTLAST      ELSE, TRY NEXT ARGUMENT
+TESTCNT  SR    R3,R1               R3 = DISPLACEMENT OF LAST ARG
+         LA    R3,4(R3)            R3 = LENGTH OF ARG LIST
+         SR    R2,R2               R2 = 0 FOR DIVISION
+         LA    R5,4*4              R5 = LENGTH OF ARGUMENT GROUP
+         DR    R2,R5               R3 = NUMBER OF ARG GROUPS
+         LTR   R2,R2               WAS REMAINDER ZERO?
+         BNZ   TESTERR               NO, # ARGS NOT MULTIPLE OF FOUR
+         C     R3,=F'2'            IS # ARG GROUPS AT LEAST TWO?
+         BNL   TESTTYPE            BRANCH IF YES
+TESTERR  SLL   R3,2                R3 = ((# ARGS)/4)*4
+         ST    R3,IERR             IERR = # OF FIRST ARG IN GROUP
+         B     TESTRTN             RETURN
+***********************************************************************
+*        GET STORAGE FOR SORTBQ                                       *
+***********************************************************************
+TESTTYPE LA    R3,AFIELDS-ARGLIST(R1) R3 = A(FIRST ARG GROUP)
+         USING FIELDS,R3
+         LH    R9,SIZE             R9 = FIXED STORAGE REQUIREMENT
+         LA    R6,4                R6 = LENGTH OF TABLE ENTRY
+         LA    R7,ENDTABLE         R7 = A(END OF TABLE)
+TESTABLE L     R10,AF              R10 = A(F)
+         USING F,R10
+         LA    R2,2                R2 = 2, ALLOWS DOUBLE LOOP
+TESTFLD  LA    R4,TABLE            R4 = A(TABLE)
+TESTCOMP CLC   F(2),0(R4)          COMPARE CONTROL FIELD TYPE TO TABLE
+         BE    TESTFIND            BRANCH IF MATCH FOUND
+         BXLE  R4,R6,TESTCOMP      TRY NEXT TABLE ENTRY
+         TM    AF+3,3              IS AF AN ADCON?
+         BNZ   TESTERRF              NO, TYPE NOT IN TABLE, ERROR
+         L     R10,0(R10)          ASSUME ARG IS PL/I DOPE VECTOR
+         BCT   R2,TESTFLD          AND TRY AGAIN
+         B     TESTERRF            TYPE NOT IN TABLE, ERROR
+TESTFIND AH    R9,2(R4)            ADD STORAGE REQUIREMENT FOR TYPE
+         TM    AS,VL               IS THIS LAST ARG GROUP?
+         BO    TESTDONE            BRANCH IF LAST
+         BXH   R3,R5,TESTABLE      GO PROCESS NEXT ARG GROUP
+TESTERRF SR    R3,R1               R3 = DISPLACEMENT OF ARG GROUP
+         LA    R3,4(R3)            R3 = POSITION OF ARG GROUP
+         SRL   R3,2                R3 = NUMBER OF ARGUMENT
+         ST    R3,IERR             IERR = # OF FIRST ARG IN GROUP
+         B     TESTRTN             RETURN
+         DROP  R1
+         DROP  R3
+         DROP  R10
+TESTDONE GETMAIN R,LV=(R9)         GET STORAGE
+         XC    0(L-AREA,R1),0(R1)  CLEAR SAVE AREA
+         ST    R9,0(R1)            STORE SIZE FOR FREEMAIN
+         ST    R13,4(R1)           CHAIN SAVE AREAS
+         ST    R1,8(R13)
+         LR    R13,R1
+         USING AREA,R13
+***********************************************************************
+*        CALL SORTBQ AND SORTAQ                                       *
+***********************************************************************
+         L     R1,4(R13)           RESTORE R1
+         L     R1,24(R1)
+         L     R15,=V(SORTBQ)      CALL SORTBQ
+         CALL  (15),MF=(E,(1))
+         L     R1,IERR             DETERMINE IF IERR SET BY SORTBQ
+         LTR   R1,R1               IS IERR NON-ZERO?
+         BNZ   TESTEXIT              YES, DON'T SORT
+         LA    R1,PARMA            POINT TO ARG LIST FROM SORTBQ
+         L     R15,=V(SORTAQ)      CALL SORTAQ
+         CALL  (15),MF=(E,(1))
+***********************************************************************
+*        FREE DYNAMIC STORAGE AND RETURN                              *
+***********************************************************************
+TESTEXIT L     R1,AREA             R1 = SIZE OF DYNAMIC STORAGE AREA
+         LA    R0,0(R1)            R0 = SP 0 + SIZE
+         LR    R1,R13              R1 = A(WORK AREA)
+         L     R13,SAVE+4          R13 = A(HIGHER SAVE AREA)
+         DROP  R13
+         FREEMAIN R,A=(1),LV=(0)   FREE WORK AREA STORAGE
+TESTRTN  RETURN (14,12),T,RC=0     RETURN
+         DROP  R8
+         DROP  BASE
+         EJECT
+***********************************************************************
+*        TABLE OF COMPARE SUBROUTINE SIZES FOR GETMAIN                *
+***********************************************************************
+         DS    0H
+TABLE    DC    C'CH'               CHARACTER
+         DC    Y(CHEND-CHCODE+BNEEND-BNECODE)
+         DC    C'ZD'               ZONED DECIMAL
+         DC    Y(ZDEND-ZDCODE+BNEEND-BNECODE)
+         DC    C'PD'               PACKED DECIMAL
+         DC    Y(PDEND-PDCODE+BNEEND-BNECODE)
+         DC    C'FI'               FIXED POINT
+         DC    Y(FIEND-FICODE+BNEEND-BNECODE)
+         DC    C'FL'               FLOATING POINT
+         DC    Y(FLEND-FLCODE+BNEEND-BNECODE)
+         DC    C'BI'               BINARY
+         DC    Y(2*(BIEND-BICODE)+CHEND-CHCODE+BNEEND-BNECODE)
+ENDTABLE EQU   *
+SIZE     DC    Y(SUBRCO-AREA)      SIZE OF "AREA"
+         LTORG
+         TITLE 'INTERNAL SORT - EXCHANGE AND COMPARE SUBR CONSTRUCTION'
+***********************************************************************
+*                                                                     *
+*        EXCHANGE AND COMPARE SUBROUTINE CONSTRUCTION                 *
+*                                                                     *
+***********************************************************************
+SORTBQ   CSECT
+         SAVE  (14,12),T,*
+         LR    BASE,R15
+         USING SORTBQ,BASE
+         USING AREA,R13
+         USING ARGLIST,R1
+         MVC   PARMA(3*4),ARGLIST  COPY FIRST PART OF ARGUMENT LIST
+         L     R2,AN               R2 = A(N)
+         L     R2,0(R2)            R2 = N
+         LTR   R2,R2               EXAMINE N
+         BM    ERROR                 ERROR IF NEGATIVE
+         L     R2,AL               R2 = A(L)
+         L     R2,0(R2)            R2 = L
+         ST    R2,L                SAVE "L" FOR CTRL FLD VALIDATION
+         LTR   R2,R2               EXAMINE L
+         BNP   ERROR                 ERROR IF NOT POSITIVE
+         EJECT
+***********************************************************************
+*        COMPARE SUBROUTINE CONSTRUCTION                              *
+***********************************************************************
+         LA    RS,SUBRCO           RS = A(COMPARE SUBROUTINE)
+         ST    RS,PARMCO           STORE COMPARE SUBR ADDR IN ARG LIST
+         LA    R1,4*4(R1)          POINT TO FIRST CONTROL FIELD GROUP
+         USING FIELDS,R1
+INIT     LM    R7,R10,FIELDS       POINT TO CONTROL FIELD ELEMENTS
+         USING P,R7
+         USING M,R8
+         USING F,R9
+         USING S,R10
+         L     RD,P                RD = CONTROL FIELD POSITION
+         DROP  R7
+         LTR   RD,RD               EXAMINE P
+         BNP   ERROR                 ERROR IF NOT POSITIVE
+         BCTR  RD,0                RD = CONTROL FIELD DISPLACEMENT
+         L     RL,M                RL = CONTROL FIELD LENGTH
+         DROP  R8
+         LTR   RL,RL               EXAMINE M
+         BNP   ERROR                 ERROR IF NOT POSITIVE
+         LA    R2,2                R2 = 2 FOR DOUBLE LOOP
+CHCOMP   CLC   =C'CH',F            IS IT CHARACTER?
+         LA    R15,CHINIT          CHARACTER CODE GENERATION
+         BE    SSCOMP                YES, GO PROCESS
+ZDCOMP   CLC   =C'ZD',F            IS IT ZONED DECIMAL?
+         LA    R15,ZDINIT          ZONED DECIMAL CODE GENERATION
+         BE    SSCOMP                YES, GO PROCESS
+PDCOMP   CLC   =C'PD',F            IS IT PACKED DECIMAL?
+         LA    R15,PDINIT          PACKED DECIMAL CODE GENERATION
+         BE    SSCOMP                YES, GO PROCESS
+FICOMP   CLC   =C'FI',F            IS IT FIXED POINT?
+         LA    R15,FIINIT          FIXED POINT CODE GENERATION
+         BE    RXCOMP                YES, GO PROCESS
+FLCOMP   CLC   =C'FL',F            IS IT FLOATING POINT?
+         LA    R15,FLINIT          FLOATING POINT CODE GENERATION
+         BE    RXCOMP                YES, GO PROCESS
+BICOMP   CLC   =C'BI',F            IS IT BINARY?
+         BE    BINIT1                YES, GO PROCESS
+         TM    AF+3,3              IS AF AN ADCON
+         BNZ   ERROR               NO, ERROR
+         TM    AS+3,3              IS AS AN ADCON
+         BNZ   ERROR               NO, ERROR
+         MVI   PARMA,X'FF'         FLAG PL/I ENVIRONMENT
+         L     R9,0(R9)            ASSUME ARG IS A PL/I DOPE VECTOR
+         L     R10,0(R10)          ASSUME ARG IS A PL/I DOPE VECTOR
+         BCT   R2,CHCOMP           AND TRY AGAIN
+         B     ERROR                 ERROR, NOT PL/I EITHER
+BINIT1   SR    R2,R2               CLEAR R2
+         LR    R3,RD               R3 = DISPLACEMENT IN BITS
+         D     R2,=F'8'            DIVIDE BY 8 (BITS/BYTE)
+         LR    RD,R3               RD = DISPLACEMENT IN BYTES
+         LTR   R2,R2               IS THERE A REMAINDER?
+         BZ    BINIT2                NO, ALREADY A BYTE BOUNDARY
+         SR    RM,RM               CLEAR MASK REGISTER
+         LA    R3,X'100'           PLACE ONE BIT IN R3
+         SRA   R3,0(R2)            SHIFT BIT TO DISPLACEMENT
+         LR    R2,RL               R2 = ACTUAL BIT STRING LENGTH
+BINIT1A  SRA   R3,1                SHIFT BIT RIGHT ONE POSITION
+         BZ    BINIT1B             IS BYTE COMPLETE?
+         OR    RM,R3               NO, "OR" INTO MASK
+         BCT   R2,BINIT1A          IS LENGTH EXHAUSTED?
+BINIT1B  LA    RL,1                SET LENGTH FOR TEST IN SINIT
+         LR    R0,R2               SAVE LENGTH
+         BAL   R14,SINIT           GET BASE-DISPLACEMENT
+         BAL   R14,BIINIT          GENERATE BIT COMPARE CODE
+         LR    RL,R0               RESTORE BIT STRING LENGTH
+         LA    RD,1(RD)            INCREMENT DISPLACEMENT
+BINIT2   C     RL,=F'8'            IS LENGTH AT LEAST ONE BYTE?
+         BL    BINIT3                NO, SKIP INTEGRAL BYTE COMPARE
+         SR    R2,R2               CLEAR R2
+         LR    R3,RL               R3 = BIT STRING LENGTH
+         D     R2,=F'8'            DIVIDE BY 8 (BITS/BYTE)
+         LR    RL,R3               RL = BYTE LENGTH
+         LR    R0,R2               SAVE BIT LENGTH (< 8 BITS)
+         BAL   R14,SINIT           GET BASE-DISPLACEMENT
+         BAL   R14,CHINIT          GENERATE BYTE COMPARE CODE
+         LA    RD,1(RL,RD)         INCREMENT DISPLACEMENT
+         LR    RL,R0               RL = REMAINING LENGTH
+BINIT3   LTR   RL,RL               ARE ANY BITS LEFT?
+         BNP   ENDINIT               NO, ALL DONE
+         L     RM,=A(X'FF00')      RM = SKELETON BIT STRING
+         SRL   RM,0(RL)            RM = MASK FOR REMAINING BITS
+         LA    RL,1                SET LENGTH FOR TEST IN SINIT
+         BAL   R14,SINIT           LOAD BASE-DISPLACEMENT
+         BAL   R14,BIINIT          GENERATE BIT COMPARE CODE
+         B     ENDINIT             ALL DONE
+RXCOMP   EQU   *
+SSCOMP   EQU   *
+         BAL   R14,SINIT           GO LOAD BASE-DISPLACEMENT
+         BALR  R14,R15             GO GENERATE COMPARE
+ENDINIT  TM    AS,VL               IS THIS LAST CONTROL FIELD?
+         BO    ENDCOMP               YES, END
+         LA    R1,4*4(R1)          INCREMENT TO NEXT CONTROL FIELD
+         B     INIT
+         EJECT
+***********************************************************************
+*        SET BASE AND DISPLACEMENT FOR DESIRED SEQUENCE               *
+***********************************************************************
+SINIT    C     RD,=F'4095'         IS DISPLACEMENT > 4095?
+         BH    ERROR                 YES, ERROR
+         LR    R,RD                IS CONTROL FIELD DISPLACEMENT
+         AR    R,RL                  PLUS CONTROL FIELD LENGTH
+         C     R,L                   GREATER THAN ITEM LENGTH?
+         BH    ERROR                 YES, ERROR
+         L     RS1,=A(RA*X'1000')  LOAD BASE REGISTERS
+         L     RS2,=A(RB*X'1000')  FOR ASCENDING SEQUENCE
+         CLI   S,C'A'              IS IT REALLY ASCENDING?
+         BE    SINITA                YES, GO LOAD DISPLACEMENT
+         L     RS1,=A(RB*X'1000')  LOAD BASE REGISTERS
+         L     RS2,=A(RA*X'1000')  FOR DESCENDING SEQUENCE
+         CLI   S,C'D'              IS IT REALLY DESCENDING?
+         BNE   ERROR                 NO, ERROR
+SINITA   OR    RS1,RD              "OR" IN DISPLACEMENT
+         OR    RS2,RD
+         BR    R14                 RETURN
+         EJECT
+ENDCOMP  S     RS,=A(BNEEND-BNECODE) BACK UP SUBR POINTER
+         MVC   0(BREND-BRCODE,RS),BRCODE MOVE SKELETON
+         TM    PARMA,X'FF'         IS THIS PL/I?
+         BZ    EXCH                  NO, GO BUILD EXCHANGE SUBROUTINE
+         L     R2,PARMA            YES, PARMA = A(ADDR(ARRAY))
+         L     R2,0(R2)            R2 = A(ARRAY)
+         ST    R2,PARMA            STORE FOR SORTAQ
+         EJECT
+***********************************************************************
+*        EXCHANGE SUBROUTINE CONSTRUCTION                             *
+***********************************************************************
+EXCH     LA    RS,SUBREX           RS = A(EXCHANGE SUBROUTINE)
+         ST    RS,PARMEX           STORE ADDRESS IN ARGUMENT LIST
+         L     RL,L                RL = LENGTH OF ELEMENT
+BCOMP    C     RL,=F'1'            IS LENGTH ONE BYTE?
+         BNE   HCOMP                 NO, TRY HALF WORD
+         MVC   0(BEND-BCODE,RS),BCODE MOVE SKELETON
+         LA    RS,BEND-BCODE(RS)   UPDATE POINTER
+         B     EXCOMP              DONE
+HCOMP    C     RL,=F'2'            IS LENGTH TWO BYTES?
+         BNE   FCOMP                 NO, TRY FULL WORD
+         TM    PARMA+3,2-1           YES, IS IT HALF WORD BOUNDARY?
+         BNZ   SCOMP                 NO, USE GENERAL MOVE
+         MVC   0(HEND-HCODE,RS),HCODE MOVE SKELETON
+         LA    RS,HEND-HCODE(RS)   UPDATE POINTER
+         B     EXCOMP              DONE
+FCOMP    C     RL,=F'4'            IS LENGTH FOUR BYTES?
+         BNE   DCOMP                 NO, TRY DOUBLE WORD
+         TM    PARMA+3,4-1           YES, IS IT FULL WORD BOUNDARY?
+         BNZ   SCOMP                 NO, USE GENERAL MOVE
+         MVC   0(FEND-FCODE,RS),FCODE MOVE SKELETON
+         LA    RS,FEND-FCODE(RS)   UPDATE POINTER
+         B     EXCOMP              DONE
+DCOMP    C     RL,=F'8'            IS LENGTH EIGHT BYTES?
+         BNE   SCOMP                 NO, TRY SHORT GENERAL MOVE
+         TM    PARMA+3,8-1           YES, IS IT DOUBLE WORD BOUNDARY?
+         BNZ   SCOMP                 NO, USE GENERAL MOVE
+         MVC   0(DEND-DCODE,RS),DCODE MOVE SKELETON
+         LA    RS,DEND-DCODE(RS)   UPDATE POINTER
+         B     EXCOMP              DONE
+SCOMP    C     RL,=F'256'          IS LENGTH <= 256?
+         BH    MCOMP                 NO, USE MOST GENERAL MOVE
+         MVC   0(SEND-SCODE,RS),SCODE MOVE SKELETON
+         LR    R2,RL               R2 = LENGTH
+         BCTR  R2,0                R2 = MACHINE LENGTH
+         STC   R2,1(RS)            SET LENGTHS IN CODE
+         STC   R2,7(RS)
+         STC   R2,13(RS)
+         LA    RS,SEND-SCODE(RS)   UPDATE POINTER
+         B     EXCOMP              DONE
+MCOMP    MVC   0(MEND-MCODE,RS),MCODE MOVE SKELETON
+         SR    R2,R2               R2 = 0 FOR DIVIDE
+         LR    R3,RL               R3 = LENGTH FOR DIVIDE
+         BCTR  R3,0                R3 = MACHINE LENGTH
+         D     R2,=F'256'          R3 = RL/256, R2 = MOD(RL,256)
+         C     R3,=F'4095'         IS LENGTH/256 A VALID DISPLACEMENT?
+         BH    ERROR                 NO, ERROR
+         STH   R3,2(RS)            STORE COUNT FOR LOOP INTO CODE
+         STC   R2,35(RS)           STORE LENGTHS IN CODE
+         STC   R2,41(RS)
+         STC   R2,47(RS)
+         LA    RS,MEND-MCODE(RS)   UPDATE POINTER
+EXCOMP   MVC   0(BREND-BRCODE,RS),BRCODE MOVE SKELETON
+         RETURN (14,12),T,RC=0
+         EJECT
+***********************************************************************
+*        SET IERR FOR ERROR                                           *
+***********************************************************************
+ERROR    LR    R2,R1               R2 = A(CURRENT ARGUMENT)
+         L     R1,24(R13)          R1 = A(ARGUMENT LIST)
+         USING ARGLIST,R1
+         SR    R2,R1               R2 = DISPLACEMENT OF CURRENT ARG
+         LA    R2,4(R2)            R2 = POSITION OF CURRENT ARGUMENT
+         SRL   R2,2                R2 = INDEX OF CURRENT ARGUMENT
+         L     R3,AIERR            R3 = A(IERR)
+         USING IERR,R3
+         ST    R2,IERR             IERR = INDEX OF ERRONEOUS ARGUMENT
+         DROP  R3
+         RETURN (14,12),T,RC=0
+         EJECT
+***********************************************************************
+*        INITIALIZE OBJECT CODE FOR SPECIFIED DATA TYPE AND LENGTH    *
+***********************************************************************
+CHINIT   C     RL,=F'256'          IS LENGTH > 256?
+         BH    ERROR                 YES, ERROR
+         BCTR  RL,0                CONVERT TO MACHINE LENGTH
+         MVC   0(CHEND-CHCODE,RS),CHCODE MOVE SKELETON
+         B     SSINIT              GO COMPLETE INSTRUCTION
+ZDINIT   C     RL,=F'16'           IS LENGTH GREATER THAN 16?
+         BH    ERROR                 YES, ERROR
+         BCTR  RL,0                CONVERT TO MACHINE LENGTH
+         MH    RL,=Y(X'11')        DOUBLE LENGTH FIELD
+         MVC   0(ZDEND-ZDCODE,RS),ZDCODE MOVE SKELETON
+         STC   RL,1(RS)            STORE LENGTH FOR TEMPA AND A
+         STC   RL,7(RS)            STORE LENGTH FOR TEMPB AND B
+         STC   RL,13(RS)           STORE LENGTH FOR TEMPA AND TEMPB
+         STH   RS1,4(RS)           STORE BASE-DISPLACEMENT FOR A
+         STH   RS2,10(RS)          STORE BASE-DISPLACEMENT FOR B
+         LA    RS,ZDEND-ZDCODE(RS) UPDATE POINTER
+         B     BNEINIT             GO END SEQUENCE
+PDINIT   C     RL,=F'16'           IS LENGTH > 16?
+         BH    ERROR                 YES, ERROR
+         BCTR  RL,0                CONVERT TO MACHINE LENGTH
+         MH    RL,=Y(X'11')        DOUBLE LENGTH FIELD
+         MVC   0(PDEND-PDCODE,RS),PDCODE MOVE SKELETON
+         B     SSINIT              GO COMPLETE INSTRUCTION
+FIINIT   MVC   0(FIHEND-FIHCODE,RS),FIHCODE MOVE SKELETON
+         C     RL,=F'2'            IS LENGTH = 2?
+         BE    RXINIT              GO COMPLETE INSTRUCTIOH
+         BL    ERROR                 LOW, ERROR
+         MVC   0(FIEND-FICODE,RS),FICODE MOVE SKELETON
+         C     RL,=F'4'            IS LENGTH = 4?
+         BE    RXINIT              GO COMPLETE INSTRUCTION
+         B     ERROR                 NOT EQUAL, ERROR
+BIINIT   MVC   0(BIEND-BICODE,RS),BICODE MOVE SKELETON
+         STC   RM,7(RS)            STORE MASK FOR A
+         STC   RM,17(RS)           STORE MASK FOR B
+         STH   RS1,4(RS)           STORE BASE-DISPLACEMENT FOR A
+         STH   RS2,14(RS)          STORE BASE-DISPLACEMENT FOR B
+         LA    RS,BIEND-BICODE(RS) UPDATE POINTER
+         B     BNEINIT             GO END SEQUENCE
+FLINIT   MVC   0(FLEND-FLCODE,RS),FLCODE MOVE SKELETON
+         C     RL,=F'4'            IS LENGTH = 4?
+         BE    RXINIT              GO COMPLETE INSTRUCTION
+         BL    ERROR                 LOW, ERROR
+         MVC   0(FLDEND-FLDCODE,RS),FLDCODE MOVE SKELETON
+         C     RL,=F'8'            IS LENGTH = 8?
+         BE    RXINIT              GO COMPLETE INSTRUCTION
+         B     ERROR               NOT EQUAL, ERROR
+SSINIT   STC   RL,1(RS)            STORE LENGTH(S)
+         STH   RS1,2(RS)           STORE BASE-DISPLACEMENT FOR A
+         STH   RS2,4(RS)           STORE BASE-DISPLACEMENT FOR B
+         LA    RS,6(RS)            UPDATE POINTER
+         B     BNEINIT             GO END SEQUENCE
+RXINIT   STH   RS1,2(RS)           STORE BASE-DISPLACEMENT FOR A
+         STH   RS2,6(RS)           STORE BASE-DISPLACEMENT FOR B
+         LA    RS,8(RS)            UPDATE POINTER
+BNEINIT  MVC   0(BNEEND-BNECODE,RS),BNECODE MOVE SKELETON
+         LA    RS,BNEEND-BNECODE(RS) UPDATE POINTER
+         BR    R14                 RETURN
+         EJECT
+***********************************************************************
+*        SKELETON COMPARISON SUBROUTINE SEGMENTS                      *
+***********************************************************************
+CHCODE   CLC   0(0,0),0(0)         COMPARE A:B
+CHEND    EQU   *
+ZDCODE   PACK  T(0,RT),0(0,0)      PACK A INTO TEMPA
+         PACK  T+16(0,RT),0(0,0)   PACK B INTO TEMPB
+         CP    T(0,RT),T+16(0,RT)  COMPARE TEMPA:TEMPB
+ZDEND    EQU   *
+PDCODE   CP    0(0,0),0(0,0)       COMPARE A:B
+PDEND    EQU   *
+FIHCODE  LH    RC,0(,0)            LOAD A
+         CH    RC,0(,0)            COMPARE A:B
+FIHEND   EQU   *
+FICODE   L     RC,0(,0)            LOAD A
+         C     RC,0(,0)            COMPARE A:B
+FIEND    EQU   *
+BICODE   MVC   T(1,RT),0(0)        MOVE ONE BYTE OF A TO TEMPA
+         NI    T(RT),0             MASK OUT EXTRANEOUS BITS
+         MVC   T+1(1,RT),0(0)      MOVE ONE OF B TO TEMPB
+         NI    T+1(RT),0           MASK OUT EXTRANEOUS BITS
+         CLC   T(1,RT),T+1(RT)     COMPARE ONE BYTE TEMPA:TEMPB
+BIEND    EQU   *
+FLCODE   LE    EC,0(,0)            LOAD A
+         CE    EC,0(,0)            COMPARE A:B
+FLEND    EQU   *
+FLDCODE  LD    DC,0(,0)            LOAD A
+         CD    DC,0(,0)            COMPARE A:B
+FLDEND   EQU   *
+BNECODE  BCR   NE,R14              TERMINATE COMPARE ON INEQUALITY
+BNEEND   EQU   *
+         EJECT
+***********************************************************************
+*        SKELETON EXCHANGE SUBROUTINES                                *
+***********************************************************************
+BCODE    IC    R0,0(RA)            SINGLE BYTE
+         IC    R15,0(RB)
+         STC   R0,0(RB)
+         STC   R15,0(RA)
+BEND     EQU   *
+HCODE    LH    R0,0(RA)            HALF WORD
+         LH    R15,0(RB)
+         STH   R0,0(RB)
+         STH   R15,0(RA)
+HEND     EQU   *
+FCODE    L     R0,0(RA)            FULL WORD
+         L     R15,0(RB)
+         ST    R0,0(RB)
+         ST    R15,0(RA)
+FEND     EQU   *
+DCODE    LD    D0,0(RA)            DOUBLE WORD
+         LD    D2,0(RB)
+         STD   D0,0(RB)
+         STD   D2,0(RA)
+DEND     EQU   *
+SCODE    XC    0(0,RA),0(RB)       2 - 256 BYTES
+         XC    0(0,RB),0(RA)
+         XC    0(0,RA),0(RB)
+SEND     EQU   *
+MCODE    LA    R0,0                257 - 256*4096 BYTES
+         XC    0(256,RA),0(RB)
+         XC    0(256,RB),0(RA)
+         XC    0(256,RA),0(RB)
+         LA    RA,256(,RA)
+         LA    RB,256(,RB)
+         BCT   R0,4(,R15)
+         XC    0(0,RA),0(RB)
+         XC    0(0,RB),0(RA)
+         XC    0(0,RA),0(RB)
+MEND     EQU   *
+BRCODE   BR    R14
+BREND    EQU   *
+         EJECT
+         LTORG
+         TITLE 'INTERNAL SORT - DUMMY SECTIONS'
+ARGLIST  DSECT ,                   ARGUMENT LIST
+AA       DS    A                   A(A)
+AN       DS    A                   A(N)
+AL       DS    A                   A(L)
+AIERR    DS    A                   A(IERR)
+AFIELDS  DS    4A                  CONTROL FIELD GROUP
+FIELDS   DSECT ,                   REPEATED PORTION OF ARGUMENT LIST
+AP       DS    A                   A(P)
+AM       DS    A                   A(M)
+AF       DS    A                   A(F)
+AS       DS    A                   A(S)
+ENDFLDS  EQU   *
+IERR     DSECT ,                   ERROR INDICATOR
+P        DSECT ,                   CONTROL FIELD POSITION
+M        DSECT ,                   CONTROL FIELD LENGTH
+F        DSECT ,                   CONTROL FIELD TYPE
+S        DSECT ,                   CONTROL FIELD ORDER
+AREA     DSECT ,                   DYNAMIC STORAGE AREA
+SAVE     DS    27F                 PL/I STANDARD SAVE AREA
+L        DS    F                   REQUIRED BY SORTAQ
+LT       DS    24F                 REQUIRED BY SORTAQ
+UT       DS    24F                 REQUIRED BY SORTAQ
+WORK     DS    4D                  WORK AREA FOR EXCHANGE & COMPARE
+T        EQU   WORK-AREA           OFFSET OF "WORK" WITHIN AREA
+PARMA    DS    A                   A(ARRAY TO BE SORTED)
+PARMN    DS    A                   A(NUMBER OF ITEMS TO BE SORTED)
+PARML    DS    A                   A(LENGTH OF EACH ITEM TO BE SORTED)
+PARMCO   DS    A                   A(COMPARE SUBROUTINE)
+PARMEX   DS    A                   A(EXCHANGE SUBROUTINE)
+         DS    0D
+SUBREX   DS    ((MEND-MCODE+BREND-BRCODE)/2)H EXCHANGE SUBROUTINE
+         DS    0D
+SUBRCO   DS    0H                  COMPARE SUBROUTINE
+         END

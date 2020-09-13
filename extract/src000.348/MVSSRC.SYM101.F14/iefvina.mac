@@ -1,0 +1,950 @@
+***********************************************************************
+*                                                                     *
+* MODULE NAME - IEFVINA                                               *
+*                                                                     *
+* DESCRIPTIVE NAME - INSTREAM PROCEDURE CONTROL  AND GET ROUTINE      *
+*                                                                     *
+* COPYRIGHT - N/A                                                     *
+*                                                                     *
+* STATUS - OS/VS2 RELEASE 3 PTF                               @ZA03865
+*                                                                     *
+* FUNCTION - READS INSTREAM PROCEDURES FROM THE JCL DATA SET AND CALLS*
+*            A SERIES OF SUBROUTINES TO RECORD THE PRESENCE OF THE    *
+*            PROCEDURE AND TO SAVE IT IN COMPRESSED FORM IN SWA.      *
+*                                                                     *
+* OPERATION -THIS MODULE ACTS AS THE ROUTING ROUTINE FOR INSTREAM     *
+*            PROCEDURES.  IT GETS CORE FOR A PARAMETER LIST (24 BYTES *
+*            AND INITIALIZES IT FOR VARIOUS ROUTINES AND FOR A QMPA   *
+*            AND EXTERNAL PARAMETER LIST.  BOTH PARAMETER LIST AND    *
+*            QMPA ARE FREED BEFORE EXIT FROM THE MODULE.              *
+*                                                                     *
+*            THE MODULE CONSISTS OF A MAIN FLOW AND FIVE SUBROUTINES, *
+*            ONE OF WHICH CONTAINS AN INTERNAL SUBROUTINE.            *
+*                                                                     *
+*            VINAPARM:  THIS SUBROUTINE GETS CORE FOR THE PARAMETER   *
+*            LIST AND INITIALIZES IT FOR IEFVINB AND/OR IEFVINC.
+*                                                                     *
+*            VINAERR:  THIS SUBROUTINE HANDLES ERROR CONDITIONS       *
+*            AND UTILIZES THE INTERNAL SUBROUTINE VINAMSG1 TO WRITE   *
+*            THE   ERROR MESSAGE TO SYSOUT.                           *
+*                                                                     *
+*            THE JOB FAILED BIT IS SET ON  AND CONTROL IS             *
+*            TRANSFERRED TO IEFVHA (PROC) OR THE COMPRESS SUBROUTINE  *
+*            (PEND) TO GET ANOTHER RECORD                             *
+*                                                                     *
+*            VINACONT:  THIS SUBROUTINE PROCESSES THE PROC OR PEND    *
+*            STATEMENT WHICH IS TO BE CONTINUED.  IT SETS A HIGH      *
+*            ORDER BIT TO INDICATE THAT THIS IS A CONTINUED STATEMENT *
+*            AND BRANCHES TO THE SYNTAX SUBROUTINE, VINASYNT.         *
+*                                                                     *
+*            VINAMSG:  THIS ROUTINE UTILIZES AN INTERNAL ROUTINE,     *
+*            VINAMSG1 TO WRITE THE MESSAGE TO SYSOUT IF ONE IS        *
+*            NEEDED.  IT BUILDS A PARAMETER LIST FOR IEZNCODE AND     *
+*            USES IEZNCODE TO COMPRESS THE RECORD.  IT USES IEFVHQ AND
+*            THE SWA MANAGER TO ASSIGN AND WRITE RECORDS TO SWA.      *
+*                                                                     *
+*            VINASYNT:  THIS SUBROUTINE BRANCHES TO IEFVINE TO        *
+*            SYNTAX CHECK THE PROC AND PEND STATEMENTS.  IT TESTS FOR *
+*            COMMON ERROR CONDITIONS.  INVALID LABEL AND DELIMITER    *
+*            ERRORS IN THE COMMENTS FIELD.                            *
+*                                                                     *
+* NOTES - NONE                                                        *
+*     CHARACTER CODE DEPENDENCIES - EBCDIC                            *
+*     DEPENDENCIES - NONE                                             *
+*     RESTRICTIONS - NONE                                             *
+*     REGISTER CONVENTIONS - R11 - BASE REG                           *
+*                            R12 - CONVERTER WORK AREA                *
+*     PATCH-LABEL - PATCH                                             *
+*                                                                     *
+* MODULE TYPE - BAL CSECT                                             *
+*     PROCESSOR - ASSEMBLER                                           *
+*     ATTRIBUTES - REFRESHABLE,PRIVILEGED, KEY 0, PAGEABLE LPA        *
+*                                                                     *
+* ENTRY POINT - IEFVINA FROM IEFVHCB                                  *
+*     PURPOSE - PROCESS INSTREAM PROCEDURE                           *
+*     LINKAGE - BALR                                                  *
+*     INPUT -                                                         *
+*               R12 - PTR TO CONVERTER WORK AREA                      *
+*               R13 - PTR TO REG SAVE AREA                            *
+*     REGISTERS SAVED - R14-R12                                       *
+*     REGISTER CONTENTS DURING PROCESSING -                           *
+*               R0  - WORK REG                                        *
+*               R1  - STATEMENT PTR                                   *
+*               R2  - SUBROUTINE LINKAGE ANDWORK REG                 *
+*               R3  - WORK REG                                        *
+*               R4  - RETURN CODE AND WORK REG                        *
+*               R5  - INPUT STMT PTR AND SUBRTN LINKAGE REG           *
+*               R6  - NEL AND QMPA BASE                               *
+*               R7  - PTR TO INSTREAM WORK AREA                       *
+*               R8  - NEL AND JCT BASE REG                            *
+*               R9  - PTR TO INPUT BUFFER                             *
+*               R10 - LOCAL WORK AREA BASE                            *
+*               R11 - CSECT BASE REG                                  *
+*               R12 - PTR TO CONVERTER WORK AREA                      *
+*               R13 - PTR TO REG SAVE AREA                            *
+*               R14 - LINKAGE REG                                     *
+*               R15 - LINKAGE REG                                     *
+*     REGISTERS RESTORED - R9 AND R10                                 *
+*                                                                     *
+* EXIT - NORMAL - BR 15 TO IEFVHA TO GET NEXT STMT                    *
+*     CONDITIONS - PEND STATEMENT FOUND                               *
+*     OUTPUT - ENTRY MADE IN INSTREAM PROCEDURE DIRECTORY AND         *
+*              ACTUAL PROCEDURE SAVED IN SWA                          *
+*     RETURN CODES - NONE                                             *
+*                                                                     *
+* EXIT-ERROR - BR 15 TO IEFVHA                                        *
+*     CONDITIONS - INCORRECT LABEL FIELD ON PROC OR PEND STMT         *
+*                - EXCESSIVE NUMBER OF INSTREAM PROCEDURES            *
+*                - EOF REACHED WITHOUT FINDING PEND STMT              *
+*                - INVALID CARD IN PROCEDURE                          *
+*     OUTPUT - JOB FAIL BIT SET AND APPROPRIATE ERROR MSG ISSUED      *
+*     RETURN CODES - NONE                                             *
+*
+* EXIT-ERROR - BR 15 TO IEFVHF
+*     CONDITIONS - I/O ERROR READING  FROM JCL DATA SET
+*     OUTPUT - TERMINATION BIT(CWATERM) SET IN CWA
+*     RETURN CODES - CWARET INITIALIZED TO 8
+*                                                                     *
+* EXTERNAL REFERENCES -                                               *
+*     ROUTINES - IEFVHQ, IEFVGM,IEZNCODE, IEFVINB,IEFVINC,IEFVINE     *
+*     DATA AREAS - CONVERTER WORK AREA,INSTREAM WORK AREA,            *
+*                  PARMLIST FOR EXTERNAL RTNS                         *
+*     CONTROL BLOCKS - QMPA,ACB,RPL
+*     TABLES - CONVERTER/INTERPRETER KEYS(IEFVKEYS)                   *
+*     MACROS - GET, PUT, GETMAIN, FREEMAIN, IEFSAVER, SAVE, IEFRELSE  *
+*     ENQUEUE RESOURCES - NONE                                        *
+*     CHANGE LEVEL - Y02668,APAR OZ03865                              *
+*                                                                     *
+* MESSAGES -                                                          *
+*            IEF662I INVALID LABEL ON PROC STMT                       *
+*            IEF662I INVALID LABEL ON PEND STMT                       *
+*            IEF663I NO LABEL ON THE PROC STATEMENT                   *
+*            IEF665I EXCESSIVE NUMBER OF INSTREAM PROCEDURES          *
+*                                                                     *
+* MORE DETAILED                                                       *
+* OPERATION - .ADDRESSIBILITY IS ESTABLISHED FOR THE WORK AREA, THE   *
+*              QMPA,  AND THE MODULE                                  *
+*             .A SAVE AREA IS GOTTEN                                  *
+*             . MSGKEY IS STORED FOR THE PROC VERB                    *
+*             .VINASYNT SUBROUTINE IS EXECUTED                        *
+*             .CHECK MADE FOR NO PROCEDURE NAME                       *
+*             . IF AN ERROR EXISTS, CONTROL IS PASSED TO VINAERR TO   *
+*              WRITE THE STATEMENT AND ERROR MSG                      *
+*             .IF NO ERROR EXISTS, THE LENGTH OF THE PROCEDURE NAME   *
+*              IS SAVED                                               *
+*             .A CHECK IS MADE TO SEE IF THIS IS A FIRST INSTREAM     *
+*              PROCEDURE                                              *
+*             .IF IT IS NOT, A PARM LIST IS MADE FOR IEFVINB AND      *
+*              CONTROL IS PASSEDTO IEFVINB TO SEARCH THE DIRECTORY    *
+*              CONTROL IS THEN PASSED TO IEFVINC                      *
+*             . IF THE COUNT FIELD IN THE WORK AREA IS ONE, INDICATING
+*              THAT THIS IS THE FIRST INSTREAM PROCEDURE, THE QMPA IS *
+*              INITIALIZED AND AN ASSIGN DONE.                        *
+*             .A PARM LIST IS GOTTEN AND BUILT FOR IEFVINC AND CONTROL*
+*              IS TRANSFERRED TO BUILD A DIRECTORY ENTRY.             *
+*             .A CHECK IS MADE TO SEE IF TOO MANY PROCEDURES WERE     *
+*              ALREADY ENCOUNTERED.                                   *
+*             . IF THEY WERE, CONTROL IS TRANSFERRED TO VINAERR TO    *
+*              WRITE THE ERROR MESSAGE                                *
+*             . THE NEXT STATEMNET IS READ AND TESTED FOR A PEND      *
+*             .IF NOT A PEND,  THE STATEMENT IS WRITTEN TO SYSOUT AND
+*              THE RECORD IS COMPRESSED AND IF NECESSARY WRITTEN TO   *
+*              SWA .  ANOTHER RECORD IS READ                          *
+*             .IF IT IS  A PEND STATEMENT THE PARAMETER LIST AND SAVE
+*              AREA ARE FREED AND EXIT IS MADE TO IEFVHA              *
+*                                                                     *
+***********************************************************************
+         EJECT
+         IEFCOMWA                                                Y02668
+         IEFCVRWA                                                Y02668
+         EJECT
+         IEFVMEWA
+         EJECT
+         IEFTXTFT                                                Y02668
+         EJECT
+         IEFQMNGR
+         DCBD  DSORG=(PS)
+         EJECT
+         IEFVKEYS
+         EJECT
+         IFGRPL
+         EJECT                                                   Y02668
+         IDARMRCD                                                Y02668
+         EJECT
+NEL      DSECT
+         IEFNEL SUBCOM=C
+         EJECT
+WORKAREA DSECT
+         USING WORKAREA,R7
+WKTTR    DS    CL4                     POINTER TO NEXT RECORD
+WKQMPAPT DS    CL4                     ADDRESS OF QMPA
+WKRECORD DS    CL168                   COMPRESSED RECORD
+WKPTR1   DS    CL4                     POINTER TO ITSELF
+WKCT     DS    CL1                     NUMBER OF ENTRIES MADE IN
+WKPTR2   DS    CL3                     HOLDER FOR TTR ASSIGNED FROM
+*                                      THE QUEUE MANAGER          O106
+WKPROCN1 DS    CL8                     PROCEDURE NAME
+WKTTR1   DS    CL3                     TTR OF FIRST RECORD
+WKPROCN2 DS    CL8                     PROCEDURE NAME
+WKTTR2   DS    CL3                     TTR OF FIRST RECORD
+WKPROCN3 DS    CL8                     PROCEDURE NAME
+WKTTR3   DS    CL3                     TTR OF FIRST RECORD
+WKPROCN4 DS    CL8                     PROCEDURE NAME
+WKTTR4   DS    CL3                     TTR OF FIRST RECORD
+WKPROCN5 DS    CL8                     PROCEDURE NAME
+WKTTR5   DS    CL3                     TTR OF FIRST RECORD
+WKPROCN6 DS    CL8                     PROCEDURE NAME
+WKTTR6   DS    CL3                     TTR OF FIRST RECORD
+WKPROCN7 DS    CL8                     PROCEDURE NAME
+WKTTR7   DS    CL3                     TTR OF FIRST RECORD
+WKPROCN8 DS    CL8                     PROCEDURE NAME
+WKTTR8   DS    CL3                     TTR OF FIRST RECORD
+WKPROCN9 DS    CL8                     PROCEDURE NAME
+WKTTR9   DS    CL3                     TTR OF FIRST RECORD
+WKPROCNA DS    CL8                     PROCEDURE NAME
+WKTTRA   DS    CL3                     TTR OF FIRST RECORD
+WKPROCNB DS    CL8                     PROCEDURE NAME
+WKTTRB   DS    CL3                     TTR OF FIRST RECORD
+WKPROCNC DS    CL8                     PROCEDURE NAME
+WKTTRC   DS    CL3                     TTR OF FIRST RECORD
+WKPROCND DS    CL8                     PROCEDURE NAME
+WKTTRD   DS    CL3                     TTR OF FIRST RECORD
+WKPROCNE DS    CL8                     PROCEDURE NAME
+WKTTRE   DS    CL3                     TTR OF FIRST RECORD
+WKPROCNF DS    CL8                     PROCEDURE NAME
+WKTTRF   DS    CL3                     TTR OF FIRST RECORD
+         EJECT
+         EJECT
+IEZPARM  DSECT                         PARAMETER AREA
+         USING IEZPARM,R1
+IEZADDR  DS    CL4                     ADDRESS OF PARAMETER LIST
+IEZUNCOM DS    A                       PTR TO UNCOMPRESSED RECORD
+IEZCOMPR DS    A                       PTR TO NEXT COMPRESSED RECORD
+IEZLEN   DS    H                       LENGTH OF UNCOMPRESSED RECORD
+IEZOUT   DS    H                       LENGTH OF AREA FOR OUTPUT RECORD
+IEZCHAR  DS    C                       CHARACTER CODE OF BLANK
+IEZTYPE  DS    B                       FLAG ASSOCIATED WITH RECORD
+IEZRES   DS    H                       WORK AREA
+         ORG IEZADDR
+ADDSS    DS    CL4                     ADDRESS OF PARAMETER LIST
+PROCNAME DS    CL8                     PROCEDURE NAME
+DIRECT   DS    CL4                     ADDRESS OF DIRECTORY
+IWAPTR   DS    CL4                     ADDRESS OF IWA
+RTCD     DS    CL4                     RETURN CODE FROM VINB
+         EJECT
+IEFVINA  CSECT
+* A 554626-554632, C 554120                                    @ZA01933
+* CODE ADDED NEAR LABEL VINACOMP                               @ZA03865
+BUFLTH   EQU   90                  STMT # + MSG LENGTH           Y02668
+STNLTH   EQU   10                  STMT# LENGTH                  Y02668
+STMTLTH  EQU   BUFLTH-STNLTH       MSG LENGTH                    Y02668
+BLANK    EQU   C' '                                              Y02668
+DISPLID  EQU   7             DISPLACEMENT OF ID IN REMOTE LIST   Y02621
+INSRECID EQU   X'25'         ID FOR INSTREAM RECORDS PUT TO SWA  Y02621
+         SAVE (14,12)
+         BALR  RB,0
+         USING *,RB
+*****************************************************************Y02668
+* MODULE TRACE CODE - FOR TESTING.                               Y02668
+         L     RF,TRACEV           LOAD TRACE RTNE ADDR.         Y02668
+         BALR  RE,RF               ENTER MOD ID IN TRACE RECORD. Y02668
+TRACEV   DC    V(TRACE)            TRACE RTNE ADDR.              Y02668
+         DC    C'VINA'             MOD ID USED BY TRACE.         Y02668
+* TRACE RETURNS HERE.                                            Y02668
+*****************************************************************Y02668
+         B     VINA000
+         SPACE
+         MODID BR=NO                                             Y01886
+         DC    C'SPLT'                                           Y02668
+         DC    C'06'               LEVEL # (VHA/VINA LOAD MERGE).Y02668
+         DC    C'REL3'              FUNCTION ID AND            @ZA01933
+         DC    C'02'         LEVEL# (IEZPARM INITIALIZATION)   @ZA03865
+         SPACE
+VINA000  DS    0H
+         L     R7,IWAWKBF              ADDRESSIBILITY FOR WORK AREA
+         L     R6,WKQMPAPT             ADDRESS OF IN-STREAM QMPA   3391
+         USING IOPARAMS,R6             FOR QMPA
+         LA    R8,WAJOBPFX         ADDR OF PSEUDO JOB PFX.       Y02668
+         USING TEXT,R8             PREFIX ADDRESSABILITY.        Y02668
+         IEFSAVER
+         L     R3,PDCBP                ADDRESS OF PROC DCB        19093
+         USING IHADCB,R3
+*                                                             M3739O106
+         MVC   IWABPAM(MVTHREE),DCBREAD+DISPLONE SAVE ADDR OF BPAM O106
+         DROP  R3
+         SPACE
+**********************************************************************
+*                                                                    *
+* SYNTAX CHECK PROC AND PEND STATEMENTS                              *
+*                                                                    *
+**********************************************************************
+         SPACE
+         L     RA,CTRLWAP              ADDRESS OF CONTROL AREA
+         MVI   MSGKEY,INTKEY3          SECONDARY MSG IF NEEDED     4360
+         BAL   R2,VINASYNT             SYNTAX CHECKER
+         SPACE
+         LTR   R4,R4                   TEST FOR EXISTENCE OF PROC NAME
+         BZ    VINAERR                 NO PROC NAME
+VINA010  DS    0H                                                 4329
+         LR    R3,R4                   LENGTH OF PROC NME
+         BCTR  R3,R0                   DECREMENT FOR MOVE
+         CLI   WKCT,NOENTRY            SEE IF THIS IS THE
+         BNE   VINA130                 IN-LINE PROCEDURE
+         SPACE
+**********************************************************************
+*                                                                    *
+* INITIALIZE CORE FOR THE QMPA AND DO ASSIGN/START                   *
+*                                                                    *
+**********************************************************************
+         SPACE
+VINA020  DS    0H                                                  3391
+         OI    QMPOP,QMASGS            ASSIGN/START
+         L     R5,RSTMT                ADDRESS OF INPUT BUFFER
+         L     R1,CTRLWAP          GET ADDR OF EXT. PARM. LIST   Y02668
+         ST    R1,QMPCL                ADDRESS OF EXTERNAL PARAMETER
+*                                      LIST
+VINA025  DS    0H                                                  3391
+         MVI   QMPCM,ASSIGN1           NUMBER OF RECORDS TO ASSIGN
+         L     RF,VIEFVHQ              Q MANAGER INTERFACE
+         BALR  RE,RF
+         L     R1,QMPCL                ADDR OF EXTERNAL PARM LIST  3391
+         MVC   WKPTR1+DISPLONE(MVTHREE),DISPLZER(R1)   TTR RETURNED3391
+         SPACE
+         BAL   R2,VINAPARM             GET CORE FOR PARM LIST, ESTAB-
+         XC    RTCD(MVFOUR),RTCD       RETURN CODE FOR IEFVINB
+         SPACE
+VINA030  DS    0H
+*                                      LIST ADDRESSIBILITY FOR DSECT,
+*                                      BUILD PARM LIST FOR VINB AND/OR
+*                                      VINC
+         L     RF,VIEFVINC             DIRECTORY BUILD ROUTINE
+         BALR  RE,RF
+         L     R1,IWAPARM              ADDRESS OF PARM LIST
+         L     RF,RTCD                 RETURN CODE FROM IEFVINC
+         LTR   RF,RF                   EXCESSIVE NAMBER OF
+         BNE   VINAERR3                IN-LINE PROCEDURES
+         BAL   R4,VINAMSG              CREATE AN SMB IF NECESSARY
+         SPACE
+VINA040  DS    0H
+         NI    SWZ,X'FF'-CMT           INITIALIZE COMMENT SWITCH F39049
+         BAL   R5,VINAGET               GO TO ACCESS METHOD      Y02668
+         SPACE
+VINA043  DS    0H                                                  3156
+         L     R1,RSTMT                ADDRESS OF INPUT BUFFER
+         LA    R2,VINAEND(R1)          COLUMN 71 OF STMT           3156
+         LA    R4,VINA040              GET ANOTHER REOCRD          3156
+         CLC   DISPLZER(MVTWO,R1),VINASLH SEE IF THE FIRST 2 CHARACTERS
+         BE    VINA045                 CHECK THE VERB
+         MVC   DISPLZER(MVONE,R1),VINABLNK     MOVE BLANK TO     A35012
+*                                              FIRST BYTE OF     A35012
+*                                              BUFFER            A35012
+         MVC   DISPLONE(MV79,R1),DISPLZER(R1)  AND CLEAR.        A35012
+         MVC   DISPLZER(MV46,R1),VINASLH GENERATE //SYSIN DD *    M3738
+         B     VINA140                  SET DATA FLUSH BUT       A35013
+         SPACE
+VINA045  DS    0H
+         CLI   DISPLTWO(R1),VINASTE    IS THIS A COMMENT STMT     4362
+         BE    VINA072                 CREATE AN SMB             A39049
+         LA    R1,DISPLONE(R1)         BUMP STATEMENT POINTER
+         SPACE
+VINA050  DS    0H
+         LA    R1,DISPLONE(R1)         BUMP STATEMENT POINTER
+         CLI   DISPLZER(R1),INITBLK    TEST FOR A BLANK
+         BNE     VINA075               LABEL ON STATEMENT
+         SPACE
+VINA060  DS    0H
+         LA    R1,DISPLONE(R1)         BUMP STTEMENT POINTR
+         CR    R2,R1                   END OF STMT                 3156
+         BL    VINACNT0                YES, CHECK FOR CONTINUATIOA39900
+*                                      NULL SO FAR               A39900
+         CLI   DISPLZER(R1),INITBLK    NEXT NON-BLNAK SHOULD BE VERB
+         BE    VINA060                 A  BLANK
+VINA065  DS    0H                                                 4362
+         SPACE
+         CLC   DISPLZER(MVFIVE,R1),VINAPEND     IS THERE A PEND VERB
+         BE    VINA080                 PEND VERB
+         CLC   DISPLZER(COMPFIVE,R1),VINAEXEC EXEC VERB?         SM4182
+         BNE   VINA066            BRANCH. NOT AN EXEC CARD.      SM4182
+         LA    R1,DISPLFOR(R1)    BUMP PTR PAST VERB.            SM4182
+VINA068  LA    R1,DISPLONE(R1)    BUMP PTR BY ONE.               SM4182
+         CR    R2,R1              END OF STMT?                   SM4182
+         BL    VINACNT            YES, CHECK FOR CONTINUATION.   SM4182
+         CLI   DISPLZER(R1),INITBLK  CHECK FOR OPERAND.          SM4182
+         BE    VINA068            CONTINUE SCAN FOR NON-BLANK.   SM4182
+         B     VINACNT8           CHECK FOR CONTINUATION.        SM4182
+VINA066  CLC   DISPLZER(COMTHREE,R1),VINADD    DD VERB           SM4182
+         BNE   VINA073                 GET ANOTHER RECORD
+         LA    R1,DISPLTWO(R1)         BUMP POINTER PAST VERB
+         SPACE
+***********************************************************************
+*                                                                     *
+* CHECK FOR DD * OR DD DATA.  IF EITHER EXIST THE DATA WILL BE FLUSHED
+* BY THE READER/INTERPRETER                                           *
+*                                                                     *
+***********************************************************************
+VINA070  DS    0H
+         LA    R1,DISPLONE(R1)         BUMP POINTER
+         CR    R2,R1                   END OF STMT?                3156
+         BL    VINACNT                 YES, CHECK FOR CONTINUATION 3156
+         CLI   DISPLZER(R1),INITBLK    CHECK FOR OPERAND
+         BE    VINA070                 NO OPERAND
+         SPACE
+         CLC   DISPLZER(COMPTWO,R1),VINAST   COMPARE FOR DD *
+         BE    VINA140                 DD *
+         CLC   DISPLZER(COMPFIVE,R1),VINADATA    DD DATA
+         BE    VINA150                 DD DATA
+         CLC   DISPLZER(COMPTWO,R1),VINASTCM   DD *,?             4362
+         BE    VINA140                 SET THE DATA FLUSH BIT     4362
+         CLC   DISPLZER(COMPFIVE,R1),VINADATC  DD  DATA,?         4362
+         BE    VINA150                 SET THE DATA FLUSH BITS    4362
+         B     VINA073                 CONTINUE THE SCAN         A39049
+         SPACE
+VINA072  DS    0H                                                A39049
+         OI    SWZ,CMT                 INDICATE COMMENT CARD     A39049
+         SPACE
+VINA073  DS    0H
+         BAL   R5,VINACNT8             CHECK FOR CONTINUATION
+         SPACE
+VINA075  DS    0H
+         LA    R1,DISPLONE(R1)         BUMP POINTER
+         CR    R2,R1                   END OF STMT?                3156
+         BL    VINACNT                 YES, CHECK FOR CONTINUATION 3156
+         CLI   DISPLZER(R1),INITBLK    END OF LABEL
+         BNE   VINA075                 END OF LABEL
+         SPACE
+VINA078  DS    0H                                                 4362
+         LA    R1,DISPLONE(R1)         BUMP POINTER               4362
+         CR    R2,R1                   END OF STMT?                3156
+         BL    VINACNT                 YES, CHECK FOR CONTINUATION 3156
+         CLI   DISPLZER(R1),INITBLK    BEGINING OF VERB?          4362
+         BE    VINA078                 NO                         4362
+         SPACE
+         CLC   DISPLZER(MVFOUR,R1),VINAJOB   THIS A JOB VERB?     4362
+         BE    VINA120                 XCTL TO IEFVHCB            4362
+         B     VINA065                 CHECK FOR PEND STMT        4362
+         SPACE
+VINA080  DS    0H
+         MVI   MSGKEY,INTKEY6          ON THE PEND STMT            4360
+         L     R1,IWAPARM              ADDRESS OF PARAMETER LIST
+         CLI   IEZLEN+DISPLONE,INPLN    SEE IF RECORD WAS COMPRESS19086
+         BE    VINA085                  PROCEDURE HAD STATEMENTS. 19086
+         LA    R2,WKRECORD              ADDRESS OF WORK RECORD    19086
+         ST    R2,IEZCOMPR              NEXT AVAILABLE BYTE FOR   19086
+*                                       COMPRESSED RECORD         19086
+         SPACE
+VINA085  DS    0H                                                 19086
+         L     R2,IEZCOMPR             ADDRESS OF WHERE EOF MARKER
+*                                      SHOULD GO
+         XC    DISPLZER(MVTWO,R2),DISPLZER(R2)  EOF MARKER
+         BAL   R2,VINASYNT             SUNTAX CHECKER
+         SPACE
+VINA090  DS    0H
+         BAL   R5,VINAMSG0             CREATE AN SMB IF NECESSARY
+         LA    R5,VINA096              RETURN FROM QUEUE WRITE   A40299
+*                                      SUBROUTINE TO XCTL TO VHA A40299
+         SPACE
+***********************************************************************
+*                                                                     *
+* WRITE THE LAST RECORD OF THE PROCEDURE ONTO THE JOB QUEUE           *
+*                                                                     *
+***********************************************************************
+VINA095  DS    0H                                                 19086
+         XC    WKTTR(MVFOUR),WKTTR     CLEAR TTR OF NEXT RECORD FIELD
+*                                      TO INDICATE END OF PROCEDURE
+         L     RF,VIEFVHQ              ADDRESS OF IEFVHQ
+         MVI   QMPOP,QMWRTE            SET FUNCTION BYTE TO WRITE
+         L     R6,QMPCL                ADDR OF EXTERNAL PARM LIST  3391
+         MVC   DISPLZER(MVFOUR,R6),IWAWKBF  ADDR OF WORK AREA      3391
+         MVC   DISPLFOR(MVTHREE,R6),WKPTR2  TTR OF WHERE RECORD SHOULD
+*                                      GO ON JOB QUEUE             3391
+         MVI   DISPLID(R6),INSRECID  BLOCK ID TO REMOTE LIST     Y02621
+         BALR  RE,RF                   WRITE RECORD ON JOB QUEUE
+         BR    R5                      RETURN TO CALLER          A40299
+         SPACE
+VINA096  DS    0H                                                A40299
+         BAL   R5,VINAEXIT             FREE SAVE AREA AND CORE   A40299
+         SPACE
+VINA100  DS    0H
+         SPACE
+         L     RF,VIEFVHA          ADDR OF GET ROUTINE.          Y02668
+         BR    RF                  BRANCH.                       Y02668
+         SPACE
+VINA120  DS    0H
+         LA    RA,RSTMT                ADDRESS OF PARM LIST       19093
+         L     R9,RSTMT                ADDRESS OF READER BUFFER   19093
+         SPACE
+         BAL   R5,VINAEXIT                                        19093
+         SPACE
+         L     RF,VIEFVHCB         ADDR OF VERB ID ROUTINE.      Y02668
+         BR    RF                  BRANCH.                       Y02668
+         SPACE
+VINA130  DS    0H
+         L     R5,RSTMT                ADDRESS OF BSAM BUFFER
+         BAL   R2,VINAPARM             GET CORE FOR PARM LIST
+         L     RF,VIEFVINB             ADDRESS OF DIRECTORY SEARCH
+*                                      ROUTINE
+         BALR  RE,RF
+         B     VINA030                 CREATE AN SMB IF ONE IS NEEDED
+         SPACE
+VINA140  DS    0H
+         B     VINA160                 CREATE AN SMB FOR STATEMNT
+         SPACE
+VINA150  DS    0H
+VINA160  DS    0H
+         BAL   R4,VINAMSG              CREATE AN SMB FOR STATEMENT
+         L     R1,IWAPARM               ADDRESS OF PARM LIST      19086
+         L     R2,IEZCOMPR              NEXT AVAILABLE BYTE       19086
+         XC    DISPLZER(MVTWO,R2),DISPLZER(R2) EODAD MARKER       19086
+         LA    R5,VINA096               DON'T RETURN FROM SUBRRTNA40299
+         B     VINA095                  WRITE PROC ON JOB QUEUE   19086
+         EJECT
+         EJECT
+**********************************************************************
+*                                                                    *
+* THIS SUBROUTINE WILL GET CORE FOR A 20 BYTE PARAMETER LIST         *
+* THIS PARAMETER LIST IS USED FOR THE DIRECTORY SEARCH ROUTINE       *
+* IEFVINB, THE DIRECTORY BUILD ROUTINE, IEFVINC AND FOR THE COMPRESS *
+* ROUTINE, IEZNCODE.  THE SUBROUTINE WILL INITIALIZE THE PARM LIST   *
+* TO CONTAIN THE VALUES NEEDED FOR BOTH IEFVINB AND IEFVINC.  THAT IS
+*     BYTES        VALUE                                             *
+*     0-3          ADDRESS OF ITSELF                                 *
+*     4-11         PROCEDURE NAME
+*     12-15        ADDRESS OF THE DIRECTORY                          *
+*     16-19        RETURN CODE FOR IEFVINB                           *
+*     20-23        RETURN CODE FROM IEFVINC                          *
+*                                                                    *
+* CONTROL IS TRANSFERRED ON REGISTER 2                               *
+* THIS ROUTINE WILL ESTABLISH ADDRESSIBILITY ON THE DSECT FOR THE    *
+* PARAMETER LIST USED BY IEZNCODE                                    *
+*                                                                    *
+**********************************************************************
+         SPACE
+VINAPARM DS    0H
+         LA    R0,VINACORE             LENGTH OF CORE
+         GETMAIN R,LV=(0)
+         ST    R1,ADDSS                ADDR OF PARM LIST          M4268
+         O     R1,IWAPARM              RETAIN INFO IN HIGH ORDER  M4268
+*                                      BYTE OF FIELD              M4268
+         ST    R1,IWAPARM              ADDR OF PARM LIST          M4268
+         MVI   PROCNAME,INITBLK        CLEAR PROCNAME FIELD
+         MVC   PROCNAME+DISPLONE(MVSEVEN),PROCNAME   TO BLANKS
+         EX    R3,VINAMV2              MOVE PROCNAME TO PARM LIST
+         LA    R3,WKPTR1               ADDRESS OF DIRECTORY
+         ST    R3,DIRECT               ADDRESS OF DIRECTORY
+         ST    RF,RTCD                 RETURN CODE FROM VINB
+         ST    RC,IWAPTR               ADDRESS OF IWA
+         BR    R2
+         EJECT
+**********************************************************************
+*                                                                    *
+* THIS SUBROUTINE WILL INITIALIZE REGISTER 2 WITH AN ERROR CODE AND  *
+* BRANCH TO A SUBROUTINE WHICH PRINTS THE ERROR MESSAGE.  THE JOB    *
+* FAILED BIT IS SET AND CONTROL RETURNED TO XCTL TO IEFVHA.          *
+*                                                                    *
+**********************************************************************
+         SPACE
+VINAERR  DS    0H
+         MVI   MSGSEC,PRIMARY1         NO PROCEDURE NAME
+         B     VINAERR0                NO PROCEDURE NAME
+         SPACE
+VINAERR2 DS    0H                      LABEL ERROR
+         MVI   MSGSEC,PRIMARY2         LABEL ERROR
+         CLI   MSGKEY,INTKEY6          IS  ERROR ON PEND CARD?    M1867
+         BNE   VINAERR0                NO - ONLY ISSUE ERROR MSG  M1867
+         BAL   R5,VINA095              QUEUE RECORDS SHOULD BE...A40299
+*                                      ...WRITTEN FOR THIS ERROR A40299
+*                                      CONDITION TO PREVENT THE  A40299
+*                                      R/I FROM ABENDING WHEN IT A40299
+*                                      EXPANDS THE PROCEDURE.    A40299
+         SPACE
+         B     VINAERR0                LABEL ERROR
+         SPACE
+         SPACE
+VINAERR3 DS    0H
+         MVI   MSGSEC,PRIMARY4         EXCESSIVE NUMBER OF PROCS
+         MVI   MSGKEY,DISPLZER         CLEAR SECONDARY MSG KEY
+         SPACE
+VINAERR0 DS    0H                      ERROR
+         BAL   R5,VINAMSG0         CREATE AN SMB                  19085
+         SPACE
+         XR    R2,R2                   INSERT PRIMARY MSG CODE
+         IC    R2,MSGSEC               FOR ERROR MESSAGE
+         BAL   R5,VINAMSG1             CREATE SMB FOR ERROR MSG
+         OI    STRJINDC,JTXJOBFL   SET JOB FAILED BIT.           Y02668
+         DROP  R8                                                Y02668
+         L     R2,IWAPARM              ADDRESS OF PARM LIST       19093
+         LTR   R2,R2                   PARM LIST GOTTEN?          19093
+         LA    R5,VINA100              XCTL TO IEFVHA             19093
+         BZ    VINAEXT1                PARMLIST WASN'T GOTTEN     19093
+         B     VINAEXIT                FREE CORE FOR PARM LIST    19093
+         EJECT
+VINACNT0 DS    0H                                                A39900
+         CLI  DISPLONE(R2),INITBLK     IS THIS TRULY A NULL      A39900
+*                                      STATEMENT                 A39900
+         BNE  VINACNT1                 NO, IT HAS CONTINUATION   A39900
+         BAL  R5,VINAMSG0              GO TO WRITE OUT NULL      A39900
+         B    VINA120                  XCTL TO IEFVHCB AS FOR    A39900
+*                                      JOB CARD                  A39900
+VINACNT  DS    0H
+         CLI   DISPLONE(R2),INITBLK    IS THIS STMT CONTINUED      3156
+         BE    VINAMSG                 NO, CREATE AN SMB           3156
+*  CONTINUATION ON STATEMENT                                      3156*
+         SPACE
+VINACNT1 DS    0H                                                  3156
+         BAL   R4,VINAMSG              CREATE AN SMB               3156
+         SPACE
+         TM    SWZ,CMT                 IS A COMMENT CARD BEING   A39049
+*                                      PROCESSED?                A39049
+         BO    VINA040                 RETURN TO MAINLINE PROCES.A39049
+         SPACE
+         BAL   R5,VINAGET               GO TO ACCESS METHOD      Y02668
+         L     R1,RSTMT                ADDR OF INPUT BUFFER      Y02668
+         LA    R2,VINAEND(R1)          POINTER TO COLUMN 71        3156
+         LA    R1,MVTHREE(R1)          INCREMENT TO COLUMN 4 WHERE 3156
+*                                      CONTINUATION CAN BEGIN      3156
+         SPACE
+VINACNT3 DS    0H                                                  3156
+         CLC   DISPLZER(MVFIVE,R1),VINAPEND   IS THIS A PEND COMMENT
+         LA    R4,VINA040              GET ANOTHER RECORD          3156
+         BE    VINACNT                 YES, CHECK FOR CONTINUTAION 3156
+         LA    R1,DISPLONE(R1)         INCREMENT POINTER           3156
+         CR    R2,R1                   END OF 2TATEMENT?           3156
+         BL    VINA043                 YES, SC1N STATEMENT         3156
+         B     VINACNT3                CHECK FOR PEND COMMENT      3156
+VINACNT8 DS    0H
+         XR    R3,R3                                               3157
+VINACT10 DS    0H                                                  3157
+         CLI   DISPLZER(R1),VINAQUOT   CHECK FOR LITERAL           3157
+         BNE   VINACT16                NOT A LITERAL               3157
+         CLI   DISPLONE(R1),VINAQUOT   CHECK FOR A LITERAL     @ZA01933
+         LA    R5,VINACT10             ONLY ONE QUOTE, A LITERAL   3157
+         BE    VINACT14                NOT A LITERAL               3157
+*****  QUOTE INDICATES A LITERAL, SET SWITCH                      3157*
+         SPACE
+         LTR   R3,R3                   END OR BEGINNING OF LITERAL 3157
+         LA    R5,VINACNT8             CLEAR LITERAL SWITCH        3157
+         BNZ   VINACT12                END OF LITERAL, CHECK FOR   3157
+*                                      ', ' TO INDICATE CONTIN     3157
+         LA    R3,DISPLONE             START OF LITERAL, SET SW    3157
+         LA    R5,VINACT10             CHECK FOR LITERAL           3157
+         SPACE
+VINACT12 DS    0H                                                  3157
+         LA    R1,DISPLONE(R1)         INCREMENT POINTER           3157
+         SPACE
+VINACT14 DS    0H                                                  3157
+         LA    R1,DISPLONE(R1)         INCREMENT POINTER           3157
+         CR    R2,R1                   END OF STATEMENT            3157
+         BL    VINACNT                 CHECK FOR CONTINUATION      3157
+         BR    R5                      RETURN TO CALLER            3157
+VINACT16 DS    0H                                                  3157
+         LA    R5,VINACT10             CHECK FOR LITERAL           3157
+         LTR   R3,R3                   IS THIS IN A LITERAL?       3157
+         BNZ   VINACT14                IN A LITERAL, CHECK FOR END 3157
+         CLC   DISPLZER(MVTWO,R1),VINACONT      CONTINUATION?      3157
+         BE    VINACNT1                CONTINUATION OF STMT        3157
+         CLI   DISPLZER(R1),INITBLK    CHECK FOR NON-BLANK     @ZA01933
+         BE    VINACNT                 CHECK FOR CONTINUATION  @ZA01933
+         B     VINACT14                INCREMENT POINTER           3157
+         EJECT
+         EJECT
+         EJECT
+**********************************************************************
+*                                                                    *
+* THIS SUBROUTINE CREATES AN SMB IF ONE IS NEEDED.  IT INITIALIZES    *
+* THE PARAMETER LIST FOR IEZNCODE WHEN THE FIRST IN-LINE PROCEDURE IS *
+* ENCOUNTERED.  THE PARAMETER LIST IS MAPPED IN THE DSECT, IEZPARM.   *
+*                                                                     *
+* IT BRANCHES TO IEZNCODE TO COMPRESS THE RECORD AND CHECKS A         *
+* RETURN CODE UPON RETURN.  IF THE OUTPUT AREA IS FULL, IT USES IEFVHQ
+* AND THE QUEUE MANAGER TO ASSIGN A NEW RECORD, AND WRITE THE RECORD  *
+* TO THE JOB QUEUE.  CONTROL IS THEN RETURNED TO IEZNCODE.  WHEN THE  *
+* COMPRESSED RECORD HAS BEEN PLACED IN THE OUTPUT BUFFER, CONTROL IS  *
+* RETURNED TO THE CALLER THROUGH REGISTER 4.                          *
+         SPACE
+*                                                                    *
+**********************************************************************
+VINAMSG  DS    0H
+         LA    R5,VINACOMP             NEXT INSTRUCTION TO BE EXECUTED
+         SPACE
+VINAMSG0 DS    0H
+         TM    IWAJMSGL,AOMSGLV1+AOMSGLV2  MSGLEVEL = 1 OR 2?   YM02706
+         BC    8,0(R5)             NO, RETURN TO CALLER.         Y02668
+         L     R9,RSTMT                ADDRESS OF INPUT BUFFER
+         L     R2,AOWSTMT          R2 PTR TO'WRITE' BUFFER       Y02668
+         MVI   0(R2),BLANK         BLANK OUT BUFFER BEFORE       Y02668
+         MVC   1(BUFLTH,R2),0(R2)  MOVEING STMT IN               Y02668
+         MVC   STNLTH(STMTLTH,R2),0(R9) MOVE STMT INTO BUFFER    Y02668
+**********************************************************************
+*                                                                    *
+* CREATE SMB
+*                                                                    *
+**********************************************************************
+         SPACE
+         XR    R2,R2                   INDICATE NO ERROR MESSAGE
+*                                      AFTER THE FOLLOWING SUBROUTINE
+*                                      WHICH BRANCHES TO IEFVGM TO
+*                                      CREATE SMB'S
+         SPACE
+**********************************************************************
+*                                                                    *
+* THIS SUBROUTINE USES IEFVGM TO CREATE AN SMB FOR AN ERROR OR A STMT*
+* IT RETURNS CONTROL ON REGISTER 5                                   *
+*                                                                    *
+**********************************************************************
+         SPACE
+VINAMSG1 DS    0H
+         OI    SWA,JTOP                SET JOB TO PROCESS BIT
+         L     RF,VIEFVGM              CREATE
+         BALR  RE,RF
+         BR    R5
+         SPACE
+VINACOMP DS    0H
+         L     R1,IWAPARM              ADDRESS OF PARAMETER AREA
+         SLL   R1,8                    CLEAR HIGH ORDER BYTE   @ZA03865
+         SRL   R1,8                                            @ZA03865
+         CL    R1,0(0,R1)              CHECK IF INITIALIZED    @ZA03865
+         BNE   VINACOM2                ALREADY INITIALIZED     @ZA03865
+         LA    R5,DISPLFOR(R1)         ADDRESS OF PARAMETER LIST
+         ST    R5,IEZADDR              PARAMETER LIST
+         LA    R3,INPLN                LENGTH OF INPUT BUFFER
+         STH   R3,IEZLEN
+         LA    R3,WKRECORD             ADDRESS OF WORK RECORD
+         ST    R3,IEZCOMPR
+         MVI   IEZCHAR,INITBLK         BLANKS TO BE COMPRESSED
+         LA    R3,OUTLN                LENGTH OF OUTPUT BUFFER
+         STH   R3,IEZOUT               AREA
+         MVI   IEZTYPE,TYPEZER         NOT SPECIAL
+         SPACE
+VINACOM2 DS    0H
+         MVC   IEZUNCOM(MVFOUR),RSTMT   ADDRESS OF INPUT BUFFER  A34832
+         L     R1,IWAPARM              ADDRESS OF PARAMETER LIST
+         L     RF,VIEZN                ADDRESS OF COMPRESS ROUTINE
+         BALR  RE,RF
+         SPACE
+         LTR   RF,RF
+         BCR   EQU,R4                  RECORD WAS COMPRESSED
+**********************************************************************
+*                                                                    *
+* IF THIS IS A PEND VERB CONTROL IS TRANSFERRED TO VIN015 TO XCTL
+* TO VHA.  FOR ANY OTHER STATEMNT ANOTHER STATEMENT WILL BE READ.
+*                                                                    *
+**********************************************************************
+         SPACE
+         MVI   QMPOP,QMASGN            ASSIGN
+         L     RF,VIEFVHQ              Q MANAGER INTERFACE
+         BALR  RE,RF                   Q MANAGER INTERFACE
+         L     R2,QMPCL                ADDR OF EXTERNAL PARM LIST  3391
+         MVC   DISPLFOR(MVTHREE,R2),WKPTR2   RECORD ON QUEUE       3391
+         MVC   WKPTR2(MVTHREE),DISPLZER(R2) TTR RETURNED FROM ASSIGN
+         MVC   WKTTR(MVTHREE),DISPLZER(R2) ADDR OF NEXT RECORD IN PROC
+         MVC   DISPLZER(MVFOUR,R2),IWAWKBF CORE ADDR OF WORK BUFFER3391
+         MVI   DISPLID(R2),INSRECID  MOVE BLOCK ID FOR WRITE     Y02621
+         MVI   QMPOP,QMWRTE            WRITE THE RRCORD TO THE Q
+         BALR  RE,RF
+         LA    R2,WKRECORD             REINITIALIZE POINTER TO
+         ST    R2,IEZCOMPR             WHERE NEXT COMPRESSED RECORD
+*                                      SHOULD GO
+         LA    R2,OUTLN                LENGTH OF OUTPUT BEFFER
+         STH   R2,IEZOUT               LENGTH OF OUTPUT BUFFER
+         B     VINACOM2                COMPRESS THE RECORD
+         EJECT
+**********************************************************************
+*                                                                    *
+* THIS SUBROUTINE BRANCHES TO IEFVINE TO SYNTAX THE PROC OR PEND     *
+* STATEMENTS.  UPON RETURN IT TESTS COMMON ERROR CONDITIONS.         *
+*        IF THE HIGH ORDER BIT OF THE RETURN CODE IS SET A CONTINUA- *
+*        TION IS EXPECTED.  CONTROL IS PASSED TO THE CONTINUATION SUB*
+*        ROUTINE                                                     *
+*                                                                    *
+*        IF THE RETURN CODE IS 12, AN ERROR EXISTS IN THE LABEL FIELD*
+*        CONTROL IS PASSED TO AN ERROR ROUTINE                       *
+*        IF THE RETURN CODE IS 16, AN ERROR EXISTS IN THE USE OF     *
+*        COMMENTS.  CONTROL IS PASSED TO AN ERROR ROUTINE            *
+*                                                                    *
+*        IF NONE OF THESE ERROR EXIST CONTROL IS RETURNED THROUGH    *
+*        REGISTER 2                                                  *
+*                                                                    *
+**********************************************************************
+         SPACE
+VINASYNT DS    0H
+         L     R1,RSTMT                ADDRESS OF INPUT BUFFER
+         L     RF,VIEFVINE             SYNTAX CHECKER
+         BALR  RE,RF
+         L     R4,DISPL10(RD)          RETURN CODE FROM IEFVINE   4329
+         LA    R3,ERRTEST              CHECK FOR ERROR
+         CR    R4,R3                   ARE THERE ANY ERRORS?      4329
+         BE    VINAERR2                ERROR IN THE LABEL FIELD
+         BR    R2                      RETURN TO CALLER            O106
+         EJECT
+***********************************************************************
+*                                                                     *
+*  THIS SUBROUTINE IS THE FIRST PORTION OF THE READER END OF FILE     *
+*  ROUTINE.  IT IS USED ONLY IF THE CONDITION OCCURS IN IEFVINA.  IT  *
+*    SETS THE READER END OF FILE BIT IN IWA AND FREES CORE.       O106*
+*    IT THEN XCTL'S TO IEFVHA TO FINISH CLOSING SYSIN                 *
+*                                                                     *
+***********************************************************************
+         SPACE
+VINAEOF  DS    0H                                                 19093
+         SPACE
+         OI    IWAPARM,EOFRINPR        SET READER EOF BIT         19093
+         LA    R5,VINA100              XCTL TO IEFVHA             19093
+         SPACE
+VINAEXIT DS    0H                                                 19093
+         SPACE
+         LA    R0,VINACORE             LENGTH OF CORE             19093
+         L     R1,IWAPARM              ADDRESS OF PARM LIST       19093
+         FREEMAIN  R,LV=(0),A=(1)
+         XC    IWAPARM+DISPLONE(MVTHREE),IWAPARM+DISPLONE         19093
+*                                      CLEAR PARM LIST POINTER    19093
+         SPACE
+VINAEXT1 DS    0H                                                 19093
+         MVI   MSGKEY,DISPLZER         CLEAR SECONDARY MESSAGE KEY19093
+         SPACE
+         IEFRELSE
+         SPACE
+         BR    R5                      RETURN TO THE CALLER       19093
+***********************************************************************
+*                                                                     *
+*  THIS SUBROUTINE IS THE FIRST PORTION OF THE SYNAD ROUTINE FOR N
+*  AN I/O ERROR SHOULD IT OCCUR WHILE READING AN INPUT RECORD IN  O106*
+*  LOAD MODULE.  THE I/O ERROR BIT IN THE IWA IS SET, THE EODAD   O106*
+*  AND SYNAD ROUTINE ADDRESSES ARE REPLACED IN THE QAAM DCB, CORE O106*
+*  IS FREED AND CONTROL IS RETURNED TO IEFVHA TO COMPLETE PROCESSING  *
+*  OF THE I/O ERROR                                               O106*
+*                                                                     *
+***********************************************************************
+         SPACE
+VINASYND DS    0H                                                 19093
+         OI    SWC,IOERR               SET I/O ERROR SWITCH IN IWA19093
+         LA    R5,VINA100              XCTL TO IEFVHA FOR INPUT  A49933
+         B     VINAEXIT                REPLACE DCB ADDRESSES      19093
+VINAGET  DS    0H                                                Y02668
+         LA    R4,RPLADDR               GET ADDRESS OF RPL       Y02668
+         USING IFGRPL,R4                SET BASE FOR RPL         Y02668
+         L     R2,WANELPTR              GET ADDRESS OF NEL       Y02668
+         USING NEL,R2                   SET BASE FOR NEL         Y02668
+         MVI RPLREQ,RPLGET              REQUEST IS A GET         Y02668
+         MVC   RPLDACB,NELJCLCB         SET POINTER TO ACB       Y02668
+         MVC   RPLAREA,RSTMT            SET POINTER TO BUFFER    Y02668
+         XC    RPLARG(4),RPLARG         ZERO UNUSED FIELD        Y02668
+         MVI   RPLOPT1,RPLSEQ           GET IS SEQUENTIAL        Y02668
+         XC    RPLRLEN(4),RPLRLEN       ZERO UNUSED FIELD        Y02668
+         LA    R0,80                    GET BUFFER LENGTH        Y02668
+         ST    R0,RPLBUFL               SET MAXIMUM BUFFER LENTH Y02668
+         XC    RPLDDDD(4),RPLDDDD       ZERO UNUSED FIELD        Y02668
+         DROP  R2                       RELEASE BASE FOR NEL     Y02668
+         ST    RD,IWASACHN         SAVE SAVE AREA POINTER        Y02668
+         LA    RD,IWAIOSA          SAVE AREA FOR ACCESS METHOD   Y02668
+         LR    R1,R4                    POINT TO RPL             Y02668
+         GET   RPL=(1)
+         L     RD,IWASACHN         RESTORE SAVE AREA POINTER     Y02668
+         LTR   RF,RF               CHECK FOR ERROR               Y02668
+         BCR   8,R5                     RETURN NO ERROR          Y02668
+         CLI   RPLRTNCD,RPLLOGER   IS THIS A LOGICAL ERROR ?     Y02668
+         BNE   ERREXIT             NO. GO TO ERROR EXIT          Y02668
+         CLI   RPLERRCD,RPLEODER   IS END OF DATA DETECTED ?     Y02668
+         BE    VINAEOF             YES. GO TO EOF ROUTINE        Y02668
+         DROP  R4                  RELEASE BASE FOR RPL          Y02668
+ERREXIT  DS    0H
+         MVC   IWARET(2),PGMERROR  SET RETURN CODE               Y02668
+         LA    R5,4                I/O ERROR MSG CODE            Y02668
+         L     RF,VIEFVHR               GET POINTER TO IEFVHR    Y02668
+         BALR  RE,RF                    WRITE MSG TO OPERATOR    Y02668
+         LA    R2,20               I/O ERROR MSG CODE            Y02668
+         L     RF,VIEFVGM               GET ADDRESS OF IEFVGM    Y02668
+         BALR  RE,RF                    WRITE OUT ERROR MSG      Y02668
+         L     RF,TERMRTN          GET TERMINATION ADDRESS       Y02668
+         BR    RF                  GO TO TERMINATION             Y02668
+         EJECT
+         DS    0F
+VIEFVINB DC    V(IEFVINB)              ADDRESS OF DIRECTORY SEARCH
+VIEFVINC DC    V(IEFVINC)              ADDRESS OF DIRECTORY BUILD
+VIEFVINE DC    V(IEFVINE)              ADDRESS OF SYNTAX CHECKER
+VIEFVHQ  DC    V(IEFVHQ)               ADDRESS OF Q MANAGER INTERFACE
+VIEFVGM  DC    V(IEFVGM)               ADDRESS OF MESSAGE MODULE
+VIEZN    DC    V(IEZNCODE)             ADDRESS OF COMPRESS ROUTINE
+VIEFVHR  DC    V(IEFVHR)
+VIEFVHCB DC    V(IEFVHCB)          ADDRESS OF VERB ID MODULE.    Y02668
+VIEFVHA  DC    V(IEFVHA)           ADDRESS OF GET MODULE.        Y02668
+         SPACE
+VINASTCM DC    C'*,'                   DD    *,   STATEMENT       4362
+VINADATC DC    C'DATA,'                SYSIN  DD  DATA,DCB=       4362
+VINADATA DC    C'DATA '                DD DATA STATEMENT
+VINAPEND DC    C'PEND '
+VINAJOB  DC    C'JOB '
+VINAEXEC DC    C'EXEC '           EXEC STATEMENT                 SM4182
+         SPACE
+VINAMV2  MVC   PROCNAME(0),2(R5)
+VINAMOVE MVC   QMNAM(0),2(R5)          PROCNAME TO QMPA
+         SPACE
+* THE FOLLOWING FIVE DC'S MUST REMAIN IN THIS ORDER.  THEY FORM THE   *
+* GENERATED DD * STATEMENT.                                           *
+VINASLH  DC    X'6161'                 FIRST TWO CHARACTERS OF STMT
+VINASYS  DC    C'SYSIN '               PART OF GENERATED STMT
+VINADD   DC    C'DD '                  DD VERB
+VINAST   DC    C'* '               OPERAND OF GENERATED STMT
+         DC    C'INSTREAM PROC GENERATED STATEMENT ' COMMENT OF GEN DD
+VINABLNK DC    C' '                     BLANK TO CLEAR READER    A35012
+*                                       BUFFER                   A35012
+         SPACE
+VINAPLUS DC    C'++'                   IN-LINE PROCEDURE
+PGMERROR DC    X'0024'             PGM ERROR CODE (36)           Y02668
+VINACORE EQU   24                      LENGTH OF THE PARAMETER LIST
+QMSYSOUT EQU   X'3'                    DEQUEUE TYPE
+WORKLN   EQU   352                     LENGTH OF WORK BUFFER       O106
+QMPALN1  EQU   48                      LENGTH OF QMPA              O106
+EOFRINPR EQU   X'40'                   INDICATE END OF READER
+VINAQUOT EQU   C''''                   TEST FOR A LITERAL
+VINACONT DC    C', '                   CHECK FOR CONTINUATION      3157
+VINASTE  EQU   C'*'                    CHECK FOR COMMENT STATEMENT4362
+MVONE    EQU   1                        LENGTH OF MOVE           A35012
+MVTWO    EQU   2                       LENGTH OF MOVE
+MVTHREE  EQU   3                       LENGTH OF MOVE
+MVFOUR   EQU   4                       LENGTH OF MOVE
+MVFIVE   EQU   5                       LENGTH OF MOVE
+MVSEVEN  EQU   7                       LENGTH OF MOVE
+MVEIGHT  EQU   8                       LENGTH OF MOVE
+MV46     EQU   46                                                 M3738
+MV79     EQU   79                       LENGTH OF READER STATE-  A35012
+*                                       MENT MINUS ONE FOR MOVE  A35012
+DISPLZER EQU   0                       DISPLACEMENT
+DISPLONE EQU   1                       DISPLACEMENT
+DISPLTWO EQU   2                       DISPLACEMENT
+DISPL3   EQU   3                       DISPLACEMENT
+DISPLFOR EQU   4                       DISPLACEMENT
+DISPL10  EQU   16                      REGISTER 15 IN THE SAVE AREA,
+*                                      RETURN CODE FROM IEFVINE
+DISPL24  EQU   X'24'                   REGISTER 4 IN THE SAVE AREA4329
+COMPTWO  EQU   2                       LENGTH OF COMPARE
+COMTHREE EQU   3                       LENGTH OF COMPARE
+COMPFIVE EQU   5                       LENGTH OF COMPARE
+NOENTRY  EQU   0                       NO IN-LINE PROCEDURES HAVE BEEN
+*                                      ENCOUNTERED YET
+VINAEND  EQU   70                      END OF STATEMENT            3156
+INPLN    EQU   80                      LENGTH OF INPUT BUFFER FOR
+*                                      IEZNCODE
+OUTLN    EQU   168                     LENGTH OF OUTPUT BUFFER FOR
+*                                      IEZNCODE
+TYPEZER  EQU   X'00'                   NOT A SPECIAL RECORD
+EQU      EQU   8                       BRANCH ON EQUAL-RECORD FIT IN
+*                                      THE BUFFER
+INITBLK  EQU   X'40'                   INITIALIZE QMNAM TO BLANKS
+QMPALN   EQU   36                  LENGTH OF QMPA
+QMTPYONE EQU   1                       LENGTH OF QMTPY FIELD
+QMTPYF   EQU   15                      DISPLACEMENT INTO QMPA TO
+*                                      QMPTY FIELD
+ASSIGN1  EQU   X'10'                   NUMBER OF RECORDS TO ASSIGN
+PRIMARY1 EQU   X'3F'                   NO PROCEDURE NAME
+PRIMARY2 EQU   X'3E'                   SYNTAX ERROR
+PRIMARY4 EQU   X'41'                   EXCESSIVE NUMBER OF PROCEDURES
+HIORDER  EQU   X'80'                   CONTINUATION OF A PEND OR PROC
+*                                      STATEMENT
+ERRTEST  EQU   12                      TEST FOR ERROR ON PROCEDURE
+*                                      DELIMITERS
+LENGONE  EQU   1                       NUMBER OF BITS TO SHIFT TO TURN
+*                                      OFF HIGH ORDER BIT
+CLFOUR   EQU   4                       CLEAR PTRS IN IWA          19093
+SYMPARM  EQU   X'40'                   SYMBOLIC PARAMETERS EXIST  4329
+PATCH    DC    25F'0'              **********PATCH SPACE*********Y02668
+         END

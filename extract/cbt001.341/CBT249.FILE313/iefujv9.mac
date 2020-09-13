@@ -1,0 +1,784 @@
+         TITLE 'IEFUJV - JOB VALIDATION EXIT (MVS)'                 RLW
+IEFUJV   CSECT
+***********************************************************************
+*
+* TITLE-       IEFUJV - SMF JOB VALIDATION EXIT (MVS)
+*
+* STATUS-      LEVEL:  3.00
+*
+* FUNCTION/OPERATION-
+*
+*              (BACKGROUND JOBS)
+*              .VALIDATES PROJ#, DEPT# ON JOB STMT.
+*               THE PROJ# CAN BE SPECIFIED IN TWO PLACES:
+*
+*                 -FIRST FOUR CHARS OF JOBNAME, I.E., (S100=PROJ#)
+*                    //S100LIST JOB (8200,0000), ...
+*
+*                 -SECOND PARM IN ACCT FLD, AFTER DEPT#, I.E.,
+*                    //TESTLIST JOB (8200,S100), ...
+*
+*              .VALIDATES 'TIME=' KEYWORD.  RESETS '1440' TO '1439'
+*
+*              .INVALIDATES (CANCELS) JOBS USING KEYWORDS:
+*               'PERFORM=', 'PRTY=', OR 'DPRTY=' ON JOB/EXEC STMTS.
+*
+*        NOTE- .DEPT# OF '8205' BYPASSES VALIDATION OF PROJ#
+*              .JOBNAME OF 'ISD8220' WILL BYPASS "ALL" VALIDATION
+*               OF JOB STMT.
+*
+*              (FOREGROUND JOBS - TSO)
+*              .VALIDATES DEPT# ONLY.
+*
+* ENTRY POINT = IEFUJV
+*
+* LINKAGE-     BALR
+*        .FROM IEFVHEB            (ENT CODES 0-8)
+*        .FROM IEFVHF             (ENT CODE 16)
+*        .FROM IEFVHH             (ENT CODE 32)
+*
+* ATTRIBUTES=  REENTRANT, PKEY =1 (ENT CODES 0-16)
+*                         PKEY =0 (ENT CODE 32)
+*
+* TABLES-      .WORK (IEFUJV WORK AREA -DSECT, GETMAIN'D)
+*              .COMMON (SMF COMMON EXIT PARAMETER AREA -DSECT)
+*
+* MACROS-      .SAVE, GETMAIN, FREEMAIN, LOAD, DELETE, WTO
+*
+         EJECT
+* INPUT- .R1 POINTS TO A THREE-ELEMENT LIST OF
+*         FOUR-BYTE ADDRESSES AS FOLLOWS:
+*              1.  A(SMF COMMON EXIT PARAMETER AREA)
+*              2.  A(80-BYTE JCL STMT TEXT)
+*              3.  A(ENT CODE)
+*
+*                  ENTRY CODE TYPES:
+*                  X'00'  NULL STMT           NOT PROCESSED
+*                  X'01'  JOB STMT
+*                  X'02'  EXEC STMT
+*                  X'04'  DD  STMT            NOT PROCESSED
+*                  X'08'  PROC STMT
+*                  X'10'  ENQUEUE (ALL JCL CONVERTED)
+*                  X'20'  ENQUEUE (ALL JCL INTERPRETED)
+*
+* OUTPUT- .IN SMF COMMON EXIT AREA:
+*              -SMFUSER  (DSP/DEC 20) = X'F0' ACCT# FLD WAS PRESENT
+*              -SMFACDAT (DSP/DEC 32)
+*                = BETWEEN CALLS DURING JCL CONVERSION => A(WORK)
+*                = AFTER COMPLETION OF ENQUEUE (X'10') => CLASS & HASP#
+*
+* EXIT-  -NORMAL = BR 14
+*         OUTPUT = NONE
+*         RETURN CODE = 0
+*
+*        -ERROR = BR 14
+*         OUTPUT = ERR MSG (MRX100I)
+*         RETURN CODE=  4  (CANCEL JOB)
+*
+* ERROR MSGS-
+*       1.  MRX100I **> JOB VIOLATES MRX STANDARDS
+*       2.  MRX100I   (... REASONS ...)
+*
+* REGISTER USAGE-
+*
+*              R0  = UNUSED
+*              R1  = A(WORK)
+*              R2  = A(SMF COMMON)
+*              R3  = A(JCL STMT TEXT)
+*              R4  = A(ENT CODE)
+*              R5 -- R10 = WORK REGS
+*              R11 = BASE REG
+*              R12 = WORK
+*              R13 = SAVE
+*              R14 = RTN ADDR
+*              R15 = EP ADDR/RET CODE
+*
+* EXTERNAL REFERENCES = NONE
+*
+***********************************************************************
+*
+*  UPDATED 10AUG79, WILLIAM SMITH, ISD TECHNICAL SUPPORT
+*     AS A CONSEQUENCE OF LOGIC ERRORS IN THE MEMOREX IEFUJV EXIT,
+*     WE BEGAN EXPERIENCING CSA EXHAUSTION AND SUBSEQUENT SYSTEM
+*     FAILURE AFTER SEVERAL DAYS WITHOUT AN IPL.  THIS WAS DUE TO
+*     A FAILURE OF THE EXIT TO FREE GETMAINED MEMORY.  CONSEQUENTLY,
+*     THE FOLLOWING 'QUICK-AND-DIRTY' CHANGES CAME ABOUT:
+*        1.  CHANGED THE SAVE MACRO TO READ IPO 6.0 INSTEAD OF IPO 2.0
+*        2.  CHANGED THE SYSTEM PROGRAMMER BYPASS FROM 'RLW8220' TO
+*            '$SYS' AND MADE SURE THAT IT WOULD ALSO ISSUE A FREEMAIN
+*        3.  CHANGED THE SEQUENCE OF TESTS FOR THE JOB CARD AND THE
+*            SMFOPTN (FOREGROUND/BACKGROUND) TO PRECLUDE A FAILURE
+*            OF EXECUTING A FREEMAIN (CSA EXHAUSTION)
+*        4.  NOTICE THAT ONLY 3 CHARACTERS OF THE HASP JOB NUMBER ARE
+*            PACKED/UNPACKED INSTEAD OF 4 - NOT FIXED - (THIS EXIT WAS
+*            WRITTEN FOR HASP 3.1 - NOT JES2 4.1)
+*        5.  ALL CHANGES ARE FLAGGED WITH MY INITIALS AND CURRENT DATE
+*
+***********************************************************************
+*
+         EJECT
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         EJECT
+         SAVE  (14,12),,IEFUJV_&SYSDATE_&SYSTIME            WJS/10AUG79
+         BALR  R11,0
+         USING *,R11
+         LM    R2,R4,0(R1)    GET PARAMETER ADDRESSES
+         USING SMFCOMON,R2
+*
+*
+         L     R1,SMFACDAT        LOAD ADDR WORK AREA (IF GOTTEN)
+         LR    R8,R3              ACCUMULATOR
+         LA    R6,1               INCREMENT
+         LA    R7,71(,R3)         COMPARAND END (COL 72)
+         TM    SMFOPTN,X'01'      TSO JOB ?                 WJS/10AUG79
+         BO    NOTJOB             YES, EXIT GRACEFULLY      WJS/10AUG79
+         TM    0(R4),X'01'        JOB CARD ?                WJS/10AUG79
+         BO    ACCTCHK            YES, CHECK ACCOUNT FIELD  WJS/10AUG79
+         TM    0(R4),X'02'        EXEC CARD ?
+         BO    CHKEXEC            YES, CHECK FOR TIME=1440
+         TM    0(R4),X'08'        PROC CARD ?
+         BO    CHKPROC            YES, CHECK FOR TIME=1440
+         TM    0(R4),X'10'        ENQUEING JOB ?
+         BO    ENQUE              BR IF ENQUEING JOB.               RLW
+         TM    0(R4),X'20'        MVS ENQUE CODE-32
+         BO    ENQUE20            DONT PROC ENQUE20                 RLW
+         B     NOTJOB             EXIT IF NOT JOB,EXEC,OR ENQ       RLW
+ACCTCHK  EQU   *                                                    RLW
+         TM    SMFUSER,X'C0'      ACCOUNT NO. PRESENT
+         BO    MOREJOB            BR IF JOB CARD PRESENT
+         EJECT
+***********************************************************************
+*
+** PROCESS JOB STATEMENT.
+*
+********
+         GETMAIN R,LV=WLEN,SP=241    GET WORK STORAGE
+         USING WORK,R1
+         ST    R1,SMFACDAT           STORE ADDR OF GOTTEN CORE
+         MVC   WORK(WLEN),INIT       INITIALIZE WORK AREA
+         MVC   COND,0(R4)            SAVE ENTRY CODE
+         CLC   73(3,R8),=C'JOB'      IS THIS A HASP JOB
+         BNE   NOTHASP               NO, SKIP STORE
+         PACK  HASPJNUM+1(2),77(3,R3)  PACK HASP JOB #
+         UNPK  HASPJNUM,HASPJNUM+1(2)  ZERO FILL HASP JOB #
+NOTHASP  MVC   72(8,R3),=C'        '   CLEAR SEQ FIELD
+         MVC   WTOJOB(8),SMFJNAME
+*    SCAN JOB CARD FOR ACCOUNTING FIELD
+         OI    SMFUSER,X'F0'      SET SWITCH FOR FIRST TIME
+         CLC   2(4,R3),=C'$SYS'   CHECK SYSTEM PROGRAMMER   WJS/10AUG79
+         BE    CARDEND            YES, NO FURTHER CHECKING  WJS/10AUG79
+         LA    R3,0(0,R3)         CLEAR HIGH ORDER BYTE             RLW
+LOOP     CLI   0(R8),C'('         FIND LEFT PARENTHESIS             RLW
+         BE    FOUND              BR IF YES
+         CLI   0(R8),C''''        ALSO, CHECK FOR QUOTE             RLW
+         BE    FOUND              YES, CHECK JOB ACCT FLD           RLW
+         CLI   0(R8),C','         START OF A NEW PARM
+         BE    NOACCT             YES, ERROR NO ACCTOUT # PRESENT
+         BXLE  R8,R6,LOOP
+         B     NOACCT             NO LEFT PAREN
+         EJECT
+*
+*    JOB ACCOUNTING FIELD HAS BEEN FOUND
+*
+FOUND    LA    R8,1(,R8)          POINT TO ACCT NO
+         MVC   SMFUSER+4(4),=C'    '
+         SPACE 2
+***********************************************************************
+*   MEMOREX CODE ADDED BY J. STEINWINDER TO EDIT DEPARTMENT NUMBER
+*   AND FIRST 4 BYTES OF THE JOB NAME FOR A VALID PROJECT ID.
+***********************************************************************
+         SPACE 2
+         LR    R4,R0              SAVE R0                           JMS
+         LR    R9,R1              SAVE R1                           JMS
+         LOAD  EP=IEFUJVTB        LOAD EDIT TABLE INTO CORE.        JMS
+         LR    R1,R9              RESTORE R1                        JMS
+         ST    R0,TBADDR          SAVE ADDRESS OF TABLE.            JMS
+         LR    R0,R4              RESTORE R0                        JMS
+         SPACE 2
+*              R3 HAS ADDRESS OF CARD IMAGE.                        JMS
+*              R8 HAS ADDRESS OF DEPT # IN JOB CARD.                JMS
+*              R4 IS A WORK REGISTER.                               JMS
+*              R9 IS A WORK REGISTER.                               JMS
+         SPACE 2
+         MVC   WTOPERF+6(5),=C'AC/PJ'  INIT ERROR MESSAGE.          JMS
+         SPACE 2
+         CLC   0(4,R8),=C'8205'   CHECK FOR SYSTEMS PROGRAMMING JOB.JMS
+         BNE   DEPTEDIT           NO DEPARTMENT AND PROJECT         JMS
+         OI    EDITSW,X'FF'       ID EDITS ON SYSTEMS PROGRAMMING   JMS
+         B     BYEDITS            JOBS.                             JMS
+         SPACE 2
+DEPTEDIT MVZ   EDITFLD(4),0(R8)   NUMERIC CHECK OF DEPT #.          JMS
+         CLC   EDITFLD,=X'F0F0F0F0'                                 JMS
+         BNE   PROJEDIT                                             JMS
+         SPACE 2
+MOREDIT  LR    R9,R5              SAVE R5 IN R9.                    JMS
+         PACK  PDEPT(8),0(4,R8)   PACK DEPARTMENT NUMBER.           JMS
+         CVB   R4,PDEPT           CONVERT DEPT # TO BINARY.         JMS
+         SRDA  R4,3               DIVIDE DEPT # BY 8.               JMS
+         SRL   R5,29              RIGHT JUSTIFY REMAINDER.          JMS
+         LTR   R5,R5              CHECK REMAINDER FOR ZERO.         JMS
+         BNZ   STORER             BRANCH IF NOT ZERO.               JMS
+         S     R4,=F'1'           SBTRACT 1 FROM OFFSET.            JMS
+STORER   ST    R5,WORKFLD         ST REMAINDER INTO A WORK FIELD.   JMS
+         A     R4,TBADDR          ADD TABLE ADDRESS TO OFFSET.      JMS
+         TR    WORKFLD+3(1),TRTABLE  TR REMAINDER INTO A TEST FLD.  JMS
+         SR    R5,R5              ZERO R5.                          JMS
+         IC    R5,0(R4)           GET ENTRY FROM EDIT TABLE.        JMS
+         N     R5,WORKFLD         TEST ENTRY IN TABLE.              JMS
+         BZ    DEPTBAD                                              JMS
+         OI    EDITSW,X'F0'       DEPARTMENT NUMBER IS GOOD.        JMS
+DEPTBAD  LR    R5,R9              RESTORE R5 FROM R9.               JMS
+         SPACE 2
+PROJEDIT EQU   *                                                    RLW
+*        TM    SMFOPTN,X'01'      TSO USER? (FORGROUND)     WJS/10AUG79
+*        BO    BYEDITS            YES, GO DELETE ACTABLE    WJS/10AUG79
+         L     R4,TBADDR          GET ADDRESS OF TABLE.             JMS
+         LA    R4,1250(R4)        OFFSET ADDRESS TO PROJ TABLE.     JMS
+         LA    R9,1000            COUNT FOR PROJ TABLE.             JMS
+PEDIT    CLC   2(4,R3),0(R4)      TEST BATCH PROJ ID                JMS
+         BNE   CHKZERO                                              JMS
+         OI    EDITSW,X'0F'       PROJECT ID GOOD.                  JMS
+         B     CHKJPTR            GET OUT OF LOOP.                  JMS
+CHKZERO  CLC   0(4,R4),=C'0000'   CHECK FOR END OF TABLE.           JMS
+         BE    CHKALTPJ           GO CHECK PROJ# AFTER DEPT#        RLW
+         LA    R4,5(R4)           BUMP POINTER IN TABLE.            JMS
+         BCT   R9,PEDIT           TEST AGAIN.                       JMS
+         B     CHKJPTR            IN CASE EOT ^= '0000'             RLW
+         SPACE 2
+CHKALTPJ EQU   *                                                    RLW
+         TM    JCLPTRV,X'AA'      PROJ FOUND?                       RLW
+         BZ    SETJPTR            GET OUT OF LOOP                   RLW
+         ST    R3,JCLPTRV         SAVE R3 (->JCL STMT)              RLW
+         LA    R3,3(R8)           REPOSITION PROJ# PTR              RLW
+         B     PROJEDIT           GO RECHECK PROJ# AFTER DEPT#      RLW
+         SPACE 2                  RLW
+CHKJPTR  TM    JCLPTRV,X'AA'      DOES R3 NEED RESTORING?           RLW
+         BO    BYEDITS                 NO, FINISH ACCT VER          RLW
+SETJPTR  L     R3,JCLPTRV         YES, RESTORE R3                   RLW
+         SPACE 2
+BYEDITS  EQU   *                                                    JMS
+         SPACE 1
+         LR    R4,R0              SAVE R0                           JMS
+         LR    R9,R1              SAVE R1                           JMS
+         DELETE EP=IEFUJVTB       DELETE EDIT TABLE.                JMS
+         LR    R0,R4              RESTORE R0                        JMS
+         LR    R1,R9              RESTORE R1                        JMS
+         SPACE 1
+*        TM    SMFOPTN,X'01'       TSO USER?                WJS/10AUG79
+*        BO    CARDEND             YES, EXIT.               WJS/10AUG79
+         SPACE 1
+         CLI   EDITSW,X'FF'       CHECK FOR OK EDITS                JMS
+         BE    LOOP1                    CHECK IF TSO USER           RLW
+         MVI   FAILJOB,C'2'       FAIL THE JOB.                     JMS
+         MVC   WTOACCT(3),=CL4'BAD'    MOVE ERROR CODE TO MESSAGE.  JMS
+         SPACE 1
+CHKPROJ  TM    EDITSW,X'0F'       IS PROJECT OK ?                   JMS
+         BO    CHKDEPT            YES IT IS.                        JMS
+         MVC   75(4,R3),=C'PROJ'  MOVE ERROR CODE TO JOB CARD.      JMS
+         SPACE 1
+CHKDEPT  TM    EDITSW,X'F0'       IS DEPARTMENT OK ?                JMS
+         BO    EDITSOK            YES IT IS.                        JMS
+         MVC   72(3,R3),=C'ACT'   MOVE ERROR CODE TO JOB CARD.      JMS
+         SPACE 1
+EDITSOK  EQU   *                                                    JMS
+         SPACE 1
+***********************************************************************
+*   END OF STEINWINDER MODIFICATION.  SEE VARIABLE DEFINITIONS.
+***********************************************************************
+         SPACE 2
+LOOP1    EQU   *                                                    RLW
+         LA    R9,2          SET LOOP CTR
+         LR    R4,R8         SAVE
+LOOP2    CLI   0(R8),C','               FIND DELIMITER              RLW
+         BE    FDEND          BR IF YES
+         CLI   0(R8),C')'               TEST PARENS ....            RLW
+         BE    LOOP2A       PAREN FOUND
+         CLI   0(R8),C''''        ....   OR, QUOTE                  RLW
+         BNE   NOPAR                    NO QUOTE, EITHER            RLW
+LOOP2A   EQU   *                                                    RLW
+         CH    R9,=H'1'      1ST FIELD
+         BNE   BADCRD        BR IF YES
+         B     FDEND
+NOPAR    DS    0H
+         BXLE  R8,R6,LOOP2
+         B     BADCRD
+FDEND    LR    R10,R8
+         SR    R10,R4
+         SH    R10,=H'1'
+         BM    BADCRD         NO ACCT NO.
+         BCT   R9,FIRST
+         LA    R12,4(,R12)    PT TO 2ND 4 BYTES
+         EX    R10,MVC       MOVE SUB ACCT NO
+         CLI   0(R8),C')'         TEST PARENS ....
+         BE    LOOP2B      YES, GO TO NEXT COL                      RLW
+         CLI   0(R8),C''''               OR, QUOTE                  RLW
+         BNE   LPAR                     NO, SET PARM/QUOTE OPEN     RLW
+LOOP2B   EQU   *                                                    RLW
+         LA    R8,1(,R8)  INCREMENT TO NEXT COL
+         B     STILL1
+         EJECT
+***********************************************************************
+*
+** PROCESS JOB CONTINUATION CARD.
+*
+********
+*
+MOREJOB  MVC   COND,0(R4)     SAVE CARD TYPE
+         MVC   72(8,R3),=C'        '   CLEAR SEQ FIELD
+         CLI   $ENDSCAN,X'FF'
+         BE    CARDEND             BRANCH IF NO MORE PARAMETERS
+         LA    R7,14(,R3)  COMPARAND END OF SCAN FOR PARMS
+         LA    R8,2(,R8)   SET ADDR TO 1ST POSSIBLE POS OF PARMS - 1
+LOOP3    CLI   1(R8),C' '   BLANK
+         BNE   PARMSTRT    NO, FOUND START OF PARMS
+         BXLE  R8,R6,LOOP3
+         B     CARDEND
+*
+PARMSTRT LA    R7,57(,R7)  SET TO COL 72 AS END
+         B     CHKTIME   CHECK FOR TIME=1440
+         EJECT
+***********************************************************************
+*
+** SCAN ROUTINES FOR JOB, EXEC, OR PROC CARDS
+*   EACH COLUMN IS CHECKED FOR TIME, CLASS, REGION,
+*   SKIPS FIELDS WITHEN QUOTES OR PARENS, COMMA .
+*   THE FIELDS ARE CHECKED IN THAT ORDER.
+*
+********
+         SPACE 2
+*
+** SKIP FIELDS IN QUOTES OR PARENS.
+*
+STILL1   CLI   0(R8),C''''    QUOTE MARK ?
+         BE    QUOTE
+         CLI   QTESW,1  WITHIN QUOTES?
+         BE    INCR3   YES, IGNORE ALL TILL NEXT QUOTE FOUND
+         CLI   0(R8),C'('     LEFT PAREN ?
+         BE    LPAR
+         CLI   0(R8),C')'     RIGHT PAREN ?
+         BE    RPAR
+         CLC   PARN(3),=XL3'0'  WITHIN QUOTES OR PARNS ?
+         BNE   INCR3            YES, INCREMENT TO NEXT COLUMN
+*
+** LOOK FOR NEXT PARM OR END OF CARD
+         CLI   0(R8),C','      NEW PARM
+         BE    CHKTIME        YES CHECK FOR TIME & CLASS
+         CLI   0(R8),C' '        BLANK
+         BE    BLNKCHK          YES, CHECK IF END OF CARD
+         SPACE 2
+********
+*
+** END OF CHECK THIS COL, BUMP TO NEXT COLUMN.
+*
+********
+INCR3    BXLE  R8,R6,STILL1
+         B     CARDEND
+         EJECT
+***********************************************************************
+*
+** CHECK THIS COLUMN FOR TIME.
+*
+CHKTIME  EQU   *
+         CLC   1(4,R8),=C'TIME'     TIME PARM?
+         BNE   CLASSCHK                 GO CHECK FOR 'PERFORM='     RLW
+         ZAP   TIME,=P'0'
+         CLI   5(R8),C'='   CHECK FOR = OR .
+         BE    ISTIME  IF = THEN THIS IS A TIME ENTRY
+         CLI   5(R8),C'.'
+         BNE   INCR3 IF NOT A = OR . THEN IS NOT A TIME ENTRY
+         TM    COND,X'01'   . IS NOT VALID ON JOB CARD
+         BO    INCR3   IF JOB CARD IGNORE ENTRY
+*      PROCESS 'TIME.AAAAA=NN' ON 'EXEC PROC=' STMT
+LOOP3B   CLI   6(R8),C'='  FIND = SIGN
+         BE    ISTIME   FOUND, SEARCH FOR TIME VALUE
+         BXLE  R8,R6,LOOP3B
+         B     CARDEND
+*      ELIMINATE SYMBOLIC PARMS AND CHECK FOR TIME=1440
+ISTIME   LA    R8,6(R8)       INCREMENT OVER TIME=
+CHKTME   CLI   0(R8),C'&&'  IS SYMBOLIC PARM ?
+         BE    INCR3     YES, IGNORE TIME (THIS IS ONLY KNOWN LOOPHOLE)
+         TM    0(R8),X'F0'    NUMERIC FIELD
+         BO    FNDTME         YES, PROCESS TIME AMT
+         CLI   0(R8),C','
+         BE    DFH100              BRANCH IF NO MUNUTES FOUND
+         BXLE  R8,R6,CHKTME   LOOP BACK TO NEXT COLUMN
+         B     CARDEND        END OF CARD
+FNDTME   CLC   0(4,R8),=C'1440'  TIME=1440 ?
+         BNE   STORTIME               NO, STORE TIME                RLW
+         MVC   2(2,R8),=C'39'    YES,   SET TIME=1439               RLW
+*      GET TIME IN PACKED-DECIMAL-FIELD 'TIME'.
+STORTIME TM    COND,X'01'        PROCESSING JOB
+         BNO   NOTJOB            NO, END PROCESS
+         ST    R8,STRTIME  STORE ADDR START OF TIME FIELD
+         BCTR  R7,R0   SET END COLUMN TO 71
+         B     INCR4 ADVANCE TO NEXT COLUMN TO FIND END OF TIME ENTRY
+FINDEND  TM    0(R8),X'F0' STILL NUMERIC ?
+         BNO   ENDTIME     NO, END OF FIELD
+INCR4    BXLE  R8,R6,FINDEND   LOOP TILL END OF CARD
+ENDTIME  LA    R7,1(,R7)  SET END COLUMN BACK TO 72
+         LR    R5,R8     PUT ADDR LAST POS. IN OWRK REG TO FIND LENGTH
+         L     R9,STRTIME  ADDR OF START OF TIME VARIBLE
+         SR    R5,R9   FIND LENGTH OF TIME ENTRY
+         BCTR  R5,R0  DECREMENT LENGTH BY ONE FOR EX
+         CH    R5,=H'3'      TIME LENGTH > 4 BYTES?
+         BH    STILL1        YES, IGNORE TIME PARM & CONTINUE SCAN
+         EX    R5,PACK   PACK TIME FIELD INTO HOLD AREA FOR TIME-CLASS
+*                        CHECK DURING ENQUENING
+         LA    R9,1(,R8)  ADDR TO CHECK FOR NUMERIC
+         CR    R9,R7   CHECK FOR END OF CARD
+         BNL   STILL1                   IF END DONT CHECK FOR SEC   RLW
+         TM    1(R8),X'F0'   IF THE NEXT CHAR AFTER THE NON-NUMERIC
+*                            IS NUMERIC ASSUME THAT SECONDS ARE CODED
+         BNO   STILL1                   NO, CONTINUE CHECKING       RLW
+DFH100   AP    TIME,=P'1'    YES, INCR TIME TO NEXT WHOLE MINUTE
+         B     STILL1                   CONTINUE SCAN               RLW
+         EJECT
+*
+* SAVE CLASS=                           RLW
+CLASSCHK EQU   *
+         CLC   1(6,R8),=C'CLASS='       CLASS= KEYWORD?             RLW
+         BNE   PERFCHK                  NO, CHECK 'PERFORM='        RLW
+         MVC   CLASS,7(R8)              SAVE CLASS                  RLW
+         MVC   WTOCLASS(1),CLASS
+***********************************************************************
+*
+**  CHECK FOR 'PERFORM' 'PRTY' OR 'DPRTY'                           RLW
+*
+*
+PERFCHK  EQU   *                                                    RLW
+         CLC   1(8,R8),=C'PERFORM='     'PERFORM' KEYWORD PRESENT?  RLW
+         BNE   PRTYCHK                  NO, CONTINUE CHECKING       RLW
+         MVI   FAILJOB,C'2'             'PERFORM' NOT ALLOWED       RLW
+         MVC   WTOPERF(5),=C'*BAD*'     IND WTO REASON              RLW
+PRTYCHK  EQU   *                                                    RLW
+         CLC   1(5,R8),=C'PRTY='        'PRTY=' KEYWORD PRESENT?    RLW
+         BNE   DPRTYCHK                 NO, CHECK FOR 'DPRTY'       RLW
+SETPMSG  MVI   FAILJOB,C'2'             SET TO FAILJOB              RLW
+         MVC   WTOPRTY(5),=C'*BAD*'     IND WTO REASON              RLW
+         B     INCR3                    CONTINUE SCAN               RLW
+DPRTYCHK EQU   *                                                    RLW
+         CLC   2(5,R8),=C'PRTY='        'DPRTY=' KEYWORD PRESENT?   RLW
+         BE    SETPMSG                  YES, GO SET WTO REASON      RLW
+         B     INCR3                    CONTINUE                    RLW
+         EJECT
+***********************************************************************
+*
+** PROCESS 'EXEC PGM=' OR 'EXEC PROC=' STMTS, OR
+*           CONTINUATION CARDS OF THESE STATEMENTS.
+*
+********
+*
+CHKEXEC  DS    0H
+CHKPROC  MVC   COND,0(R4)     SAVE EXIT CONDITION
+         LA    R8,1(R8)  ADDR 1ST COL.-1 THAT COULD BE BLANK
+LOOP4A   CLI   1(R8),C' '   FIND FIRST BLANK
+         BNE   INCR7  NO, CHECK NEXT COLUMN
+         B     INCR5   YES, LOOK FOR FIRST NON BLANK
+INCR7    BXLE  R8,R6,LOOP4A
+         B     CARDEND
+*      SCAN FOR 'EXEC'
+LOOP4    CLI   1(R8),C' '    BLANK
+         BE    INCR5
+         CLC   1(5,R8),=C'EXEC '   EXEC PGM= OR PROC= ?
+         BNE   DFH040              NO, START OF PARMS THIS CARD.
+         MVI   $ENDSCAN,X'00'      TURN OFF END-SCAN SWITCH.
+         LA    R8,4(R8)            INCREMENT OVER EXEC PARAMETER
+INCR5    BXLE  R8,R6,LOOP4         SCAN NEXT COLUMN
+         B     CARDEND
+*      NO 'EXEC' FOUND, COULD BE A CONTINUATION CARD
+DFH040   CLI   $ENDSCAN,X'FF'
+         BE    CARDEND             BRANCH IF NO MORE PARAMETERS.
+         B     CHKTIME             BRANCH IF MORE PARAMETERS.
+         EJECT
+***********************************************************************
+*
+** PROCESS ENQUE INDICATION
+*
+********
+ENQUE    MVC   COND,0(R4)
+         CLI   CLASS,C' '   IS CLASS BLANK (DEFAULT)?
+         BNE   NOTA  IF NOT BLANK DO NOT SET TO CLASS A
+         MVI   CLASS,C'A'  SET TO CLASS=A
+NOTA     MVC   WTOCLASS(1),CLASS
+         TM    FAILJOB,X'F0'
+         BO    ERRMSG         BRANCH IF POSSIBLE STANDARDS VIOLATION.
+         BZ    OKENQUE        BRANCH IF JOB OK (STANDARDS WISE)
+ENQUE10  DS    0H 'ENQUE20' FOLLOWS TO FAIL JOB NOW (SEE 'ENQUE40')
+*      WTO & WTP THE VIOLATION MESSAGE
+         DROP  R1                       SWITCH BASE REG WORK AREA   RLW
+         USING WORK,R6                                              RLW
+         LR    R6,R1         SAVE R1
+         LA    R1,WTOPARM               WTO 1ST LINE ERRMSG         RLW
+         SVC   35                       ISSUE WTO                   RLW
+         LA    R1,WTOPARM2                  2ND LINE                RLW
+         SVC   35                       ISSUE WTO                   RLW
+         DROP  R6                       SWITCH BACK                 RLW
+         USING WORK,R1                                              RLW
+         LR    R1,R6          RESTORE R1
+         EJECT
+***********************************************************************
+*                                                                     *
+** SWITCH TO FAIL OR NOT FAIL JOB FOR VIOLATING CLASS STANDARDS.      *
+*                                                                     *
+         NOP   OKENQUE   * NOP TO FAIL JOB, B TO NOT FAIL JOB.        *
+*                                                                     *
+***********************************************************************
+         FREEMAIN R,A=(1),LV=WLEN,SP=241
+         LA    R15,4          SET CANCEL
+         ST    R15,16(R13)    STORE IN R15 SAVE AREA
+         LM    R14,R12,12(13) RESTORE REGISTERS
+         BR    R14            RETURN  (CANCEL JOB)
+         EJECT
+***********************************************************************
+*
+** THE JOB HAS PASSED MEMOREX CHECKING, RELEASE IT FOR ENQUEING.
+*
+********
+*
+OKENQUE  DS    0H
+         L     R1,SMFACDAT              RESTORE R1                  RLW
+         MVC   SMFACDAT(4),CLASS  SETUP CLASS & HASPNUM FOR FUTURE.
+         FREEMAIN R,A=(1),LV=WLEN,SP=241
+         B     CARDEND        NO, LET JOB ENQUE
+         SPACE 4
+***********************************************************************
+*
+QUOTE    XI    QTESW,X'01'    SET OR RESET QUOTE ACTIVE BIT
+         B     INCR3
+LPAR     LH    R5,PARN        # OF PAREN COUNT
+         LA    R5,1(R5)       INCREMENT # BY 1
+         STH   R5,PARN        STORE INCREMENTED PAREN COUNT
+         B     INCR3
+RPAR     LH    R5,PARN        # OF PAREN COUNT
+         LTR   R5,R5   IS VALUE POSITIVE
+         BNP   INCR3   NO, IGNORE PARN
+         BCTR  R5,R0          DECREMENT COUNT BY 1
+         STH   R5,PARN        STORE DECREMENTED PAREN COUNT
+         B     INCR3
+         EJECT
+***********************************************************************
+*
+** END OF PARMS ON CARD, CHECK IF CONTINUED EXPECTED.
+*
+********
+BLNKCHK  LR    R4,R8     PUT COL ADDR IN WORK REG FOR DECREMENT
+         BCTR  R4,R0     DECRECMENT BACK 1 COL FOF COMPARE FOR COMMA
+         CLI   0(R4),C',' IS CHAR BEFORE BLANK A COMMA
+         BE    CARDEND
+         MVI   $ENDSCAN,X'FF'      TURN ON END-SCAN SWITCH
+         B     CARDEND
+         EJECT
+***********************************************************************
+*
+** NORMAL EXIT
+*
+********
+*
+ENQUE20  DS    0H
+ENQUE40  DS    0H 'ENQUE20' BEFORE THIS CARD TO FAIL JOB LATER
+*                           IN IEFUJI (INITIATION). (SEE 'ENQUE10')
+CARDEND  DS    0H
+NOTJOB   DS    0H
+         LM    R14,R12,12(13) RESTORE REGS
+         SR    R15,R15       CONTINUE JOB
+         BR    R14
+         EJECT
+***********************************************************************
+*
+** THE JOB DOES NOT CONFORM TO MEMOREX STANDARDS, SO CHECK IF IT IS
+*   A SYSTEM JOB.
+*
+********
+ERRMSG   DS    0H
+         CLI   FAILJOB,C'2'
+         BE    DFH090         BRANCH IF POSSIBLE FAILURE.
+         CLI   WTOACCT,C'O'
+         BE    OKENQUE        BRANCH IF ACCT FIELD OK.
+DFH090   LA    R6,SYSEND   DETERMINE COUNT
+         SRA   R6,3          DIVIDE BY 8
+         LA    R5,SYSPROG    SYSTEM PROGRAM JOB NAMES
+PRLOOP   CLC   0(8,R5),SMFJNAME
+         BE    PROGFND       BR IF YES
+         LA    R5,8(,R5)     NXT NAME
+         BCT   R6,PRLOOP
+         MVI   FAILJOB,C'1'    FAIL JOB ON ENQUEING
+*
+NOACCT   EQU   *
+BADCRD   MVC   WTOACCT(3),=CL4'BAD'     INDICATE ACCT # IS BAD
+         MVC   72(3,R3),=C'ACT'    INDICATE ACCT BAD TO PROGRAMMER.
+*        CLC   HASPJNUM(3),=C'   '                                  JMS
+*        BE    DFH030                                               JMS
+         MVI   FAILJOB,C'2'                                         JMS
+         B     DFH030
+ERRMSG2  UNPK  WTOTIME(4),TIME(3)       INDICATE TIME   IS BAD
+         MVZ   WTOTIME+3(1),=X'F0'
+         MVC   77(3,R3),=C'TME'    INDICATE TIME BAD TO PROGRAMMER.
+         MVI   FAILJOB,C'2'
+         B     DFH030
+PROGFND  DS    0H
+         MVI   SMFACDAT,X'FF'  SET SYSTEMS TASK WITH BAD ACCOUNT
+         B     OKENQUE                  BE FORGIVING OF SYS TASKS   RLW
+DFH030   TM    COND,X'10'
+         BO    ENQUE10             BRANCH IF ENQ CONDITION.
+*        TM    COND,X'20'               MVS CODE 32-ENQUEUE       RLW
+*        BO    ENQUE20                     ISSUE ERRMSG,RC=4      RLW
+         B     CARDEND
+         EJECT
+***********************************************************************
+*
+*    SAVE 1ST ACCT NO
+*
+FIRST    DS    0H
+         CH    R10,=H'3'      4 BYTE ACCT NO
+         BNE   BADCRD         BR IF NO
+         LA    R12,SMFUSER
+         EX    R10,MVC        SAVE ACCT NO
+         LA    R4,1(,R8)      SETUP FOR NXT TEST
+         LR    R8,R4
+         B     LOOP2
+         EJECT
+*
+*    DATA & SMF DSECTS
+*
+SYSPROG  DS    0C
+         DC    CL8'START'
+         DC    CL8'SYS'
+         DC    CL8'HSP'
+         DC    CL8'TCAM'
+         DC    CL8'TSO'
+         DC    CL8'MAPDISK'
+         DC    CL8'R'
+         DC    CL8'RDR'
+         DC    CL8'WTR'
+         DC    CL8'W'
+         DC    CL8'I'
+         DC    CL8'INIT'
+         DC    CL8'MOUNT'
+         DC    CL8'P'
+         DC    CL8'HASP'
+         DC    CL24' '
+SYSEND   EQU   *-SYSPROG
+         SPACE 2
+*   TRANSLATE TABLE FOR DEPT # EDITS.                               JMS
+         SPACE 1
+TRTABLE  DS    0BL1                                                 JMS
+         DC    BL1'00000001'      REMAINDER = 0.                    JMS
+         DC    BL1'10000000'      REMAINDER = 1.                    JMS
+         DC    BL1'01000000'      REMAINDER = 2.                    JMS
+         DC    BL1'00100000'      REMAINDER = 3.                    JMS
+         DC    BL1'00010000'      REMAINDER = 4.                    JMS
+         DC    BL1'00001000'      REMAINDER = 5.                    JMS
+         DC    BL1'00000100'      REMAINDER = 6.                    JMS
+         DC    BL1'00000010'      REMAINDER = 7.                    JMS
+         EJECT
+INIT     DC    0D'0'        * CORRESPONDING-NAMES *
+MAXREGP  DC    PL8'16383'     REGLIMP
+MAXREGH  DC    H'16383'       REGLIMH
+REGBADHI DC    H'0'           REGBADH
+         DC    PL4'16383'     REGSIZ
+ZEROP    DC    PL4'0'         WREGSIZ
+ZEROF    DC    F'0'           STRTIME
+         DC    F'0'           STRREG
+         DC    C' '           CLASS
+         DC    CL3' '         HASPJNUM
+         DC    X'01'          COND
+         DC    PL3'0'         TIME
+         DC    XL2'0'         PARN
+         DC    X'00'          QTESW
+         DC    X'00'          WEND
+         DC    X'00'          $ENDSCAN
+         DC    X'00'          FAILJOB
+         DC    X'00'          EDITSW                                JMS
+         DC    X'00'                    AVAILABLE                   JMS
+         DC    F'0'           WORKFLD                               JMS
+         DC    D'0'           PDEPT                                 JMS
+         DC    XL4'00000000'  EDITFLD                               JMS
+         WTO   'MRX100I **> XXXXXXXX VIOLATES MRX STANDARDS--> PRTY IS C
+               NO   ',ROUTCDE=(2),DESC=(3),MF=L                     RLW
+         WTO   'MRX100I **> CLASS= , TIME IS OK  ,PERFORM IS NO   , ACCX
+               T IS OK  ',ROUTCDE=(2),DESC=(3),MF=L                 RLW
+         DC    4F'0'
+         DC    F'0'                     TBADDR                      RLW
+         DC    XL4'AAAAAAAA'      JCLPTRV (W/'AA' SWITCH)
+         MVC   0(0,R12),0(R4) MOVE INST
+         PACK  TIME,0(0,R9)  USED BY EX INSTRUCTION
+         EJECT
+         LTORG
+         EJECT
+SMFCOMON DSECT               SMF COMMON EXIT TABLE
+SMFJNAME DS    CL8           JOB NAME
+SMFTSTMP DS    CL4           JOB TIME STAMP
+SMFDATE  DS    CL4           JOB DATE STAMP
+SMFUSRID DS    CL2           USER SERIAL ID NO
+SMFSYSMD DS    CL2           SYSTEM MODEL NO.
+SMFUSER  DS    0C            SMF RECORD USER DATA
+         DS    CL8
+SMFSTPNO DS    CL1           STEP NO.
+SMFOPTN  DS    CL1           SMF OPTION SELECTED.
+SMFREST  DS    CL1           SMF RESTART INDICATOR
+SMFCLASS DS    CL1           SMF JOB CLASS
+SMFUDATA DS    0C            COMMON USER EXIT DATA
+SMFACDAT DS    CL4           MEG ACCT DATA AREA
+SMFTFLAG DS    CL4           TERMINATION FLAG
+         EJECT
+WORK     DSECT
+         DS    0D      * INITIAL-VALUES *
+REGLIMP  DS    PL8       PL8'16383'
+REGLIMH  DS    H         H'16383'
+REGBADH  DS    H         H'0'
+REGSIZ   DS    PL4       PL4'16383'
+WREGSIZE DS    PL4       PL4'0'
+STRTIME  DS    F         F'0'
+STRREG   DS    F         F'0'
+CLASS    DS    C         C' '
+HASPJNUM DS    CL3       CL3' '
+COND     DS    X         X'01'
+TIME     DS    PL3       PL3'0'
+PARN     DS    XL2       XL2'00'
+QTESW    DS    X         X'00'
+WEND     DS    X         X'00'
+$ENDSCAN DS    X         X'00'
+FAILJOB  DS    X         X'00'
+EDITSW   DS    XL1            X'00'                                 JMS
+         DS    XL1            X'00'                                 JMS
+WORKFLD  DS    F              F'0'                                  JMS
+PDEPT    DS    D              D'0'                                  JMS
+EDITFLD  DS  XL4              X'00000000'                           JMS
+WTOPARM  DS    0F
+         DS    CL16                     WTO CTL FLDS/INFO           RLW
+WTOJOB   DS    CL8
+         DS    CL35                     WTO CTL FLDS/INFO           RLW
+WTOPRTY  DS    CL5                                                  RLW
+         DS    XL4                                                  RLW
+WTOPARM2 DS    0F                       WTO NEXT LINE               RLW
+         DS    CL22                     WTO CTL FLDS/INFO           RLW
+WTOCLASS DS    CL1
+         DS    CL10
+WTOTIME  DS    CL4
+         DS    CL12
+WTOPERF  DS    CL5                                                  RLW
+         DS    CL10
+WTOACCT  DS    CL4
+         DS    XL4
+SPARE    DS    4F
+TBADDR   DS    F                                                    JMS
+JCLPTRV  DS    F                  R3 SAVE (-> JCL STMT)             RLW
+MVC      DS    3H             INSTR TO BE 'EX'D
+PACK     DS    3H
+WLEN     EQU   *-REGLIMP
+         END

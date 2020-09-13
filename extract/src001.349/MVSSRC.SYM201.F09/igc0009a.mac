@@ -1,0 +1,1077 @@
+         TITLE 'IGC0009A           LOAD 1              SVC91'
+         MACRO
+         DATEM
+         LCLC  &FILL
+&FILL    SETC  'CL8'.''''.'&SYSDATE'.''''
+         DC    &FILL
+         MEND
+IGC0009A START X'00'                   SVC 91
+***********************************************************************
+* STATUS:                                                             *
+*    VS2/REL4.0                                                       *
+* FUNCTION/OPERATION:                                                 *
+*    THIS TYPE 4 SVC IS CALLED BY CLOSE/EOV, DEALLOCATION,            *
+*    EOD, DDR, AND IEHDASDR FOR DEMOUNTS                              *
+*                                                                     *
+*    IF THE UNIT IS A DISK OR UNIT RECORD IT BRANCHES TO PART 2.      *
+*    IF THE UNIT IS A DIRECT ACCESS TYPE, 3800, 3895, OR 3851,
+*    A TPER RECORD IS BUILT ACCORDING TO THE LOGRECD PORTION OF       *
+*    THE GETMAIN AREA.  THE FORMATTED TPER RECORD IS THEN WRITTEN     *
+*    ONTO SYS1.LOGREC BY SVC 76.                                      *
+*                                                                     *
+*    IF THE UNIT IS A 3400 DEVICE TYPE, IT ALSO OUTPUTS TO            *
+*    SYS1.LOGREC AS A DISMOUNT RECORD & WRITES AN SMF RECORD.         *
+*    AFTER THE RECORDS ARE PROCESSED, THE SVC ZEROS ALL ERROR         *
+*    COUNTERS AND RETURNS TO THE CALLER.                              *
+*    IF A 2400 DEVICE, ONLY SMF RECORDS ARE WRITTEN.                  *
+*                                                                     *
+* ENTRY POINTS:                                                       *
+*         IGC0009A                                                    *
+*                                                                     *
+* INPUT:                                                              *
+*    REG 0 - ADDR OF DCB OR UCB        REG 4 - ADDRESS OF TCB         *
+*    REG 1 - CLOSE/EOV FLAG            REG 5 - ADDRESS OF SVRB        *
+*    REG 3 - ADDRESS OF CVT            REG 14 - RETURN ADDRESS        *
+*    NOTE - REG 0 IS ADDR OF DCB IF SVC 91 CALLED BY CLOSE/EOV OR DDR *
+*    NOTE - REG 0 IS ADDR OF UCB IF SVC 91 IS CALLED BY UNALLOCATION  *
+*                                                                     *
+* OUTPUT:                                                             *
+*    THE DISMOUNT RECORD GOES TO SYS1.LOGREC                          *
+*    THE FORMATTED ESV RECORD GOES TO SYS1.MAN.                       *
+*                                                                     *
+* EXTERNAL ROUTINES:                                                  *
+*         1. TIME MACRO (SVC 11)       5. LOGREC RECORDER (SVC 76)    *
+*         2. SMFWTM MACRO (SVC 83)     6. ABEND MACRO (SVC 13)        *
+*         3. GETMAIN MACRO (SVC 10)    7. TESTAUTH MACRO (SVC 119)    *
+*         4. FREEMAIN MACRO (SVC10                                    *
+*                                                                     *
+* TABLES/WORKAREAS:                                                   *
+*    WORK AREAS ARE USED IN THE EXTENDED SVRB & IN THE GETMAIN AREA   *
+*                                                                     *
+* EXITS - NORMAL:                                                     *
+*         RETURN TO CALLER VIA BRANCH ON REGISTER 14                  *
+*         ABNORMAL: ISSUE ABEND MACRO WHEN UNAUTHORIZED CALLER        *
+*                                                                     *
+* ATTRIBUTES:                                                         *
+*    REENTRANT TRANSIENT TYPE 4 SVC ROUTINE                           *
+* RESTRICTIONS:                                                       *
+*    CALLED BY APF AUTHORIZED PROGRAMS, SUPERVISOR STATE OR           *
+*    KEY 0-7 ROUTINES. UNAUTHORIZED CALLERS WILL BE ABENDED.          *
+*                                                                     *
+* NOTES:                                                              *
+*    THIS MODULE HAS BEEN REVISED AND REWRITTEN TO SUPPORT 3400       *
+*    TAPE UNITS.  SUPPORT CODE S21048.                                *
+*    THIS MODULE FURTHER HAS BEEN REVISED TO HANDLE THE DSM.  @Y30LB11*
+*    THE SUPPORT CODE IS @Y30LB11.                            @Y30LB11*
+*                                                                     *
+*    GENERAL REWRITE OF MODULE, WITH NO FUNCTIONAL CHANGES.    X02975 *
+*    MODULE MADE RE-ENTRANT                                  @YA00072 *
+*    SAVE TIME FOR SMF RECORD IN SVRB EXTENSION              @YM03278 *
+*    RECOGNIZE BIRCH DENSITY SETTING                         @YM07123 *
+*                                                                     *
+*    LOADS 1 AND 2 COMBINED AND REWRITTEN FOR VS2/REL 2        Y02032 *
+*    1600 BIT UCB ADDRESSING                                 @Z30AB01 *
+*    PUT PROPER SYSTEM ID IN THE MDR RECORD                  @ZUP1066 *
+*    INSERT SUPPORT FOR 3800 DEVICE                          @Z40MB01 *
+*    INSERT SUPPORT FOR 3350 DEVICE                          @Z20AB05 *
+*    CHANGE TEST FOR PRIMARY UCB                             @ZA05146 *
+*    APAR OZ09512 SECONDARY ADDRESS USED AS PRIMARY ADDRESS  @ZA09512 *
+*                 IN OBR RECORD                              @ZA09512 *
+*    APAR OZ09525 SUPPORT MICRO CODE CHANGE                  @ZA09525 *
+*    CORRECT READ BUFFERED LOG COMMAND FOR 3800                @ZM03166
+*    TEST READ BUFFERED LOG FAIL                               @ZA11019
+*    PUT CORRECT CHANNEL ID IN OBR RECORD                      @ZA11663
+*    INSERT SUPPORT FOR 3895                                   @G30HB19
+*    PREVENT ENQUEUE WAIT IF BUFF LOG DEV IS OFF LINE          @ZA18278
+*    INCREASE SIZE OF MDR RECORDS C087000,294500,470000        @ZA27122
+*    TAPE,UNIT SERIAL NUMBER A070500,C271000                   @ZA27097
+*    PE08355 RESPECIFY IOBFLAG4,C078500                        @ZA26593
+*    BASE CVTREG ON CVT PREFIX                                 @YA11111
+*D415500-417000,479500-481000  STORE CPU ID        UZ15665     @ZA27554
+*A415001-415002                                                @ZA27554
+*    DEB VALIDITY CHECK  A214000-217008            UZ15400     @ZA25497
+*    CORRECT UCB ADDR. FOR SDR TABLE A138000,                  @ZA30027
+*    A273001,281001                                            @ZA30027
+*    REWORK OF ZA25497                                         @ZA32130
+***********************************************************************
+         EJECT
+*
+*                     S  V  R  B    D  S  E  C  T
+*
+SVRB     DSECT
+         DS    CL96                    SVRB COMMON SECTION
+LISTA    DS    0CL1                    GETMAIN/XCTL PARM LIST AREA
+RECTOT   DS    CL2                     SMF TOTAL RECORD LENGTH
+RECZERO  DS    CL2                     SMF ZERO FIELD
+LISTB    DS    0CL1                    GETMAIN/SCTL PARM LIST
+RECRES   DS    CL1                     SMF RESERVED CHARACTER
+RECNUM   DS    CL1                     SMF RECORD TYPE
+RECTIME  DS    CL2                     TIME OF DAY, 1ST HALF
+LISTC    DS    0CL1                    GETMAIN/XCTL PARM LIST
+         DS    CL2                     TIME OF DAY, 2ND HALF
+RECDATE  DS    CL2                     CURRENT DATE 1ST HALF
+LISTD    DS    0CL1                    GETMAIN/SCTL PARM LIST
+         DS    CL2                     CURRENT DATE, 2ND HALF
+RECCPU   DS    CL2                     CPU PROCLIB ID
+RECMOD   DS    CL2                     MODEL NUMBER
+RECLEN   DS    CL2                     DATA LENGTH (PLUS 2)
+RECVOL   DS    CL6                     VOLUME SERIAL NUMBERL
+RECADDR  DS    CL2                     CHANNEL/UNIT ADDRESSL
+RECDEV   DS    CL4                     DEVICE TYPE
+RECNTRS  DS    CL11                    VOLUME STATISTICS COUNTERS
+RECDEN   DS    CL1                     FLAG DENOTING DENSITY
+RECBLK   DS    CL2                     RECORD BLOCK SIZE
+RECFLGS  DS    CL1                     I/O PROCESSING AND SEQ NUMBER
+RECNULL  DS    CL1                     UNUSED
+         ORG   SVRB+136                EXTENDED WORK AREA      @Y30LB11
+PLBOP    DS    XL1                     PBL ORDER CODE          @Y30LB10
+         DS    XL1                                             @Y30LB10
+ATTRIB   DS    XL2                     ATTRIBUTE BYTE          @Y30LB10
+SSIDXX   DS    XL2                     SSID BYTE               @Y30LB10
+WORKB    DS    XL2                     WORK AREA               @Y30LB10
+         EJECT
+*
+*              G E T M A I N   A R E A   D S E C T
+*
+MAIN     DSECT
+OBREC    EQU   *
+CLSOURCE DS    CL1                     CLASS/SOURCE
+SYSREL   DS    CL1                     SYSTEM RELEASE
+SWITCHES DS    CL2                     SWITCHES
+         DS    CL4                     N/A
+DATE     DS    CL4                     DATE
+TIME     DS    CL4                     TIME
+NA1      DS    CL1                     N/A
+CPUSER   DS    CL3                     CPU SERIAL NUMBER
+CPUID    DS    CL2                     CPU ID
+         DS    CL2                     N/A
+JOBID    DS    CL8                     JOB IDENTITY              M0900
+         DS    CL8                     FAILING CCW               M0900
+CSW      DS    CL8                     CSW STORED                M0900
+DDCNT    DS    CL1                     DEV DEPENDENT DATA COUNT  M0900
+SECCUA   DS    CL3                     SECONDARY CUA             M0900
+DEVTYPE  DS    CL4                     DEVICE TYPE               M0900
+SDRCNT   DS    CL1                     SDR COUNT                 M0900
+PRICUA   DS    CL3                     PRIMARY CUA               M0900
+IORET    DS    CL2                     N/A                       M0900
+SNSCNT   DS    CL2                     SENSE COUNT               M0900
+VLID     DS    CL6                     VOL ID
+BLKLTH   DS    CL2                     BLOCK LENGTH
+HDRSER   DS    CL2                     TAPE UNIT SERIAL NUMBER@ZA27097
+         DS    CL2                     N/A
+TEMPRD   DS    CL7                     VES DATA
+MODSET   DS    CL5                     MODESET
+SDR      DS    CL20                    SDR COUNTERS
+SNS      DS    CL24                    SENSE BYTES
+         DS    CL4                     ALIGN ON DOUBLE WORD BNDRY
+WORKA    DS    CL10                    WORK AREA
+*
+         ORG   OBREC                   **
+CTLBLK   EQU   *                       CONTROL BLOCKS - IOB, ECB & DEB
+ECB      DS    F                       ECB FOR EXCP
+IOB      DS    F                       START OF IOB
+IOBECBPT DS    F                       ECB POINTER
+IOBCSW   DS    2F                      CSW POINTER
+IOBSTART DS    F                       POINTER TO FIRST CCW
+IOBFLAG4 DS    0C                      FLAG BYTE 4            @ZA26593
+IOBDCBPT DS    F                       DCB POINTER
+IOBRESTR DS    F                       ERP RESTART POINTER
+IOBSEEK  DS    2F                      SEEK ADDRESS
+*
+         ORG   ECB                     **
+DCB      DS    11F                     SPACE
+DCBDEB   DS    F                       POINTER TO DEB
+*
+DEB      DS    6F                      SPACE
+DEBDCBAD DS    F                       POINTER TO DCB
+DEBAPPAD DS    F                       POINTER TO APPENDAGE TABLE
+DEBUCBAD DS    F                       POINTER TO UCB
+DEBFINUM DS    F                       BIN NUMBER OF EXTENTS
+DEBSTRHH DS    F                       FIRST TRACK OF EXTENT
+DEBENDHH DS    F                       LAST TRACK OF EXTENT
+*
+         ORG   OBREC+336               **                      @ZA27122
+DOUBLE   DS    D                       DOUBLE WRD FOR CVB & STORE CPUID
+         ORG   DOUBLE                  **
+CCW      DS    D                       READ LOG CCW            @YM01189
+         ORG   CCW+4                   **                      @YM01189
+CCWFLG   DS    3C                      CCW FLAGS               @YM01189
+CCWLNG   DS    C                       LENGTH                  @YM01189
+*
+         ORG   OBREC+232               **
+CCW1     DS    D                       PREPARE BUFFERED LOG    @Y30LB11
+         ORG   CCW1+4                  **                      @Y30LB11
+CCWFLG1  DS    3C                      CCW FLAGS               @Y30LB11
+CCWLNG1  DS    C                       LENGTH                  @Y30LB11
+CCW2     DS    D                       READ/RESET BUFFERED LOG @Y30LB11
+         ORG   CCW2+4                  **                      @Y30LB11
+CCWFLG2  DS    3C                      CCW FLAGS               @Y30LB11
+CCWLNG2  DS    C                       LENGTH                  @Y30LB11
+*
+LOGRECD  DSECT *
+LOGKEY   DS    C                       X'90' KEY
+RELNO    DS    C                       RELEASE NUMBER IN BINARY
+SWITCH1  DS    C                       INDICATE TIME MACRO USED S99204
+         DS    C                       SPACE
+RECID    DS    C                       RECORD ID
+         DS    CL2                     SPACE
+TPERID   DS    C                       C'T'
+RDATE    DS    CL4                     DATE FROM TIME MACRO
+RTIME    DS    CL4                     TIME IN BINARY
+RECSER   DS    CL4                     CPU SER NUMBER
+RECPUID  DS    CL2                     CPU ID
+         DS    CL2                     SPACE
+UNITID   DS    CL2                     CHANNEL AND UNIT
+VOLID    DS    CL6                     VOLUME SERIAL NUMBER
+*                                      2305 LOG AREA STARTS HERE
+LOG      DS    CL122                   CONTROL UNIT LOG AREA
+*                                      DSM LOG AREA STARTS HERE@Y30LB11
+         ORG   LOG                                             @Y30LB11
+         DS    C                       SPACE                   @Y30LB11
+SSID     DS    XL2                     DSM SSID FIELD          @Y30LB11
+*
+*      THIS IS THE 3800 RECORD
+*
+         ORG   VOLID
+COUNT    DS    C                        RECORD COUNT           @Z40MB01
+         DS    C                        UNUSED                 @Z40MB01
+ERRREC   DS    CL128                    16-8 BYTE RECORDS      @Z40MB01
+COPYCNT  DS    CL4                      COPY COUNTER           @Z40MB01
+FRMFLCNT DS    CL4                      FORMS FLASH COUNT      @Z40MB01
+*
+         EJECT
+         ORG   VOLID                                           @G30HB19
+FLG3895  DS    C                        RECORD COUNT           @G30HB19
+         DS    C                        UNUSED                 @G30HB19
+PREDSNS  DS    CL238                    PREDICTOR SENSE        @G30HB19
+*
+*        E Q U A T E S   -   M I S C E L L A N E O U S
+*
+A370     EQU   X'01'                   A370 CPU TYPE
+A0       EQU   X'00'                   3851 LOOP ATTRIBUTE FLAG@Y30LB11
+A80      EQU   X'80'                   3851 NO-LOOP ATTRIB FLAG@Y30LB11
+BIRCHMS  EQU   X'D3'                   6250 DENSITY MODESET    @YM07123
+COUNT3   EQU   X'03'                   SSID CHAIN CCW FLGS     @Y30LB11
+CHAINFLG EQU   X'40'                   SSID CHAIN CCW FLGS     @Y30LB11
+CHARF    EQU   X'C6'                   CHARACTER F             @ZA09512
+CODE7F   EQU   X'7F'                   GOOD I/O COMP           @Y30LB11
+CPUIDEN  EQU   16                      SYS ID OFFSET
+CUAMASK  EQU   X'0F'                   CHANNEL ADDR MASK       @YA00070
+VS2MASK  EQU X'80'                     SYSTEM ID FOR MDR REC   @ZUP1066
+DDSM     EQU   X'42'                   3851 DEV TYPE IN UCB    @Y30LB11
+D3895    EQU   X'19'                   3895 DEV TYPE IN UCB    @G30HB19
+HEXC0    EQU   X'C0'                                           @ZA09525
+HEXDF    EQU   X'DF'                                           @ZA09525
+HEXFF    EQU   X'FF'                                           @G30HB19
+IDDSM    EQU   X'0E'                   3851 RECORD             @Y30LB11
+LDSM     EQU   64                      64 BYTE 3851 RECORD     @Y30LB11
+PBLCMD   EQU   X'87'                   PBL CMD FOR 3851        @Y30LB11
+CMNFLAG  EQU   X'00'                   3895 RECORD TYPE        @G30HB19
+AN80     EQU   X'80'                   3895 ERR RECORD TYPE    @G30HB19
+RRBLCMD  EQU   X'A4'                   RRBL CMD FOR 3851       @Y30LB11
+RDLOG3Y  EQU   X'14'                   RRBL CMD FOR 3895       @G30HB19
+PLBORD   EQU   X'26'                   PRBL ORDER CODE         @Y30LB10
+EMULFLG  EQU   X'08'                   3350 EMULATION FLAG     @Z20AB05
+C0       EQU   0                       COUNT OF 0
+C1       EQU   1                       COUNT OF 1
+C2       EQU   2                       COUNT OF 2
+C3       EQU   3                       COUNT OF 3              @Z30AB01
+C4       EQU   4                       COUNT OF 4
+C5       EQU   5                       COUNT OF 5
+C6       EQU   6                       COUNT OF 6
+C7       EQU   7                       COUNT OF 7
+C8       EQU   8                       COUNT OF 8
+C10      EQU   10                      COUNT OF 10
+C12      EQU   12                      COUNT OF 12
+C16      EQU   16                      COUNT OF 16             @Z40MB01
+C19      EQU   19                      COUNT OF 19
+C24      EQU   24                      COUNT OF 24
+C26      EQU   26                      COUNT OF 26
+C28      EQU   28                      COUNT OF 28             @Z40MB01
+C30      EQU   30                      COUNT OF 30
+C32      EQU   32                      LENGTH OF 3851 SENSE    @Y30LB11
+C40      EQU   40                      COUNT OF 40             @Z40MB01
+C44      EQU   44                      COUNT OF 44
+C62      EQU   62                      COUNT OF 62
+C70      EQU   70                      COUNT OF 70             @G30HB19
+C72      EQU   72                      COUNT OF 72
+C76      EQU   76                      COUNT OF 76
+C80      EQU   80                      COUNT OF 80             @G30HB19
+C96      EQU   96                      OFFSET FOR LOG DATA      X04QC11
+C108     EQU   108                     COUNT OF 108              M0900
+C128     EQU   128                     COUNT OF 128
+C136     EQU   136                     COUNT OF 136            @Z40MB01
+C154     EQU   154                     COUNT OF 154
+C168     EQU   168                     COUNT OF 168
+C238     EQU   238                     COUNT OF 238            @G30HB19
+C256     EQU   256                     COUNT OF 256
+C336     EQU   336                     COUNT OF 336            @G30HB19
+C512     EQU   512                     COUNT OF 512            @ZA30027
+C2304    EQU   2304                    COUNT OF 2304
+DATALEN  EQU   30                      DATA LENGTH + 2
+DEBDVMOD EQU   32                      DEVICE MODIFIER           M0900
+DEBFLG   EQU   X'0F'                   DEB INDICATOR
+DEBOPATB EQU   12                      TYPE OF I/O               M0900
+DEBUCB   EQU   32                      UCB ADDRESS               M0900
+DEN      EQU   X'C3'                   DENSITY MASK
+DENX     EQU   X'83'                   800 BPI MASK
+DISMNT   EQU   X'04'                   DISMOUNT RECORD FLAG
+EOD      EQU   51                      EOD INDICATOR             M0877
+EODBIT   EQU   X'80'                   EOD FLAG BIT              M0877
+EXCPMSK  EQU   X'80'                   EXCP MASKBIT
+FIXREC1  EQU   X'80'                   FIXED LENGTH RECORD MASK
+FIXREC2  EQU   X'40'                   FIXED LENGTH RECORD MASK
+FULL     EQU   X'FF'                   ALL ONES
+HEX07    EQU   X'07'                   HEX '07'
+HEXF8    EQU   X'F8'                   HEX 'F8'
+IOBFLG1  EQU   X'42'                   IOBFLAG BYTE
+IOBCC3WE EQU   X'40'                   IOS POST '6D' ON CC=3   @ZA18278
+JOBNAME  EQU   0                       JOB LOG NUMBER OFFSET
+NAME     EQU   525                     OFFSET IN UCB TO CHAN   @ZA11663
+KEY      EQU   X'90'                   KEY FOR TPER RECORD
+NOERRTNS EQU   X'0C'                   DON'T USE IOS ERROR RTNS
+NRZI     EQU   X'CB'                   NRZI MODE SET MASK
+RDLOG    EQU   X'24'                   READ BUFFERED LOG OP CODE
+RDLOG3X  EQU   X'A4'                   READ LOG COMMAND FOR 3330
+REC      EQU   96                      REC OFFSET IN SVRB
+SDRCN    EQU   20                      COUNT OF SDR BYTES
+SLI      EQU   X'20'                   SUPPRESS LENGTH BIT
+SNSCT    EQU   4                       COUNT OF SENSE BYTES
+STI      EQU   1                       STAT TABLE INDEX
+SWCHMASK EQU   X'08'                   TIME MACRO MASK
+TIMAC    EQU   X'08'                   TIME MACRO USED
+TIOT     EQU   12                      TASK I/O TABLE OFFSET
+TPR      EQU   C'T'                    T TYPE RECORD
+UCBX     EQU   X'30'                   UCB EXTENSION ADDRESS
+UNCK     EQU   X'30'                   UNIT CHECK RECORD
+X0F      EQU   X'0F'                   HEX BYTE OF 0F          @Y30LB10
+ZERO     EQU   X'00'                   ZERO
+DBDCB    EQU   X'18'                   DCB ADDR FROM DEB       @ZA32130
+         EJECT
+*
+*        E Q U A T E S   -  B U F F E R E D  L O G  D E V I C E S
+*
+D2305A   EQU   6                       2305A DEVICE
+D2305B   EQU   7                       2305B DEVICE
+D3330    EQU   9                       3330 DEVICE
+D33301   EQU   X'0D'                   3330-1 DEVICE
+D3340    EQU   X'0A'                   3340 DEVICE
+D3800    EQU   X'0E'                   3800 DEVICE             @Z40MB01
+D3350    EQU   X'0B'                   3350ID DEVICE IN UCB    @Z20AB05
+ID3350   EQU   X'11'                   3350ID RECORD ID        @Z20AB05
+ID2305   EQU   X'12'                   2305 RECORD             @YA02415
+ID2305A  EQU   X'02'                   2305 TPER RECORD ID     @YA02415
+ID3330   EQU   1                       3330 RECORD
+ID33301  EQU   X'0A'                   3330-1 RECORD
+ID3340   EQU   X'09'                   3340 TYPE RECORD
+ID3800   EQU   X'0C'                   3800 TYPE RECORD        @Z40MB01
+ID3895   EQU   X'0D'                   3895 TYPE RECORD        @G30HB19
+L56      EQU   56                      056-BYTE RECORD - 3330
+L154     EQU   154                     154-BYTE RECORD - 2305
+L164     EQU   164                     164-BYTE RECORD - 3800  @Z40MB01
+L3895    EQU   266                     266-BYTE RECORD - 3895  @G30HB19
+         EJECT
+*
+*        R E G I S T E R   A S S I G N M E N T S
+*
+R0       EQU   0                       REGISTER 0
+R1       EQU   1                       REGISTER 1
+WORK     EQU   2                       WORK REGISTER
+LNKREG   EQU   2                       LINK REGISTER
+CVTREG   EQU   3                       CVT REGISTER
+TCBREG   EQU   4                       TCB REGISTER
+R4       EQU   4                       WORK REGISTER
+SVRBREG  EQU   5                       SVRB REGISTER
+UXREG    EQU   6                       UCB EXTENSION ADDR REG
+LOGREG   EQU   7                       RECORD REGISTER
+ADDR     EQU   8                       ADDRESS REGISTER
+WORKREG2 EQU   8                       WORK REGISTER           @Z40MB01
+TEST     EQU   9                       GENERAL TEST REGISTER
+WORKREG3 EQU   9                       WORK REGISTER           @Z40MB01
+UCBREG   EQU   10                      UCB REGISTER
+DEBREG   EQU   11                      DEB REGISTER
+CORE     EQU   11                      GETMAIN ADDRESS
+BASREG   EQU   12                      PROGRAM BASE REGISTER
+DCBREG   EQU   13                      DCB REGISTER
+RETREG   EQU   14                      RETURN REGISTER
+CODREG   EQU   15                      RETURN CODE REGISTER
+R15      EQU   15                      REGISTER 15
+         EJECT
+***********************************************************************
+*                         P A R T   1                                 *
+***********************************************************************
+IGC0009A CSECT
+* A-000000-999999                                                Y026XZ
+         BALR  BASREG,ZERO             BASE REGISTER
+START    EQU   *
+         USING *,BASREG                *
+         USING CVT,CVTREG              CVT DSECT ADDRESS
+         USING IHADCB,DCBREG           DCB DSECT ADDRESS
+         USING SVRB,SVRBREG            SVRB AND RECORD DSECT ADDR
+         USING MAIN,CORE               GETMAIN DSECT ADDRESS
+         USING UCBMT,UXREG             UCB EXTENSION ADDRESS
+         USING UCB,UCBREG              UCB DSECT ADDRESS
+         USING LOGRECD,LOGREG          LOGRECD DSECT ADDRESS
+         SH    CVTREG,BACK8            GET CVT PREFIX          @YA11111
+         B     BEGIN                   BRANCH AROUND DECLARE
+         DC    C'IGC0009A-SVC 91 OZ30027'
+         DATEM
+*
+         DS    0F                      ALIGN
+BEGIN    EQU   *
+         EJECT
+         STC   R1,RECNULL              SAVE INDICATOR FLAG       M0877
+         LR    WORKREG3,R0             SAVE INPUT
+* ISSUE TESTAUTH TO INSURE CALLER IS APF AUTHORIZED           @ZA32130
+         TESTAUTH  FCTN=1,STATE=YES,KEY=YES                   @ZA32130
+*
+         LTR   R15,R15                 TEST RETURN CODE       @ZA32130
+         BZ    BEGIN2                  BRANCH IF ZERO         @ZA32130
+         L     R1,ABEND1               GET COMP CODE.         @ZA32130
+* ISSUE ABEND FOR ANY UNAUTHORIZED CALLER                     @ZA32130
+         ABEND (1),,,SYSTEM                                   @ZA32130
+*
+BEGIN2   MVC   RECNTRS(C8),BLANKS      BLANK JOBNAME FIELD
+         MVC   RECVOL(C6),BLANKS       BLANK VOL I.D. FIELD
+         MVC   RECBLK(C2),ZEROES       ZERO BLOCK COUNT        @YA02144
+         L     ADDR,TIOT(TCBREG)       ADDRESS OF TIOTT
+         LTR   R0,WORKREG3             IS REGISTER NEGATIVE?
+         BNM   A110                    NO - BRANCH, CONTAINS DCB
+*
+*  REGISTER 0 CONTAINS ADDRESS OF UCB IN TWOS COMPLEMENT
+*
+         LPR   UCBREG,R0               MAKE R0 POSITIVE
+         SH    UCBREG,H512             POINT TO UCB PREFIX
+         TM    UCBID,UCBSTND           IS IT A UCB - ID='FF'?
+         BCR   14,RETREG               NO - RETURN TO CALLER
+*
+*  TEST UCB FOR TYPE OF DEVICE
+*
+         CLI   UCBTBYT3,UCB3DACC       UCB FOR DISK?
+         BE    PART2                   YES - GO TO PART 2
+         CLI   UCBTBYT3,UCB3UREC       IS IT UNIT RECORD       @Y30LB10
+         BE    PART2                   BR YES TO PART 2        @Y30LB10
+*
+*  TEST FOR TAPE UCB
+*  DETERMINE IF CALL WAS FROM EOD.  IF SO, TEST FOR ZERO
+*  SIO COUNT.  IF ZERO, RETURN TO CALLER
+*
+A100     EQU   *
+         CLI   UCBTBYT3,UCB3TAPE       UCB FOR TAPE?
+         BCR   7,RETREG                NO - RETURN TO CALLER
+         L     UXREG,UCBXTN            ADDR OF UCB EXTENSION
+         CLC   UCBSIO,ZEROES           SIO COUNT ZERO?         @YA00073
+         BCR   8,RETREG                YES - RETURN TO CALLER  @YA00073
+         B     A140                    GET REST OF RECORD
+*
+*  REG 0 CONTAINED A DCB ADDRESS.  THIS ROUTINE GETS CONTROL
+*  BLOCK ADDRESSES, I.E., DEB AND UCB AND VALIDITY CHECKS THE DEB.
+*
+A110     EQU   *
+         LR    R1,R0                   DCB IN R1 OF DEBCHECK   @ZA25497
+         DEBCHK (1)                    VALIDITY CHECK THE DEB  @ZA25497
+         LR    DEBREG,R1               IF RETURNED, VALID DEB  @ZA32130
+         L     DCBREG,DBDCB(DEBREG)    GET DCB FROM DEB        @ZA32130
+         SR    R1,R1                   CLEAR REG 1             @ZA25497
+         IC    R1,RECNULL              RESTORE INDICATOR FLAG  @ZA25497
+         XR    UCBREG,UCBREG           CLEAR REG              @Z30AB01
+         ICM   UCBREG,C3,DEBUCB+C2(DEBREG) ADDR OF UCB        @Z30AB01
+         SH    UCBREG,H512             POINT TO UCB PREFIX
+         TM    UCBID,UCBSTND           IS IT A UCB-ID='FF'?    @ZA25497
+         BCR   14,RETREG               NO, RETURN TO CALLER    @ZA25497
+*
+*  TEST UCB FOR TYPE OF DEVICE                                 @ZA25497
+*
+         CLI   UCBTBYT3,UCB3DACC       UCB FOR DISK?           @ZA25497
+         BE    PART2                   YES, GO TO PART 2       @ZA25497
+         CLI   UCBTBYT3,UCB3UREC       IS IT UNIT RECORD?      @ZA25497
+         BE    PART2                   YES, GO TO PART 2       @ZA25497
+         CLI   UCBTBYT3,UCB3TAPE       UCB FOR TAPE?           @ZA25497
+         BCR   7,RETREG                NO, RETURN TO CALLER    @ZA25497
+         L     UXREG,UCBXTN            ADDR OF UCB EXTENSION
+*
+*  THIS ROUTINE GETS MODE SET AND BLOCK COUNT FOR
+*  RECORDS AND SAVES THEM IN THE SVRB EXTENDED WORK AREA
+*
+A120     EQU   *
+         MVC   UCBMS,DEBDVMOD(DEBREG)  SAVE MODE SET
+         TM    DCBMACRF,EXCPMSK        PROGRAMMED IN EXCP?
+         BO    A130                    YES - LEAVE BLK COUNT ZERO
+         TM    DCBRECFM,FIXREC1        FIXED RECORD LENGTH?
+         BZ    A130                    NO - LEAVE BLK COUNT ZERO
+         TM    DCBRECFM,FIXREC2        FIXED FOR SURE?
+         BO    A130                    NO - LEAVE BLK COUNT ZERO
+         MVC   RECBLK(C2),DCBBLKSI     SAVE BLOCK COUNT
+*
+*  GET JOBNAME HERE IF TIOT IS AVAILABLE
+*
+A130     EQU   *
+         LTR   ADDR,ADDR               TIOT AVAILABLE?
+         BZ    A140                    NO - JOBNAME NOT AVAILABLE
+         MVC   RECNTRS(C8),JOBNAME(ADDR)   SAVE JOB NAME
+*
+*  VOLUME SERIAL NUMBER PROCESSING ROUTINE                     @YA00078
+*  IF A LABEL EXISTS IN THE UCB AND IT IS VERIFIED,
+*  THIS ROUTINE WILL INCLUDE THAT LABEL IN THE RECORD.
+*
+A140     EQU   *
+         CLI   UCBVOLI,ZERO            VOL SER AVAILABLE?      @YA00078
+         BE    A150                    NO - CONTINUE REC PROC  @YA00078
+         TM    UCBDMCT,UCBMOUNT        HAS LABEL BEEN VERIFIED @YA00078
+         BO    A150                    NO - LEAVE FIELD BLANK  @YA00078
+         MVC   RECVOL(C6),UCBVOLI      SAVE VOLUME I.D.        @YA00078
+*
+*  THIS ROUTINE GETS ALL COMMON DATA, I.E., DEVICE TYPE, CONTROL
+*  UNIT ADDRESS, TIME AND DATE.  THIS DATA IS SAVED IN THE SVRB
+*  EXTENDED WORK AREA.
+*
+A150     EQU   *
+         MVC   RECDEV(C4),UCBTYP       SAVE DEVICE TYPE
+         MVC   RECADDR(C2),UCBCHA      SAVE CONTROL UNIT ADDRESS
+         NI    RECADDR,CUAMASK         FOR RECORD
+*
+         TM    UCBTBYT4,UCB3400        3400 TYPE DEVICE?
+         BNO   A230                    NO - SKIP OBR FOR 2400
+*
+*  DO GETMAIN TO OBTAIN CORE FOR LOG RECORD
+*
+         BAL   LNKREG,GETMAIN          GO ISSUE GETMAIN
+         LTR   CODREG,CODREG           WAS GETMAIN SUCCESSFUL? @Y30LB11
+         BNZ   A180                    NO - TRY SMF RECORD     @Y30LB11
+         XC    OBREC(C168),OBREC       CLEAR WORK AREA
+         EJECT
+***********************************************************************
+*                       0   B   R                                     *
+***********************************************************************
+*
+*  THE FOLLOWING CREATES THE OBR (LOGREC) RECORD IN THE GETMAIN AREA.
+*  MOVE IN COMMON DATA FROM SVRB EXTENDED WORK AREA.
+*
+OBR      EQU   *
+         TIME  DEC                     GET TIME AND DATE
+         ST    R0,DOUBLE+C4            SAVE TIME INFORMATION   @YA00071
+         ST    R1,DOUBLE               SAVE DATE INFORMATION   @YA00071
+         MVC   DATE(C8),DOUBLE         MOVE TO RECORD AREA     @YA00071
+         MVC   DEVTYPE(C4),RECDEV      GET DEVICE TYPE
+         MVC   SECCUA+C1(C2),RECADDR   GET CONTROL UNIT ADDR   @ZA09512
+         MVC   PRICUA+C2(C1),RECADDR+C1 GET CU AND DEV ADDR    @ZA09512
+         IC    WORK,NAME(UCBREG)       GET CHANNEL NUMBER      @ZA09512
+         CLI   NAME(UCBREG),CHARF      IS IT ALPHA (A-F)       @ZA09512
+         BH    A155                    NO, ENTER AS IS         @ZA09512
+         AH    WORK,DEC57              ADD HEX 39 TO NUMBER    @ZA09512
+A155     STC   WORK,PRICUA+C1          PUT CHANNEL IN RECORD   @ZA09512
+         NI    PRICUA+C1,CUAMASK       TURN OFF HIGH BITS      @ZA09512
+         MVC   VLID(C6),RECVOL         GET VOLUME ID
+         MVC   BLKLTH(C2),RECBLK       GET BLOCK SIZE
+         MVC   JOBID(C8),RECNTRS       GET JOB NAME
+*
+*  THE REMAINING ROUTINES OBTAIN ALL NON-COMMON
+*  DATA FIRST, THE CPU ID AND RELEASE NUMBER
+*
+         MVC   CPUID,CVTMDL            CPU ID IN RECORD
+         PACK  WORKA(C8),CVTRELNO(C2)  GET RELEASE NUMBER
+         CVB   WORK,WORKA              CONVERT TO BINARY
+         STC   WORK,SYSREL             RELEASE NUMBER IN RECORD
+         OI    SYSREL,VS2MASK          VS2 SYS IN MDR REC      @ZUP1066
+         TM    CPUID,FULL              IS THIS A 360?
+         BZ    A160                    YES - GET NEXT RECORD
+         CLC   CON175(C2),CPUID        IS IT A 175?
+         BE    A160                    YES - BRANCH AROUND
+         STIDP NA1                     STORE CPUID INSTRUCTION @Y30LB11
+*
+*  OBTAIN CLASS/SOURCE, SET SWITCHES, INCLUDING EOD SWITCH
+*  IF NECESSARY, DEVICE DEPENDENT DATA COUNT, AND SDR COUNT
+*
+A160     EQU   *
+         MVI   SDRCNT,SDRCN            SET IN SDR COUNT
+         MVI   CLSOURCE,UNCK           SET CLASS/SOURCE
+         MVI   SWITCHES,TIMAC          SET SWITCHES
+         MVI   SWITCHES+C1,DISMNT      SET SWITCHES
+         CLI   RECNULL,EOD             CALLED BY EOD?
+         BNE   A170                    NO - LEAVE EOD BIT OFF
+         MVI   SWITCHES+C1,EODBIT      YES - TURN EOD BIT ON
+         EJECT
+*
+*  THIS ROUTINE GETS VES COUNTERS
+*
+A170     EQU   *
+         MVC   HDRSER(C16),UCBCTD      MOVE IN VES COUNTERS    @ZA27097
+*
+*  THIS ROUTINE LOCATES SDR COUNTERS FOR THIS RECORD
+*
+A180     EQU   *
+         L     ADDR,CVTSTB             ADDR OF SDR TABLE
+         SR    TEST,TEST               ZERO REGISTER
+         L     R4,UCBEXTPT             GET ADDR OF UCB COMMON EXTN.
+         LA    R4,0(R4)                GET 3-BYTE ADDRESS
+         IC    TEST,STI(R4)            GET SDR INDEX
+         LR    WORK,ADDR               SAVE SDR TABLE ADDR
+         LA    UCBREG,C512(UCBREG)     POINT TO UCB BASE       @ZA30027
+A200     EQU   *
+         CLM   UCBREG,C3,0(ADDR)       SDR AREA SECTION?       @Z30AB01
+         BNH   A210                    YES-GET OUT OF LOOP     @Z30AB01
+         LA    ADDR,C2(ADDR)           INCREMENT TO NEXT SECTION
+         LA    TEST,C256(TEST)         STEP INDEX
+         B     A200                    TEST NEXT SECTION
+*
+*  FOUND SDR SECTION.  NOW LOCATE ENTRY FOR THIS TABLE
+*
+A210     EQU   *
+         SH    UCBREG,H512             POINT TO PREFIX         @ZA30027
+         MH    TEST,X10                INDEX TIMES 10
+         AR    WORK,TEST               ENTRY FOR THIS TABLE
+         LTR   CORE,CORE               CREATING A RECORD?
+         BZ    A215                    NO - CORE UNAVAILABLE
+         MVC   SDR,0(WORK)             MOVE IN SDR COUNTERS
+A215     EQU   *
+         XC    C1(C19,WORK),C1(WORK)   CLEAR SDR COUNTERS
+         LTR   CORE,CORE               CREATING A RECORD?
+         BZ    A230                    NO - TRY SMF RECORD
+*
+*  THIS ROUTINE COLLECTS SENSE DATA
+*
+         SR    R1,R1                   ZERO REGISTER 1
+         IC    R1,SNSCT(R4)            GET NUMBER OF SENSE BYTES
+         STC   R1,SNSCNT+C1            STORE IN SENSE COUNT
+         LA    R0,C108                 RECORD LENGTH LESS SENSE COUNT
+         AR    R0,R1                   ADD TO RECORD LENGTH
+         LNR   R0,R0                   MAKE TWO'S COMPLEMENT
+         LA    R1,OBREC                ADDRESS OF OBR RECORD
+         SVC   76                      GO TO OBR ROUTINE TO RECORD
+         EJECT
+*
+*  THIS ROUTINE FREES THE GOTTEN CORE
+*
+A220     EQU   *
+         LR    R1,CORE                 ADDRESS OF GOTTEN CORE
+         FREEMAIN  R,LV=344,A=(1),SP=255                       @ZA27122
+         EJECT
+*
+*  THIS ROUTINE BUILDS THE SMF TYPE 21 RECORDS
+*  IN THE SVRB EXTENDED WORK AREA
+*
+A230     EQU   *
+         MVC   RECTOT(C6),LENTAP       LENGTH OF REC AND TAPE FLAG
+         TIME  BIN                     GET TIME AND DATE       @YA00071
+         STM   R0,R1,RECNTRS           PUT TIME AND DATE       @YM03278
+         MVC   RECTIME(C8),RECNTRS        IN RECORD            @YM03278
+*
+         L     ADDR,CVTSMCA            ADDRESS OF SMCA
+         MVC   RECCPU(C4),CPUIDEN(ADDR)   GET CPU ID & MODEL NUMBER
+*
+         LA    WORK,DATALEN            DATA LENGTH + 2
+         STH   WORK,RECLEN               IN RECORD
+         MVC   RECDEV,UCBTYP           DEV TYPE IN RECORD
+         MVC   RECNTRS(C7),UCBTR       ESV COUNTERS
+         MVC   RECNTRS+C7(C4),UCBERG     IN RECORD
+         MVC   RECDEN,UCBMS            TAPE DENSITY IN RECORD
+         CLI   UCBMS,BIRCHMS           6250 MODE SET?          @YM07123
+         BE    A240                    YES, BRANCH AROUND      @YM07123
+         NI    RECDEN,DEN              SAVE DENSITY BITS ONLY
+         CLI   UCBMS,NRZI              NRZI MODE SET?
+         BNE   A240                    NO - BRANCH AROUND
+         NI    RECDEN,DENX             SET TO 800 BPI
+*
+A240     EQU   *
+         LA    R1,REC(SVRBREG)         ADDRESS OF ESV RECORD
+         SMFWTM (1)                    WRITE REC TO SYS1.MAN
+         EJECT
+A250     EQU   *
+         XC    UCBTR(C12),UCBTR        ZERO VES COUNTERS
+         BR    RETREG                  RETURN TO CALLER
+         EJECT
+***********************************************************************
+*                           P A R T   2                               *
+*                             D I S K                                 *
+***********************************************************************
+*        THIS SECTION BUILDS CONTROL BLOCKS WHICH ARE NECESSARY       *
+*        TO ISSUE AN EXCP TO READ THE CONTROL UNIT BUFFERED LOG       *
+*        IN A 3330, 3330-1, 3340, 3851, 2305 ,3800, OR 3895.          *
+*                                                                     *
+*        A TPER RECORD IS THEN BUILT ACCORDING TO THE LOGRECD         *
+*        PORTION OF THE GETMAIN AREA.  THE FORMATTED TPER             *
+*        RECORD IS THEN WRITTEN ONTO SYS1.LOGREC BY SVC 76.           *
+***********************************************************************
+PART2    EQU   *
+         SR    CODREG,CODREG           SET 0 RETURN CODE
+         CLI   UCBTBYT4,D3330          IS THIS A 3330?
+         BE    B100                    YES - LOGABLE, BRANCH
+         CLI   UCBTBYT4,D3350          IS THIS A 3350?         @Z20AB05
+         BE    B100                    YES - LOGABLE, BRANCH   @Z20AB05
+         CLI   UCBTBYT4,D33301         IS IT A 3330-1?          XL03145
+         BE    B100                    YES - LOGABLE, BRANCH    XL03145
+         CLI   UCBTBYT4,D3340          IS IT A 3340?            XL03130
+         BE    B110                    YES - LOGABLE, BRANCH    XL03130
+         CLI   UCBTBYT4,D2305A         IS THIS A 2305A?
+         BE    B110                    YES - LOGABLE, BRANCH
+         CLI   UCBTBYT4,D2305B         IS THIS A 2305B?
+         BE    B110                    YES - LOGABLE, BRANCH   @Y30LB11
+         CLI   UCBTBYT4,D3800          IS THIS A 3800?         @Z40MB01
+         BE    B110                    YES - LOGABLE, BRANCH   @Z40MB01
+         CLI   UCBTBYT4,D3895          IS THIS A 3895?         @G30HB19
+         BE    B095                    YES - LOGABLE, BRANCH   @G30HB19
+         CLI   UCBTBYT4,DDSM           IS THIS A 3851 COMPONENT@Y30LB11
+         BNE RETURN                    IF NOT RETURN TO CALLER @Y30LB11
+         B     B110                    OTHERWISE BRANCH        @Y30LB11
+B095     EQU   *                                               @G30HB19
+         NI    UCBFL1,HEXFF-UCBNRY     SET THE DEVICE READY    @G30HB19
+         B     B110                    BRANCH TO CONTINUE      @G30HB19
+*
+*                   L O G A B L E
+*
+B100     EQU   *
+         TM    UCBTBYT2,UCBRVDEV       IS THE DASD VIRTUAL     @Y30LB11
+         BO    RETURN                  BRANCH IF YES           @Y30LB11
+*
+B110     EQU   *
+         LA    CODREG,C1               SET RETURN CODE TO 1
+         TM    UCBFL1,UCBNRY           IS THE DEVICE READY?
+         BO    RETURN                  NO - RETURN TO CALLER
+         XC    PLBOP(C8),PLBOP         ZERO 3851 DATA AREA     @Y30LB10
+         STH   R1,SSIDXX               STORE SSID              @Y30LB10
+*
+*  DO GETMAIN TO OBTAIN CORE FOR CONTROL BLOCKS AND LOG RECORD
+*
+         BAL   LNKREG,GETMAIN          GO ISSUE GETMAIN RECORD
+         LTR   CODREG,CODREG           WAS CORE AVAILABLE?     @Y30LB11
+         BNZ   RETURN                  BRANCH IF NO CORE       @Y30LB11
+*
+         XC    CTLBLK(C256),CTLBLK     CLEAR WORK AREA         @G30HB19
+         XC    CTLBLK+C256(C80),CTLBLK+256 CLEAR WORK AREA     @G30HB19
+         XC    CCW,CCW                 CLEAR CCW               @G30HB19
+         MVI   CCWFLG,SLI              SUPPRESS LENGTH         @G30HB19
+*
+*  SET UP CONTROL BLOCKS:  IOB & DEB
+*
+         MVI   IOB,IOBFLG1             SET COMMAND CHAINING BITS
+         LA    WORK,ECB                GET ECB ADDR
+         ST    WORK,IOBECBPT           PUT IN IOB
+         LA    WORK,CCW                GET CCW ADDR
+         ST    WORK,IOBSTART           PUT IN IOB'
+         LA    WORK,DCB                GET DCB ADDR
+         ST    WORK,IOBDCBPT           PUT IN IOB
+         ST    WORK,DEBDCBAD              AND IN DEB
+         LA    WORK,DEB                GET DEB ADDR
+         ST    WORK,DCBDEB             PUT IN DEB
+         AH    UCBREG,H512             POINT TO UCB
+         ST    UCBREG,DEBUCBAD         PUT UCB ADDR IN DEB
+         SH    UCBREG,H512             POINT BACK TO UCB PREFIX
+*
+         L     WORK,CVTXAPG            GET DUMMY APPENDAGE TABLE
+         ST    WORK,DEBAPPAD           PUT ADDR IN DEB
+         MVI   DEBAPPAD,C4             INDICATE DASD DEB
+*
+         MVI   DEBDCBAD,DEBFLG         INDICATE THIS IS A DEB
+*
+         CLI   UCBTBYT4,DDSM           IS THE 3851 THE CALLER  @ZM02157
+         BE    B160                    BRANCH IF YES           @ZM02157
+         OI    DCB+C44,NOERRTNS        DON'T USE IOS ERROR RTNS  A47255
+         CLI   UCBTBYT4,D3895          IS THE 3895 THE CALLER  @G30HB19
+         BNE   DA3800                   NO, GO TEST 3800       @G30HB19
+         MVI   CCWLNG,C238              238 BYTE LOG           @G30HB19
+         LA    LOGREG,C70(CORE)         GET RECORD ADDRESS     @G30HB19
+         LA    WORK,PREDSNS             GET RECORD LOCATION    @G30HB19
+         ST    WORK,CCW                 PUT IT IN THE CCW      @G30HB19
+         MVI   CCW,RDLOG3Y              READ LOG COMMAND       @G30HB19
+         B     B200                     GO READ LOG            @G30HB19
+*
+*
+DA3800   EQU   *
+         CLI   UCBTBYT4,D3800           IS THIS A 3800         @Z40MB01
+         BNE   B150                     NO, GO TEST DASD       @Z40MB01
+         MVI   CCWLNG,C136              136 BYTE LOG           @Z40MB01
+*TURN ON BIT 1 IN IOBFLAG4 SO THAT IOS WILL POST X'6D' ON CC=3
+         MVI   IOBFLAG4,IOBCC3WE        SET X'40' IN IOBFLAG4  @ZA18278
+         LA    LOGREG,C72(CORE)         GET RECORD ADDRESS     @Z40MB01
+         LA    WORK,ERRREC              GET RECORD LOCATION    @Z40MB01
+         ST    WORK,CCW                 PUT IT IN THE CCW      @Z40MB01
+         MVI   CCW,RDLOG                READ LOG COMMAND       @ZM03166
+         B     B200                     GO READ LOG            @Z40MB01
+*
+*  SET UP READ LOG COMMAND FOR DIRECT ACCESS DEVICES
+*
+B150     EQU   *
+         LA    LOGREG,C72(CORE)        POSITION RECORD IN MAIN
+         LA    WORK,LOG                GET ADDR OF READ-IN AREA
+         ST    WORK,CCW                BUILD READ LOG CCW
+         MVI   CCWLNG,C24              24-BYTE LOG
+         MVI   CCW,RDLOG3X             USE 3330/X READ LOG CMD   S99204
+         CLI   UCBTBYT4,D3330          IS THIS A 3330?
+         BE    B200                    YES - GO EXCP
+         CLI   UCBTBYT4,D33301         IS IT 3330-1?            XL03145
+         BE    B200                    YES - GO EXCP            XL03145
+         CLI   UCBTBYT4,D3340          IS IT A 3340?            XL03145
+         BE    B200                    YES - GO EXCP            XL03145
+         CLI   UCBTBYT4,D3350          IS IT A 3350?           @Z20AB05
+         BE    B200                    YES - GO EXCP           @Z20AB05
+*
+         LA    WORK,VOLID              2305 LOG AREA STARTS AT VOLID
+         ST    WORK,CCW                READ DATA INTO 2305 BUFFER
+         MVI   CCW,RDLOG               READ LOG COMMAND
+         MVI   CCWLNG,C128             SET LENGTH OF 128
+         B     B200                    BRANCH TO ISSUE EXCP    @Y30LB11
+*
+*  SET UP PREPARE BUFFERED LOG AND READ AND RESET BUFFERED LOG COMMANDS
+*
+B160     EQU   *
+         L     WORK,CVTEXT2             GET ADR OF CVT EXT     @Y30LB11
+         USING CVTXTNT2,WORK                                   @Y30LB11
+         L     WORK,CVTICB              GET ADR OF SSC CTL BLK @Y30LB11
+         DROP WORK                                             @Y30LB11
+         USING ICB2SSCB,WORK                                   @Y30LB11
+         LR    R4,UCBREG               GET UCB ADR IN WORK REG @Y30LB10
+         AH    R4,H512                 CORRECT UCB ADDR        @Y30LB10
+         CLM   R4,C3,ICBPUCB+2         IS IT THE PRIMARY UCB   @ZA05146
+         DROP WORK                                             @Y30LB11
+         BNE   B348                     BRANCH IF NO           @Y30LB11
+         MVI   ATTRIB,A80               INIT 3851 ATTRIB BYTE  @ZM02158
+         CLC   SSIDXX,ZEOD              IS CALL FOR 3851 ZEOD  @Y30LB11
+         BNE   DSMCCW                   BRANCH IF NO           @Y30LB11
+         MVI   ATTRIB,A0                RESPECIFY 3851 ATTRIB  @ZM02158
+DSMCCW   EQU   *                                               @Y30LB11
+         LA    WORK,PLBOP               GET PTR TO SSID & ATTR @Y30LB11
+         ST    WORK,CCW1                LOAD ADDR IN CCW       @Y30LB11
+         MVI   PLBOP,PLBORD            SET IN PBL ORDER        @Y30LB10
+         MVI   CCW1,PBLCMD              INSERT PBL COMMAND     @Y30LB11
+         MVI   CCWFLG1,CHAINFLG         INSERT CHAINED CCW FLAG@Y30LB11
+         MVI   CCWLNG1,C8               INSERT SSID DATA COUNT @Y30LB11
+         XC    CCW2(C8),CCW2           ZERO CCW 2              @Y30LB10
+         LA    WORK,C128(CORE)          LOAD BUF LOG ADDR      @Y30LB11
+         ST    WORK,CCW2                PUT PTR INTO CCW2      @Y30LB11
+         MVI   CCW2,RRBLCMD             ENTER RRBL COMMAND     @Y30LB11
+         MVI   CCWFLG2,SLI              SUPPRESS LENGTH FLAG   @Y30LB11
+         MVI   CCWLNG2,C32              BUFFERED LOG LENGTH    @Y30LB11
+         LA    WORK,CCW1               GET ADDR OF CCW LIST    @Y30LB11
+         ST    WORK,IOBSTART           PUT ADDR IN IOB         @Y30LB11
+         LA    LOGREG,C96(CORE)         INITIALIZE LOGREG ADDR @Y30LB11
+         EJECT
+***********************************************************************
+*                      E  X  C  P                                     *
+***********************************************************************
+*
+B200     EQU   *
+         EXCP  IOB                     READ LOG INTO GETMAIN AREA
+         WAIT  ECB=ECB
+*
+         CLI   ECB,CODE7F              WAS I/O OK              @ZA11019
+         BE    B210                    BR YES TO CONTINUE      @G30HB19
+         CLI   UCBTBYT4,D3895           IS IT A 3895?          @G30HB19
+         BNE   B348                     NO,BR TO 3800 RECORD   @G30HB19
+         XC    LOGRECD(C28),LOGRECD     CLEAR 28 BYTE HDR      @G30HB19
+         MVI   FLG3895,AN80            3895 TYPE ERROR RCD     @G30HB19
+         B     B205                    GO COMPLETE RECORD      @G30HB19
+*
+B210     EQU   *
+         CLI   UCBTBYT4,D3895           IS IT A 3895?          @G30HB19
+         BNE   D3800REC                 NO,BR TO 3800 RECORD   @G30HB19
+         XC    LOGRECD(C28),LOGRECD     CLEAR 28 BYTE HDR      @G30HB19
+         MVI   FLG3895,CMNFLAG         3895 TYPE ERROR RCD     @G30HB19
+B205     EQU   *
+         MVI   RECID,ID3895            INDICATE 3895 DEVICE    @G30HB19
+         B     B320                    GO COMPLETE RECORD      @G30HB19
+D3800REC EQU   *
+         CLI   UCBTBYT4,D3800           IS IT A 3800?          @Z40MB01
+         BNE   B300                     NO,BR TO DASD RECORD   @Z40MB01
+         XC    LOGRECD(C28),LOGRECD     CLEAR 28 BYTE HDR      @Z40MB01
+         LA    WORKREG3,ERRREC          GET ADDR OF LOG REC.   @Z40MB01
+         XR    WORK,WORK                CLEAR REG FOR COUNTER  @Z40MB01
+         LA    WORKREG2,C16             PUT MAX REC CNT IN REG @Z40MB01
+B250     EQU   *
+         NC    C0(C8,WORKREG3),C0(WORKREG3) IS RECORD ZERO?    @Z40MB01
+         LA    WORKREG3,C8(WORKREG3)    INDEX TO NEXT RECORD   @Z40MB01
+         BZ    B260                     DON'T COUNT 0 RECORD   @Z40MB01
+         LA    WORK,C1(WORK)            ADD 1 TO RECORD COUNT  @Z40MB01
+B260     EQU   *
+         BCT   WORKREG2,B250            NOT LAST REC, GEN NEXT @Z40MB01
+         STC   WORK,COUNT               PUT REC CNT IN RECORD  @Z40MB01
+         MVI   RECID,ID3800             3800 ID IN RECORD      @Z40MB01
+         B     B320                     GO COMPLETE RECORD     @Z40MB01
+B300     EQU   *
+         XC    LOGRECD(C26),LOGRECD    CLEAR START OF RECORD     A48492
+         MVI   TPERID,TPR              T TYPE RECORD
+         MVI   RECID,ID2305            INDICATE 2305 DEVICE      A43332
+         CLI   UCBTBYT4,D2305A         IS THIS A 2305A?
+         BE    B320                    YES - GO GET TIME
+         MVI   RECID,ID2305A           INDICATE 2305 RECORD
+         CLI   UCBTBYT4,D2305B         IS THIS A 2305B?
+         BE    B320                    YES - GO GET TIME
+         MVI   RECID,ID33301           INDICATE 3330-1 RECORD   XL03145
+         CLI   UCBTBYT4,D33301         IS IT A 3330-1?          XL03145
+         BE    B320                    YES - GET VOLID         @YA00081
+         MVI   RECID,ID3340            INDICATE 3340 RECORD     XL03130
+         CLI   UCBTBYT4,D3340          IS IT A 3340?            XL03130
+         BE    B320                    YES - GET VOLID          XL03130
+         MVI   RECID,ID3350            INDICATE 3350 RECORD    @Z20AB05
+         CLI   UCBTBYT4,D3350          IS IT A 3350?           @Z20AB05
+         BE    B320                    YES - GET VOLID         @Z20AB05
+         MVI   RECID,ID3330            INDICATE 3330 TYPE REC    S99204
+         CLI   UCBTBYT4,D3330          IS IT A 3330?           @Y30LB11
+         BE    B320                    BRANCH IF YES           @Y30LB11
+         MVI   RECID,IDDSM             INDICATE 3851 REC TYPE  @Y30LB11
+         XC    TPERID,TPERID           BLANK 3851 RECRD PORTION@Y30LB11
+*
+B320     EQU   *
+*
+         TIME  DEC
+         ST    R0,RTIME                PUT TIME IN RECORD
+         ST    R1,RDATE                PUT DATE IN RECORD
+         STIDP DOUBLE                  STORE CPU ID            @ZA27554
+         MVC   RECSER(C8),DOUBLE       MOVE SER TO RECORD      @ZA27554
+         MVC   WORKB,CVTRELNO          GET RELEASE NUMBER
+         PACK  DOUBLE,WORKB            GET RELEASE NUMBER
+         CVB   WORK,DOUBLE             CONVERT TO BINARY
+         STC   WORK,RELNO              PUT RELEASE NUMBER IN RECORD
+         OI    RELNO,VS2MASK           VS2 SYS IN MDR REC      @ZUP1066
+         XC    WORKB(C2),WORKB         ZERO WORKB              @Y30LB10
+         OI    SWITCH1,SWCHMASK        INDICATE TIME MACRO USED  S99204
+         MVI   LOGKEY,KEY              INDICATE TYPE OF RECORD
+         MVC   UNITID,UCBCHA           RECORD CHANNEL AND UNIT
+         MVN   UNITID(C1),UCBNAME      GET CHANNEL ADDR          A43332
+         CLI   UCBNAME,X'F0'           CHAN ADDR 0-9 OR A-F?     A43332
+         BNL   B376                    CHAN ADDR 0,1,2,...,9     A43332
+         LH    WORK,UNITID             CHAN ADDR A,B,C,...,F     A43332
+         LA    WORK,C2304(WORK)        GET EQUIVALENT A-F VALUE  A43332
+         STH   WORK,UNITID             STORE CHAN ADDR IN LOG    A43332
+         EJECT
+***********************************************************************
+*                       S V C   7 6                                   *
+***********************************************************************
+B376     EQU   *
+         CLI   UCBTBYT4,DDSM           IS IT THE 3851          @Y30LB11
+         BE    B345                    BRANCH TO ATTRIB TEST   @Y30LB11
+         LA    R1,LOGRECD              GET RECORD
+         LA    R0,L164                  SET UP FOR 3800        @Z40MB01
+         CLI   UCBTBYT4,D3800           IS THIS A 3800         @Z40MB01
+         BE    B340                    YES GOT NEGATIVE ADDR   @Z40MB01
+         LA    R0,L3895                 SET UP FOR 3895        @G30HB19
+         CLI   UCBTBYT4,D3895           IS THIS A 3895         @G30HB19
+         BE    B340                    YES GOT NEGATIVE ADDR   @G30HB19
+         LA    R0,L56                  SET UP FOR 3330 - 56-BYTE RCD
+         CLI   UCBTBYT4,D3330          IS THIS A 3330?
+         BE    B331                    YES-TEST FOR EMULATION  @Z20AB05
+         CLI   UCBTBYT4,D3350          IS THIS A 3350?         @Z20AB05
+         BE    B335                    YES-VOLID               @Z20AB05
+         CLI   UCBTBYT4,D33301         IS IT A 3330-1?          XL03145
+         BE    B331A                   YES-TEST FOR EMULATION  @ZA09525
+         CLI   UCBTBYT4,D3340          IS IT A 3340?            XL03130
+         BE    B330A                   YES-CNVT PHYSICAL ADDR  @ZA09525
+         LA    R0,L154                 GET 2305 RECORD LENGTH - 154
+         B     B340                    GO ISSUE SVC76
+B331A    EQU   *                                               @ZA09525
+         TM    LOG+C2,EMULFLG          IS DEVICE EMULATED      @Z20AB05
+         BNO   B333                    IF NOT, BRANCH          @Z20AB05
+         B     B335                    ADDR OK                 @ZA09525
+*        FOR 3340 EMULATED
+B330A    EQU   *
+         TM    LOG+C2,EMULFLG          IS DEVICE EMULATED?     @ZA09525
+         BNO   B335                    IF NOT ADDR OK          @ZA09525
+         SR    WORK,WORK               ZERO IT                 @ZA09525
+         IC    WORK,LOG+C4             GET ADDR                @ZA09525
+         SLL   CVTREG,C3               SECURE CVT PTR          @ZA09525
+         SRDL  WORK,C3                                         @ZA09525
+         SRL   WORK,C3                                         @ZA09525
+         SLDL  WORK,C3                                         @ZA09525
+         SRL   CVTREG,C3               RESTORE CVT PTR         @ZA09525
+         NI    UNITID+C1,HEXC0                                 @ZA09525
+         LH    R1,UNITID                                       @ZA09525
+         OR    WORK,R1                                         @ZA09525
+         STH   WORK,UNITID                                     @ZA09525
+         LA    R1,LOGRECD                                      @ZA09525
+         B     B335                                            @ZA09525
+*        3330 EMULATED TEST
+B331     EQU   *                                               @ZA09525
+         TM    LOG+C2,EMULFLG                                  @ZA09525
+         BNO   B333                                            @ZA09525
+         NI    UNITID+C1,HEXDF                                 @ZA09525
+         B     B335                                            @ZA09525
+B333     EQU   *                                               @YA00081
+         MVC   LOG+C30(C1),LOG+C4      PHYS ADDR FROM SENSE    @YA00081
+B334     EQU   *                       EMULATION ENTRY
+         NI    LOG+C30,HEX07           CLEAR HIGH ORDER BITS   @YA00081
+         NI    UNITID+C1,HEXF8         CLEAR LOW ORDER BITS    @YA00081
+         OC    UNITID+C1(C1),LOG+C30   MOVE IN PHYS ADDRESS    @YA00081
+*
+B335     EQU   *
+         MVC   VOLID,UCBVOLI           MOVE VOLID INTO LOG
+B340     EQU   *
+         LNR   R0,R0
+*
+*
+         SVC   C76
+*
+         CLI   UCBTBYT4,DDSM            IS IT THE 3851         @Y30LB11
+         BNE   B348                     BRANCH IF NO           @Y30LB11
+*
+         TM    ATTRIB,A80               TEST THE ATTRIB FLAG   @Y30LB11
+         BO    B348                     BRANCH IF ON           @ZM02158
+*
+         EXCP  IOB                      PERFORM I/O            @Y30LB11
+         WAIT  ECB=ECB                  WAIT UNTIL ECB POSTED  @Y30LB11
+         CLI   ECB,CODE7F              WAS SIO OK              @Y30LB10
+         BNE   B348                    BR NO TO EXIT           @Y30LB10
+*
+B345     EQU   *
+         MVC   SSIDXX,SSID              MOVE IN SSID           @Y30LB11
+         NI    SSIDXX,X0F              MASK OUT HI ORDER       @Y30LB10
+         LA    R1,LOGRECD               GET ADDRESS            @Y30LB11
+         LA    R0,LDSM                  GET RECORD LENGTH      @Y30LB11
+         CLC   SSIDXX,LOOPEND           ARE WE FINISHED        @Y30LB11
+         BNE   B340                     LOOP IF NOT ZERO       @Y30LB11
+*
+B348     EQU   *
+***********************************************************************
+*                 F R E E M A I N                                     *
+***********************************************************************
+         LR    R1,CORE                 ADDR OF MAIN TO BE FREED
+         FREEMAIN  R,LV=344,A=(1),SP=255                      @ZA27122
+*
+RETURN   EQU   *
+         BR    RETREG                  RETURN TO CALLER
+         EJECT
+***********************************************************************
+*                          G E T M A I N                              *
+***********************************************************************
+GETMAIN  EQU   *
+         MVC   LISTB(C10),LIST         MOVE GETMAIN LIST TO SVRB
+         XC    RECTOT(C4),RECTOT       ZERO ADDR OF GOTTEN CORE
+         LA    R1,RECTOT               ADDRESS OF GOTTEN CORE
+         ST    R1,LISTC                STORE IN LIST
+         LA    R1,LISTB                ADDRESS OF GETMAIN LIST
+         GETMAIN  EC,MF=(E,(1))        GET MAIN FOR 344 BYTES
+         L     CORE,RECTOT             SAVE ADDRESS OF GOTTEN CORE
+         BR    LNKREG                  RETURN
+*
+         EJECT
+***********************************************************************
+*                      C O N S T A N T S                              *
+***********************************************************************
+         DS    0F
+ABEND1   DC    X'0000015B'             ABEND COMPLETION CODE  @ZA32130
+CLEAR    DC    X'0000FFFF'             CLEAR LEFT HALF WORD CONSTANT
+BLANKS   DC    CL12'            '      BLANKS
+H512     DC    H'512'                  HALFWORD OF 512
+LIST     GETMAIN  EC,LV=344,A=CLEAR,SP=255,MF=L  GET MAIN LIST  M2135
+CON175   DC    X'0175'                 MODEL 175 CONSTANT
+BACK8    DC    H'8'                    COUNT OF 8 FOR CVT PRE @YA11111
+X10      DC    H'10'                   COUNT OF 10
+DEC57    DC    H'57'                   A-F ADDING VARIABLE     @ZA09512
+LENTAP   DC    X'0030'                 TOTAL LENGTH OF SMF RECORD
+ZEROES   DC    X'000000'               ZEROS
+         DC    X'15'                   TAPE RECORD INDICATOR
+ZEOD     DC    X'FFFF'                  3851 EOD CONDITION     @Y30LB11
+LOOPEND  DC    X'0FFF'                  3851 LOOP END CONDITION@Y30LB11
+         ORG   IGC0009A+2007
+         DC    C'<<   E N D   O F   I G C 0 0 0 9 A   >>'   **
+*
+*  END OF CONSTANTS
+*
+         EJECT
+         IEFUCBOB  LIST=YES,PREFIX=YES
+         EJECT
+         DCBD      DSORG=PS
+         EJECT
+CVT      DSECT
+         CVT       PREFIX=YES
+         EJECT
+         IEZSSC
+         END

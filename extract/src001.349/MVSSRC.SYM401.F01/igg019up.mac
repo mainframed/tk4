@@ -1,0 +1,361 @@
+         TITLE 'IGG019UP - ASYNCHRONOUS READY PROCESSOR 05/01/73'
+IGG019UP CSECT
+*
+***********************************************************************
+*                                                                     *
+*        MAINTENANCE ACTIVITY                                         *
+*                                                                     *
+*        ZA00537  (12/19/74)        ZA00549  (12/19/74)               *
+*        ZA08050  (01/30/76)        ZA08056  (01/30/76)               *
+*        ZA14028  (09/14/76)                                          *
+***********************************************************************
+*
+* /* START OF SPECIFICATIONS ****
+*
+*01*  MODULE-NAME = IGG019UP (OS/360 CQ513)
+*01*  COPYRIGHT = NONE
+*01*  STATUS = 00
+*01*  CHANGE-ACTIVITY = NONE
+*01*  DESCRIPTIVE-NAME = LOCAL 3270 READY ROUTINE
+*01*  FUNCTION = PROCESS ASYNCHRONOUS DE INTERRUPTS FROM 3270 LOCAL
+*     DEVICES. ROUTINE IS ASYNCHRONOUSLY SCHEDULED BY FIRST LEVEL
+*     ATTENTION ROUTINE (IECTATEN) IF: 1) THE USER SPECIFIED 'READYQ=0'
+*     IN A DCB MACRO INSTRUCTION FOR A LOCAL 3270 LINE GROUP, 2) THE
+*     USER HAS ATTEMPTED TO OPEN THE PREVIOUSLY MENTIONED LINE GROUP,
+*     3) AND THE DEVICE FROM WHICH AN UNSOLICITED DEVICE END INTERRUPT
+*     IS RECEIVED WAS NOT READY (INTERVENTION REQUIRED) AT OPEN TIME;
+*     OR AN INTERVENTION REQUIRED CONDITION HAS PREVIOUSLY BEEN
+*     DETECTED BY LOCAL 3270 ERP'S FOR A DEVICE WHICH HAD BEEN IN USE
+*     AND AN UNSOLICITED DEVICE END INTERRUPT IS RECEIVED.
+*01*  NOTES = STANDARD CODING PRACTICES, AS DESCRIBED BY SDD
+*     PROGRAMMING STANDARDS, ARE FOLLOWED.
+*02*    DEPENDENCIES = NONE
+*02*    PERFORMANCE = NOT APPLICABLE
+*02*    RESTRICTIONS = NONE
+*02*    REGISTER-CONVENTIONS = SEE EQUATES IMMEDIATLY FOLLOWING THIS
+*       PROLOG
+*02*    PATCH-LABEL = MAINPTCH
+*01*  MODULE-TYPE = MODULE
+*02*    PROCESSOR = ASSEMBLER
+*02*    MODULE-SIZE = 200 BYTES
+*02*    ATTRIBUTES = REENTERABLE
+*01*  ENTRY = IGG019UP
+*02*    PURPOSE = ENTERED AT FIRST EXECUTABLE INSTRUCTION VIA
+*       SCHEDULING OF IRB
+*02*    LINKAGE = BALR
+*02*    INPUT = REGISTER ONE CONTAINS THE RLN OF THE DEVICE WHICH CAME
+*       READY IN THE HIGH BYTE AND THE ADDRESS OF THE DEB FOR THE LINE
+*       GROUP. THIS COMES FROM THE IQE PARAMETER FIELD WHERE IT WAS
+*       PLACED BY IECTATEN BEFORE BRANCHING TO THE ASYNCHRONOUS EXIT
+*       EFFECTOR STAGE 2 TO SCHEDULE THIS ROUTINE.
+*02*    OUTPUT = IF A READ INITIAL WAS PENDING FOR THE LINE GROUP, A
+*       RESETPL WILL HAVE BEEN DONE. OTHERWISE, THE UCBGRAF FIELD WILL
+*       HAVE BEEN SET SUCH THAT THE NEXT READ INITIAL FOR THIS LINE
+*       GROUP WILL RESULT IN A RESETPL TYPE COMPLETION. THE DECB WILL
+*       HAVE BEEN MODIFIED AS FOLLOWS (IN EITHER CASE): 1) DECFLAGS
+*       WILL CONTAIN A X'F0', 2) DECPOLPT WILL CONTAIN THE RLN OF THE
+*       DEVICE WHICH CAME READY. IN THE EVENT OF MULTIPLE DEVICES IN
+*       THE SAME LINE GROUP COMING READY, THEY WILL BE PROCESSED
+*       SIMILARLY TO ATTENTIONS. THAT IS TO SAY, ONE WILL BE PROCESSED
+*       FOR EACH READ INITIAL ISSUED TO THE LINE GROUP, THE SEARCH FOR
+*       A READY DEVICE BEGINNING WITH THE RLN SPECIFIED IN THE READ
+*       INSTRUCTION.
+*02*    EXIT-NORMAL = BRANCH RETURN ON THE ENTRY CONTENTS OF REGISTER
+*       14
+*02*    EXIT-ERROR = NONE
+*01*  EXTERNAL-REFERENCES = SEE FOLLOWING:
+*02*    ROUTINES = NONE
+*02*    DATA-SETS = NONE
+*02*    DATA-AREA = UCB, DEB, DCB, DECB, IOB
+*01*  TABLES = NONE
+*01*  MACROS = RESETPL IECTUCBX IECTIOBX IECTDEBX IECTDECB
+*
+**** END OF SPECIFICATIONS ***/
+*
+*              EQUATE THE GENERAL REGISTERS
+*
+RPARM0   EQU   0                   PARAMETER REGISTER 0
+RPARM1   EQU   1                   PARAMETER REGISTER 1
+REVN     EQU   2                   EVEN OF ARITHMETIC PAIR
+RODD     EQU   3                   ODD OF ARITHMETIC PAIR
+RRLN     EQU   4                   RLN SAVE REGISTER
+RDEB     EQU   5                   DEB SAVE REGISTER
+RSAVE    EQU   6                   RETURN POINT SAVE REGISTER
+RUCB     EQU   7                   UCB ADDRESS REGISTER
+RDECB    EQU   8                   DECB ADDRESS REGISTER
+RWORK1   EQU   9                   WORK REGISTER
+RWORK2   EQU   10                  WORK REGISTER
+RIC      EQU   11                  CHARACTER REGISTER
+RBASE    EQU   12                  BASE REGISTER
+RWORKD   EQU   13                  UTILITY REGISTER
+RRTRN    EQU   14                  LINK REGISTER
+REP      EQU   15                  ENTRY POINT REGISTER
+RROUTE   EQU   15                  ROUTING REGISTER FOR SVC 116
+*
+         SPACE 3
+*
+*              EQUATE THE CONSTANTS
+*
+ONE      EQU   1                   NUMBER 1
+TWO      EQU   2                   NUMBER 2
+THREE    EQU   3                   NUMBER 3
+FOUR     EQU   4                   NUMBER 4
+FIVE     EQU   5                   NUMBER 5
+SIX      EQU   6                   NUMBER 6
+SEVEN    EQU   7                   NUMBER 7
+EIGHT    EQU   8                   NUMBER 8
+NINE     EQU   9                   NUMBER 9
+TEN      EQU   10                  NUMBER 10
+*
+*               GRAPHICS STATUS FIELD FLAGS
+*
+OPENINIT EQU   X'80'               OPEN IS IN PROGRESS
+OPENRDY  EQU   X'40'               DEVICE CAME READY DURING OPEN
+DVCRDY   EQU   X'20'               DEVICE CAME READY - NOT IN OPEN
+BTAMROUT EQU   X'10'               USING IGG019UP
+USERROUT EQU   X'08'               USING USER WRITTEN EXIT
+*                                  NOTE: THIS FLAG SHOULD NEVER BE
+*                                  ON UPON ENTRY TO IGG019UP
+RDYNDONE EQU   X'04'               PROCESSING OF 'DEVICE CAME READY
+*                                  CONDITION' NOT COMPLETE
+DVCNRDY  EQU   X'02'               DEVICE HAS RETURNED INTERVENTION
+*                                  REQUIRED (SET BY IGG0194P IF
+*                                  DETECTED DURING OPEN OR
+*                                  IGE0210E IF SUBSEQUENT TO OPEN)
+RSVED    EQU   X'01'               FLAG RESERVED FOR BTAM'S USE
+*
+*              GRAPHICS CONTROL BYTE FLAGS
+*
+ONLINTST EQU   X'80'               ONLINE TEST CURRENTLY HAS THE
+*                                  DEVICE
+DEERR    EQU   X'40'               DEVICE END WITH ERROR
+*                                  IN IECTATEN
+RDTIACTV EQU   X'08'               READ TI ACTIVE FLAG (SET BY
+*                                  IECTSVC FOR DURATION OF READ
+*                                  INITIAL)
+RDTIPEND EQU   X'04'               READ TI PENDING (SET BY IECTSVC
+*                                  IF NO ATTENTIONS AT INITIATION
+*                                  OF READ INITIAL, RESET BY
+*                                  IECTATEN WHEN IGG019PG IS
+*                                  SCHEDULED TO ACTUALLY PERFORM
+*                                  THE EXCP FOR THE READ)
+SKIP     EQU   X'02'               DO NOT HONOR ATTENTIONS FROM
+*                                  DEVICE FOR READ TI'S
+ATTEN    EQU   X'01'               ATTENTION RECEIVED FROM DEVICE
+*
+*              OTHER EQUATES
+*
+ALLON    EQU   X'FF'               ALL BITS IN A BYTE
+NOBITS   EQU   X'00'               ALL BITS OFF IN A BYTE
+READY    EQU   X'F0'               DECFLAGS FOR READY DEVICE
+SADENERR EQU   X'80'               IOBINCAM OPEN FAIL BIT
+         EJECT
+         BALR  RBASE,0             ESTABLISH BASE REGISTER
+         USING *,RBASE             AND ASSEMBLER ADDRESSABILITY
+         B     PASTID              BRANCH AROUND ID           NOW
+         DC    C'IGG019UP'         TO LOCATE IN DUMP
+         DC    C'** MVS *'
+         DC    C'&SYSDATE'         ASSEMBLY DATE
+PATCH    DC    48XL1'00'                   PATCH AREA
+PASTID   DS    0H                  AROUND ID
+         LR    RSAVE,RRTRN         SAVE RETURN ADDRESS
+         XR    RRLN,RRLN           CLEAN RLN REGISTER
+         LR    RDEB,RPARM1         SAVE DEB AND RLN
+         SLDL  RRLN,EIGHT          PLUG RLN
+         SRL   RDEB,EIGHT          PUT DEB ADDRESS BACK
+         USING IECTDEB+36,RDEB     ESTABLISH DEB ADDRESSABILITY
+         LR    RODD,RRLN           GET THE RLN
+         BCTR  RODD,0              REDUCE BY ONE
+         LA    REVN,FOUR           GET LENGTH OF EXTENT
+         MR    REVN,REVN           RODD CONTAINS DISPLACEMENT
+*                                  FROM DEB EXTENT LIST TO
+*                                  EXTENT FOR THIS DEVICE
+         L     RUCB,DEBUCBAD(RODD) GET THE UCB ADRESS
+         LA    RUCB,0(RUCB)        INSURE HIGH BYTE CLEAR
+         L     RWORK1,DEBUCBAD     GET MASTER UCB ADDRESS
+         LA    RWORK1,0(RWORK1)    INSURE HIGH BYTE CLEAR
+         USING UCB,RUCB            ESTABLISH UCB ADDRESSABILITY
+         USING MSTRUCB,RWORK1      ESTABLISH MASTER ADDRESSABILITY
+         TM    UCBGRAF,DVCRDY      THIS DEVICE COME READY ?
+         BNO   CANTDO              NO, CAN'T PROCESS THIS DEVICE
+         CLI   MTRINRLN,NOBITS     INITIALIZED ?
+         BE    CANTDO              NO, NO IOB TO USE
+         XR    RWORKD,RWORKD       CLEAR REG
+         IC    RWORKD,MTRINRLN     GET INIT RLN
+         L     RWORK2,MTRDEBAD     GET THE DEB ADDRESS
+         LA    RWORK2,0(RWORK2)    INSURE HIGH BYTE CLEAR
+         CR    RDEB,RWORK2         DEB SAME AS PASSED ?
+         BNE   CANTDO              NO, CONTROL BLOCKS MESSED UP
+         OI    MTRGRAF,RDYNDONE    SET READY NOT DONE
+         DROP  RWORK1              DON'T NEED MASTER ANY MORE
+         L     RWORK1,DEBPROTG     GET THE DCB ADDRESS
+         LA    RWORK1,0(RWORK1)    INSURE HIGH BYTE CLEAR
+         USING IHADCB,RWORK1       ESTABLISH DCB ADDRESSABILITY
+         L     RWORK2,DCBIOBAD     GET ADDRESS OF IOB POOL
+         LR    RODD,RWORKD         GET RLN
+         XR    REVN,REVN           CLEAN EVEN REGISTER
+         IC    REVN,DCBEIOBX       GET SIZE OF IOB
+         LR    RWORKD,RWORK1       SAVE DCB ADDRESS
+         DROP  RWORK1              DON'T NEED DCB ANYMORE
+         MR    REVN,REVN           RODD CONTAINS DISPLACEMENT
+*                                  FROM TOP OF IOB POOL TO
+*                                  IOB FOR THIS DEVICE
+         LA    RWORK1,0(RODD,RWORK2) GET IOB ADDRESS
+         USING IECTIOB,RWORK1      ESTABLISH IOB ADDRESSABILITY
+         L     RWORK2,IOBECBPT     GET DECB ADDRESS
+         LA    RWORK2,0(RWORK2)    INSURE HIGH BYTE CLEAR
+         USING IECTDECB,RWORK2     ADDRESS DECB
+         STC   RRLN,DECRLN         UPDATE RLN TO READY DEVICE
+         DROP  RWORK1              DON'T NEED IOB ANYMORE
+         B     RESETPL              BRANCH TO RESETPL        LD YA02128
+CONTINUE EQU   *                                             LD YA02128
+         LTR   REP,REP             RETURN ZERO ?
+         BNZ   OPENOF              NO, DON'T RESET FLAGS
+         USING IECTDECB,RWORK2     ESTABLISH DECB ADDRESSABILITY
+         NI    DECFLAGS,NOBITS     RESET THE FLAGS
+         OI    DECFLAGS,READY      SET DEVICE CAME READY
+         STC   RRLN,DECPOLPT+THREE PLUG THE RLN              LD YA03233
+OPENOF   EQU   *                   RESET SAD/ENABLE FAILED IN IOB
+         USING IHADCB,RWORKD       ESTABLISH DCB ADDRESSABILITY
+         L     RWORK2,DCBIOBAD     GET ADDRESS OF IOB POOL
+         LR    RODD,RRLN           GET RLN
+         XR    REVN,REVN           CLEAR EVEN REG
+         IC    REVN,DCBEIOBX       GET SIZE OF IOB
+         DROP  RWORKD              DON'T NEED DCB ANY MORE
+         MR    REVN,REVN           RODD CONTAINS DISPLACEMENT
+*                                  FROM TOP OF IOB POOL TO
+*                                  IOB FOR THIS DEVICE
+         LA    RWORK1,0(RODD,RWORK2) GET IOB ADDRESS
+         USING IECTIOB,RWORK1      ESTABLISH IOB ADDRESSABILITY
+         NI    IOBINCAM,ALLON-SADENERR TURN OFF SAD ENABLE FAILED
+         DROP  RWORK1              DON'T NEED IOB ANYMORE
+CANTDO   EQU   *                   PROCESSING COMPLETE
+         LR    RRTRN,RSAVE         PICK UP RETURN POINT
+         BR    RRTRN               RETURN TO AEE2
+         EJECT
+*
+*
+*        THIS SUBROUTINE WILL SIMULATE RESETPL MACRO         LD YA02128
+*        EXPANSION. (RESETPL MACRO EXPANSION IS NOT          LD YA02128
+*        RE-ENTRANT.)                                        LD YA02128
+*
+*
+         SPACE 4
+*        REGISTER EQUATONS                                   LD YA02128
+*
+EXTREG   EQU   0                    NO. OF EXT               LD YA02128
+RLNREG   EQU   1                    RELATIVE LINE NUMBER REG LD YA02128
+WORKREG  EQU   1                    WORK REG                 LD YA02128
+DEBREG   EQU   2                    DEB ADDRESS              LD YA02128
+IOBREG   EQU   3                    IOB ADDRESS              LD YA02128
+UCBREG   EQU   7                    UCB ADDRESS              LD YA02128
+UCBPTR   EQU   9                    UCB POINTER              LD YA02128
+DECBREG  EQU   10                   DECB ADDRESS             LD YA02128
+DCBREG   EQU   14                   DCB ADDRESS              LD YA02128
+CODEREG  EQU   15                   RETURN CODE REG          LD YA02128
+*
+         SPACE 4
+*
+*        MISCELANEOUS EQUATIONS                              LD YA02128
+*
+ZERO     EQU   0                                             LD YA02128
+SIXTEEN  EQU   16                                            LD YA02128
+TWENTY4  EQU   24                                           LD @ZA00537
+X01      EQU   X'01'                                         LD YA02128
+RDINT    EQU   X'01'                                         LD YA02128
+X0C      EQU   X'0C'                                         LD YA02128
+OPCOMPLT EQU   X'40'                                         LD YA02128
+X58      EQU   X'58'                                         LD YA02128
+XBF      EQU   X'BF'                                         LD YA02128
+SVC116   EQU   116                                           LD YA02128
+*
+         SPACE 4
+RESETPL  EQU   *                                             LD YA02128
+         XR    RLNREG,RLNREG       CLEAR REG 1               LD YA02128
+         IC    RLNREG,DECRLN       GET RLN FROM DECB         LD YA02128
+         L     DCBREG,DECDCBAD     GET DCB ADDRESS           LD YA02128
+         USING IHADCB,DCBREG       DCB ADDRESSABILITY        LD YA02128
+         TM    DCBOFLGS,DCBOFOPN   HAS DCB BEEN OPENED       LD YA02128
+         BO    RESETPL0            IF SO, CONTINUE           LD YA02128
+         LA    CODEREG,X0C         IF NOT,SET RETURN CODE    LA YA02128
+         B     RESETPL7             AND EXIT                 LD YA02128
+RESETPL0 EQU   *                                             LD YA02128
+         L     DEBREG,DCBDEBAD     GET ADDR OF DEB           LD YA02128
+         LA    DEBREG,ZERO(DEBREG) CLEAR HIGH-ORDER BYTE     LD YA02128
+         SLA   RLNREG,TWO          MULTIPLY RLN BY 4         LD YA02128
+         L     UCBREG,DEBUCBAD-FOUR(RLNREG)  UCB ADDR        LD YA02128
+         CLI   UCBTBYT3,UCB3DISP   DEVICE CLASS=GRAPHICS     LD YA02128
+         BNE   RESETPL6            NO, DEVICE IS NOT ANR     LD YA02128
+         CLI   DECTYPE+ONE,RDINT   IS OP. READ INITIAL       LD YA02128
+         BNE   RESETPL5            NO, GIVE RC=10 AND EXIT   LD YA02128
+         TM    DECSDECB,OPCOMPLT   IS THIS OP COMPLETED      LD YA02128
+         BO    RESETPL4             YES, GIVE RC=4 AND EXIT  LD YA02128
+         LR    RPARM0,DECBREG       DECB ADDR IN REG 0       LD YA02128
+         LR    RPARM1,UCBREG        UCB ADDR IN REG 1        LD YA02128
+         LA    CODEREG,FOUR         ROUTING CODE IN REG 15   LD YA02128
+         SVC   SVC116               ISSSUE SVC 116           LD YA02128
+         SLL   CODEREG,TWENTY4      MAKE SURE THAT ONLY...  LD @ZA00537
+         SRL   CODEREG,TWENTY4      ...RC IN REG 15         LD @ZA00537
+         LA    WORKREG,FOUR         ESTABLISH COMPARANT      LD YA02128
+         CR    CODEREG,WORKREG      IS RC 0 OR 4             LD YA02128
+         BH    RESETPL8            NO, CHECK RC=16             @ZA14028
+         L     IOBREG,DCBIOBAD      GET IOB ADDRESS          LD YA02128
+         USING IECTIOB,IOBREG       IOB ADDRESSABILITY       LD YA02128
+         LA    IOBREG,X58(IOBREG)   GET ADDR OF FIRST IOB    LD YA02128
+         XR    EXTREG,EXTREG        CLEAR REG 0              LD YA02128
+         IC    EXTREG,DEBNMEXT      GET NO. OF EXTENT        LD YA02128
+*                                   AND USE AS LOOP COUNTER  LD YA02128
+         LA    UCBPTR,DEBUCBAD      ADDR OF 1ST DEB UCB PTR  LD YA02128
+RESETPL1 EQU   *                                             LD YA02128
+         OI    IOBFLAG2,X01         SET RESETPL ISSUED FLAG  LD YA02128
+         TM    IOBINCAM,X01         RFT IN PROGRESS          LD YA02128
+         BO    RESETPL3             YES, ADJUST RC           LD YA02128
+         L     UCBREG,ZERO(UCBPTR)  ADDRESS OF UCB           LD YA02128
+         TM    UCBFLA,UCBPST        OUTSTANDING I/O OP.      LD YA02128
+         BO    RESETPL2             YES, KEEP IOB BUSY       LD YA02128
+         NI    IOBINCAM,XBF         TURN OFF IOB BUSY FLAG   LD YA02128
+RESETPL2 EQU   *                                             LD YA02128
+         LA    IOBREG,X58(IOBREG)   STEP TO NEXT IOB         LD YA02128
+         LA    UCBPTR,FOUR(UCBPTR)  STPE TO NEXT UCB PTR     LD YA02128
+         BCT   EXTREG,RESETPL1      LOOP IF NOT FINISHED     LD YA02128
+         B     RESETPL7             EXIT                     LD YA02128
+RESETPL3 EQU   *                                             LD YA02128
+         XR    CODEREG,CODEREG      SET RC TO ZERO           LD YA02128
+         B     RESETPL2                                        @ZA08056
+RESETPL4 EQU   *                                             LD YA02128
+         LA    CODEREG,FOUR         SET RC TO 4              LA YA02128
+         B     RESETPL7             EXIT                     LD YA02128
+RESETPL5 EQU   *                                             LD YA02128
+         LA    CODEREG,SIXTEEN       SET RC TO X'10'         LD YA02128
+         B     RESETPL7              EXIT                    LD YA02128
+RESETPL6 EQU   *                                             LD YA02128
+         LA    CODEREG,EIGHT        SET RC TO 8              LD YA02128
+RESETPL7 EQU   *                                             LD YA02128
+         B     CONTINUE                                      LD YA02128
+RESETPL8 EQU   *                                               @ZA14028
+         LA    WORKREG,SIXTEEN    ESTABLISH COMPARAND          @ZA14028
+         CR    CODEREG,WORKREG    IS RC=16                     @ZA14028
+         BNE   RESETPL7           NO - EXIT WITH ORIG RC       @ZA14028
+         TM    DECSDECB,OPCOMPLT  IS OPERATION COMPLETE        @ZA14028
+         BO    RESETPL4           YES - GIVE RC=4 AND EXIT     @ZA14028
+         B     RESETPL7           EXIT WITH ORIG RC            @ZA14028
+         DROP  IOBREG
+         EJECT
+UCB      DSECT
+         IEFUCBOB
+         EJECT
+MSTRUCB  DSECT                                               LD YA02128
+MTRGRAF  EQU   MSTRUCB+(UCBGRAF-UCBOB)                       LD YA02128
+MTRINRLN EQU   MSTRUCB+(UCBINRLN-UCBOB)
+MTRRLN   EQU   MSTRUCB+(UCBRLN-UCBOB)
+MTRDEBAD EQU   MSTRUCB+(UCBCTLNK-UCBOB)
+         EJECT
+         IECTIOBX
+         EJECT
+         IECTDEBX
+         EJECT
+         IECTDECB
+         EJECT
+         DCBD  DSORG=BX
+         EJECT
+         END   IGG019UP

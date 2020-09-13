@@ -1,0 +1,364 @@
+         TITLE 'IEDAYP  -  TIOC TPOSTING ROUTINE'
+***********************************************************************
+*C000000-999999                                                @OY14094
+***********************************************************************
+*
+*01* MODULE-NAME = IEDAYP
+*
+*01* DESCRIPTIVE-NAME = TIOC TPOSTING ROUTINE
+*
+*01* COPYRIGHT = NONE
+*
+*01* STATUS = 00
+*
+*01* FUNCTION = PERFORMS TPOSTING AND UPDATING OF TCAM
+*               CONTROL BLOCKS WHILE SYNCHRONIZED WITH OTHER
+*               TCAM TASKS VIA THE TCAM DISPATCHER.
+*
+*01* NOTES = N/A
+*
+*02*   DEPENDENCIES = N/A
+*
+*02*   RESTRICTIONS = N/A
+*
+*02*   REGISTER-CONVENTIONS = SEE REGISTER EQUATES
+*
+*02*   PATCH-LABEL = AYPEND
+*
+*01* MODULE-TYPE = ASSEMBLER LANGUAGE CSECT
+*
+*02*   PROCESSOR = ASSEMFX-370R
+*
+*02*   MODULE-SIZE = SEE EXTERNAL SYMBOL DICTIONARY TYPE SD ID 01
+*
+*02*   ATTRIBUTES = REENTRANT, REFRESHABLE, PROBLEM STATE, TCAM'S
+*                   PROTECTION KEY
+*
+*01* ENTRY-POINT = IEDAYP+2
+*
+*02*   PURPOSE = SEE FUNCTION
+*
+*02*   LINKAGE = FROM TCAM DISPATCHER VIA BRANCH
+*
+*01* INPUT = REGISTER 01 CONTAINS ADDRESS OF ELEMENT TPOSTED
+*            REGISTER 11 CONTAINS ADDRESS OF TCAM DISPATCHER
+*            REGISTER 13 CONTAINS ADDRESS OF AVTSAVE2
+*
+*01* OUTPUT = REGISTER 01 CONTAINS ADDRESS OF A CHAIN OF 0 OR MORE
+*                         ELEMENTS TO BE TPOSTED
+*             REGISTER 11 CONTAINS ADDRESS OF TCAM DISPATCHER
+*             REGISTER 13 CONTAINS ADDRESS OF AVTSAVE2
+*
+*01* EXIT-NORMAL = TO TCAM DISPATCHER AT ENTRY POINT DSPCHAIN
+*
+*01* EXIT-ERROR = NONE
+*
+*01* EXTERNAL-REFERENCES -
+*
+*02*   ROUTINES = TERMINAL NAME TABLE ROUTINE
+*
+*02*   DATA-AREAS = AVTSAVE2 IS USED AS A WORK AREA BY IEDAYP.
+*                   (SEE SEQUENCE NUMBER 744000)
+*
+*02*   CONTROL-BLOCKS = SEE MAPPING MACROS AT END OF LISTING
+*
+*01* TABLES = N/A
+*
+*01* MACROS = NONE
+*
+*
+****END OF SPECIFICATIONS********************************************
+         EJECT
+IEDAYP   CSECT
+*
+*   REGISTER EQUATES
+*
+RWRK0    EQU   0                        WORK REGISTER
+RWRK1    EQU   1                        WORK REGISTER
+REVN2    EQU   2                        WORK REGISTER
+RODD3    EQU   3                        WORK REGISTER
+REVN4    EQU   4                        WORK REGISTER
+RMASK    EQU   4                        ADDR OF MASK BYTE
+RWRK4    EQU   4                        WORK REGISTER
+RODD5    EQU   5                        WORK REGISTER
+RFLAG    EQU   6                        ADDR OF FLAG BYTE
+RWRK6    EQU   6                        WORK REGISTER
+RQCB     EQU   7                        QCB POINTER
+RTSB     EQU   8                        TSB POINTER
+RTPST    EQU   9                        ADDR OF TPOST WORK AREA
+RTSI     EQU   10                       TSI POINTER
+RDISP    EQU   11                       ADDR OF TCAM DISPATCHER
+RBASE    EQU   12                       BASE REGISTER
+RAVT     EQU   13                       AVT POINTER
+RLINK    EQU   14                       LINK REGISTER
+RWRK14   EQU   14                       WORK REGISTER
+REPA     EQU   15                       ENTRY POINT ADDR
+*
+*   MASKS AND DISPLACEMENTS
+*
+E0       EQU   0                        NULL DISPLACEMENT
+E1       EQU   1                        DECIMAL 1
+E7       EQU   7                        DECIMAL 7
+ELEVEN   EQU   11                       NUMBER OF BITS TO CHECK
+SIXTEEN  EQU   16                       SHIFT TO GET INTO HI-BYTES
+INHB3705 EQU   4                        OFFSET TO 3705 INHIBIT BYTE
+USEINHIB EQU   X'10'                    3705 TIMEOUT INHIBIT SETTING
+OFF      EQU   X'FF'                    ALL BITS OFF FLAG
+*
+*   TCAM SUB-TASK CONTROL BLOCK
+*
+         DC    AL1(DSPMCPL2,0)          STCB
+*
+*   ESTABLISH ADDRESSABILITY
+*
+         USING *,RBASE                  BASE ADDR
+         LR    RBASE,REPA               LOAD BASE REGISTER
+         B     GETPTRS                  GO GET POINTERS
+IEDAYP   IEDHJN ,
+         USING IEDQDISP,RDISP           DISPATCHER ADDRESSABLE
+         USING AVTSAVE2,RAVT            AVT ADDRESSABLE
+*
+*   GET POINTERS TO CONTROL BLOCKS
+*
+GETPTRS  EQU   *
+         LA    RWRK0,TSBRCB-TSB         GET OFFSET OF RCB IN TSB
+         LR    RTSB,RWRK1               GET RCB ADDR
+         SR    RTSB,RWRK0               GET TSB ADDR
+         USING TSB,RTSB                 TSB ADDRESSABLE
+         L     RTSI,AVTTSOPT            GET TSI ADDR
+         USING IEDQTSI,RTSI             TSI ADDRESSABLE
+         SR    RQCB,RQCB                ASSUME NO QCB
+         LH    RWRK1,TSBASRCE           GET TERMINAL INDEX
+         LTR   RWRK1,RWRK1              TERMINAL INDEX ZERO
+         BZ    PICKUP                   YES
+         L     REPA,AVTRNMPT            EPA OF TERM TBL RTN
+         BALR  RLINK,REPA               GE GET TRM ADDR
+         USING IEDQTRM,RWRK1            TRM ADDR RETURNED IN 1
+         L     RQCB,TRMDESTQ-E1         TERM DEST QCB ADDR
+         USING IEDQQCB,RQCB             QCB ADDRESSABLE
+*
+*   IF THIS TERMINAL IS NOT IN A TIME SHARING SESSION,
+*   EXIT TO THE TCAM DISPATCHER
+*
+         TM    QCBFLAG,QCBTSSES         IS QCB IN TS SESSION
+         BNO   DSPDISP                  NO, EXIT
+*
+*   PICK UP TSBTPOST & ZERO IT USING COMPARE & SWAP.
+*   THIS WILL SYNCHRONIZE THIS ROUTINE WITH OTHER ASYNCHRONOUS
+*   ROUTINES USING THIS FIELD.  ACTIONS REQUESTED AFTER THIS
+*   POINT WILL REQUIRE IEDAYP TO BE TPOSTED AGAIN.
+*
+PICKUP   EQU   *
+         LM    REVN2,RODD3,TSBTPOST     GET CURRENT SETTINGS
+         SR    REVN4,REVN4              CLEAR
+         LR    RODD5,REVN4              CLEAR
+RETRY    EQU   *
+         CDS   REVN2,REVN4,TSBTPOST     ZERO TPOST FLAGS
+         BNZ   RETRY                    RETRY UNTIL DONE
+*
+         STM   REVN2,RODD3,AYPTPOST     SAVE IN WORK AREA
+         LA    RTPST,AYPTPOST           GET ADDR OF SAVE AREA
+         USING TSBTPOST,RTPST           TSB REFERENCES WILL NOW
+*                                       REFERENCE THE WORK AREA COPY
+         ST    REVN4,AYPCHAIN           CLR ELEM CHAIN POINTER
+         LTR   RQCB,RQCB                ANY TERMINAL FOR THIS USER
+         BZ    PASTQCB                  NO, SKIP QCB PROCESSING
+*
+*   RECONNECT A USER TO HIS OLD ENVIROMENT BY STORING HIS
+*   OLD ASID IN HIS NEW QCB
+*
+         TM    TSBTPFLG,TSBNEWID        SHOULD ASID BE UPDATED
+         BNO   GO                       NO, SKIP ASID UPDATING
+         L     REVN2,TSBASCBA           ASCB ADDRESS
+         LH    REVN4,ASCBASID-ASCB(,REVN2)  GET OLD ASID
+         TM    QCBTSOF1,QCBDELAY        QCB ON DELAY QUEUE
+         BNZ   DELAYQ                   YES, ASID IS RELOCATED
+         STH   REVN4,QCBTJID            STORE OLD ASID
+         B     GO                       PROCESS TSBTPOST
+DELAYQ   EQU   *
+         STH   REVN4,QCBLINK+E1         STORE ASID IN QCB ON DELAY Q
+*
+*   SET & RESET BITS AS INDICATED IN TSB TPOST
+*
+GO       EQU   *
+         LA    RFLAG,QCBFLAG            .SET AND/OR RESET
+         LA    RMASK,TSBFLAGM           .BITS IN
+         BAL   RLINK,SST                .QCBFLAG
+*
+         LA    RFLAG,QCBTSOF2           .SET AND/OR RESET
+         LA    RMASK,TSBF2M             .BITS IN
+         BAL   RLINK,SST                .QCBTSOF2
+*
+         LA    RFLAG,QCBTSOF1           .SET AND/OR RESET
+         LA    RMASK,TSBF1M             .BITS IN
+         BAL   RLINK,SST                .QCBTSOF1
+         SPACE 2
+*---------------------------------------------------------------------*
+*     CHECK FOR 3705 IF QCBINHBN WAS SET/RESET.                       *
+*---------------------------------------------------------------------*
+         TM    TSBF2M,QCBINHBN          ANYTHING TO DO WITH TIMEOUT
+         BZ    TPOST                    NO,SKIP 3705 PROCESSING
+         TM    TRMDSORG,TRMLGB          IS TERMINAL ATTACHED VIA 3705
+         BZ    TPOST                    NO SKIP 3705 PROCESSING
+         TM    TRMSTATE,TRMOPTFN        ARE THERE ANY OPTION FIELDS
+         LA    RWRK4,TRMOPNO            ASSUME NONE - GET START OF
+*                                       DEVICE DEPENDENT FIELDS
+         BZ    NOPTION                  BRANCH IF NONE
+         SR    RWRK14,RWRK14            CLEAR REGISTER
+         IC    RWRK14,TRMOPNO           NUMBER OF OPTION FIELDS
+         LA    RWRK4,TRMOPT(RWRK14)     GET START OF DEVICE
+*                                       DEPENDENT FIELDS
+NOPTION  EQU   *
+         LH    RWRK14,TRMDEVFL          GET DEVICE DEPENDENT FLAGS
+         LA    REPA,ELEVEN              SET UP FOR BIT SEARCH
+         SLL   RWRK14,SIXTEEN           SHIFT BITS TO HI-ORDER 2 BYTES
+         SR    RWRK6,RWRK6              CLEAR REGISTER
+         SPACE 1
+*---------------------------------------------------------------------*
+*    COUNT THE BITS ON AND SKIP THAT MANY FIELDS.                     *
+*---------------------------------------------------------------------*
+SHIFT    EQU   *
+         LTR   RWRK14,RWRK14            CHECK HI-ORDER BIT ON
+         BNM   CHKCOUNT                 NOT ON,DON'T COUNT
+         LA    RWRK6,E1(,RWRK6)         ON,COUNT
+CHKCOUNT EQU   *
+         SLL   RWRK14,E1                SHIFT TO CHECK NEXT BIT
+         BCT   REPA,SHIFT               CHECK ALL 12 BITS
+         SPACE 1
+*---------------------------------------------------------------------*
+*    RWRK6 NOW HAS NUMBER OF FIELDS TO SKIP TO GET TO DEVICE          *
+*     DEPENDENT FIELD.                                                *
+*---------------------------------------------------------------------*
+         LTR   RWRK6,RWRK6              ANY FIELDS TO SKIP
+         BZ    SETMODE                  NO,GO SET 3705 FIELD
+         SR    RWRK14,RWRK14            CLEAR FOR IC INSTRUCTION
+SKIP     EQU   *
+         IC    RWRK14,AVTEZERO(,RWRK4)  GET FIELD LENGTH
+         LA    RWRK4,E1(RWRK14,RWRK4)   SKIP OVER FIELD
+         BCT   RWRK6,SKIP               DO IT FOR EACH FIELD
+         SPACE 1
+*---------------------------------------------------------------------*
+*    RWRK4 NOW POINTS TO 3705 DEVICE DEPENDENT FIELD.                 *
+*---------------------------------------------------------------------*
+SETMODE  EQU   *
+         TM    TSBF2V,QCBINHBN          SET OR RESET 3705 INHIBIT
+         BZ    TIMEOUT                  SET 3705 INHIBIT BIT OFF
+         OI    INHB3705(RWRK4),USEINHIB TURN INHIBIT BIT ON
+         B     TPOST                     DO TPOSTING
+TIMEOUT  EQU   *
+         NI    INHB3705(RWRK4),OFF-USEINHIB   TURN INHIBIT BIT OFF
+         SPACE 2
+*
+*   DO TPOSTING AS INDICATED IN TSBTPOST
+*
+TPOST    EQU   *
+         TM    TSBTPFLG,TSBTPQCB        TPOST TERM. DEST. QCB
+         BNO   PASTQCB                  NO, DON'T TPOST QCB
+*
+         TM    QCBTSOF1,QCBDELAY        IS QCB ON DELAY QUEUE
+         BNO   NODELAY                  NO, CAN TPOST QCB
+*
+         TM    TSIDYQFG,TSIDYPOS        DELAY QCB TPOSTED
+         BO    PASTQCB                  YES, CAN'T TPOST QCB
+*
+         OI    TSIDYQFG,TSIDYPOS        SHOW DELAY QCB TPOSTED
+         LA    RQCB,TSIDYQFG            GET DELAY QUEUE QCB ADDR
+         B     POSTQCB                  GO POST
+*
+NODELAY  EQU   *
+         TM    QCBTSOF2,QCBPOSTO        QCB ALREADY TPOSTED
+         BO    PASTQCB                  YES, DON'T TPOST
+         OI    QCBTSOF2,QCBPOSTO        SHOW QCB TPOSTED
+*
+POSTQCB  EQU   *
+         STCM  RQCB,E7,QCBELCHN         STORE QCB ADDR
+         MVI   QCBPRI,PRIDESTQ          SET TPOST PRIORITY
+         MVC   QCBLINK,AYPCHANB         LINK TO NEXT ELEMENT
+         ST    RQCB,AYPCHAIN            ADD THIS ELEM TO CHAIN
+         DROP  RQCB                     RQCB MAY HAVE TSI ADDR
+*
+PASTQCB  EQU   *
+         TM    TSBTPFLG,TSBTPAYI        TPOST TSINPUT
+         BNO   PASTTSI                  NO, DON'T TPOST TSI
+*
+         TM    TSIFLAG,TSIPOST          TSI ALREADY TPOSTED
+         BO    PASTTSI                  YES, DON'T TPOST AGAIN  YM03998
+         OI    TSIFLAG,TSIPOST          SHOW TSI TPOSTED
+*
+         STCM  RTSI,E7,TSIELCHN         STORE 'QCB' ADDR
+         MVI   TSIPRI,PRIBFRTB          SET PRIORITY
+         MVC   TSILINK,AYPCHANB         LINK TO NEXT ELEMENT
+         ST    RTSI,AYPCHAIN            ADD THIS ELEM TO CHAIN
+*
+PASTTSI  EQU   *
+         L     RWRK1,AYPCHAIN           GET CHAIN OF ELEM'S
+         B     DSPCHAIN                 EXIT TO DISPATCHER
+         DROP  RTSB,RTPST
+*
+**********************************************************************
+*
+*   PERFORM BIT SETTINGS IN A FLAG BYTE
+*
+*   REGISTERS AT ENTRY--
+*        RMASK - ADDR OF MASK BYTE.  CONTAINS ONES IN BIT
+*                POSITIONS WHICH ARE TO BE SET OR RESET IN THE
+*                FLAG BYTE.
+*              - AT THIS ADDRESS +1 IS A 'VALUE' BYTE, CONTAINING
+*                THE VALUE (1 OR 0) TO WHICH THE CORRESPONDING
+*                BIT IN THE FLAG BYTE SHOULD BE SET.
+*        RODD5 - WORK REGISTER.
+*        ALL THE ABOVE REGISTERS MAY BE ALTERED.
+*        RFLAG - ADDR OF FLAG BYTE
+*        RLINK - RETURN ADDRESS.
+*
+SST      EQU  *
+         CLI   E0(RMASK),E0             ANY ACTION REQUESTED
+         BER   RLINK                    NO, RETURN
+*
+         IC    RODD5,E1(,RMASK)         GET VALUE BYTE
+         IC    RMASK,E0(,RMASK)         GET MASK BYTE
+         NR    RODD5,RMASK              CLEAR IRRELEVANT BITS
+*                                       IN THE VALUE BYTE
+         EX    RODD5,OR                 SET BITS AS REQUIRED
+         LCR   RMASK,RMASK              GET 2'S COMPLEMENT
+         BCTR  RMASK,E0                 GET 1'S COMPLEMENT
+         OR    RMASK,RODD5              SET BIT POSITIONS NOT
+*                                       TO BE RESET
+         EX    RMASK,AND                RESET BITS AS REQUIRED
+         BR    RLINK                    RETURN
+*
+OR       OI    E0(RFLAG),*-*            EXECUTED OR
+AND      NI    E0(RFLAG),*-*            EXECUTED AND
+*                                                                    *
+**********************************************************************
+*                                                                    *
+AYPEND   DC    9F'0'                    PATCH AREA
+         EJECT
+         TAVTD
+         EJECT
+*
+*   WORK AREA
+*
+IEDQAVTD DSECT
+         ORG   AVTSAVE2
+         DS    3F                       RESERVED
+AYPTPOST DS    2F                       TPOST WORK AREA
+AYPBYTE  DS    X                        BYTE-SIZE WORK AREA
+AYPCHAIN DS    0A                       POINTER TO CHAIN OF
+         DS    X                        ELEMENTS TO TPOST
+AYPCHANB DS    AL3                      BYTE BOUNDARY POINTER
+         EJECT
+         TDISPD
+         EJECT
+         TPRIOR
+         EJECT
+         TQCBD
+         EJECT
+         TTRMD
+         EJECT
+         IKJTSB LIST=YES
+         EJECT
+         TTSID
+         EJECT
+         IHAASCB
+         END

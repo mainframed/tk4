@@ -1,0 +1,439 @@
+APES     TITLE 'APEMAN LOG SPLITTING ROUTINE'
+SPLIT    CSECT
+         B     ENTRY-SPLIT(15)
+         DC    X'06',CL7'SPLIT'
+ENTRY    EQU   *
+*
+**  ROUTINE READS DATA FROM THE LOG
+**  FOR EACH MONITOR WHOSE RECORDS ARE FOUND IN THE LOG, A PARTIAL
+**  LOG IS WRITTEN, CONTAINING ONLY THE RECORDS FOR THAT MONITOR.
+*
+RW0      EQU   0
+RW1      EQU   1
+RB2      EQU   2                       BASE REGISTER
+RW3      EQU   3                       BLOCKSIZE
+RW4      EQU   4
+RW5      EQU   5                       POINTER TO OUTPUT CONTROL BLKS
+RW6      EQU   6
+RW7      EQU   7
+RW8      EQU   8                       OUTPUT BUFFER POINTER
+RW9      EQU   9
+RW10     EQU   10                      INPUT BUFFER POINTER
+RW11     EQU   11
+RW12     EQU   12                      END OF INPUT BUFFER
+RW14     EQU   14
+RW15     EQU   15
+*
+         STM   14,12,12(13)            SAVE REGISTERS
+         BALR  RB2,0
+         USING *,RB2                   ESTABLISH ADDRESSABILITY
+ENTER    EQU   *
+         ST    13,SAVE+4
+         LR    RW3,13
+         LA    13,SAVE
+         ST    13,8(RW3)               CHAIN SAVE AREAS
+*
+         OPEN  (INDCB)                 OPEN CONSOLIDATED LOG FOR INPUT
+*
+         SR    RW4,RW4                 SHOW NO CURRENT OUTPUT RECORD
+         GET   INDCB                   GET FIRST BLOCK OF LOG DATA
+         LR    RW10,1                  LOAD BUFFER ADDRESS
+         LH    RW3,INDCB+DCBLRECL-IHADCB    SAVE INPUT BLOCKSIZE
+         STH   RW3,DCBSKEL+DCBBLKSI-IHADCB  FORCE OUTPUT BLOCKSIZE
+         STH   RW3,DCBSKEL+DCBLRECL-IHADCB  FORCE OUTPUT LRECL
+         LA    RW12,0(RW3,RW10)        COMPUTE END OF BUFFER
+*
+         CLC   MAIN,0(RW10)            IS THIS THE MAIN RECORD?
+         BNE   BADLOG                  NO, SOMETHING WRONG WITH LOG
+         LA    RW1,26                  LENGTH OF MAIN FIELD IN WORDS
+         C     RW1,4(,RW10)            VERIFY LENGTH OF MAIN RECORD
+         BNE   BADLOG                  QUIT IF NOT 26 WORDS
+         LA    RW10,112(,RW10)         SKIP OVER MAIN RECORD
+         CLC   DATE,0(RW10)            NEXT SEGMENT SHOULD BE DATE
+         BNE   BADLOG                  QUIT IF NOT
+         LA    RW1,2                   LENGTH OF DATE FIELD IN WORDS
+         C     RW1,4(,RW10)            VERIFY LENGTH OF DATE RECORD
+         BNE   BADLOG                  QUIT IF NOT 2 WORDS
+         MVC   DATEREC,0(RW10)         PRESERVE DATE RECORD
+         LA    RW10,16(,RW10)          ADVANCE TO FIRST DATA RECORD
+*
+**  GET A POOL OF OUTPUT BUFFERS
+**  TO ALLOW FOR MONITORS BEING STARTED VIA MODIFY COMMANDS,
+**  WE ASSUME THAT ALL 26 POSSIBLE MONITORS MAY HAVE BEEN RUNNING.
+**  ENOUGH BUFFERS ARE OBTAINED SO THAT WE MAY HAVE ONE BUFFER
+**  ASSIGNED TO EACH, WITH EXTRA BUFFERS FOR ACTIVE I/O.
+*
+         L     RW4,NBUFS               ALLOW FOR EXCESSIVE BUFFERS
+         SRL   RW4,2                   BYTES TO WORDS
+         LR    RW1,RW4                 NUMBER OF BUFFERS TO ODD REG
+         MR    RW0,RW3                 COMPUTE TOTAL NEED FOR BUFFERS
+         LA    RW0,8(,RW1)             ALLOW FOR BUFFER POOL CTL BLK
+         ST    RW0,POOLSIZE            SAVE TOTAL SIZE OF BUFFER POOL
+         GETMAIN R,LV=(0)              GET A BUFFER POOL
+*
+**  NOW BUILD THE POOL OF OUTPUT BUFFERS
+*
+         ST    RW1,DCBSKEL+DCBBUFCB-IHADCB  SAVE ADDRESS OF BUFFER POOL
+         LR    RW5,RW1                 SAVE TO COMPUTE BUFFER ADDRESSES
+         STC   RW4,DCBSKEL+DCBBUFNO-IHADCB  STORE IN SKELETON DCB
+         BUILD (1),(RW4),(RW3)         AND FORMAT THE BUFFER POOL
+*
+**  NOW COMPUTE ADDRESSES OF ALL THE BUFFERS
+*
+         LA    RW1,BUFSTACK            POINT TO BOTTOM OF BUFFER STACK
+         LA    RW5,8(RW5)              OVER BUFCB TO FIRST BUFFER
+BUFMARK  ST    RW5,0(RW1)              SAVE BUFFER ADDRESS IN STACK
+         AR    RW5,RW3                 ADVANCE TO NEXT BUFFER
+         LA    RW1,4(RW1)              ADVANCE TO NEXT STACK ENTRY
+         BCT   RW4,BUFMARK             STORE ANOTHER BUFFER ADDRESS
+*
+         EJECT
+GETREC   CLC   END,0(RW10)             CHECK FOR END OF APEMAN RUN
+         BE    ENDATA                  CLEAN UP OUTPUT DCB'S IF SO
+         CLC   MON,0(RW10)             IS IT A MONITOR RECORD?
+         BNE   FOUR                    ABEND IF NOT
+         SR    RW11,RW11               CLEAR REGISTER FOR INSERTS
+         IC    RW11,3(RW10)            LOAD MONITOR ID
+         IC    RW11,INDEX1(RW11)       OFFSET OF CTL WORD FOR MON
+         L     RW5,INDEX2(RW11)        LOAD CONTROL WORD
+         LTR   RW5,RW5                 FIRST TIME FOR THIS MONITOR?
+         BNZ   NOTFIRST                BR IF DCB ALREADY EXISTS
+         GETMAIN R,LV=WORKLEN          GET WORK AREA FOR MONITOR
+         ST    RW1,INDEX2(RW11)        STORE WORK AREA PTR IN INDEX2
+         LR    RW5,RW1                 LOAD WORK AREA ADDRESS
+         USING WORKAREA,RW5            GET ADDRESSABILITY
+*
+**  BUILD A DECB
+*
+         MVI   0(RW5),0                PREPARE TO CLEAR
+         MVC   1(WORKLEN-1,RW5),0(RW5)   ALL OF GETMAINED AREA
+         STH   RW3,DECBUFLN            STORE BUFFER LENGTH IN DECB
+         LA    RW9,OUTDCB              GET ADDRESS OF DCB TO BE BUILT
+         ST    RW9,DECDCBAD            STORE DCB ADDRESS IN DECB
+*
+**  BUILD A DCB
+*
+         MVC   OUTDCB(DCBLEN),DCBSKEL  MOVE IN SKELETON DCB
+         MVC   OUTDCB+DCBDDNAM+3-IHADCB(1),3(RW10)   MON ID TO DDNAME
+*
+         OPEN  ((RW9),(OUTPUT))        OPEN THE DCB
+*
+         BAL   RW9,GETBUF              GET AN OUTPUT BUFFER
+         MVC   0(4,RW8),MAIN           INDICATE MAIN RECORD
+         LA    RW0,26                  STANDARD LENGTH OF MAIN RECORD
+         ST    RW0,4(,RW8)             STORE RECORD LENGTH
+         LA    RW1,4(RW11,RW8)         MAIN RECORD FIELD FOR THIS MON
+         MVI   3(RW1),1                INDICATE ONLY THIS MONITOR
+         LA    RW8,112(,RW8)           BUMP OUTPUT POINTER PAST MAIN
+         MVC   0(16,RW8),DATEREC       MOVE IN DATE RECORD
+         LA    RW8,16(,RW8)            MOVE POINTER PAST DATE RECORD
+         B     SPANTEST                PUT OUT CURRENT DATA RECORD
+         EJECT
+NOTFIRST EQU   *
+         L     RW8,BUFAD               LOAD BUFFER ADDRESS FOR THIS DCB
+         AH    RW8,BUFPTR              ADVANCE TO CURRENT POSITION
+*
+**  CHECK FOR SPECIAL CASE OF ONLY MONITOR NAME IN CURRENT BUFFER
+*
+SPANTEST LR    RW4,RW8                 SAVE START OF OUTPUT RECORD
+         LA    RW11,4(,RW10)           NEXT BYTE PAST MONITOR NAME
+         CR    RW11,RW12               IS IT IN CURRENT INPUT BUFFER?
+         BL    MOVE                    NORMAL CASE IF SO
+         MVC   0(4,RW8),0(RW10)        PUT OUT MONITOR NAME
+         LA    RW8,4(RW8)              BUMP OUTPUT POINTER
+         C     RW8,BUFEND              DOES THAT FILL OUTPUT BUFFER?
+         BL    *+12                    SKIP WRITE AND GETBUF IF NOT
+         BAL   RW9,ENDBUF              WRITE OUT COMPLETED BUFFER
+         BAL   RW9,GETBUF              GET A NEW OUTPUT BUFFER
+         GET   INDCB                   GET A NEW INPUT BUFFER
+         LR    RW10,RW1                SET INPUT BUFFER POINTER
+         LA    RW12,0(RW3,RW10)        COMPUTE END OF NEW BUFFER
+         L     RW11,0(,RW10)           PICK UP APEMAN RECORD LENGTH
+         LTR   RW11,RW11               MAKE SURE IT IS POSITIVE
+         BNP   FIVE                    ABEND IF NOT
+         CR    RW11,RW3                CHECK FOR REASONABLE LENGTH
+         BNL   FIVE                    ABEND IF NOT
+         BCT   RW11,MOVE+4             ADJUST FOR WRITTEN MONITOR NAME
+*
+**  MOVE DATA INTO BUFFER AREA
+*
+MOVE     EQU   *
+         L     RW11,4(,RW10)           LOAD APEMAN RECORD LENGTH
+         LTR   RW11,RW11               MAKE SURE IT IS POSITIVE
+         BNP   NUMIO                   ABEND IF NOT
+         CR    RW11,RW3                CHECK FOR REASONABLE LENGTH
+         BNL   NUMIO                   ABEND IF NOT
+         SLL   RW11,2                  CONVERT FROM BYTES TO WORDS
+         LA    RW11,8(RW11)            INCLUDE 2 HEADER WORDS
+         LR    RW7,RW12                ADDRESS END OF INPUT BUFFER
+         SR    RW7,RW10                AMOUNT LEFT IN INPUT BUFFER
+RETRY    L     RW6,BUFEND              ADDRESS END OF OUTPUT BUFFER
+         SR    RW6,RW8                 AMOUNT LEFT IN OUTPUT BUFFER
+         LR    RW9,RW7                 INPUT BUFFER RUNS OUT SOONER
+         CR    RW9,RW6                 WHICH HAS MORE ROOM LEFT?
+         BNH   *+6                     BR INLESS OUTPUT IS SHORT
+         LR    RW9,RW6                 LESSER VALUE IN RW9
+         CR    RW11,RW9                WILL CURRENT RECORD FIT?
+         BH    NOTROOM                 BRANCH IF RECORD MUST BE SPLIT
+         LR    RW9,RW11                COPY COUNT TO OUTPUT REGISTER
+         MVCL  RW8,RW10                MOVE THE ENTIRE RECORD
+         C     RW8,BUFEND              DID IT JUST FILL OUTPUT BUFFER?
+         BL    *+12                    READY FOR NEXT RECORD IF NOT
+         BAL   RW9,ENDBUF              WRITE OUT COMPLETED BUFFER
+         BAL   RW9,GETBUF              ELSE NEED A NEW BUFFER
+         S     RW8,BUFAD               REDUCE TO OFFSET = 0
+         STH   RW8,BUFPTR              SAVE FOR NEXT RECORD
+         SR    RW4,RW4                 SHOW NO CURRENT OUTPUT RECORD
+         CR    RW10,RW12               IS INPUT BUFFER EXHAUSTED?
+         BL    GETREC                  JUST GET NEXT RECORD IF NOT
+         GET   INDCB                   READ ANOTHER BLOCK
+         LR    RW10,RW1                SET INPUT BUFFER POINTER
+         LA    RW12,0(RW3,RW10)        COMPUTE END OF BUFFER
+         B     GETREC                  GO GET NEXT RECORD
+*
+**  RECORD MAY BE FRAGMENTED ON INPUT, OUTPUT, OR BOTH
+*
+NOTROOM  SR    RW6,RW9                 COMPUTE REMAINDERS
+         SR    RW7,RW9
+         MVCL  RW8,RW10                MOVE WHAT WILL FIT
+         LTR   RW7,RW7                 IS INPUT RECORD FRAGMENTED?
+         BP    CKOUT                   NO, CHECK OUTPUT BUFFER
+         GET   INDCB                   GET NEXT INPUT BLOCK
+         LR    RW10,RW1                SET INPUT BUFFER POINTER
+         LA    RW12,0(RW3,RW10)        COMPUTE END OF BUFFER
+         LR    RW7,RW3                 SHOW FULL INPUT BUFFER AVAILABLE
+CKOUT    LTR   RW6,RW6                 ANY SPACE LEFT IN OUTPUT BUFFER?
+         BP    RETRY                   YES, RETRY THE MOVE
+         BAL   RW9,ENDBUF              WRITE OUT FILLED OUTPUT BUFFER
+         BAL   RW9,GETBUF              GET NEW OUTPUT BUFFER
+         B     RETRY                   RETRY WITH NEW OUTPUT BUFFER
+         EJECT
+*
+**  END OF OUTPUT BUFFER - WRITE OUT DATA
+*
+ENDBUF   EQU   *
+         TM    FLAG1,IOACT             ANY I/O ACTIVE FOR THIS DCB?
+         BZ    PROCEED                 PROCEED WITH WRITE IF NOT
+*                                      MUST WAIT ON PARTICULAR DECB
+         CHECK OUTDECB                 COMPLETE PREVIOUS WRITE
+*
+         L     RW8,DECBUFAD            OLD BUFFER NOW AVAILABLE
+         LR    RW6,RW3                   WITH STANDARD BLOCK SIZE
+         MVC   DECBUFAD,BUFAD          STORE ADDRESS OF BUFFER TO WRITE
+         ST    RW8,BUFAD               STORE NEW WORKING BUFFER ADDRESS
+         LA    RW0,0(RW3,RW8)          COMPUTE END OF NEW BUFFER
+         ST    RW0,BUFEND                AND STORE FOR BLOCKING
+         LA    RW9,4(RW9)              BYPASS CALL TO GETBUF ON RETURN
+*                                      *** MUST BE A BETTER WAY ???
+         B     DOWRITE                 PRESERVE BOTH BUFFER ADDRESSES
+*
+PROCEED  EQU   *                       PROCEED WITH WRITE
+         MVC   DECBUFAD,BUFAD          STORE ADDR OF BUFFER TO WRITE
+         LA    RW14,ECBLIST            POINT TO ECBLIST
+         L     RW15,NUMIO              SPACE CURRENTLY USED
+         ST    RW5,0(RW15,RW14)        ADD THIS DECB TO LIST
+         AH    RW15,FOUR               INCREMENT COUNT OF ECB'S
+         ST    RW15,NUMIO                IN LIST
+*
+DOWRITE  XC    OUTDECB,OUTDECB         CLEAR THE ECB FIELD IN DECB
+         OI    FLAG1,IOACT             INDICATE WRITE IN PROGRESS
+*
+         WRITE OUTDECB,SF,MF=E         WRITE OUT THE BUFFER
+*
+         BR    RW9                     RETURN TO CALLER
+         EJECT
+*
+**  ROUTINE TO GET A NEW BUFFER
+*
+GETBUF   EQU   *
+         SR    RW4,RW4                 KILL POINTER INTO OLD BUFFER
+         STM   RW9,RW12,STASH          MAKE MORE REGISTERS AVAILABLE
+         LA    RW10,BUFSTACK           POINT TO BUFFER STACK
+GETBUF2  L     RW11,NBUFS              CURRENT NUMBER OF BUFS IN STACK
+*
+         L     RW9,NUMIO               COUNT CURRENT I/O ACTIVITY
+         LTR   RW8,RW9                 A COPY FOR INDEXING ECBLIST
+         BZ    GETABUF                 IF NO I/O, JUST GET BUFFER
+*                                      SINCE THERE ARE MORE BUFFERS
+*                                       THAN MONITORS, IN THE ABSENCE
+*                                       OF I/O ONE MUST BE AVAILABLE
+         LA    RW6,ECBLIST-4           PREPARE TO SCAN ECB'S
+*                                      RETURN BUFFERS TO THE STACK AS
+*                                       SOON AS POSSIBLE SO THAT
+*                                       UNNECESSARY BUFFERS WILL NOT BE
+*                                       BE USED, MINIMIZING WORKING SET
+LOOKDECB L     RW12,4(RW6)             LOAD AN ECB ADDRESS
+         TM    0(RW12),X'40'           HAS IT BEEN POSTED?
+         BNZ   DOCHECK                 PROCESS IT IF SO
+NEXTDECB AH    RW6,FOUR                ADVANCE TO NEXT ECBLIST ENTRY
+         SH    RW8,FOUR                LENGTH OF LIST YET TO PROCESS
+         BP    LOOKDECB                CONTINUE IF ANY ARE LEFT
+         MVI   0(RW6),0                CLEAR END OF LIST MARKER
+*
+**  NOW OBTAIN A BUFFER FROM THE STACK
+*
+         LTR   RW11,RW11               ARE ANY BUFFERS IN THE STACK?
+         BP    GETABUF                 NEED NOT WAIT IF SO
+         MVI   0(RW6),0                SET END OF LIST MARKER FOR WAIT
+*
+         WAIT  ECBLIST=ECBLIST         WAIT FOR AN I/O TO COMPLETE
+         B     GETBUF2                 AND RESCAN THE ECB LIST
+*
+GETABUF  EQU   *
+         ST    RW9,NUMIO               SAVE CURRENT COUNT OF ACTIVE I/O
+         SH    RW11,FOUR               ADJUST STACK POINTER
+         ST    RW11,NBUFS              CURRENT COUNT OF BUFS IN STACK
+         L     RW8,0(RW11,RW10)        GET A BUFFER FROM THE STACK
+         ST    RW8,BUFAD               SAVE BUFFER ADDRESS IN WORKAREA
+         LR    RW9,RW3                 BUFFER SIZE IN RW8+1 FOR MVCL
+         SR    RW15,RW15               INPUT LENGTH AND PAD CHARACTER
+*                                      CONTENTS OF RW14 IRRELEVANT
+         MVCL  RW8,RW14                APEMAN ALWAYS CLEARS THE BUFFER
+         L     RW8,BUFAD               RESTORE RW8 DESTROYED BY MVCL
+         LA    RW6,0(RW3,RW8)          COMPUTE END OF NEW BUFFER
+         ST    RW6,BUFEND              SAVE FOR LATER USE
+         LR    RW6,RW3                 RETURN BUFFER SIZE TO CALLER
+         LM    RW9,RW12,STASH          RESTORE THE REGISTERS
+         BR    RW9                     RETURN TO CALLER
+*
+**  CHECK COMPLETED I/O AND STACK THE BUFFER
+*
+DOCHECK  EQU   *
+         DROP  RW5
+         USING WORKAREA,RW12
+         CHECK (RW12)                  CHECK COMPLETED WRITE
+         NI    FLAG1,255-IOACT         SHOW I/O NO LONGER OUTSTANDING
+         SH    RW9,FOUR                ADJUST COUNT OF ACTIVE I/O
+         L     RW0,DECBUFAD            LOAD ADDRESS OF COMPLETED BUFFER
+         ST    RW0,0(RW11,RW10)        PUSH BUFFER ONTO STACK
+         AH    RW11,FOUR               BUMP BUFFER STACK POINTER
+         LR    RW1,RW8                 LENGTH REMAINING IN ECBLIST
+         SH    RW1,FIVE                TAIL OF LIST LESS 1 FOR MVC
+         BNP   NEXTDECB                IF LAST DROPPED, SKIP SQUEEZE
+         EX    RW1,DROPECB             SQUEEZE THIS ECB OUT OF LIST
+         B     NEXTDECB+4              CONTINUE SCANNING DECB'S
+DROPECB  MVC   4(1,RW6),8(RW6)         *** EXECUTED INSTRUCTION ***
+         DROP  RW12
+         USING WORKAREA,RW5
+         EJECT
+*
+**  END OF DATA WRITE BUFFER
+*
+ENDATA   EQU   *
+         LTR   RW4,RW4                 IS AN OUTPUT RECORD INCOMPLETE?
+         BZ    ENDALL                  NO, NO SPECIAL ACTION NEEDED
+         MVC   0(4,RW4),END            NULLIFY THE INCOMPLETE RECORD
+ENDALL   LA    RW4,26                  SET LOOP OVER ALL MONITORS
+         LA    RW7,INDEX2A             POINTER TO FIRST WORK AREA
+ENDOUT   L     RW5,0(RW7)              LOAD WORK AREA POINTER
+         LTR   RW5,RW5                 DOES ONE EXIST?
+         BZ    NEXTCLOS                SKIP CLOSE IF NOT
+         LH    RW8,BUFPTR              GET CURRENT OFFSET IN BUFFER
+         LTR   RW8,RW8                 IS BUFFER EMPTY?
+         BZ    NEXTCLOS                IF SO, END OF FILE IS OK
+         A     RW8,BUFAD               GET CURRENT POSITION IN BUFFER
+         MVC   0(4,RW8),END            MOVE IN END OF DATA FLAG
+         BAL   RW9,ENDBUF              WRITE OUT LAST BUFFER
+         NOP   0                       PROTECT AGAINST ENDBUF ROUTINE
+*
+**  MAY NEED TO CLOSE THE DCB
+*
+NEXTCLOS AH    RW7,FOUR                ADVANCE TO NEXT WORKAREA POINTER
+         BCT   RW4,ENDOUT              TERMINATE NEXT MONITOR LOG
+*
+**  RETURN
+*
+RETURN   EQU   *
+         SR    RW15,RW15               NORMAL COMPLETION CODE
+         RETURN (14,12),RC=(15)        RETURN WITH COMPLETION CODE
+*
+**  ERROR EXIT
+*
+SYNEX    EQU   *
+         BALR  RW3,0
+         USING *,RW3                   ESTABLISH ADDRESSABILITY
+         L     RB2,ADENTER
+         B     EOD1
+ADENTER  DC    A(ENTER)
+EOD1     EQU   *
+         DROP  RW3
+         LA    13,SAVE                 RECHAIN SAVE AREAS
+         LR    RW3,14                  SAVE RETURN ADDRESS
+*
+BADLOG   WTO   'APEMAN LOG DATA SET INVALID',ROUTCDE=(11)
+*
+         LA    15,16                   SET NASTY COMPLETION CODE
+         B     RETURN+2
+*
+**  LITERAL CONSTANTS
+*
+         LTORG
+*
+**  SAVE AREAS AND STORAGE
+*
+SAVE     DS    18F
+END      DC    C'END '
+DATE     DC    C'DATE'
+MAIN     DC    C'MAIN'
+FOUR     DC    H'4'
+FIVE     DC    H'5'
+*
+MON      DC    C'MON'
+*
+STASH    DS    4F                      SAVE AREA FOR GETBUF
+*
+*
+POOLSIZE DS    F
+*
+DATEREC  DS    CL16
+ADEXIT   DC    X'92',AL3(SYNEX)
+*
+INDEX1A  DC    AL1(4,8,12,16,20,24,28,32,36)     ABCDEFGHI
+         DC    AL1(0,0,0,0,0,0,0)                CA-D0
+         DC    AL1(40,44,48,52,56,60,64,68,72)   JKLMNOPQR
+         DC    AL1(0,0,0,0,0,0,0,0)              DA-E1
+         DC    AL1(76,80,84,88,92,96,100,104)    STUVWXYZ
+INDEX1   EQU   INDEX1A-C'A'
+*
+INDEX2A  DC    26F'0'
+INDEX2   EQU   INDEX2A-4
+*
+ECBLIST  DC    26F'0'
+NUMIO    DC    F'0'                    4 * NUMBER OF WRITES OUTSTANDING
+*
+BUFSTACK DC    28F'0'
+NBUFS    DC    A(28*4)                 4 * NUMBER OF FREE BUFS IN POOL
+*
+         SPACE 3
+INDCB    DCB   DSORG=PS,MACRF=GL,RECFM=F,DDNAME=MONLOG,EODAD=ENDATA
+         SPACE 3
+DCBSKEL  DCB   DDNAME=MON0,DSORG=PS,MACRF=W,RECFM=F
+DCBLEN   EQU   *-DCBSKEL               LENGTH OF BSAM DCB
+         EJECT
+WORKAREA DSECT
+OUTDECB  DC    F'0'                    DECB
+DECBTYPE DS    H                       TYPE OF WRITE OPERATION
+DECBUFLN DS    H                       LENGTH OF OUTPUT BUFFER
+DECDCBAD DS    F                       ADDRESS OF OUTPUT DCB
+DECBUFAD DS    F                       OUTPUT BUFFER ADDRESS
+DECIOBAD DS    F                       ADDRESS OF IOB
+*                                      *** END OF DECB ***
+*
+**  THE FOLLOWING ADDRESS POINTS TO THE BUFFER CURRENTLY BEING BLOCKED.
+**  THE BUFFER WHOSE ADDRESS IS IN THE DECB IS BEING WRITTEN OUT.
+*
+BUFAD    DS    F                       ADDRESS OF CURRENT BUFFER
+BUFEND   DS    F                       ADDRESS OF END OF BUFFER
+BUFPTR   DS    H                       CURRENT OFFSET IN BUFFER
+FLAG1    DS    C
+IOACT    EQU   1                       UNCHECKED WRITE FOR THIS DCB
+*
+*
+*
+*
+*
+OUTDCB   DS    0F
+WORKLEN  EQU   *-WORKAREA+DCBLEN
+         EJECT
+         DCBD  DSORG=PS,DEVD=(DA,TA)
+         END

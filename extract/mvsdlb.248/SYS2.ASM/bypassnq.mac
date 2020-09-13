@@ -1,0 +1,165 @@
+***********************************************************************
+*                                                                     *
+* MODULE NAME = BYPASSNQ                                              *
+*                                                                     *
+* DESCRIPTIVE NAME = SCRATCH/RENAME A DATA SET WITHOUT ENQ            *
+*                                                                     *
+* STATUS = R203                                                       *
+*                                                                     *
+* FUNCTION = This program was designed for systems programmers        *
+*            who install a new version of MVS or another software     *
+*            product.  They sometimes face a situation where they     *
+*            have to delete or rename a data set not currently        *
+*            allocated to anyone but which they can't delete          *
+*            because it has the same name as another data set         *
+*            which (1) exists on a different disk volume and          *
+*            (2) is currently allocated to a long-running task.       *
+*                                                                     *
+*            BYPASSNQ is a driver that allows you to run any          *
+*            utility program (such as IEHPROGM or IDCAMS) and         *
+*            bypass dsname ENQ that is normally performed by          *
+*            the DYNALLOC, SCRATCH and RENAME SVCs.                   *
+*            This technique allows data sets to be deleted or         *
+*            renamed using standard MVS services and is fully         *
+*            compatible with indexed VTOCs and SMS.                   *
+*                                                                     *
+* AUTHOR = Gilbert Saint-Flour <gsf@pobox.com>                        *
+*                                                                     *
+* ENVIRONMENT = SEE BELOW                                             *
+*                                                                     *
+*    DEPENDENCIES: OS/VS2                                             *
+*                                                                     *
+* MODULE TYPE = PROCEDURE, (CSECT TYPE)                               *
+*                                                                     *
+*    PROCESSOR = Assembler XF                                         *
+*                                                                     *
+*    MODULE SIZE = 2K                                                 *
+*                                                                     *
+*    ATTRIBUTES = REENTERABLE, RMODE ANY, AMODE 31                    *
+*                 SUPERVISOR STATE, KEY 8                             *
+*                 APF AUTHORIZATION: YES                              *
+*                                                                     *
+* SYNTAX = SEE BELOW                                                  *
+*                                                                     *
+*          The name of the utility program is passed in the PARM      *
+*                                                                     *
+*          Examples:                                                  *
+*                                                                     *
+*               //SCRATCH EXEC PGM=BYPASSNQ,PARM=IEHPROGM             *
+*               //DD1      DD UNIT=3390,VOL=SER=OS39R3,DISP=OLD       *
+*               //SYSPRINT DD SYSOUT=*                                *
+*                 RENAME DSNAME=GILBERT.TEST29,VOL=3390=OS39R3,      X*
+*                              NEWNAME=GILBERT.TEST29B                *
+*                SCRATCH DSNAME=GILBERT.TEST29B,VOL=3390=OS39R3       *
+*                                                                     *
+*               //ALTER   EXEC PGM=BYPASSNQ,PARM=IDCAMS               *
+*               //SYSPRINT DD SYSOUT=*                                *
+*                 ALTER IBMUSER.TEST29 NEWNAME(IBMUSER.TEST29B)       *
+*                 DELETE IBMUSER.TEST29B                              *
+*                                                                     *
+* OPERATION = SEE BELOW                                               *
+*                                                                     *
+*            1. Retrieve the name of the utility program              *
+*               from the PARM field.                                  *
+*            2. Fix myself in memory                                  *
+*            3. Set up an SVC screening environment to intercept      *
+*               ENQ and DEQ SVC requests                              *
+*            4. Issue XCTL to pass control to the utility program     *
+*                                                                     *
+*         Note: Each time it is invoked, the SVC screening routine    *
+*               checks the first QNAME in the ENQ/DEQ parm list.      *
+*               If it is equal to SYSDSN, it changes it to SYSNOENQ.  *
+*                                                                     *
+*         Credits: The idea of using SVC screening to bypass          *
+*                  DSN ENQ was borrowed from the SYSIEH               *
+*                  utility (author unknown).                          *
+*                                                                     *
+* ABENDS = See below                                                  *
+*                                                                     *
+*            U1001  Invalid Parm                                      *
+*                                                                     *
+* CHANGE ACTIVITY                                                     *
+*                                                                     *
+*  $100 INITIAL RELEASE                                               *
+*  $101 Use ASMH and ISGPEL macro                                     *
+*  $102 Issue PGFIX before setting TCBSVCS                            *
+*  $203 OS/VS2 Version                                                *
+*                                                                     *
+***********************************************************************
+BYPASSNQ CSECT
+         DC    C'GSF UTILITIES - BYPASSNQ R203 '
+BEGIN    LR    R10,R15
+         USING BEGIN,R10
+         LR    R11,R1                  SAVE PARM ADDRESS
+         USING FSA,R13
+         MODESET MODE=SUP              SUPERVISOR MODE
+*
+*        Check that the user has update authority to SYS1.PARMLIB
+*
+*        Retrieve the name of the utility program from the parm
+*
+         L     R2,0(,R11)              addr of the PARM
+         LH    R3,0(,R2)               parm length
+         LTR   R3,R3                   parm missing?
+         BNP   ABEND1                  yes, abend
+         CH    R3,=H'8'                parm too long?
+         BH    ABEND1                  yes, abend
+         LA    R14,PGMNAME             "to" addr
+         LA    R15,L'PGMNAME           "to" length
+         LA    R2,2(,R2)               "from" address
+         ICM   R3,B'1000',=C' '        padding
+         MVCL  R14,R2                  move pgm name
+*
+*        Make sure I don't disappear
+*
+         PGFIX R,                      PREVENT S07C ABEND              X
+               A=SVCA2,                FROM                            X
+               EA=SVCARRAY+255,        TO                              X
+               LONG=Y,                                                 X
+               ECB=0
+         LOAD  EP=BYPASSNQ             bump my own use count for XCTL
+*
+*        Set up the SVC screening environment
+*
+         MODESET EXTKEY=ZERO
+         L     R4,X'21C'               A(TCB) from PSATOLD
+         USING TCB,R4
+         LA    R0,SVCA2                ADDR OF SVC SCREENING ROUTINE
+         ST    R0,TCBSVCA2
+         OI    TCBFLGS7,TCBSVCS        SVC SCREENING ON
+         MODESET KEY=NZERO,MODE=PROB
+*
+*        XCTL to utility program with PARM=''
+*
+         LR    R1,R11                  restore R1
+         L     R2,0(,R1)               addr of the PARM
+         MVI   1(R2),0                 zero parm length
+         XCTL  EPLOC=PGMNAME,SF=(E,XCTLL)
+*
+ABEND1   ABEND 1001                    bad parm
+***********************************************************************
+*                                                                     *
+*        SVC SCREENING ARRAY                                          *
+*                                                                     *
+***********************************************************************
+         DC    0D'0'
+         EXTRN SCREEN
+SVCA2    DC    A(SCREEN+X'80000000')
+         DC    X'80,00',X'0000'        SVC TYPE, LOCKS
+SVCARRAY DC    256X'80'                SVC ARRAY
+         ORG   SVCARRAY+48
+         DC    X'00'                   DEQ
+         ORG   SVCARRAY+56
+         DC    X'00'                   ENQ
+         ORG
+***********************************************************************
+*        Work area (First Save Area)                                  *
+***********************************************************************
+FSA      DSECT
+         DS    3F                      first 3 words of FSA
+PGMNAME  DS    CL8                     name of utility program
+XCTLL    XCTL  EPLOC=PGMNAME,SF=L
+*
+         IKJTCB DSECT=YES
+         YREGS
+         END   BEGIN

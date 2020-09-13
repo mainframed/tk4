@@ -1,0 +1,650 @@
+WHT      TITLE ' W H A T I F  - TSO COMMAND PROCESSOR'
+***********************************************************************
+*                                                                     *
+* WHATIF - A TSO COMMAND WHICH TESTS THE STATUS OF A DATA SET         *
+*          OR THE VALUE OF A VARIABLE IN A COMMAND PROCEDURE          *
+*          OR THE VALUE OF SYSRC (LAST RETURN CODE)                   *
+*          AND STACKS A COMMAND IF THE CONDITION IS TRUE.             *
+*                                                                     *
+* CONVERTED FROM OS/MVT VERSION TO MVS VERSION AT AFDSC/PENTAGON      *
+* BY BILL GODFREY. MAJOR CHANGE WAS REPLACING SEARCH OF 'DSE'         *
+* CHAIN WITH SEARCH OF 'DSAB' CHAIN.  DATE 11SEP80.                   *
+*                                                                     *
+* CHANGES -                                                           *
+* 11SEP80                                                             *
+*  .  REPLACE 'DSE' SEARCH WITH 'DSAB' SEARCH.  DSE'S HAD             *
+*     DDNAME AND DSNAME FIELDS. DSAB'S HAVE POINTER TO TIOT           *
+*     INSTEAD, WHICH CONTAINS DDNAME AND POINTER TO JFCB WHICH        *
+*     CONTAINS THE DSNAME.                                            *
+*  .  MOVE DATA SET NAME TO 44-BYTE FIELD PADDED WITH BLANKS          *
+*     IMMEDIATELY AFTER PARSE.                                        *
+*  .  REMOVE DATA SET NAME PADDING ROUTINE FROM LOCATE.               *
+*  .  REPLACED USER MACROS (TSENTRY,TSPARSE,EXIT,TSPARERR)            *
+*     WITH INLINE CODE.                                               *
+*  .  ADDED IKJRLSA TO FREE PARSE PDL.                                *
+*  .  MOVED DSECTS FROM TOP OF PROGRAM TO BOTTOM.                     *
+*  .  ADDED 'USID' TO DSN IKJPOSIT MACRO SO UNQUOTED                  *
+*     DATA SET NAMES WILL BE PREFIXED.  ON OS/MVT VERSION             *
+*     UNQUOTED DSNAMES WERE TREATED AS FULLY QUALIFIED.               *
+*  .  THESE FIRST TWO PAGES OF COMMENTS WERE ADDED.                   *
+*                                                                     *
+***********************************************************************
+         EJECT
+***********************************************************************
+*                                                                     *
+* PROBLEMS -                                                          *
+*  .  IF THE 'THEN(COMMAND)' KEYWORD IS NOT SPECIFIED, THE            *
+*     RETURN CODE WILL BE SET TO INDICATE TRUE (0) OR FALSE (4).      *
+*                                                                     *
+*  .  IF THE 'THEN(COMMAND)' KEYWORD IS SPECIFIED, THE RETURN         *
+*     CODE WILL BE COPIED FROM THE 'ECT', WHERE THE RETURN CODE       *
+*     OF THE PREVIOUS COMMAND IS STORED. SO IF THE COMMAND IS         *
+*     NOT STACKED, THE VALUE OF &LASTCC WILL BE THE SAME AS IT       *
+*     WAS BEFORE THE WHATIF COMMAND.  IF THE COMMAND IS STACKED       *
+*     THE VALUE OF &LASTCC WILL BE SET BY THE STACKED COMMAND WHEN    *
+*     IT EXECUTES, BUT BETWEEN THE TIME WHATIF ENDS AND THE           *
+*     STACKED COMMAND STARTS, THE RETURN CODE IN THE 'ECT' IS THE     *
+*     SAME AS IT WAS PRIOR TO WHATIF.                                 *
+*                                                                     *
+***********************************************************************
+         EJECT
+***   COPYRIGHT 1976 - REGENTS OF THE UNIVERSITY OF CALIFORNIA,     ***
+***   CAMPUS COMPUTING NETWORK   (SHARE CODE 'UR')  -  1/15/76      ***
+***   ALTHOUGH WE ARE RUNNING THIS MODULE IN OUR PRODUCTION SYSTEM, ***
+***   NO WARRANTY, EXPRESSED OR IMPLIED, IS MADE BY CCN AS TO THE   ***
+***   FUNCTIONING OR CORRECTNESS OF THE FOLLOWING CODE.             ***
+         EJECT
+         MACRO
+&L       ERR   &M
+         LCLA  &A
+&A       SETA  K'&M-2                                       *HMD 09/81*
+&L.MSG   DC    H'&A'
+         DC    C&M
+         MEND
+         EJECT
+WHATIF   CSECT
+         USING *,R12
+         B     @PROLOG-*(,R15)
+         DC    AL1(11),CL11'WHATIF'
+         DC    CL16' &SYSDATE &SYSTIME '
+@SIZE    DC    0F'0',AL1(1),AL3(TSDSECTL) SUBPOOL AND SIZE
+@PROLOG  STM   14,12,12(R13)
+         LR    R12,R15                  BASE REGISTER
+         LR    R5,R1                    CPPL POINTER
+         L     R0,@SIZE
+         GETMAIN R,LV=(0)
+         ST    R13,4(,R1)               CHAIN SAVEAREAS
+         ST    R1,8(,R13)               CHAIN SAVEAREAS
+         LR    R13,R1                   NEW SAVEAREA PTR
+         USING TSDSECT,R13
+         MVC   CPPL(16),0(R5)
+         L     R1,CPPLUPT
+         L     R2,CPPLECT
+         LA    R3,TSECB
+         SR    R0,R0
+         ST    R0,TSECB
+         STM   R1,R3,PPL
+         LA    R4,TSPARANS
+         ST    R4,PPLANS
+         ST    R13,PPLUWA
+         ST    R0,TSPARANS
+         STM   R1,R3,IOPL
+* SET UP FOR ERROR MESSAGES                                 *HMD 09/81*
+         MVC   OLD,=F'1'                SET ONE SEGMENT     *HMD 09/81*
+         LA    R1,MSGLN                 SET MESSAGE ADDR    *HMD 09/81*
+         ST    R1,OLD+4                 SAVE IN O.L.D       *HMD 09/81*
+         MVC   MSGLN(4),=H'84,0'        SET FIXED LENGTH    *HMD 09/81*
+         MVC   MSGID,=C'HMD00056I '     SET MESSAGE ID      *HMD 09/81*
+         SPACE
+         L     R1,CPPLECT               GET PTR TO ECT
+         TM    ECTSWS-ECT(R1),ECTNOPD   SEE IF ANY OPERANDS
+         BO    SYN                      IF NOT EXIT
+         LA    R1,SYSREL
+         ST    R1,PPLUWA
+         SPACE
+         L     R0,=V(PCL)
+         ST    R0,PPLPCL
+         L     R0,CPPLCBUF
+         ST    R0,PPLCBUF
+         LA    R1,PPL
+         CALLTSSR EP=IKJPARS                                *HMD 09/81*
+PARSERET LTR   R15,R15
+         BNZ   PARSEBAD
+         SPACE
+         L     R11,TSPARANS
+         USING PDL,R11
+         CLI   DTSK+1,0                 'DATASET' SPECIFIED
+         BE    NOPAD                    NO, SKIP PADDING ROUTINE
+         LH    R1,DSN+4                 GET LENGTH OF DSN
+         BCTR  R1,0                     DECREMENT FOR EXECUTE
+         LA    R2,DSNB                  GET TO ADDRESS
+         MVI   0(R2),C' '               BLANK IN DSNAME
+         MVC   1(43,R2),0(R2)           PAD WITH BLANKS
+         L     R3,DSN                   GET PTR TO DSN
+         EX    R1,MVC                   MVC 0(1,R2),0(R3)
+NOPAD    EQU   *
+         CLI   SYSRCK+1,0               SEE IF  SYSRC SPECIFIED
+         BE    IF0
+         BAL   R10,SYSRCTST
+IF0      CLI   RELK+1,0                 SEE IF STRING RELATION SPECIFD
+         BE    IF1
+         BAL   R10,STRING               IF SO DO THE CHECK
+IF1      CLI   ALK+1,0                  SEE IF ALLOCATE KEYWORD SPECIFD
+         BE    IF2
+         BAL   R10,ALOCTEST
+IF2      CLI   CATK+1,0                 SEE IF CAT KEYWORD SPECFD
+         BE    STK
+         BAL   R10,CATEST
+STK      CLI   THENK+1,1                SEE IF THEN SPECIFIED
+         BE    STK0
+         B     RC0
+STK0     L     R2,THEN                  GET ADD OF STRING
+         BCTR  R2,0                     ADJUST FOR SPACE
+         ST    R2,THEN                  STORE FOR LATER USE
+         BCTR  R2,0                     ADJUST FOR SCAN
+         LH    R1,THEN+4                GET LENGTH OF STR
+         LA    R1,1(R1)                 ADJUST FOR SPACE
+STK1     LA    R3,0(R2,R1)              GET PTR TO END OF STRING
+         CLI   0(R3),C')'               SEE IF THIS IS TRAILING PAREN
+         BE    STK2
+         BCT   R1,STK1
+         B     SYN
+STK2     CH    R1,=H'1'                 SEE IF A NULL ARG
+         BE    SYN
+         BCTR  R1,0                     ADJUST FOR TRAILING PAREN
+         STH   R1,THEN+4                STORE FOR LATER USE
+         LA    R1,STKLEN(0,R1)          LENGTH FOR GETMAIN
+         LA    R0,78                    SP FOR GETMAIN
+         SLL   R0,24                    PUT SP IN POSITION
+         AR    R0,R1                    ADD IN LENGTH
+         GETMAIN R,LV=(0)
+         LR    R10,R1                   SAVE ADDRESS
+         USING STKBLK,R10
+STK10    XC    STKBLK(STKLEN),STKBLK    ZERO WORKING STORAGE
+         L     R3,THEN                  GET STRING ADD
+         LH    R1,THEN+4                GET LENGTH
+         STH   R1,LSDRLEN               STORE IN LSD
+         STH   R1,LSDTLEN
+         BCTR  R1,0                     DECREMENT FOR EXECUTE
+         LA    R2,STKBUF                GET ADD OF STR BUFFER
+         ST    R2,LSDATA                STORE IN LSD
+         ST    R2,LSDNXT
+         EX    R1,MVC                   MVC 0(1,R2),0(R3)
+         STACK PARM=STKPB,STORAGE=(LSDATA,SOURCE),MF=(E,IOPL)
+         BXLE  R15,R15,RC0
+         LA    R1,STKMSG                GET ADD OF STACK ERR MSG
+         B     ERROR                    GO PRINT IT
+         DROP  R10
+RTN      L     R15,CPPLECT              RESTORE RETURN CODE OF CALLER
+         L     R15,ECTRCDF-ECT(R15)
+RETURN   EQU   *
+         LR    R2,R15                  HOLD RETURN CODE
+         IKJRLSA TSPARANS
+         LR    R1,R13                  ADDRESS TO BE FREED
+         L     R0,@SIZE                SUBPOOL AND LENGTH
+         L     R13,4(,R13)             OLD SAVEAREA PTR
+         FREEMAIN R,LV=(0),A=(1)
+         LR    R15,R2                  RESTORE RETURN CODE
+         LM    0,12,20(R13)            RESTORE REGISTERS
+         L     R14,12(,R13)            RESTORE RETURN ADDRESS
+         BR    R14                     RETURN
+         SPACE
+RC0      CLI   THENK+1,1               SEE IF THEN GIVEN
+         BE    RTN
+         XR    R15,R15
+         B     RETURN
+RC4      CLI   THENK+1,1               SEE IF THEN GIVEN
+         BE    RTN
+         LA    R15,4
+         B     RETURN
+         EJECT
+***********************************************************************
+*                                                                     *
+*     COMPARE PSTRING AND QSTRING ACCORDING TO THE RELATION SPECIFIED *
+*     BY THE RELK KEYWORD. IF THE RELATION HOLDS RETURN VIA R10, ELSE *
+*     GOTO RC0                                                        *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+STRING   SR    R8,R8                    CLEAR CONDITION REGISTERS
+         SR    R9,R9
+         CLC   PSTRING+4(2),QSTRING+4   SEE IF EQUAL SIZE
+         BE    STR1
+         BH    STR4
+         LA    R9,1                     SET LESS THAN CONDITION
+         B     STR4
+STR1     LH    R1,PSTRING+4             GET LENGTH OF STRINGS
+         LTR   R1,R1                    SEE IF BOTH ZERO
+         BNZ   STR2
+         LA    R8,1                     IF SO SET EQUAL CONDITION
+         B     STR4
+STR2     BCTR  R1,0                     DECREMENT FOR EXECUTE
+         L     R2,PSTRING               GET ADD OF STRING A
+         L     R3,QSTRING               GET ADD OF STRING B
+         EX    R1,CLC                   CLC 0(1,R2),0(R3)
+         BNE   STR3
+         LA    R8,1                     IF = SET EQUAL CONDITION
+         B     STR4
+STR3     BH    STR4
+         LA    R9,1                     IF LESS THAN SET LT CONDITION
+STR4     LA    R1,RELK+1                POINT TO RELATION
+         B     CONDTEST                 GO DO THE TEST
+         EJECT
+***********************************************************************
+*                                                                     *
+* COMPARE THE RETURN CODE FROM THE PERVIOUS COMMAND WITH THE          *
+* GIVEN VALUE                                                         *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+SYSRCTST L     R1,RC                    GET ADD OF STRING
+         LH    R2,RC+4                  GET LNTH OF STRING
+         BCTR  R2,0                     DECREMENT FOR EXECUTE
+         EX    R2,PACK                  PACK IT
+         CVB   R2,WA                    CONVERT TO BINARY
+         SR    R8,R8                    CLEAR CONDITION REGS
+         SR    R9,R9
+         L     R1,CPPLECT               GET PTR TO ECT
+         C     R2,ECTRCDF-ECT(R1)       COMPARE RETURN CD
+         BNE   RCD1
+         LA    R8,1                     SET EQUAL CONDITION
+         B     RCD2
+RCD1     BNH   RCD2
+         LA    R9,1                     SET LESS THAN CONDITION
+RCD2     LA    R1,SYSREL
+         B     CONDTEST
+PACK     PACK  WA(8),0(1,R1)
+         EJECT
+***********************************************************************
+*                                                                     *
+*     ON ENTRY R8=1 IF COMPARANDS WERE EQUAL, R9=1 IF FIRST WAS LESS  *
+*     R1 CONTAINS A POINTER TO A RELATION NUMBER. TEST TO SEE IF REL  *
+*     SATISFIED                                                       *
+***********************************************************************
+         SPACE 2
+         USING COND,R1
+CONDTEST LA    R7,1                     GET A BIT TO DO FLIPS WITH
+         CLI   COND,1                   SEE IF RELATION IS EQ
+         BE    COND6
+         CLI   COND,2                   SEE IF RELATION IS NE
+         BNE   COND1
+         XR    R8,R7                    FLIP = COND
+         B     COND6
+COND1    CLI   COND,3                   SEE IF RELATION IS LE
+         BNE   COND2
+         OR    R8,R9                    OR EQ AND LT
+         B     COND6
+COND2    CLI   COND,4                   SEE IF RELATION IS GE
+         BNE   COND3
+         XR    R9,R7                    FLIP LESSTHAN RELATION
+         OR    R8,R9                    MOVE COND TO CORRECT REG
+         B     COND6
+COND3    CLI   COND,5                   SEE IF RELATION IS LT
+         BNE   COND4
+         LR    R8,R9                    MOVE COND TO CORRECT REG
+         B     COND6
+COND4    CLI   COND,6                   SEE IF RELATION IS NL
+         BNE   COND5
+         XR    R9,R7                    FLIP LT COND
+         LR    R8,R9                    MOVE COND TO CORRECT REG
+         B     COND6
+COND5    XR    R8,R7                    GENERATE NE CONDITION
+         XR    R8,R9                    GENERATE GT CONDITION
+         CLI   COND,7                   SEE IF RELATION IS GT
+         BE    COND6
+         CLI   COND,8                   SEE IF RELATION IS NG
+         BNE   RC4
+         XR    R8,R7
+COND6    LTR   R8,R8                    SEE IF CONDITION HOLDS
+         BZ    RC4                      IF NOT EXIT
+         BR    R10                      IF SO RETURN TO CALLER
+COND     DS    0XL1
+         DROP  R1
+         EJECT
+***********************************************************************
+*                                                                     *
+* GIVEN A DDNAME OR DSNAME SEE IF CORRESPONDING FILE IS ALLOCATED     *
+* GIVEN BOTH SEE IF DSNAME ALLOCATED TO GIVEN DDNAME.                 *
+* IF NOT FORM OF KEYWORD SPECIFIED FLIP THE RESULTING TRUE/FALSE COND *
+* IF THE FINAL COND IS TRUE RETURN VIA REGISTER 10 ELSE GOTO RC0      *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+ALOCTEST L     R9,16                    CVTPTR
+         L     R9,0(R9)                 NEW/OLD
+         L     R9,4(R9)                 TCB
+         L     R9,X'B4'(,R9)            TCBJSCB
+         L     R9,X'140'(,R9)           JSCDSABQ, QDB FOR DSAB CHAIN
+         L     R9,12(,R9)               FIRST DSAB
+         LA    R9,0(,R9)                SEE IF ANY THERE
+         SR    R8,R8                    CLEAR CONDITION REGISTER
+         LTR   R9,R9                    IF NOT NOTHING ALLOCATED
+         BZ    ALTST                    SO GO TO KEYWORD TEST
+         USING DSAB,R9
+         CLI   FILEK+1,1                SEE IF DDN GIVEN
+         BE    AL1                      IF SO GO PROCESS
+         CLI   DTSK+1,1                  SEE IF SEARCH ON DSNAME
+         BE    ALDSNSRC                 IF SO GO DO THAT SEARCH
+         B     ALTST
+AL1      MVI   WA,C' '                  BLANK WORK AREA
+         MVC   WA+1(7),WA
+         LH    R1,DDN+4                 GET LENGTH OF DDN
+         BCTR  R1,0                     DECREMENT FOR EXECUTE
+         LA    R2,WA                    GET TO ADDRESS
+         L     R3,DDN                   GET PTR TO DDN
+         EX    R1,MVC                   MVC 0(1,R2),0(R3)
+ALDDNLP  L     R7,DSABTIOT              POINT TO TIOT ENTRY
+         CLC   WA(8),4(R7)              COMPARE DDNAME TO TIOT DDNAME
+         BNE   ALDDNINC                 IF NO MATCH SKIP
+         TM    DSABFLG1,DSABDALC+DSABPALC DYNAMICLY OR PERMANENTLY
+         BNZ   ALDDNFND                 IF SO GO TO DDN FOUND
+ALDDNINC L     R9,DSABFCHN              STEP DOWN CHAIN
+         LA    R9,0(R9)                 CLEAR HIGH ORDER BYTE
+         LTR   R9,R9                    SEE IF END OF CHAIN
+         BNZ   ALDDNLP                  IF NOT CONTINUE SCAN
+         B     ALTST                    COND=NO
+ALDDNFND CLI   DTSK+1,1                 SEE IF DSNAME ALSO GIVEN
+         BNE   ALYES                    IF NOT SET COND AND TEST
+         L     R3,DSABTIOT
+         L     R3,12(,R3)               TIOEJFCB
+         SRL   R3,8                     CONVERT TO STORAGE ADDRESS
+         CLC   12(4,R3),=C'JFCB'        THIS SHOULD ALWAYS BE TRUE
+         BNE   ALTST
+         LA    R3,16(,R3)               POINT TO JFCB
+         CLC   DSNB(44),0(R3)           COMPARE DSN TO JFCB
+         BE    ALYES                    IF MATCH SET COND AND TEST
+         B     ALTST                    IF NOT SET COND AND TEST
+ALDSNSRC EQU   *
+ALDSNLP  EQU   *
+         L     R3,DSABTIOT
+         L     R3,12(,R3)               TIOEJFCB
+         SRL   R3,8                     CONVERT TO STORAGE ADDRESS
+         CLC   12(4,R3),=C'JFCB'        THIS SHOULD ALWAYS BE TRUE
+         BNE   ALTST
+         LA    R3,16(,R3)               POINT TO JFCB
+         CLC   DSNB(44),0(R3)           COMPARE DSN TO JFCB
+         BNE   ALDSNINC                 IF NOT SKIP
+         TM    DSABFLG1,DSABDALC+DSABPALC SEE IF ALLOCATED
+         BNZ   ALYES                    SET YES COND AND TEST
+ALDSNINC L     R9,DSABFCHN              STEP DOWN CHAIN
+         LA    R9,0(R9)                 CLEAR HIGH ORDER BYTE
+         LTR   R9,R9                    SEE IF END OF CHAIN
+         BNZ   ALDSNLP                  IF NOT CONTINUE SCAN
+         B     ALTST                    COND FALSE TEST KEYWORD
+ALYES    LA    R8,1                     SET COND TRUE
+ALTST    LH    R1,ALK                   GET KEYWORD
+         BCTR  R1,0                     PERFORM RITUAL MAGIC
+         XR    R1,R8                    TO DETERMIN PROPER COND
+         BZ    RC4                      IF FALSE GO EXIT
+         BR    R10                      IF TRUE RETURN TO CALLER
+         EJECT
+***********************************************************************
+*                                                                     *
+* GIVEN DSN SEE IF IT IS CATALOGED. IF NOT FORM OF KEYWORD SPECIFIED  *
+* FLIP THE RESULTING CONDITION. IF THE FINAL CONDITION IS TRUE RETURN *
+* VIA REGISTER 10 ELSE GOTO RC0                                       *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+CATEST   TM    DSN+6,X'80'              SEE IF ARGUMENT SPECIFIED
+         BO    CT1                      IF SO PROCESS
+         LA    R1,ARGMSG                IF NOT COMPLAIN
+         B     ERROR
+CT1      MVC   CAMLST(LCAMLST),CAMLSTDC INIT CAMLST
+         LA    R1,DSNB
+         ST    R1,DSNP
+         LA    R1,OUTAREA
+         ST    R1,OUTAP
+         L     R3,DSN                   GET PTR TO DSN
+         LH    R1,DSN+4                 GET LENGTH OF DSN
+         BCT   R1,CT2                   DECREMENT FOR EXECUTE
+         CLI   0(R3),C'*'              SEE IF TERMINAL
+         BE    CTYES                   TERM ALWAYS EXISTS
+CT2      SR    R9,R9                    CLEAR CODITION REG
+         LOCATE CAMLST                  DO THE LOCATE
+         L     R14,CTBTBL(R15)          ANALIZE RETURN
+         BR    R14
+CTBTBL   DC    A(CTYES)                 0
+         DC    A(CTERR)                 4
+         DC    A(CTEST)                 8
+         DC    A(CTEST)                 12
+         DC    A(CTEST)                 16
+         DC    A(CTERR)                 24
+         DC    A(CTERR)                 32
+CTERR    LA    R1,CATMSG
+         B     ERROR
+CTYES    LA    R9,1                     SET COND TRUE
+CTEST    LH    R1,CATK                  GET CAT KEYWORD
+         BCTR  R1,0                     PERFORM RITUAL MAGIC
+         XR    R1,R9                    TO DETERMIN CORRECT COND
+         BZ    RC4                      IF FALSE EXIT
+         BR    R10                      IF TRUE RETURN VIA R10
+         EJECT
+ERROR    DS    0H                                           *HMD 09/81*
+         MVI   MSGAREA,C' '             CLEAR MESSAGE AREA  *HMD 09/81*
+         MVC   MSGAREA+1(L'MSGAREA-1),MSGAREA               *HMD 09/81*
+         LH    R3,0(R1)                 GET MESSAGE LENGTH  *HMD 09/81*
+         BCTR  R3,0                     -1 FOR EXECUTE      *HMD 09/81*
+         EX    R3,MOVEMSG               MOVE MESSAGE        *HMD 09/81*
+         LA    R1,TSECB                 GET ECB ADDRESS     *HMD 09/81*
+         ST    R1,IOPLECB               SAVE IN IOPL        *HMD 09/81*
+         XC    TSECB,TSECB              CLEAR ECB           *HMD 09/81*
+         PUTLINE PARM=PTPB,OUTPUT=(OLD,TERM,SINGLE,INFOR),  *HMD 09/81*X
+               MF=(E,IOPL)                                  *HMD 09/81*
+         B     RTN                                          *HMD 09/81*
+         SPACE 1                                            *HMD 09/81*
+MOVEMSG  MVC   MSGAREA(0),2(R1)         MOVE MESSAGE TO AREA*HMD 09/81*
+SYN      LA    R1,SYNTMSG
+         B     ERROR
+         SPACE 1                                            *HMD 09/81*
+SYNT     ERR   'SYNTAX ERROR ON INVOCATION OF COMMAND'      *HMD 09/81*
+         SPACE 1                                            *HMD 09/81*
+PARSEBAD LA    R1,PARMSG
+         B     ERROR
+         EJECT
+***********************************************************************
+*                                                                     *
+* VALIDITY CHECK ROUTINE FOR THE RELATION OPERAND OF THE SYSRC KEYWORD*
+* ROUTINE PLACES A NUMERIC EQUIVALENT OF THE RELATION IN SYSREL       *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+         USING *,R15
+RELCK    L     R2,0(R1)                 GET ADD OF PDE
+         L     R3,4(R1)                 GET ADDRESS OF RESULT
+         CLI   5(R2),2                  SEE IF STRING IS CORRECT LENGTH
+         BNE   RELKE
+         L     R2,0(R2)                 GET PTR TO STRING
+         CLC   0(2,R2),=CL2'EQ'
+         BNE   RELK1
+         MVI   0(R3),1
+         B     RELKR
+RELK1    CLC   0(2,R2),=CL2'NE'
+         BNE   RELK2
+         MVI   0(R3),2
+         B     RELKR
+RELK2    CLC   0(2,R2),=CL2'LE'
+         BNE   RELK3
+         MVI   0(R3),3
+         B     RELKR
+RELK3    CLC   0(2,R2),=CL2'GE'
+         BNE   RELK4
+         MVI   0(R3),4
+         B     RELKR
+RELK4    CLC   0(2,R2),=CL2'LT'
+         BNE   RELK5
+         MVI   0(R3),5
+         B     RELKR
+RELK5    CLC   0(2,R2),=CL2'NL'
+         BNE   RELK6
+         MVI   0(R3),6
+         B     RELKR
+RELK6    CLC   0(2,R2),=CL2'GT'
+         BNE   RELK7
+         MVI   0(R3),7
+         B     RELKR
+RELK7    CLC   0(2,R2),=CL2'NG'
+         BNE   RELKE
+         MVI   0(R3),8
+RELKR    SR    R15,R15
+         BR    R14
+RELKE    LA    R15,4
+         BR    R14
+         DROP  R15
+         EJECT
+MVC      MVC   0(1,R2),0(R3)
+CLC      CLC   0(1,R2),0(R3)
+CAMLSTDC CAMLST NAME,0,,0
+STK      ERR   'STACK ERROR'
+ARG      ERR   'INCORECT ARGUMENT(S) SPECIFIED'
+CAT      ERR   'ERROR IN TRYING TO ACCESS CATALOG'
+PAR      ERR   'PARSE ERROR'
+         LTORG
+         EJECT
+***********************************************************************
+*                                                                     *
+*         PARSE PCL DEFINITION                                        *
+*                                                                     *
+***********************************************************************
+         SPACE
+PCL      IKJPARM DSECT=PDL
+ASTK     IKJKEYWD
+         IKJNAME 'PSTRING',SUBFLD=ASTS
+BSTK     IKJKEYWD
+         IKJNAME 'QSTRING',SUBFLD=BSTS
+RELK     IKJKEYWD
+         IKJNAME 'EQ'
+         IKJNAME 'NE'
+         IKJNAME 'LE'
+         IKJNAME 'GE'
+         IKJNAME 'LT'
+         IKJNAME 'NL'
+         IKJNAME 'GT'
+         IKJNAME 'NG'
+SYSRCK   IKJKEYWD
+         IKJNAME 'SYSRC',SUBFLD=SYSRC
+ALK      IKJKEYWD
+         IKJNAME 'ALLOCATED'
+         IKJNAME 'NALLOCATED'
+CATK     IKJKEYWD
+         IKJNAME 'CATALOGED'
+         IKJNAME 'NCATALOGED'
+FILEK    IKJKEYWD
+         IKJNAME 'FILE',SUBFLD=FILES
+DTSK     IKJKEYWD
+         IKJNAME 'DATASET',SUBFLD=DTSS
+THENK    IKJKEYWD
+         IKJNAME 'THEN',SUBFLD=THENS
+ASTS     IKJSUBF
+PSS      IKJPOSIT DELIMITER
+PSTRING  IKJPOSIT STRING,PROMPT='PSTRING'
+BSTS     IKJSUBF
+QSS      IKJPOSIT DELIMITER
+QSTRING  IKJPOSIT STRING,PROMPT='QSTRING'
+FILES    IKJSUBF
+DDN      IKJIDENT 'DDNAME',MAXLNTH=8,OTHER=ALPHANUM
+DTSS     IKJSUBF
+DSN      IKJPOSIT DSTHING,USID,PROMPT='DSNAME'
+THENS    IKJSUBF
+THENSP   IKJPOSIT SPACE
+THEN     IKJPOSIT STRING
+SYSRC    IKJSUBF
+SYSREL1  IKJIDENT 'RELATION',MAXLNTH=2,FIRST=ALPHA,OTHER=ALPHA,        X
+               VALIDCK=RELCK,PROMPT='RELATION'
+RC       IKJIDENT 'COMPARAND',MAXLNTH=15,FIRST=NUMERIC,OTHER=NUMERIC,  X
+               PROMPT='COMPARAND'
+         IKJENDP
+         EJECT
+***********************************************************************
+*                                                                     *
+*         DSECTS                                                      *
+*                                                                     *
+***********************************************************************
+         SPACE
+TSDSECT  DSECT
+         DS    18F
+CPPL     DS    0A
+CPPLCBUF DS    A        PTR TO COMMAND BUFFER
+CPPLUPT  DS    A        PTR TO UPT
+CPPLPSCB DS    A        PTR TO PSCB
+CPPLECT  DS    A        PTR TO ECT
+PPL      DS    0A
+PPLUPT   DS    A        PTR TO UPT
+PPLECT   DS    A        PTR TO ECT
+PPLECB   DS    A        PTR TO CP'S ECB
+PPLPCL   DS    A        PTR TO PCL
+PPLANS   DS    A        PTR TO ANS PLACE
+PPLCBUF  DS    A        PTR TO CMD BUFFER
+PPLUWA   DS    A        PTR TO USER WORK AREA (FOR VALIDITY CK RTNS)
+IOPL     DS    0A
+IOPLUPT  DS    A        PTR TO UPT
+IOPLECT  DS    A        PTR TO ECT
+IOPLECB  DS    A        PTR TO USER'S ECB
+IOPLIOPB DS    A        PTR TO THE I/O SERVICE RTN PARM BLOCK
+TSECB    DS    A
+TSPARANS DS    A
+OLD      DS    2F       OUTPUT LINE DESCRIPTOR              *HMD 09/81*
+MSGLN    DS    F                                            *HMD 09/81*
+MSGID    DS    CL10     MESSAGE ID                          *HMD 09/81*
+MSGAREA  DS    CL70     MESSAGE TEXT AREA                   *HMD 09/81*
+PTPB     PUTLINE MF=L   PUTLINE PARM BLOCK                  *HMD 09/81*
+WA       DS    D
+CAMLST   DS    0F
+         DS    3AL1(0)                  FCTN FLGS
+         DS    AL1(0)                   OPTION 3
+DSNP     DS    A                        PTR TO DSNAME
+         DS    A                        PARM 3
+OUTAP    DS    A                        PTR TO RETURN AREA
+LCAMLST  EQU   *-CAMLST
+DSNB     DS    CL44
+OUTAREA  DS    0D
+         DS    CL265
+SYSREL   DS    X
+STKPB    DS    2F                                                *WDD*
+         DS    0D
+TSDSECTL EQU   *-TSDSECT
+         EJECT
+GTDSECT  DSECT
+GTCPPL   DS    0F
+GTCBUFP  DS    F
+GTUPT    DS    F
+GTPSCB   DS    F
+GTECT    DS    F
+GTLNTH   DS    H
+GTOFST   DS    H
+GTBUF    EQU   *
+         EJECT
+STKBLK   DSECT
+*TKPB    DS    2F                       PARM BLK                  *WDD*
+LSDATA   DS    F                        PTR TO CMD BUFF
+LSDRLEN  DS    H                        RECORD LENGTH
+LSDTLEN  DS    H                        TOTAL LENGTH
+LSDNXT   DS    F                        PTR TO NEXT REC
+LSDRSVD  DS    F                        RESERVED
+STKLEN   EQU   *-STKBLK
+STKBUF   EQU   *
+         EJECT
+         IKJECT
+         EJECT
+R0       EQU   0                   <>
+R1       EQU   1                 <<  >>
+R2       EQU   2               <<      >>
+R3       EQU   3             <<          >>
+R4       EQU   4           <<              >>
+R5       EQU   5         <<                  >>
+R6       EQU   6       <<                      >>
+R7       EQU   7     <<    SYMBOLIC REGISTERS    >>
+R8       EQU   8       <<                      >>
+R9       EQU   9         <<                  >>
+R10      EQU   10          <<              >>
+R11      EQU   11            <<          >>
+R12      EQU   12              <<      >>
+R13      EQU   13                <<  >>
+R14      EQU   14                  <>
+R15      EQU   15
+         EJECT
+* IHADSAB MACRO IS IN SYS1.MACLIB                           *HMD 09/81*
+         IHADSAB
+         EJECT                                              *HMD 09/81*
+         CVT   DSECT=YES,LIST=YES      COMM. VECTOR TABLE   *HMD 09/81*
+         END

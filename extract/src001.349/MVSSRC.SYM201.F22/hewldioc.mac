@@ -1,0 +1,2247 @@
+IOCA     TITLE 'INPUT/OUTPUT - CONTROL - ALLOCATION MODULE FOR THE VS  X
+               LOADER'
+***********************************************************************
+*                                                                     *
+*TITLE 'HEWLIOCA' - I/O, CONTROL, AND ALLOCATION MODULE FOR THE       *
+*    VS LOADER                                                       *
+*                                                                     *
+*STATUS - CHANGE LEVEL 20
+*        TSO CHANGES FOR IDENTIFICATION,TERM OPTION AND INCORE DS     *
+*        SECOND BASE REGISTER (4) ADDED                               *
+*                                                                     *
+*FUNCTION/OPERATION- THIS MODULE PERFORMS THE FOLLOWING -             *
+*   1. ISSUES AN UNCONDITIONAL 6K GETMAIN FOR INITIALIZATION    A42698*
+*   1A. ISSUES AN EXTRACT TO FIND WHETHER TSO IS OPERATING            *
+*   2. SCANS THE OPTION,DDNAME AND DCB LISTS                          *
+*   3. ISSUES A VARIABLE CONDITIONAL GETMAIN FOR PROGRAM AND TABLES   *
+*   4. ALLOCATES AND INITIALIZES THE LOADER COMMUNICATION AREA        *
+*   4A. SETS SYSPRINT RECORD SIZE AT 81 OR 121 DEPENDING ON WHETHER   *
+*      TSO IS OPERATING                                               *
+*   5. ALLOCATES AND CHAINS SAVE AREAS FOR USE DURING LOADING         *
+*   6. FREEMAINS THE INITIAL 4K STORAGE FOR USE BY DATA MANAGEMENT    *
+*   7. CONSTRUCTS SYSLIN AND SYSPRINT DCBS                            *
+*   7A.ALLOCATES SPACE FOR SYSTERM DCB,DECBS, AND BUFFERS             *
+*   8. OPENS SYSLIN AND SYSPRINT DCBS                                 *
+*   9. CALLS IEWBUFFR (SEE BELOW) TO ALLOCATE SYSPRINT BUFFERS        *
+*  10. PRINTS LOADER HEADING, OPTIONS USED, REJECTED OPTIONS, ERRORS  *
+*      ENCOUNTERED DURING OPEN, AND MAP HEADING                       *
+*  11. CALLS HEWBUFFR (SEE BELOW) TO ALLOCATE SYSLIN BUFFERS          *
+*  12. CALLS HEWPRIME (SEE BELOW) TO PRIME OBJECT MODULE BUFFERS      *
+*  13. CALLS HEWLRELO TO PROCESS OBJECT MODULES                       *
+*  14. CALLS HEWLODE TO PROCESS LOAD MODULES                          *
+*  15. CALLS HEWACALL TO PROCESS AUTO-CALL AND FINAL RESOLUTION       *
+*  16. CALLS AEWBTMAP TO PROCESS THE DIAGNOSTIC MESSAGE DICTIONARY    *
+*  17. PURGES THE SYSPRINT BUFFERS                                    *
+*  18. CLOSES DATA SETS                                               *
+*  19. FREEMAINS STORAGE NOT ALLOCATED TO THE LOADED PROGRAM          *
+*  20. CONSTRUCTS RETURN PARAMETERS                                   *
+*  21. RETURNS TO THE INVOKING PROGRAM                                *
+*                                                                     *
+*ENTRY POINTS - 'HEWLOAD' - MAIN ENTRY POINT FOR ALIAS HEWLOAD        *
+*                         LOADING WITH IDENTIFICATION                 *
+*   'HEWOPNLB' - CLOSES SYSLIN DATA SET                               *
+*              - OPENS SYSLIB DATA SET                                *
+*              - CALLS HEWBUFFR (SEE BELOW) TO ALLOCATE SYSLIB BUFFERS*
+*                                                                     *
+*   'HEWBUFFR' - DEALLOCATES ANY PREVIOUS INPUT BUFFERS AND DECBS     *
+*              - ALLOCATES BUFFERS AND DECBS FOR DCB SPECIFIED        *
+*              - RESETS INPUT I/O FLAGS                               *
+*                                                                     *
+*   'HEWPRIME' - ISSUES A 'READ' ON ALL INPUT BUFFERS EXCEPT ONE      *
+*              - SETS DATA LENGTH TO ZERO ON BUFFER NOT READ          *
+*              - SETS INPUT RECORD POINTER TO ZERO-LENGTH BUFFER      *
+*                                                                     *
+*   'HEWLREAD' - READS PHYSICAL RECORDS (BSAM)                        *
+*              - DEBLOCKS INCORE DATA SET                             *
+*              - DEBLOCKS FIXED RECORD FORMAT                         *
+*                                                                     *
+*   'HEWLPRNT' - INSERTS ASA CARRIAGE CONTROL CHARACTERS IN RECORDS   *
+*              - BLOCKS LOGICAL RECORDS INTO PHYSICAL RECORDS         *
+*              - WRITES PHYSICAL RECORDS                              *
+*                                                                     *
+*   'HEWTERM'  - OPENS SYSTERM IF NOT OPEN                            *
+*                WRITES PHYSICAL RECORDS (BSAM)                       *
+*                                                                     *
+*INPUT- STANDARD OS/360 PARAMETER LIST                                *
+*                                                                     *
+*OUTPUT- REGISTER 15 - RETURN CODE                                    *
+*        REGISTER  0 - ENTRY POINT ADDRESS OF LOADED PROGRAM          *
+*        REGISTER  1 - POINTER TO TWO FULL WORDS                      *
+*           WHEN INVOKED VIA IEWLOAD                                  *
+*           TWO WORDS CONTAIN NAME OF IDENTIFIED PROGRAM              *
+*              EITHER AS SPECIFIED IN NAME PARAMETER OR DEFAULT **GO  *
+*           WHEN INVOKED VIA IEWLOADR                                 *
+*           WORD1 - BEGINNING ADDRESS OF STORAGE OCCUPIED BY PROGRAM  *
+*           WORD2 - EXTENT (IN BYTES) OF PROGRAM                      *
+*                                                                     *
+*EXTERNAL ROUTINES-                                                   *
+*                                                                     *
+*   'HEWERROR' - LOG ERROR MESSAGES                                   *
+*   'HEWLRELO' - PROCESS OBJECT MODULES                               *
+*   'HEWLOAD ' - PROCESS LOAD MODULES                                 *
+*   'HEWACALL' - PROCESS AUTO-CALL AND FINAL RESOLUTION               *
+*   'HEWBTMAP' - CONSTRUCT THE DIAGNOSTIC MESSAGE DICTIONARY          *
+*   'HEWLDDEF' - USED TO OBTAIN DEFAULT OPTIONS AND DDNAMES           *
+*                                                                     *
+*EXITS-NORMAL- RETURN TO CALLER VIA REGISTER 14 - REG 15 = 0          *
+*     -ERROR- RETURN TO CALLER VIA REGISTER 14 - ERROR CODE IN REG 15 *
+*                                                                     *
+*TABLES/WORK AREAS-                                                   *
+*   'HEWLDCOM' - ALL COMMUNICATION INFORMATION                        *
+*   'DCB     ' - INPUT AND OUTPUT DCBS                                *
+*   'DECB    ' - INPUT AND OUTPUT DECBS                               *
+*                                                                     *
+*ATTRIBUTES- REFRESHABLE,REENTRANT,REUSABLE                           *
+*                                                                     *
+*NOTES - TWO BASE REGISTERS USED - 12 AND 4                           *
+*        SYSLOUT SHOULD BE SUBSTITUED FOR SYSPRINT                    *
+*                                                                     *
+*  MAINTANCE CHANGES
+*
+*    PTM  3177   FREEMAIN WITH NO EXTENTS       $352740,353060
+*
+***********************************************************************
+         EJECT
+*   OS/360 LOADER --- MAIN ENTRY POINT
+*
+HEWLIOCA CSECT
+*A061850                                                         A41067
+*C002600,415800                                                  A42698
+*                                                                YM3064
+*                         FIX IS INCORPORATED IN FIX TO 42698 (M1488)
+*                                                               SA49491
+*                                                                YM3465
+*I356500-356540,I356100-356188                                  ZA01334
+         SAVE  (14,12),,IEWLOADR   SAVE CALLERS REGISTERS
+         LR    R12,R15               MOVE EP BASE
+         USING HEWLIOCA,R12            AND IDENTIFY IT
+         LR    R3,R1               MOVE PARAMETER REGISTER
+         L     R4,IOCABSE2        LOAD SECOND BASE REGISTER
+         USING HEWLIOCA+4096,R4
+*
+         GETMAIN R,LV=DMSIZE,SP=0      GETMAIN FOR INITIALIZATION
+*
+         LR    R10,R1              MOVE POINTER TO ADDRESSING REGISTER
+         USING INITMAIN,R10          AND IDENTIFY IT
+         USING ERCODES,0           IDENTIFY ERROR CODE DSECT
+*
+         SR    R2,R2               SET FORWARD CHAIN
+         ST    R2,INITSAVE+8         TO ZERO IN MY SAVE AREA
+         ST    R13,INITSAVE+4      SET BACKWARD CHAIN TO PREV SAVE
+         LA    R5,INITSAVE         SET PREVIOUS SAVE AREA'S
+         ST    R5,8(R13)             FORWARD CHAIN TO ME
+         LR    R13,R5              MOVE MY SAVE POINTER TO R13
+*
+*   MOVE DEFAULT OPTIONS AND DDNAMES INTO 'INITMAIN' DSECT
+*
+         L     R9,DFLTBASE         GET POINTER TO DEFAULTS CSECT
+         USING DEFAULTS,R9           AND IDENTIFY IT
+         SPACE
+         MVC   INITDDNM(24),DFLTDDNM    MOVE DEFAULT DDNAMES
+         MVC   INITDDNM+24(8),DFLTTERM  MOVE DEFAULT SYSTERM DDNAME
+         MVC   INITRMAX(4),DFLTSIZE     MOVE DEFAULT SIZE
+         MVC   INITRMIN(4),DFLTMIN      MOVE MIN SIZE (NOT IN IEWLDDEF)
+         MVC   INITPARM(2),DFLTFLAG     MOVE DEFAULT OPTIONS
+         MVC   INITPGMN(8),DFLTNAME  STORE DEFAULT PROGRAM NAME
+         XC    INFLAG3(2),INFLAG3 ZERO OUT FLAGS
+         DROP  R9
+         SPACE
+         MVI   INITNAME,C' '           BLANK OUT
+         MVC   INITNAME+1(7),INITNAME  ENTRY POINT NAME FIELD
+*
+         MVC   INITEXTR(EXTRLEN),EXTR  MOVE EXTRACT PARM LIST
+         EXTRACT   INITEXAD,MF=(E,INITEXTR)
+         L     R6,INITEXAD             GET IT
+         LTR   R6,R6                   WAS IT DEFINED
+         BZ    MNINIT                  NO. BRANCH
+         TM    0(R6),TCBTSTSK          YES. IS IT TIME-SHARING TASK
+         BNO   MNINIT                  NO. DON'T SET TSO FLAG
+         OI    INFLAG3,CQTS            SET ON TIME-SHARING FLAG
+MNINIT   EQU   *
+         LA    R6,INITREJP        INITIALIZE INVALID OPTIONS
+         ST    R6,INITREJL        BUFFER ADDRESS
+         LR     R1,R3             DID WE ENTER VIA IEWLOAD
+         N      R1,ENTFLG2        CHANGE FLAG
+         C      R1,ENTFLG2        IDEN WANTED?
+         BNE    MNPARSE           NO, LEAVE IDEN FLAG OFF
+         OI    INFLAG3,CQIDEN     SHOW IDENTIFICATION WANTED
+         SR    R1,R1              CLEAR REGISTER ONE             A41067
+MNPARSE  EQU   *
+*
+         L     R11,0(R3)            GET POINTER TO LIST
+*
+         LH    R5,0(R11)               GET LIST LENGTH
+         LTR   R5,R5                     IS THE SIZE ZERO
+         BZ    MNCKDDNM                    YES - NO PARAMETERS
+*
+         SR    R8,R8                         ZERO OUT
+         SR    R7,R7                           THE TRANSLATE
+         STM   R7,R8,INITRTAB                    AND TEST
+         MVC   INITRTAB+8(256-8),INITRTAB          TABLE
+         MVI   INITRTAB+C',',C','            MOVE IN COMMA FOR DELIM
+         MVI   INITRTAB+C'=',C'='                 AND = FOR DELIM
+*
+         LA    R11,2(R11)          POINT TO LIST
+         BCTR  R5,0                  DECREMENT COUNT FOR EXECUTE
+         LA    R14,MNSETCHK            CONTINUE ADDRESS
+         LA    R7,255              CHECK IF LENGTH OF OPTIONS
+         CR    R5,R7                 IS GREATER THAN 256
+         BNH   MNPRMSCN            LENGTH OK - GO SCAN
+         LR    R5,R7               LENGTH GREATER - TRUNCATE TO 256
+         SPACE
+*   SCAN PARAMETER LIST TO A COMMA OR EQUAL SIGN
+         SPACE
+MNPRMSCN EX    R5,MNPRMTRT         SCAN TO COMMA
+         BNZ   MNPRMCHK              AND CHECK PARM IF COMMA FOUND
+         LA    R1,1(R11,R5)        SIMULATE COMMA FOUND IF END
+MNPRMCHK SR    R1,R11              GET SIZE OF PARM
+         BCTR  R1,0                 DECRIMENT FOR EXECUTE
+         BZ    MNNXTPRM              NO PARM IF LENGTH ZERO
+         BR    R14                 DROP THROUGH IF KEYWORD --
+*                                    RETURN TO 'MNSIZE' OR 'MNEP'
+*                                      IF OPERAND
+         SPACE
+MNSETCHK LM    R7,R9,SCANCTRL      LOAD CONTROL WORDS FOR LIST COMPARE
+         SPACE 2
+*   COMPARE OPTION IN PARAMETER LIST AGAINST VALID OPTIONS
+         SPACE
+MNNXTCHK SR    R2,R2               LOCATE
+         IC    R2,0(R7)              ENTRY
+         LA    R14,PARMLIST(R2)    IN VALID OPTION LIST
+         EX    R1,LENTHCHK         IS LENGTH IN LIST EQ LENGTH OF OPT'N
+         BNE   MNNXTINC              NO - CHECK NEXT OPTION
+         EX    R1,PARMSCAN         COMPARE AGAINST OPTION IN USER LIST
+         BE    MNPARMEQ              OPTION EQUAL -- GO PROCESS IT
+         SPACE
+MNNXTINC BXLE  R7,R8,MNNXTCHK      NOT THIS OPTION - CHECK NEXT IF ONE
+         SPACE
+*   THE PARAMETER HAS BEEN REJECTED -- PUT INVALID OPTION ONTO LIST
+         SPACE
+MNREJECT EX    R1,MVREJECT         MOVE INVALID OPTION TO BUFFER
+         AR    R6,R1                 UPDATE ADDRESS IN BUFFER
+         MVI   1(R6),C','              MOVE COMMA IN
+         LA    R6,2(R6)            COMPENSATE FOR COMMA AND BCTR
+         B     MNNXTPRM            GO TO PROCESS NEXT OPTION
+         SPACE 2
+*   A MATCH HAS BEEN FOUND -- PERFORM OPERATION DEFINED BY 'SCANLIST'
+         SPACE
+MNPARMEQ IC    R2,3(R7)            PICK UP INDEX INTO EXECUTE LIST
+         IC    R8,1(R7)              PICK UP FUNCTION BYTE
+         EX    R8,SETPARM(R2)          AND PERFORM OPERATION
+         SPACE
+MNNXTPRM LA    R14,MNSETCHK        ESTABLISH CHECK FOR NEW KEYWORD
+MNOPRAND LA    R1,2(R1)            ADD TO LENGTH FOR COMMA AND BCTR
+         AR    R11,R1                ADD LENGTH TO PREV ADDRESS
+         SR    R5,R1                 SUBTRACT LENGTH FROM LIST LENGTH
+         BNM   MNPRMSCN                AND GO SCAN NEXT IF THERE
+*
+         ST    R6,INITREJL         SAVE END OF REJECTED OPTIONS LIST
+         B     MNCKDDNM              AND GO CHECK FOR DDNAMES
+*
+*   SCAN OFF ENTRY NAME AND MOVE IT TO 'INITMAIN'
+*
+MNEP     BAL   R14,MNOPRAND        ENTRY POINT NAME -- SCAN OFF OPERAND
+         LR    R8,R1                 MOVE OPERAND LENGTH
+         LA    R7,7                  MAXIMUM LENGTH FOR NAME
+         CR    R8,R7               IS LENGTH SPECIFIED OK
+         BNH   MNEPOK                LOW OR EQUAL IS OK
+         LR    R8,R7                   MAKE NAME LENGTH = 8 CHARS
+MNEPOK   EX    R8,MOVEPNM          MOVE ENTRY POINT NAME
+         OI    INITPARM,CQEPNAME     SET NAME SPECIFIED FLAG
+         B     MNNXTPRM                AND SCAN NEXT
+*
+*
+MNNAME   BAL   R14,MNOPRAND   PROGRAM NAME - SCAN OFF OPERAND
+         MVI   INITPGMN,C' '       BLANK OUT
+         MVC   INITPGMN+1(7),INITPGMN  PROGRAM NAME FIELD
+         LR    R8,R1          MOVE OPERAND LENGTH
+         LA    R7,7           MAXIMUM LENGTH FOR NAME
+         CR    R8,R7          IS LENGTH SPECIFIED OK
+         BNH   MNNAMEOK       LOW OR EQUAL IS OK
+         LR    R8,R7          MAKE LENGTH = 8 CHARACTERS
+MNNAMEOK EX    R8,MOVPGMNM    MOVE PROGRAM NAME
+         OI    INFLAG3,CQPGMNM     SHOW PROGRAM NAME REC'D
+         B     MNNXTPRM       AND SCAN NEXT.
+*
+*   SCAN OFF SIZE OPERAND AND MOVE IT OVER DEFAULT IN 'INITMAIN'
+*
+MNSIZE   BAL   R14,MNOPRAND        SIZE SPECIFIED -- SCAN OFF OPERAND
+         ST    R11,INITDUM         SAVE POINTER TO OPERAND
+         LR    R9,R1                   AND LENGTH
+         SPACE
+         ST    R1,INITSCAN             SAVE SCAN POINTER
+         SPIE  SPIEEXIT,(7)              SPIE FOR DATA EXCEPTION
+         ST    R1,INITSPIE                 SAVE PREVIOUS PICA ADDRESS
+         SPACE
+         LA    R1,1                PUT 1 INTO REG FOR INCR - DECR
+         CLI   0(R11),C'('         IS FIRST CHAR A PAREN
+         BNE   MNSIZE1               NO - GO AROUND
+         AR    R11,R1                YES - BUMP POINTER OVER IT
+         SR    R9,R1                       DECRIMENT COUNT
+         BM    SPIEEXIT         INVALID IF COUNT ZERO
+MNSIZE1  LA    R8,0(R9,R11)        POINT TO END OF OPERAND
+         CLI   0(R8),C')'            IS LAST CHAR A PAREN
+         BNE   MNSIZE2                 NO - GO AROUND
+         SPACE
+         SR    R8,R1                   YES - BACK UP OVER PAREN
+         SR    R9,R1                         DECRIMENT LENGTH
+         BM    SPIEEXIT         INVALID IF LENGTH ZERO
+MNSIZE2  CLI   0(R8),C'K'          IS IT A 'K' TYPE SIZE
+         BNE   MNSIZE3               NO - GO AROUND
+         SPACE
+         SR    R9,R1                 YES - DECRIMENT LENGTH
+         BM    SPIEEXIT         INVALID IF COUNT ZERO
+         SPACE
+MNSIZE3  EX    R9,PACKSIZE         PACK THE DIGITS
+         OI    INITSIGN,X'0F'      INSURE SIGN IS POSITIVE
+         CVB   R2,INITDBLW           AND CONVERT TO BINARY
+         CLI   0(R8),C'K'          IS 'K' VALUE SPECIFIED
+         BNE   MNSIZE4               NO - GO AROUND
+         SPACE
+         SLL   R2,10                 YES -- MULTIPLY RESULT BY K (1024)
+MNSIZE4  C     R2,INITRMIN         IS SIZE SPECIFIED GREATER THAN MIN
+         BH    MNSIZE6               YES - OK
+         SPACE
+MNSIZE5  L     R2,INITRMIN         NO - SUBSTITUTE MINIMUM SIZE
+MNSIZE6  ST    R2,INITRMAX         STORE RESULT INTO MAX REQUEST
+         SPACE
+MNSIZE7  LA    R14,MNNXTPRM          SPIE EXIT NOT TAKEN
+MNSIZE8  L     R1,INITSPIE             PICK UP PREVIOUS PICA ADDRESS
+         SPIE  MF=(E,(1))                RE-SPIE IT
+         L     R1,INITSCAN             RELOAD SCAN POINTER
+         L     R11,INITDUM         RELOAD OPERAND POINTER
+         BR    R14                       AND GO SCAN NEXT OPTION
+         SPACE 2
+SPIEEXIT MVC   0(5,R6),VPSIZE      INVALID SIZE OPERAND -- MOVE
+         LA    R6,5(R6)              'SIZE=' TO REJECTED OPTIONS BUFFER
+         LA    R14,MNREJECT        FIX SO OPERAND IS MOVED
+         B     MNSIZE8               AND GIVE DEFAULT SIZE
+         SPACE 3
+*   CHECK IF DDNAMES PASSED AND MOVE THEM OVER DEFAULTS IN 'INITMAIN'
+         SPACE 2
+MNCKDDNM TM    0(R3),X'80'         IS THIS THE END OF LIST
+         BO    MNVCGTMN              YES - NO DDNAMES PASSED
+*
+         L     R2,4(R3)            NO. GET
+         LH    R5,0(R2)            GET COUNT
+         LTR   R5,R5                     IS COUNT ZERO
+         BZ    MNCHKDCB
+*
+         LA    R2,2(R2)            POINTER TO BEGINNING
+         LA    R6,INITLIN            POINTER TO DEFAULT IN LOADER
+         LA    R7,0                  DISPLACEMENT IN DDNAME LIST
+         BAL   R14,MNMVDDNM        CHECK IF SYSLIN DEFINED
+*
+         LA    R6,INITLIB            POINTER TO DEFAULT IN LOADER
+         LA    R7,24                 DISPLACEMENT IN DDNAME LIST
+         BAL   R14,MNMVDDNM        CHECK IF SYSLIB DEFINED
+*
+         LA    R6,INITPRNT           POINTER TO DEFAULT IN LOADER
+         LA    R7,40                 DISPLACEMENT IN DDNAME LIST
+         BAL   R14,MNMVDDNM        CHECK IF SYSPRINT DEFINED
+         LA    R6,INITTERM         POINTER TO DEFAULT IN LOADER
+         LA    R7,88               DISPLACEMENT IN DDNAME LIST
+         BAL   R14,MNMVDDNM        CHECK IF SYSTERM DEFINED
+*
+MNCHKDCB TM    4(R3),X'80'        WERE DDNAMES LAST ENTRY
+         BO    MNVCGTMN           YES.
+         TM    8(R3),X'80'        PG HDG LAST
+         BO    MNVCGTMN           YES
+         L     R2,12(R3)           DCBS PASSED
+         L     R5,0(R2)            GET NO ENTRIES IN LIST
+         LTR   R5,R5              IS COUNT 0
+         BZ    MNVCGTMN           YES. NO DCBS PASSED
+         L     R6,4(R2)            TRY SYSLIN
+         LTR   R6,R6              IS A DCB PASSED
+         BZ    MNCKLIB            NO. CHECK SYSLIB
+         USING IHADCB,R6
+       CLI     DCBDEVT,X'00'       IS IT INCORE
+         BNE   MNCKLIB            NO. IGNORE IT
+         OI INFLAG3,CQINCORE+CQPASLIN
+         ST    R6,INLINDCB        SAVE DCB ADDRESS
+MNCKLIB  LA    R7,4               SYSLIB IS FOURTH ENTRY
+         CR    R7,R5              IS IT POSSIBLY HERE
+         BH    MNVCGTMN           NO
+         L     R6,16(R2)           YES. PICK IT UP
+         LTR   R6,R6              IS IT REALLY HERE
+         BZ    MNVCGTMN           NO. WEHRE THRU WITH PARMS
+         TM    DCBOFLGS,DCBOPEN   IS IT OPEN
+         BZ    MNVCGTMN           NO. IGNORE IT
+         OI    INFLAG3,CQPASLIB   YES. SET FLAG
+         ST    R6,INLIBDCB        SAVE DCB ADDRESS
+         B     MNVCGTMN
+*
+*
+MNMVDDNM LA    R8,8(R7)            IS LENGTH OF NAME PLUS DISPLACEMENT
+         CR    R8,R5                 IN LIST GREATER THAN LIST LENGTH
+         BCR   2,R14                   YES - RETURN
+*
+         AR    R7,R2               NO. ADD DISPLACEMENT AND BEGIN
+         NC    0(8,R7),0(R7)             IS DDNAME SPECIFIED ZERO
+         BCR   8,R14                       YES - RETURN
+*
+         MVC   0(8,R6),0(R7)               NO - MOVE IN NEW DDNAME
+         BR    R14                           AND RETURN
+*
+MOVPGMNM MVC   INITPGMN(0),0(R11)  EXECUTED MOVE PROG NAME FROM LIST
+MOVEPNM  MVC   INITNAME(0),0(R11)  EXECUTED MOVE EPNAME FROM PARM LIST
+MNPRMTRT TRT   0(0,R11),INITRTAB   TRT FOR PARAMETER SCAN
+PACKSIZE PACK  INITDBLW(8),0(0,R11) EXECUTED PACK PARM SIZE
+PARMSCAN CLC   0(0,R14),0(R11)   COMPARE OPTION FOR MATCH
+MVREJECT MVC   0(0,R6),0(R11)    MOVE REJECTED OPTION TO BUFFER
+REJTOCM  MVC   0(0,R2),0(R6)       MOVE REJECTED OPTIONS FROM INIT - CM
+LENTHCHK CLI   2(R7),0             CHECK LENGTH OF OPTION
+*
+SETPARM  DS    0F                  INDEXED EXECUTE LIST FOR OPTION SET
+ORPARM   OI    INITPARM,0            SET BIT
+ANDPARM  NI    INITPARM,0            CLEAR BIT
+SIZEPARM B     MNSIZE                GO TO PROCESS SIZE
+EPPARM   B     MNEP                  GO TO PROCESS ENTRY NAME
+NAMEPARM B     MNNAME         GO TO PROCESS PROGRAM NAME
+         EJECT
+*              ENTRY POINT FOR IDENTIFICATION
+         USING HEWLOAD,R15
+         ENTRY HEWLOAD
+HEWLOAD  O     R1,ENTFLG          SHOW WE ENTERED HERE
+         L     R15,IOCABASE        NOW GO BACK TO HEWLOADR
+         BR    R15
+         DC    C'HEWLOAD '
+         DS    0F
+ENTFLG   DC    X'FF000000'
+         DROP  R15
+         EJECT
+***********************************************************************
+*                                                                     *
+*   VARIABLE CONDITIONAL GETMAIN FOR PROGRAM AND TABLES               *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+MNVCGTMN GETMAIN VC,LA=INITRMIN,A=INITMADR,SP=0,MF=(E,INITGTML)
+*
+*
+         LTR   R15,R15             WAS MAIN STORAGE ALLOCATED
+         BZ    MNMAINOK              YES - ALL OK
+*
+         GETMAIN R,LV=MINREQ,SP=0      GO OUT ON GETMAIN ERROR
+         LA    R2,MINREQ           SIMULATE VC ALLOCATED
+         STM   R1,R2,INITMADR        IF UNCONDITIONAL WORKED
+         SPACE 2
+*   SET UP BASE ADDRESS FOR THE COMMUNICATION AREA (IEWLDCOM) AND
+*   INITIALIZE IT
+         SPACE
+MNMAINOK L     R11,INITMADR        PICK UP POINTER TO ALLOCATED CORE
+         LA    R9,CQCMSIZE           SIZE OF STATIC COMMUNICATION AREA
+         A     R11,INITMSIZ          ADD ALLOCATED CORE SIZE TO POINTER
+         SR    R11,R9                  SUBTRACT OFF SIZE OF COM AREA
+*
+         USING HEWLDCOM,R11       IDENTIFY COMMUNICATION AREA
+*
+         MVC   CMINITCM(INITCMSZ),INITCMCM   MOVE COMMON AREA FROM
+*                                              INITIAL AREA TO
+*                                                COMMUNICATION AREA
+         SR    R2,R2                         INITIALIZE THE
+         SR    R3,R3                           REST OF THE
+         STM   R2,R3,CMINTZRO                    COMMUNICATION AREA
+         MVC   CMINTZRO+8(CQINTSIZ-8),CMINTZRO     TO ZERO
+*
+         ST    R11,CMLOWTBL        COMMUNICATION BASE IS LOWEST TABLE
+         AR    R9,R11                COMMUNICATION SIZE + BASE
+         ST    R9,CMHITBL              IS HIGHEST ALLOCATED CORE
+*
+         L     R2,CMMAINPT         PICK UP BEGINNING OF ALLOC CORE
+         MVC   0(8,R2),CMPGMNM     MOVE PROGRAM NAME IN
+         LA    R2,8(R2)              ALLOW FOR RETURN PARMS
+         SR    R3,R3                   NEXT TWO WORDS MAY
+         ST    R3,0(R2)                MAY CONTAIN ADDR AND
+         ST    R3,4(R2)                LENGTH OF COMPILER-
+         LA    R2,8(R2)                LOADED TEXT
+         ST    R2,CMNXTTXT             AND STORE AS NEXT TEXT ADDRESS
+         ST    R2,CMLSTTXT                          LAST TEXT ADDRESS
+         ST    R2,CMBEGADR                          DEFAULT ENTRY POINT
+         ST    R2,CMOBJST         OBJ MOD START ADDR            XA03395
+MNCKTSO  TM    CMFLAG3,CQTS       ARE WE TIME-SHARING
+         BZ    MN121              NO.
+         MVC   CMMAPLIN(6),PRNT81  YES. 81 CHAR PRINT RECORD
+         B     MNINITZR
+MN121    MVC   CMMAPLIN(6),PRNT121  121 PRINT RECORD
+MNINITZR EQU   *
+*
+*   MOVE REJECTED OPTIONS FROM INITMAIN AND INITIALIZE CMERLIST
+*
+         L     R7,INITREJL         GET END OF INVALID OPTIONS STRING
+         LA    R8,7(R7)            ROUND UP TO
+         N     R8,DBLMASK            DOUBLE WORD
+         LA    R6,INITREJP         LOAD POINTER OR INVALID OPTIONS
+         SR    R8,R6                 COMPUTE LENGTH OF LIST
+         AR    R8,R2                   ADD ADDRESS IN VC STORAGE
+         ST    R8,CMERLIST               AND STORE AS START OF ERROR L
+         SPACE
+         SR    R7,R6               COMPUTE LENGTH OF INVALID OPTIONS
+         BZ    MNALOCSV            ZERO INDICATES NO LIST
+         SPACE
+         LH    R8,CMMAXLST        GET MAX LIST LENGTH
+         OI    CMSTATUS,CQREJOPT   SET LIST-PRESENT FLAG
+         CR    R7,R8               IS LIST LENGTH GREATER THAN MAX
+         BNH   MNREJOPT              NO - MOVE ENTIRE LIST
+         SPACE
+         LR    R7,R8                 YES - TRUNCATE
+MNREJOPT BCTR  R7,0
+         BCTR  R7,0
+         EX    R7,REJTOCM          MOVE THE INVALID OPTIONS TO SAVE
+         STC   R7,CMOPTECT         SAVE COUNT OF LIST
+*
+*   ALLOCATE AND FORMAT SAVE AREAS TO BE USED THROUGHOUT LOADING
+*
+MNALOCSV LA    R2,NUMSAVES         NUMBER OF AREAS TO BE ALLOCATED
+         LA    R0,72                 SIZE OF EACH SAVE AREA
+         L     R13,4(R13)          POINTER TO CALLING PGM'S SAVE AREA
+         LR    R9,R13
+MNMORESV BAL   R14,GETPRIME        GET STORAGE FOR SAVE AREA
+         ST    R9,4(R1)            BACK CHAIN THIS TO LAST
+         ST    R1,8(R9)            FORWARD CHAIN LAST TO THIS
+         LR    R9,R1                 MAKE THIS EQUAL LAST
+         BCT   R2,MNMORESV             AND GET ANOTHER IF REQD
+*
+         SR    R1,R1               SET LAST FORWARD
+         ST    R1,8(R9)              CHAIN TO ZERO
+         L     R13,8(R13)              AND PICK UP FIRST AREA
+         ST    R13,CMFSTSAV        STORE AS FIRST SAVE AREA
+*
+*   FREE THE INITIAL STORAGE FOR DATA MANAGEMENT
+*
+         LR    R1,R10
+         FREEMAIN R,LV=DMSIZE,A=(1),SP=0
+*
+*              ALLOCATE SPACE FOR SYSTERM CONTROL BLOCKS AND BUFFER
+*
+         TM    CMPRMFLG,CQTERM     WAS TERM OPTION WANTED
+         BNO   MNSETDCB            NO
+         LA    R0,DCBSIZE+2*DECBSIZE+2*TRMBUFLN  YES. GET SPACE
+         BAL   R14,GETCORE           FOR DCB,DECB AND BUFFERS
+         ST    R1,CMTDCBPT         SAVE POINTER TO DCB
+         LA    R1,DCBSIZE(R1)
+         ST    R1,CMTRMREC         STORE POINTER TO 1ST BUFFER
+         MVI   0(R1),C' '          BLANK THE
+         MVC   1(TRMRECSZ-1,R1),0(R1)    BUFFER
+MNSETDCB EQU   *
+*
+*   MOVE SYSLIN AND SYSPRINT DCB'S TO GOTMAIN CORE AND INITIALIZE
+*
+         OI    CMSTATUS,CQMSGSAV   SET REQ FOR OPEN-EXIT TO SAVE ERRORS
+         TM    CMFLAG3,CQPASLIN   IS SYSLIN PASSED
+         BZ    MNLINDCB           NO. GET DCB
+         L     R10,CMLINDCB       YES. PICK UP DUMMY DCB
+         ST    R10,CMRDCBPT       ASSUME INCORE
+         USING IHADCB,R10
+         SR    R1,R1               ZERO OUT BUFFER POINTER
+         ST    R1,CMGETREC        FOR READ ROUTINE
+         TM    CMPRMFLG,CQPRINT   IS SYSPRINT REQUESTED
+         BO    MNPRTDCB           YES. GET DCB
+         B     MNONEBUF           NO. SKIP OPEN ENTIRELY
+MNLINDCB LA    R0,DCBSIZE         DCB SIZE
+         BAL   R14,GETCORE           GET STORAGE FOR INPUT DCB
+         ST    R1,CMRDCBPT           STORE POINTER TO DCB
+         LR    R10,R1              MOVE TO ADDRESSING REGISTER
+         USING IHADCB,R10
+         SPACE
+         MVC   IHADCB(DCBSIZE),MODELDCB   MOVE IN DCB MODEL
+         MVC   DCBDDNAM(8),CMLINDD   MOVE SYSLIN DDNAME TO DCB
+         MVC   DCBDSORG(2),DSORGPS     SET DCB SEQUENTIAL
+         MVC   DCBMACR(2),MACRREAD      AND INPUT
+         SPACE
+         O     R1,OPENIN           OR OPTION BYTE INTO DCB ADDRESS
+         ST    R1,CMIOLST1           AND STORE INTO OPEN LIST
+         SPACE
+         TM    CMPRMFLG,CQPRINT    IS SYSPRINT REQUESTED
+         BZ    MNOPENIN              NO - GO OPEN SYSLIN ONLY
+*
+MNPRTDCB LA    R0,DCBSIZE         DCBSIZE
+         BAL   R14,GETCORE           GET STORAGE FOR OUTPUT DCB
+         ST    R1,CMWDCBPT           STORE POINTER TO DCB
+         LR    R10,R1              MOVE TO ADDRESSING REGISTER
+*
+         MVC   IHADCB(DCBSIZE),MODELDCB   MOVE IN DCB MODEL
+         MVC   DCBDDNAM(8),CMPRNTDD         MOVE IN SYSPRINT DDNAME
+         MVC   DCBDSORG(2),DSORGPS          SET DCB SEQUENTIAL
+         MVC   DCBMACR(2),MACRWRTE            AND OUTPUT
+         O     R1,OPENOUT          OR OPTION BYTE INTO DCB ADDRESS
+         TM    CMFLAG3,CQPASLIN   DO WE WANT TO OPEN SYSLIN
+         BZ    MNBOTH             YES.
+         ST    R1,CMIOLST1        NO. PRINT ONLY
+         B     MNOPE
+MNBOTH   ST    R1,CMIOLST2        STORE DCB ADDRESS INTO OPEN LIST
+         NI    CMIOLST1,X'7F'      CLEAR LIST DELIMITER ON FIRST ENTRY
+         SPACE
+***********************************************************************
+*                                                                     *
+*   OPEN SYSLIN AND SYSPRINT DATA SETS                                *
+*                                                                     *
+***********************************************************************
+         SPACE
+MNOPE    OPEN MF=(E,CMIOLST1)
+*
+         TM    DCBOFLGS,DCBOPEN    WAS SYSPRINT SUCCESSFULLY OPENED
+         BO    MNALOCPR              YES - ALLOCATE BUFFERS AND DECB'S
+*
+         LA    R0,DCBSIZE            NO - GET DCB SIZE
+         LR    R1,R10                       AND ADDRESS
+         BAL   R14,FREECORE                   AND FREE THE STORAGE
+         L     R10,CMRDCBPT        PICK UP POINTER TO INPUT DCB
+         B     MNONEBUF              AND GO CHECK IF OPEN
+*
+*
+MNALOCPR OI    CMSTATUS,CQPRTDCB   IDENTIFY PRINT DCB OPEN
+         L     R15,ADRBUFFR          GET POINTER TO BUFFER ALLOCATION
+         BALR  R14,R15                 AND GO ALLOCATE BUFFERS
+         TM    CMSTATUS,CQABORT      TERMINATION ERROR OCCURR
+         BNZ   MNIDEN                  AND GO CLOSE OUT
+         OI    CMSTATUS,CQPRTOPN   SET SYSPRINT ALLOCATED FLAG
+         SPACE 2
+*   INITIALIZE SYSPRINT DATA SET AND PRINT HEADINGS
+         SPACE 2
+         LA    R1,50            SET MAXIMUM LINE COUNT
+         STH   R1,CMMAXLNE        TO 50
+         SPACE
+         L     R9,CMWDECPT         GET OUTPUT DECB POINTER
+         USING DECB,R9               AND IDENTIFY IT
+         SPACE
+         L     R2,DECAREA          GET BUFFER POINTER FOR THIS DECB
+         ST    R2,CMPUTREC           AND STORE AS FIRST LREC
+         SPACE
+         MVI   0(R2),C' '                         SET UP
+         LH    R15,CMWLRECL        GET LENGTH OF RECORD
+         BCTR  R15,0               SUBTRACT FIRST BYTE
+         BCTR  R15,0              DECREMENT FOR EXECUTE
+         EX    R15,MOVEHDNG        CLEAR BUFFER
+         MVC   60-HDGLNGTH/2(HDGLNGTH,R2),LOADHEAD    HEADING
+         MVI   CMPRTCTL,CTEJECT                   EJECT BEFORE PRINT
+         L     R15,ADRPRNT         PRINT THE
+         BALR  R14,R15               HEADING 'OS/360 LOADER'
+         SPACE 2
+*   CONSTRUCT LIST OF OPTIONS USED
+         SPACE 2
+         SR    R1,R1               ZERO REGISTER USED FOR OPTION LENGTH
+         L     R2,CMPUTREC              GET POINTER TO BUFFER
+         MVC   1(OKOPTLNG,R2),OKOPTHDG    MOVE PREFIX 'OPTIONS USED'
+         LA    R2,1+OKOPTLNG(R2)            AND UPDATE BUFFER POINTER
+         SPACE
+         LM    R7,R9,OPTCNTRL      GET CONTROL FOR LIST CONSTRUCTION
+         SPACE
+MNMOVOPT IC    R3,0(R7)            PICK UP MASK FOR BIT TO TEST
+         IC    R1,1(R7)              PICK UP LENGTH OF OPTION NAME
+         LH    R5,2(R7)                AND INDEX TO OPTION NAME
+         LA    R6,PARMLIST(R5)     FORM ADDRESS FROM INDEX
+         EX    R3,TESTOP           TEST IF OPTION SPECIFIED
+         BO    MNPOSOPT              YES - PUT OUT OPTION NAME
+         SPACE
+         MVC   1(2,R2),NEGATE        NO - PREFIX OPTION WITH 'NO'
+         LA    R2,2(R2)                AND UPDATE POINTER
+         SPACE
+MNPOSOPT EX    R1,MOVEOPT          MOVE OPTION NAME TO PRINT BUFFER
+         LA    R2,2(R1,R2)           UPDATE BUFFER POINTER
+         MVI   0(R2),C','              AND INSERT COMMA AFTER IT
+         BXLE  R7,R8,MNMOVOPT      GO PUT OUT NEXT OPTION IF PRESENT
+         SPACE 2
+*   MOVE MAIN STORAGE SIZE RECEIVED INTO LIST
+         SPACE 2
+         MVC   1(5,R2),VPSIZE      MOVE IN 'SIZE='
+         LA    R2,5(R2)            UPDATE BUFFER POINTER
+         SPACE
+         L     R6,CMMAINSZ         GET SIZE RECEIVED FROM VC GETMAIN
+         CVD   R6,CMXDBLWD           CONVERT IT TO DECIMAL
+         UNPK  1(11,R2),CMXDBLWD(9)    AND UNPACK IT INTO PRINT BUFFER
+         SPACE
+         LA    R6,1(R2)            SET UP FOR LEADING ZERO SCAN
+         LA    R7,9(R2)              COMPUTE END OF SIZE FIELD
+         SPACE
+MNCKZERO CLI   0(R6),C'0'          IS THE CHARACTER A ZERO
+         BNE   MNMVSIZE              NO - END OF SCAN
+         LA    R6,1(R6)              YES - UPDATE POINTER
+         B     MNCKZERO                AND GO CHECK NEXT CHARACTER
+         SPACE
+MNMVSIZE SR    R7,R6               GET LENGTH OF NON-ZERO SIZE
+         EX    R7,MOVEOPT            AND MOVE IT UP IN THE BUFFER
+         LA    R2,1(R7,R2)         UPDATE THE BUFFER POINTER
+         MVC   1(10,R2),11(R2)       AND BLANK OUT ANY GARBAGE LEFT
+         SPACE 2
+*         MOVE PROGRAM NAME INTO LIST
+         SPACE 2
+         MVI   1(R2),C','         INSERT COMMA
+         MVC   2(5,R2),VPNAME     MOVE IN 'NAME='
+         MVC   7(8,R2),CMPGMNM    AND SPECIFIED OR DEFAULT NAME
+         LA    R2,14(R2)      UPDATE THE BUFFER POINTER
+         SPACE 2
+         SPACE
+PRINTOPT MVI   CMPRTCTL,CTSPACE2   SPACE 2 BEFORE PRINT
+         L     R15,ADRPRNT           AND PRINT THE
+         BALR  R14,R15                 OPTIONS USED MESSAGE
+         SPACE 1
+*        NEW LINE FOR EP IF USED
+         SPACE 1
+         TM    CMPRMFLG,CQEPNAME   IS EP NAME SPECIFIED
+         BZ    MNNOEP              NO. BRANCH
+         L     R2,CMPUTREC         YES. GET NEW LINE
+         LA    R2,1+OKOPTLNG(R2)   INDENT
+         MVC   1(3,R2),VPEP        MOVE IN 'EP='
+         MVC   4(8,R2),CMEPNAME    AND THE NAME SPECIFIED
+         L     R15,ADRPRNT         AND PRINT
+         BALR  R14,R15             THIS LINE
+MNNOEP   EQU   *
+         SPACE 2
+*   PRINT THE INVALID OPTIONS
+         SPACE 2
+         TM    CMSTATUS,CQREJOPT   ANY INVALID OPTIONS
+         BZ    MNOPNMSG              NO - GO CHECK FOR OPEN ERRORS
+         SPACE
+         L     R2,CMPUTREC           YES - GET PRINT BUFFER ADDRESS,
+         L     R3,CMNXTTXT                   POINTER TO ERRORS,
+         IC    R1,CMOPTECT                     AND BYTE COUNT
+         MVC   1(REJOPTLG,R2),REJOPT       MOVE IDENTIFIER
+         EX    R1,MVREJOPT                   AND INVALID OPTIONS
+         L     R15,ADRPRNT                 GO PRINT
+         BALR  R14,R15                       THE INVALID OPTIONS
+         SPACE 2
+*   PRINT ERRORS ENCOUNTERED DURING OPEN
+         SPACE 2
+MNOPNMSG TM    CMSTATUS,CQOPNERR   WERE ERRORS FOUND DURING OPEN
+         BZ    MNMAPHDG              NO - GO CHECK FOR MAP HEADING
+         SPACE
+         MVI   CMPRTCTL,CTSPACE2     YES - SPACE 2 BEFORE MESSAGES
+         L     R2,CMERLIST                  GET POINTER TO LIST
+         SPACE
+MNOPNERR LM    R0,R1,0(R2)                 GET ERROR INFO
+         L     R15,ADRERROR                  AND PRINT
+         BALR  R14,R15                         IT OUT
+         SPACE 2
+*   PRINT MAP HEADING IF REQUIRED
+         SPACE 2
+MNMAPHDG TM    CMPRMFLG,CQMAP      IS MAP SPECIFIED
+         BZ    MNPRDONE              NO - GO FINISH SYSPRINT
+         SPACE
+         L     R2,CMPUTREC           YES - GET PRINT BUFFER ADDRESS
+         LH    R3,CMMAPLIN         R3 HAS LENGTH OF LINE
+         AR    R3,R2               HIGH ADDRESS
+         SPACE
+MNMORMAP MVC   6(MAPHDLNG,R2),MAPHEAD   MOVE A MAP HEADING ENTRY
+         LA    R2,ENTRYSZ(R2)      UPDATE DISPLACEMENT TO NEXT
+         CR    R2,R3               ARE WE OVER LIMIT FOR BUFFER
+         BL    MNMORMAP            NO. INSERT ANOTHER
+         MVI   CMPRTCTL,CTSPACE3       SPACE 3 BEFORE PRINT
+         L     R15,ADRPRNT               AND PRINT
+         BALR  R14,R15                     THE MAP HEADING
+         SPACE
+MNPRDONE MVI   CMPRTCTL,CTSPACE2   MOVE SPACE 2 TO CONTROL
+         L     R10,CMRDCBPT          PICK UP INPUT DCB POINTER
+         B     MNCHKLIN                AND GO CHECK SYSLIN
+         SPACE 2
+TESTOP   TM    CMPRMFLG,0               TEST IF OPTION SPECIFIED
+MOVEOPT  MVC   1(0,R2),0(R6)            MOVE VALID OPTIONS TO PRINT BUF
+MVREJOPT MVC   REJOPTLG+2(0,R2),0(R3)   MOVE REJ OPTIONS TO PRINT BUF
+MOVEHDNG MVC   1(0,R2),0(R2)       EXECUTED CLEAR OF BUFFER
+         EJECT
+***********************************************************************
+*                                                                     *
+*   OPEN SYSLIN ONLY -- NOPRINT OPTION SPECIFIED                      *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+MNOPENIN OPEN  MF=(E,CMIOLST1)
+         SPACE
+MNONEBUF LA    R0,121              PROVIDE ONE
+         BAL   R14,GETCORE           SYSPRINT BUFFER
+         ST    R1,CMPUTREC             SINCE SYSPRINT NOY SPECIFIED
+         NI    CMPRMFLG,X'FF'-CQMAP  INSURE MAP FLAG IS OFF
+MNCHKLIN NI    CMSTATUS,X'FF'-CQMSGSAV  TURN OFF MESSAGE SAVE REQUEST
+         TM    CMFLAG3,CQINCORE   IS SYSLIN INCORE
+         BO    MNGOTORL           YES. SKIP PRIME
+         TM    CMIOFLGS,CQIOERR    TERMINATION ERROR OCCUR
+         BO    MNIDEN                  YES. GO CLOSE OUT
+         TM    DCBOFLGS,DCBOPEN    WAS SYSLIN SUCCESSFULLY OPENED
+         BO    MNALOCRD              YES - ALLOCATE BUFFERS AND DECB'S
+*
+         LA    R0,ERIOUT1       NO - LOAD ERROR CODE
+         LA    R1,CMLINDD                 ADDRESS OF DDNAME
+         L     R15,ADRERROR               ADDRESS OF ERROR ROUTINE
+         BALR  R14,R15            GIVE ERROR
+         B     MNIDEN                  AND GO CLOSE OUT
+         SPACE 2
+MNALOCRD OI    DCBOFLGS,UNLKATRB     YES - SET UNLIKE ATTRIBUTES BIT
+         L     R15,ADRBUFFR            AND GO ALLOCATE
+         BALR  R14,R15                 FOR SYSLIN
+         TM    CMSTATUS,CQABORT      TERMINATION ERROR OCCURR
+         BNZ   MNIDEN                  YES - GO CLOSE OUT
+*
+         TM    CMIOFLGS,CQFIXED    IS THE RECORD FORMAT FIXED
+         BO    MNOBJMOD              YES - GO PRIME FOR OBJECT MODULE
+*
+*   LOAD MODULE INPUT -- GO TO IEWLLIBR FOR PROCESSING
+*
+         L     R15,ADRLMPRC        GET ENTRY POINT TO LOAD MODULE PROC
+         BALR  R14,R15               AND GO PROCESS
+         B     MNEOCRET            LOAD MODULE IN -- GO CHECK FOR MORE
+*
+*   OBJECT MODULE INPUT -- GO TO IEWLRELO FOR PROCESSING
+*
+MNOBJMOD L     R15,ADRPRIME        FIRST -- PRIME THE
+         BALR  R14,R15               OBJECT MODULE BUFFERS
+*
+MNGOTORL EQU   *
+         L     R15,ADROMPRC        THEN -- GO PROCESS
+         BALR  R14,R15               THE OBJECT MODULE
+         SPACE
+MNEOCRET TM    CMSTATUS,CQABORT      TERMINATION ERROR OCCUR
+         BNZ   MNBITMAP                YES - GO CLOSE OUT
+*
+*   RETURN FROM PROCESSING ONE CONCATENATION OF SYSLIN -----
+*     CHECK FOR ANOTHER CONCATENATION RECEIVED
+*
+         TM    CMIOFLGS,CQEOCB+CQEOFB   CHECK EOC AND EOF
+         SPACE
+         BM    MNALOCRD                   ONLY ONE - ANOTHER CONCAT
+*
+*   ALL PRIMARY INPUT HAS BEEN LOADED --- GO TO IEWACALL TO PROCESS
+*  AUTO-CALL AND FINAL RESOLUTION
+*
+         L     R15,ADRACALL
+         BALR  R14,R15
+*              LOADING IS COMPLETE     IDENTIFY PROGRAM
+*
+MNIDEN   L     R1,CMNXTTXT         ROUND UP LAST ADDRESS USED
+         LA    R1,7(R1)            TO DOUBLEWORD
+         N     R1,DBLMASK
+         ST    R1,CMNXTTXT
+         L     R1,CMLOWTBL         ROUND DOWN LOWEST TABLE
+         N     R1,DBLMASK          ADDRESS USED
+         ST    R1,CMLOWTBL
+         TM    CMFLAG3,CQIDEN     IS IDENTIFICATION WANTED
+         BZ    MNNOID             NO, DON'T IDENTIFY
+         TM    CMFLAG4,CQNOEX     IS EXECUTION SCHEDULED
+         BO    MNNOID             NO. DON'T IDENTIFY
+         L     R15,ADRCDE         YES. GO CONSTRUCT CDE OR LPRB
+         BALR  R14,R15            GO DO IT
+MNNOID   EQU   *
+*
+*   LOADING IS COMPLETE -- GO PROCESS THE DIAGNOSTIC MESSAGE DICTIONARY
+*
+MNBITMAP L     R15,ADRABTMP        GO TO PROCESS THE BITMAP
+         BALR  R14,R15
+         LR    R5,R15              SAVE THE RETURN CODE
+         EJECT
+*******************************************************************
+*                                                                 *
+*   ALL PROCESSING IS COMPLETE -- THE FOLLOWING WILL              *
+*                                                                 *
+*     1.  WRITE THE LAST SYSPRINT BLOCK (SHORT IF NECESSARY)      *
+*     2.  CHECK ALL UNCHECKED SYSPRINT DECB'S                     *
+*     3.  CLOSE INPUT AND OUTPUT DCB'S                            *
+*     4.  SET UP THE RETURN PARAMETER LIST                        *
+*     5.  FREE ALL STORAGE NOT USED BY THE LOADED PROGRAM         *
+*     6.  RETURN TO THE INVOKING PROGRAM                          *
+*                                                                 *
+*   NOTE - REGISTER 5 MUST BE PRESERVED UNTIL RETURN TO THE INVOKING
+*          PROGRAM.  IT CONTAINS THE RETURN CODE PASSED FROM IEWBTMAP.
+*
+*******************************************************************
+         SPACE 3
+MNPRPURG TM    CMSTATUS,CQPRTOPN   IS THE SYSPRINT DCB OPEN
+         BZ    MNCLOSE               NO - GO CLOSE INPUT DATA-SET
+         SPACE
+         L     R10,CMWDCBPT          YES - GET SYSPRINT DCB
+         USING IHADCB,R10              AND IDENTIFY IT
+         L     R9,CMWDECPT           GET CURRENT DECB
+         LA    R9,0(R9)              INSURE TOP BYTE IS ZERO
+         USING DECB,R9                 AND IDENTIFY IT
+         SPACE
+         L     R3,CMPUTREC         COMPUTE SIZE
+         AH    R3,DCBLRECL           OF LAST
+         S     R3,DECAREA              SYSPRINT BLOCK AND
+         STH   R3,DCBBLKSI               STORE INTO DCB BLOCKSIZE
+         SPACE
+         BAL   R7,WTWRITE             AND WRITE THE LAST BLOCK
+         SPACE
+MNNOTRNC LR    R8,R9               SAVE POINTER TO DECB
+MNNXTPRG L     R9,DECDECPT         GET POINTER TO NEXT DECB
+         BAL   R7,WTCHECK            AND GO CHECK IT
+         SPACE
+MNNOCHK  CR    R8,R9               WAS THAT THE LAST DECB
+         BNE   MNNXTPRG              NO - GO CHECK THE NEXT
+         SPACE 2
+MNCLOSE  EQU   *
+         LA    R3,CMIOLST1         POINT TO BEGINNING OF CLOSE LIST
+         TM    CMSTATUS,CQLIBOPN  IS LIBRARY OPEN
+         BO    MNCLS2             YES. SEE IF IT'S PASSED
+         TM    CMFLAG3,CQPASLIN   NO. IS LIN PASSED
+         BZ    MNCLS3             NO. WE NEED TO CLOSE IT
+         B     MNCLS35             CHECK SYSPRINT
+MNCLS2   TM    CMFLAG3,CQPASLIB   WAS LIB PASSED
+         BZ    MNCLS3                  NO.
+         L     R10,CMRDCBPT        YES. GET LIB DCB
+         MVC   DCBSYNAD+1(3),CMLIBSYN+1   RESTORE EXIT ADDRESSES
+         MVC   DCBEODAD+1(3),CMLIBEOD+1   RESTORE EXIT ADDRESSES
+         MVC   DCBEXLST+1(3),CMLIBEXL+1   RESTORE EXIT ADDRESSES
+         B     MNCLS35             DON'T CLOSE IT
+MNCLS3   EQU   *
+         SPACE 2
+         L     R10,CMRDCBPT        PICK UP INPUT DCB POINTER
+         BAL   R8,ENTCLOSE         STORE INTO CLOSE LIST
+         SPACE
+MNCLS35  TM    CMSTATUS,CQPRTDCB   IS SYSPRINT OPEN
+         BZ    MNCLS4              BRANCH TO CHECK SYSTERM
+         SPACE
+         L     R10,CMWDCBPT          YES - PICK UP OUTPUT DCB POINTER
+         BAL   R8,ENTCLOSE         STORE INTO CLOSE LIST
+MNCLS4   TM    CMFLAG4,CQTRMOPN    IS SYSTERM OPEN
+         BNO   MNCHKCLS            NO. BRANCH
+         L     R10,CMTDCBPT        YES. CLOSE IT
+         BAL   R8,ENTCLOSE         STORE INTO CLOSE LIST
+MNCHKCLS LA    R1,CMIOLST1
+         CR    R1,R3               DO WE NEED TO ISSUE CLOSE
+         BE    MNCLS5              NO.
+         LA    R1,4                YES. BACK TO LAST ENTRY
+         SR    R3,R1
+         OI    0(R3),X'80'         FLAG LAST ENTRY
+         SPACE 2
+MNNOPRNT CLOSE MF=(E,CMIOLST1)     CLOSE OUT DATA SETS
+MNCLS5   EQU   *
+         SPACE
+         L     R1,CMMAINPT             GET 1ST ADDR USED
+         LR    R2,R1                   SAVE FOR RETURN
+         L     R8,CMXLCHN              GET FIRST EXTENT ADDR      M3177
+*                                      BY COMPILER
+         LTR   R8,R8                   WERE THERE ANY?
+         BZ    MNCLSG                  NO
+         L     R6,4(R8)
+         ST    R6,8(R1)                STORE FOR LATER FREEMAIN
+         L     R6,8(R8)                GET 1ST EXTENT LENGTH
+         ST    R6,12(R1)               STORE FOR LATER FREEMAIN
+         TM    CMFLAG4,CQNOEX          ARE WE GOING TO EXECUTE?
+         BNO   MNXOK                   YES.
+         TM    CMFLAG4,CQIDONE    NO. HAS PGM BEEN IDENTIFIED?
+         BNO   MNNOX              NO. GO FREEMAIN EXTENTS
+MNLDDT   LOAD  EPLOC=CMPGMNM      YES. DE-IDENTIFY W/LOAD & DELETE
+         DELETE EPLOC=CMPGMNM
+         B     MNNOR1
+MNCLSG   EQU   *
+         TM    CMFLAG4,CQNOEX          IS PGM EXECUTABLE?
+         BNO   MNXOK                   YES.
+         TM    CMFLAG4,CQIDONE     NO. HAS PGM BEEN IDENTIFIED?
+         BO    MNLDDT              YES, GO TO LOAD AND DELETE
+MNIDCHK  TM    CMFLAG3,CQIDEN      ENTERED THRU IEWLOAD?
+         BO    MNMARK              YES, FREEMAIN EVERYTHING
+         B     MNLOADR             NO, PROCESS FOR IEWLOADR
+MNXOK    EQU   *
+         TM    CMFLAG3,CQIDEN      ENTERED THRU IEWLOAD?
+         BO    MNNOR1              YES
+MNLOADR  ST    R1,0(R1)            NO, ENTERED THRU IEWLOADR
+         L     R3,CMNXTTXT         PICK UP LENGTH
+         SR    R3,R1               GET TRUE LENGTH
+         ST    R3,4(R1)            AND STORE IT
+         B     MNNOR1              GO TO MNNOR1
+MNNOX    EQU   *
+         L     R0,12(R1)               PICK UP 1ST EXTENT LENGTH
+         L     R1,8(R1)                PICK UP 1ST EXTENT ADDR
+         FREEMAIN R,LV=(0),A=(1)       FREE 1ST EXTENT
+         LR    R1,R2                   RESTORE REG. 1
+         B     MNIDCHK
+MNNOR1   L     R1,CMNXTTXT         HI ADDRESS FOR FREEMAIN
+MNMARK   L     R8,CMEPADDR         GET ENTRY POINT ADDRESS
+         L     R13,4(R13)          PICK UP SAVE AREA POINTER
+         L     R0,CMHITBL          GET HIGHEST CORE ADDRESS
+         SR    R0,R1                 AND CALCULATE FREEMAIN SIZE
+*    FREEING TABLE AND BUFFER STORAGE.
+*     ALSO PROGRAM STORAGE IF RETURN CODE GREATER THAN 4
+         BZ    MNNOFREE            FREEMAIN SIZE ZERO -- NO FREE
+         SPACE
+         FREEMAIN R,LV=(0),A=(1)   FREE ALL STORAGE NOT USED BY PRO
+         SPACE
+MNNOFREE LR    R0,R8              MOVE EP ADDRESS TO REG 0
+         LR    R1,R2               MOVE RETURN LIST ADDRESS TO R1
+         LR    R15,R5              PUT RETURN CODE INTO R15
+         SPACE
+*   RETURN TO INVOKING PROGRAM
+         SPACE
+         L     R14,12(0,13)             LOAD RETURN REGISTER
+         LM    R2,R12,28(13)              LOAD REGISTERS EXCEPT 15-0-1
+         MVI   12(13),X'FF'             SET RETURN INDICATION
+         BR    R14                        AND RETURN
+*
+*        STORES DCB POINTER INTO CLOSE LIST. R3 POINTS TO LIST ENTRY
+*
+ENTCLOSE O     R10,CLOSE           OR IN OPTION BYTE
+         ST    R10,0(R3)           STORE INTO CLOSE LIST
+         NI    0(R3),X'7F'         CLEAR LIST DELIMITER
+         LA    R3,4(R3)            UP TO NEXT ENTRY
+         BR    R8
+         SPACE 3
+         EJECT
+*******************************************************************
+*                                                                 *
+*   OPEN SYSLIB -- THIS ROUTINE WILL CLOSE 'SYSLIN', MOVE THE     *
+*  'SYSLIB' DDNAME INTO THE DCB AND RE-OPEN IT FOR PARTITIONED    *
+*  ORGANIZATION.  IF IT OPENS SUCCESSFULLY, BUFFERS ARE ALLOCATED *
+*  AND THE 'SYSLIB OPEN' BIT IN THE COMMUNICATIONS AREA IS SET ON.*
+*   IF THE 'SYSLIB' DATA-SET HAS NOT BEEN ALLOCATED (DCB DOES NOT *
+*  OPEN), A DIRECT RETURN IS MADE.                                *
+*                                                                 *
+*******************************************************************
+         SPACE 3
+         ENTRY HEWOPNLB
+         USING IHADCB,R10
+HEWOPNLB SAVE  (14,12),,*          SAVE CALLERS REGISTERS
+         USING HEWOPNLB,R15       IDENTIFY ENTRY POINT BASE
+         L     R12,IOCABASE            LOAD CSECT BASE
+         DROP  R15                       DROP ENTRY POINT BASE
+         USING HEWLIOCA,R12          AND IDENTIFY CSECT BASE
+         L     R4,IOCABSE2      LOAD AND IDENTIFY
+         USING HEWLIOCA+4096,R4    SECOND BASE REGISTER
+         SPACE
+         L     R13,8(R13)          GET NEXT SAVE AREA POINTER
+*
+         L     R10,CMRDCBPT        GET POINTER TO INPUT DCB
+         TM    CMFLAG3,CQPASLIN   WAS SYSLIN PASSED
+         BO    LB1                YES. SKIP CLOSE AND CHECK LIB
+         O     R10,CLOSE             OR CLOSE OPTIONS INTO IT
+         ST    R10,CMIOLST1            AND STORE INTO LIST
+         SPACE
+         CLOSE MF=(E,CMIOLST1)     CLOSE PRIMARY INPUT DCB
+LB1      TM    CMFLAG3,CQPASLIB   WAS SYSLIB PASSED
+         BO    LB2                YES. ASSUME IT'S OPEN
+         TM    CMFLAG3,CQPASLIN   DO WE HAVE TO ALLOCATE
+         BZ    LB4                NO. USE SYSLIN DCB
+         LA    R0,DCBSIZE         ALLOCATE DCB
+         BAL   R14,GETCORE
+         ST    R1,CMRDCBPT
+         LR    R10,R1
+         MVC   IHADCB(DCBSIZE),MODELDCB
+         MVC   DCBMACR(2),MACRREAD
+LB4      EQU   *
+         SPACE
+         MVC   DCBDDNAM(8),CMLIBDD      MOVE SYSLIB DDNAME INTO DCB
+         MVC   DCBDSORG(2),DSORGPO        SET DCB PARTITIONED
+         SR    R2,R2               ZERO OUT
+         STH   R2,DCBLRECL           LRECL AND
+         STH   R2,DCBBLKSI             BLKSIZE
+         SPACE
+         LA    R10,0(R10)          ZERO FLAG BYTE IN DCB POINTER
+         O     R10,OPENIN            OR IN OPTION BYTE
+         ST    R10,CMIOLST1            AND STORE INTO LIST
+         SPACE
+         OPEN  MF=(E,CMIOLST1)     OPEN DCB FOR AUTO-CALL LIBRARY
+         SPACE
+         TM    CMIOFLGS,CQIOERR    TEST IF RECFM=V FOUND IN OPEN
+         BO    IOABORT               YES - ABORT LOADING
+LB5      TM    DCBOFLGS,DCBOPEN   WAS THE DCB OPEN
+         BZ    LBRETURN              NO - REUTRN
+         SPACE
+         OI    CMSTATUS,CQLIBOPN     YES - SET LIBRARY OPEN BIT
+         L     R15,ADRBUFFR            AND GO
+         BALR  R14,R15                   ALLOCATE BUFFERS
+         SPACE
+LBRETURN L     R13,4(R13)          PICK UP PREVIOUS SAVE AREA
+         RETURN (14,12),T            AND RETURN
+LB2      L     R10,CMLIBDCB       GET PASSED DCB
+         ST    R10,CMRDCBPT
+         MVC   CMLIBSYN+1(3),DCBSYNAD+1   SAVE EXIT ROUTINE ADDRESSES
+         MVC   CMLIBEOD+1(3),DCBEODAD+1   SAVE EXIT ROUTINE ADDRESSES
+         MVC   CMLIBEXL+1(3),DCBEXLST+1   SAVE EXIT ROUTINE ADDRESSES
+         XC    DCBSYNAD+1(3),DCBSYNAD+1  USE LOADER SYNAD ROUTINE
+         LA    R7,SYNAD
+         L     R6,DCBSYNAD
+         OR    R7,R6
+         ST    R7,DCBSYNAD
+         XC    DCBEODAD+1(3),DCBEODAD+1
+         LA    R7,EODAD
+         L     R6,DCBEODAD
+         OR    R7,R6
+         ST    R7,DCBEODAD
+             XC    DCBEXLST+1(3),DCBEXLST+1  USE LOADER DCB EXIT
+         LA    R7,DCBEXIT
+         L     R6,DCBEXLST
+         OR    R7,R6
+         ST    R7,DCBEXLST
+         B     LB5
+         EJECT
+***********************************************************************
+*                                                                     *
+*   DECB AND BUFFER DEALLOCATION - ALLOCATION ROUTINE
+*     UPON ENTRY -- R10 POINTS TO THE DCB FOR WHICH BUFFERS ARE
+*     TO BE ALLOCATED
+*                                                                     *
+***********************************************************************
+         SPACE 3
+         USING DECB,R9
+         ENTRY HEWBUFFR
+HEWBUFFR SAVE (14,12)             SAVE REGISTERS
+         USING HEWBUFFR,R15       IDENTIFY EP BASE
+         L     R12,IOCABASE            LOAD CSECT BASE
+         DROP  R15                       DROP EP BASE
+         USING HEWLIOCA,R12      AND IDENTIFY CSECT BASE
+         L     R4,IOCABSE2      LOAD AND IDENTIFY
+         USING HEWLIOCA+4096,R4   SECOND BASE REGISTER
+         L     R13,8(R13)          PICK UP NEXT SAVE AREA
+*
+         C     R10,CMWDCBPT        IS THIS ALLOCATION FOR SYSPRINT
+         BE    ALOCPRNT              YES - NO PREVIOUS BUFFERS ALLOC
+*
+         TM    CMIOFLGS,CQFIXED+CQUNDEF  IS THERE A PREV ALLOCATION
+         BZ    CHKFORMT                    NO - BYPASS DEALLOCATION
+         SPACE
+         L     R9,CMRDECPT               PICK UP POINTER TO FIRST DECB
+         TM    CMIOFLGS,CQUNDEF    WAS THE PREV ALLOC FOR UNDEFINED
+         BZ    DEALFIXD              NO - DEALLOCATE FIXED
+*
+         TM    DCBRECFM,UNDEFINE   IS THIS ALLOCATION FOR UNDEFINED
+         BO    UNDFINSH              YES - LEAVE ALLOCATION THE SAME
+*
+*   THE PREVIOUS ALLOCATION WAS FOR UNDEFINED AND THIS ONE IS FOR
+*  FIXED -- DEALLOCATE THE UNDEFINED BUFFERS BEFORE ALLOCATION FOR
+*  THE FIXED FORMAT
+*
+         L     R1,CMGETREC         PICK UP POINTER TO THE RLD BUFFER
+         LA    R0,RLDSIZE            PUT SIZE INTO R0
+         BAL   R14,FREECORE            AND FREE THE BUFFER
+*
+         L     R1,DECDECPT         PICK UP POINTER TO SECOND DECB
+         LA    R0,DECBSIZE         PUT DECB SIZE INTO R0
+         BAL   R14,FREECORE          AND FREE THE SECOND DECB
+*
+         LR    R1,R9               POINTER TO FIRST DECB TO PARM REG
+         LA    R0,DECBSIZE         SIZE OF DECB
+         BAL   R14,FREECORE          FREE THE FIRST DECB
+*
+         B     ALFIXSET            GO ALLOCATE FOR THIS CONCATENATION
+*
+*   DEALLOCATE A LIST OF FIXED SIZE BUFFERS AND THEIR ASSOCIATED DECB'S
+*
+DEALFIXD LR    R6,R9               LIMIT IS POINTER TO FIRST DECB
+*
+DEALMORE L     R7,DECDECPT         GET THE POINTER TO NEXT DECB
+         L     R1,DECAREA          BUFFER POINTER FOR THIS DECB
+         LH    R0,CMBLKSIZ           SIZE OF BUFFER
+         BAL   R14,FREECORE        FREE THE BUFFER
+*
+         LR    R1,R9               MOVE THE DECB POINTER
+         LA    R0,DECBSIZE           SIZE OF DECB
+         BAL   R14,FREECORE        FREE THE DECB
+*
+         LR    R9,R7               POINT TO NEXT DECB
+         CR    R9,R6                 IS IT BACK AROUND TO THE FIRST
+         BNE   DEALMORE                NO - GO FREE THIS COMBINATION
+*
+CHKFORMT TM    DCBRECFM,UNDEFINE   IS THIS ALLOCATION FOR UNDEFINED
+         BO    ALOCUNDF              YES - GO ALLOCATE FOR IT
+*
+*   ALLOCATE A LIST OF FIXED SIZE BUFFERS AND THEIR ASSOCIATED DECB'S
+*     THE SIZE OF THE BUFFERS IS FOUND IN 'DCBBLKSI'
+*     THE NUMBER OF BUFFERS IS FOUND IN 'DCBNCP'
+*
+ALFIXSET EQU   *
+ALOCPRNT SR    R7,R7               GET THE NUMBER
+         IC    R7,DCBNCP             PICK UP NUMBER OF BUFFERS
+         SPACE
+ALOCFIXD BAL   R15,GETDECB         GET A DECB
+         LR    R6,R9                 SAVE POINTER TO IT
+         B     FIXDSTRT                AND GO ALLOCATE THE LIST
+         SPACE
+FIXDMORE LR    R8,R9               SAVE POINTER TO THIS DECB
+         BAL   R15,GETDECB           AND GET ANOTHER
+         SPACE
+FIXDSTRT LH    R0,DCBBLKSI         GET SIZE OF A BUFFER
+         BAL   R14,GETCORE           AND GET A BUFFER FOR THE DECB
+*
+         ST    R1,DECAREA          STORE BUFFER ADDRESS INTO DECB
+         ST    R8,DECDECPT           CHAIN THIS DECB TO THE LAST
+         BCT   R7,FIXDMORE             AND GO GET ANOTHER IF NEEDED
+*
+*   ALL BUFFERS AND DECB'S HAVE BEEN ALLOCATED
+*
+         ST    R9,DECDECPT-DECB(R6)  CHAIN LAST DECB TO THE FIRST
+*
+         C     R10,CMWDCBPT        IS THIS ALLOCATION FOR SYSPRINT
+         BNE   FIXDIND               NO - SET INPUT INDICATORS
+*
+         ST    R9,CMWDECPT           YES - STORE POINTER FOR OUTPUT
+         B     ALOCRETN                  AND RETURN
+*
+FIXDIND  MVC   CMBLKSIZ(2),DCBBLKSI     SAVE BLKSIZE FOR NEXT CONCAT
+         MVI   CMIOFLGS,CQFIXED     TURN OFF ALL I/O FLAGS EXCEPT FIXED
+         B     INPFINSH              AND GO FINISH UP
+*
+*   ALLOCATE 2 DECB'S AND 1 RLD BUFFER FOR UNDEFINED FORMAT
+*     THE FIRST DECB IS FOR THE RLD RECORDS AND IS POINTED TO
+*    BY 'CMRDECPT'
+*     THE RLD BUFFER POINTER IS STORED INTO THE DECB AND 'CMGETREC'
+*     THE SECOND DECB IS CHAINED TO THE RLD DECB
+*     THE SECOND DECB HAS NO BUFFER ALLOCATED FOR IT -- IT IS USED
+*    FOR READING TEXT DIRECTLY TO THE LOCATION WHERE IT WILL REMAIN
+*
+ALOCUNDF BAL   R15,GETDECB         GET A DECB
+         LR    R7,R9                 MOVE POINTER
+         BAL   R15,GETDECB         GET ANOTHER
+         ST    R7,DECDECPT           STORE POINTER TO LAST INTO IT
+         ST    R9,DECDECPT-DECB(R7)  STORE POINTER TO THIS INTO LAST
+         SPACE
+         LA    R0,RLDSIZE          GET A BUFFER
+         STH   R0,DECLNGTH              STORE SIZE INTO DECB
+         BAL   R14,GETCORE           FOR RLD RECORDS
+         ST    R1,DECAREA          STORE BUFFER POINTER IN DECB
+         ST    R1,CMGETREC         STORE BUFFER POINTER IN COMMON AREA
+*
+UNDFINSH MVI   CMIOFLGS,CQUNDEF    CLEAR I/O FLAGS EXCEPT UNDEFINED
+*
+INPFINSH ST    R9,CMRDECPT         STORE POINTER TO DECB CHAIN
+ALOCRETN L     R13,4(R13)          PICK UP PREVIOUS SAVE AREA POINTER
+         RETURN (14,12),T            AND RETURN
+         SPACE 3
+GETDECB  LA    R0,DECBSIZE         SIZE OF A DECB
+         BAL   R14,GETCORE           GET STORAGE FOR IT
+         LR    R9,R1                   MOVE POINTER TO USING REG
+         XC    DECB(DECBSIZE-4),DECB     CLEAR IT OUT
+         ST    R10,DECDCBAD                STORE THE DCB POINTER
+         BR    R15                           AND RETURN
+         EJECT
+***********************************************************************
+*                                                                     *
+*   ROUTINE TO ALLOCATE STORAGE FROM A LIST OF FREE AREAS POINTED TO
+*  BY 'CMFRECOR' -- AND PRIME (NEVER ALLOCATED) CORE IF A PREVIOUSLY
+*  ALLOCATED AREA IS NOT AVAILABLE
+*
+*   UPON ENTRY -- REGISTER 0 CONTAINS THE SIZE REQUESTED
+*
+*   UPON RETURN -- REGISTER 1 POINTS TO THE ALLOCATED AREA
+*
+*   THIS ROUTINE DOES NOT SAVE AND RESTORE REGISTERS ---
+*     REGISTERS 2 THROUGH 5 ARE USED AND THEREFOR ARE VOLITILE
+*
+***********************************************************************
+         SPACE 2
+GETCORE  LA    R2,CMFRECOR         PICK UP POINTER TO FREE CORE CHAIN
+         SPACE
+         LR    R3,R0               ROUND
+         LA    R0,7(R3)              SIZE UP TO
+         N     R0,DBLMASK              DOUBLE WORD
+         SPACE
+GCAGAIN  L     R1,0(R2)            GET POINTER TO NEXT AREA
+         LTR   R1,R1                 IS THERE A NEXT AREA
+         BZ    GETPRIME                NO - GO ALLOCATE PRIME CORE
+*
+         L     R5,4(R1)                  YES - GET SIZE OF THE AREA
+         SR    R5,R0              SUBTRACT REQUEST SIZE FROM THIS SIZE
+         BZ    GCGIVEL               IF EQUAL -- GIVE THE ENTIRE AREA
+         BP    GCSUBDIV              IF THIS SIZE LARGER - GIVE PORTION
+         LR    R2,R1                 NOT ENOUGH ----
+         B     GCAGAIN                 TRY NEXT AREA
+*
+*
+GCGIVEL  L     R5,0(R1)           PICK UP POINTER TO NEXT AREA
+         ST    R5,0(R2)             AND CHAIN IT TO LAST AREA
+         BR    R14                 RETURN WITH AREA
+*
+GCSUBDIV ST    R5,4(R1)           STORE NEW SIZE AS DIFFERENCE
+         AR    R1,R5                ADD DIFFERENCE TO POINTER
+         BR    R14                     AND RETURN
+*
+*
+GETPRIME L     R1,CMLOWTBL         GET LOWEST ADDRESS USED SO FAR
+         SR    R1,R0                 SUBTRACT OFF REQUESTED SIZE
+         ST    R1,CMLOWTBL             AND STORE AS NEW LOW ADDRESS
+         C     R1,CMLSTTXT         IS IT LOWER THAN THE HIGHEST TEXT
+         BCR   10,R14                NO -- RETURN GIVING AREA
+*
+*   TABLE OVERFLOW -- GIVE ERROR MESSAGE AND EXIT
+*
+         LA    R0,ERSIZE2          LOAD MESSAGE NUMBER
+         L     R15,ADRERROR          ENTRY POINT TO ERROR LIST
+         BR    R15                     AND ABORT LOADING
+         EJECT
+***********************************************************************
+*                                                                     *
+*   ROUTINE TO RETURN STORAGE TO A FREE LIST POINTED TO BY 'CMFRECOR'
+*
+*   UPON ENTRY -- REGISTER 1 POINTS TO THE AREA TO BE FREED
+*                 REGISTER 0 CONTAINS THE SIZE OF THE AREA TO BE FREED
+*
+*   THIS ROUTINE DOES NOT SAVE AND RESTORE REGISTERS ---
+*     REGISTERS 1 THROUGH 4 ARE USED AND THEREFOR ARE VOLITILE
+*
+***********************************************************************
+         SPACE 2
+FREECORE LA    R1,0(R1)            INSURE TOP BYTE OF POINTER IS ZERO
+         LA    R2,CMFRECOR         GET POINTER TO FREE CORE CHAIN
+         SPACE
+         LR    R3,R0               ROUND
+         LA    R0,7(R3)              SIZE UP TO
+         N     R0,DBLMASK              DOUBLE WORD
+         SPACE
+FCAGAIN  L     R3,0(R2)            GET POINTER TO FREE AREA
+         LTR   R3,R3                 IS THERE REALLY ONE THERE
+         BZ    FCSTASH                 NO - GO SAVE THIS ONE BY ITSELF
+*
+         LR    R5,R1            DOES THE ADDRESS PLUS SIZE OF
+         AR    R5,R0              THE RETURNING AREA EQUAL
+         CR    R5,R3                THE START OF THIS AREA
+         BE    FCBELOW          YES - COMBINE THE TWO INTO ONE BIG ONE
+*
+         L     R5,4(R3)         DOES THE ADDRESS PLUS SIZE OF
+         AR    R5,R3              THIS ONE EQUAL THE START
+         CR    R5,R1                OF THE RETURNING AREA
+         BE    FCABOVE          YES -- COMBINE THESE TWO TOGETHER
+*
+         LR    R2,R3          THE RETURNING BLOCK IS NOT CONTIGUOUS
+         B     FCAGAIN          WITH THIS ONE -- GO CHECK THE NEXT
+*
+*
+FCABOVE  LR    R1,R3          MAKE SUBJECT AREA EQ THIS ONE
+FCBELOW  A     R0,4(R3)         ADD IT'S SIZE TO SUBJECT SIZE
+         L     R5,0(R3)         TAKE IT OUT
+         ST    R5,0(R2)           OF THE CHAIN
+         B     FCAGAIN        AND GO TRY TO MERGE THIS ONE
+*
+*
+FCSTASH  ST    R1,0(R2)       PUT THE BLOCK ON THE END OF THE LIST
+         ST    R3,0(R1)         ZERO IT'S POINTER FIELD
+         ST    R0,4(R1)           STORE IT'S SIZE
+         BR    R14                  AND RETURN
+         EJECT
+***********************************************************************
+*                                                                     *
+*   OBJECT MODULE BUFFER PRIME ROUTINE
+*
+***********************************************************************
+         SPACE 2
+         ENTRY HEWPRIME
+HEWPRIME SAVE  (14,12),,*         SAVE CALLERS REGISTERS
+         USING HEWPRIME,R15       IDENTIFY ENTRY POINT BASE
+         L     R12,IOCABASE            LOAD CSECT BASE
+         DROP  R15                       DROP ENTRY POINT BASE
+         USING HEWLIOCA,R12       AND IDENTIFY CSECT BASE
+         L     R4,IOCABSE2      LOAD AND IDENTIFY
+         USING HEWLIOCA+4096,R4   SECOND BASE REGISTER
+         SPACE 2
+         L     R13,8(R13)          GET POINTER TO NEXT SAVE AREA
+         L     R9,CMRDECPT         GET POINTER TO INPUT DECB CHAIN
+         USING DECB,R9               AND IDENTIFY IT
+         SPACE
+         LR    R8,R9               SET READ LIMIT TO THIS DECB
+         L     R9,DECDECPT           AND GET POINTER TO NEXT DECB
+         BAL   R7,RDREAD           READ ALL INTERVENING DECB'S
+         SPACE
+         LR    R9,R8               GET POINTER TO DECB NOT READ
+         L     R6,DECAREA            LOAD IT'S BUFFER POINTER
+         ST    R6,CMGETREC           AND STORE AS LAST RECORD ADDRESS
+         SR    R7,R7               SET LENGTH OF READ
+         STH   R7,DECLNGTH           TO ZERO (NO DATA)
+         ST    R9,CMRDECPT           STORE THIS DECB AS CURRENT
+         SPACE 2
+         L     R13,4(R13)          LOAD POINTER TO CALLERS SAVE AREA
+         RETURN (14,12),T            AND RETURN
+         EJECT
+***********************************************************************
+*
+*   READ ROUTINE FOR THE LOADER --- ALL REQUESTS FOR DATA IN THE
+*  LOADER ARE MADE THROUGH THIS ROUTINE.
+*
+*     FOR READING OBJECT MODULE INPUT ---
+*        NO PARAMETERS ARE PASSED
+*        THE ADDRESS OF THE NEW BUFFER IS RETURNED IN 'CMGETREC'
+*
+*     FOR READING LOAD MODULE INPUT ---
+*        THREE OPTIONS EXIST
+*          1 - (REGISTER 0 IS ZERO) - READ AN RLD RECORD
+*          2 - (REGISTER 0 IS POSITIVE) - READ A TEXT RECORD
+*              REGISTER 0 CONTAINS THE LENGTH TO BE READ
+*              REGISTER 1 CONTAINS THE ADDRESS TO READ THE TEXT
+*          3 - (REGISTER 0 IS NEGATIVE) - READ A TEXT AND RLD RECORD
+*              REGISTER 0 CONTAINS THE COMPLEMENT OF LENGTH OF TEXT   *
+*              REGISTER 1 CONTAINS THE ADDRESS TO READ THE TEXT
+*
+*
+*     REGISTERS USED FOR IMPLIED ADDRESSING (USING STATEMENTS)
+*
+*        REGISTER 12 - PROGRAM BASE
+*        REGISTER 11 - LOADER COMMUNICATION AREA
+*        REGISTER 10 - DCB ADDRESS (DATA CONTROL BLOCK)
+*        REGISTER  9 - DECB ADDRESS (DATA EVENT CONTROL BLOCK)
+*
+***********************************************************************
+         SPACE 2
+         ENTRY HEWLREAD
+         USING IHADCB,R10
+         USING DECB,R9
+*
+*
+HEWLREAD SAVE  (14,12),,*         SAVE CALLERS REGISTERS
+         USING HEWLREAD,R15       IDENTIFY ENTRY POINT ADDRESS
+         L     R12,IOCABASE            LOAD CSECT BASE
+         DROP  R15                       DROP ENTRY POINT BASE
+         USING HEWLIOCA,R12            IDENTIFY CSECT BASE
+         L     R4,IOCABSE2      LOAD AND IDENTIFY
+         USING HEWLIOCA+4096,R4   SECOND BASE REGISTER
+         L     R13,8(R13)          PICK UP NEXT SAVE AREA
+*
+         L     R10,CMRDCBPT        LOAD BASE FOR DCB
+         L     R9,CMRDECPT           AND DECB
+         TM    CMFLAG3,CQINCORE   ARE WE READING INCORE DATA SET
+         BO    RDINCORE           YES.
+*
+         TM    CMIOFLGS,CQRECFM    IS THIS A FIXED OR UNDEFINED READ
+         BO    RDUNDEFN              IT'S UNDEFINED
+*
+*   AN OBJECT MODULE IS BEING PROCESSED -- READ FIXED RECORD FORMAT
+*
+         L     R2,CMGETREC         GET POINTER TO LAST RECORD
+         LH    R3,DCBLRECL           GET LOGICAL RECORD SIZE
+         AR    R2,R3                   COMPUTE NEW RECORD ADDRESS
+         AR    R3,R2                     ADD RECORD SIZE AND ADDRESS
+         S     R3,DECAREA                  SUBTRACT OFF BUFFER BASE
+         CH    R3,DECLNGTH         WILL THIS RECORD GO OVER END OF BLK
+         BNH   RDFIXFIN              NO - GIVE THIS RECORD AND RETURN
+*
+*   END OF BLOCK HAS BEEN REACHED -- READ ANOTHER
+*
+         L     R8,DECDECPT         SET READ LIMIT TO NEXT DECB
+         BAL   R7,RDREAD             AND GO READ THE NEXT BLOCK
+*
+         LR    R9,R8               MOVE NEXT DECB TO CURRENT
+         BAL   R7,RDCHECK            AND CHECK IT FOR COMPLETION
+*
+         ST    R9,CMRDECPT         STORE IT AS THE CURRENT DECB
+         L     R8,DECIOBPT      GET THE IOB ADDRESS FROM THE DECB
+         LH    R5,DCBBLKSI         GET BLKSIZE FROM THE DCB
+         SH    R5,14(R8)          SUBTRACT OFF RESIDUAL COUNT
+         STH   R5,DECLNGTH             AND STORE INTO THE DECB
+*
+         L     R2,DECAREA          PICK UP BUFFER ADDRESS FROM DECB
+*
+RDFIXFIN ST    R2,CMGETREC         STORE NEW RECORD POINTER INTO COMMUN
+         B     RDRETURN              AND EXIT
+*
+*            INCORE DATA SET -- ONE BLOCK ASSUMED
+*
+RDINCORE L     R2,CMGETREC             GET ADR OF LAST RECORD
+         TM    DCBRECFM,VARIABLE       IS THIS VARIABLE FORMAT
+         BNO   FIXFORM                 NO, GOTO PROCESS FIXED FROMAT
+*                                      VARIABLE LENGTH RECORDS
+         LTR   R2,R2                   WAS THERE A LAST RECORD
+         BNZ   VARINC1                 YES
+         L     R2,DCBRELAD             NO, PICK UP ADDRESS
+         LA    R2,8(R2)                SKIPCNTRL WDS-1ST TIME ONLY
+         B     RDFIXFIN
+VARINC1  LA    R3,4                    MOVE BACK TO
+         SR    R2,R3                   GET CONTROL WORD WITH LENGTH
+         AH    R2,0(R2)                GET ADDRESS OF NEW RECORD
+         LA    R2,3(R2)                ROUND UP
+         N     R2,FULMSK               TO FULLWORD
+         LR    R3,R2
+         S     R3,DCBRELAD             SUBTRACT BEGINNING OF DATA SET
+         CH    R3,DCBBLKSI             ARE WE DONE
+         BL    VARINC2                 NO,SEND BACK THIS RECORD
+COMMON   OI    CMIOFLGS,CQEOFB+CQEOCB  THRU WITH SYSLIN
+         NI    CMFLAG3,X'FF'-CQINCORE
+         B     RDRETURN
+VARINC2  LA    R2,4(R2)                SKIP CONTRL WRD-NOT 1ST TIME
+         B     RDFIXFIN
+*                                      FIXED    LENGTH RECORDS
+FIXFORM  LTR   R2,R2                   WAS THERE A LAST RECORD
+         BNZ   FIXINC1
+         L     R2,DCBRELAD             NO, PICK UP ADDRESS
+         B     RDFIXFIN
+FIXINC1  LH    R3,DCBLRECL             GET RECORD LENGTH
+         AR    R2,R3                   GET ADDRESS OF NEW RECORD
+         LR    R3,R2
+         S     R3,DCBRELAD             SUBTRACT BEGINNING OF DATA SET
+         CH    R3,DCBBLKSI             ARE WE DONE
+         BL    RDFIXFIN                NO,SEND THIS RECORD BACK
+         B     COMMON                  THRU WITH SYSLIN
+*
+*
+*   A LOAD MODULE IS BEING PROCESSED -- TEST FOR TYPE OF READ REQUIRED
+*
+RDUNDEFN LTR   R0,R0
+         BZ    RDRLD               ZERO - READ RLD/CONTROL RECORD
+         BP    RDTXT               POSITIVE - READ TEXT
+*
+*   REGISTER 0 IS NEGATIVE --- READ TEXT AND RLD/CONTROL
+*
+         LPR   R0,R0               COMPLEMENT THE SIZE
+         L     R9,DECDECPT           PICK UP TXT DECB POINTER
+         STH   R0,DECLNGTH             STORE TXT SIZE INTO DECB
+         ST    R1,DECAREA              STORE TXT ADDRESS INTO DECB
+         LR    R8,R9               SET READ LIMIT TO THIS DECB
+         BAL   R7,RDREAD             AND GO READ TXT/RLD RECORDS
+*
+*   THE TEXT DECB MUST BE CHECKED FIRST
+*
+         LR    R9,R8               GET TEXT DECB POINTER
+         BAL   R7,RDCHECK            AND CHECK IT FOR COMPLETION
+         L     R9,DECDECPT         PICK UP POINTER TO NEXT DECB
+         TM    CMIOFLGS,CQEOCB     DID END OF CONCATENATION OCCUR
+         BZ    RDLSTCHK              NO - GO CHECK THE OTHER DECB
+*
+         OI    CMIOFLGS,CQEOFSB      YES - SET BIT TO INDICATE NO REC
+         B     RDRETURN                AND RETURN
+*
+*
+*   REGISTER 0 IS POSITIVE --- READ A TEXT RECORD
+*
+RDTXT    L     R9,DECDECPT         GET POINTER TO TEXT DECB
+         STH   R0,DECLNGTH           STORE TXT SIZE INTO DECB
+         ST    R1,DECAREA            STORE TXT ADDRESS INTO DECB
+*
+*   REGISTER 0 IS ZERO --- READ AN RLD/CONTROL RECORD
+*     (OR TEXT IF FALL THROUGH FROM ABOVE)
+*
+RDRLD    L     R8,DECDECPT         SET READ LIMIT TO NEXT DECB
+         BAL   R7,RDREAD             AND READ THIS DECB
+*
+RDLSTCHK BAL   R7,RDCHECK          CHECK THE DECB FOR COMPLETION
+*
+RDRETURN L     R13,4(R13)          GET POINTER TO LAST SAVE AREA
+         RETURN (14,12),T            AND RETURN
+         EJECT
+***********************************************************************
+*
+*   COMMON READ AND CHECK ROUTINES
+*
+*     UPON ENTRY -- REGISTER 9 POINTS TO THE DECB TO READ OR CHECK
+*                -- REGISTER 8 POINTS TO A DECB WHICH SHOULD NOT BE
+*                 READ OTHER THAN FIRST
+*
+*     UPON EXIT FROM CHECK -- ALL REGISTERS (EXCEPT 14-15-0-1) ARE
+*                           THE SAME AS WHEN ENTERED
+*
+*     UPON EXIT FROM READ -- REGISTER 9 POINTS TO THE LAST DECB READ
+*                          ALL OTHERS (EXCEPT 14-15-0-1) ARE THE SAME
+*                          AS WHEN ENTERED
+*
+*     EXIT IS VIA REGISTER 7
+*
+***********************************************************************
+         SPACE 3
+RDREAD   READ  (R9),SF,MF=E        READ DECB POINTED TO BY R9
+         LA    R0,72
+         LR    R1,R13
+         SR    R1,R0              GET NEXT SAVE AREA IN CHAIN
+         ST    R1,8(R13)          RESET FORWARD PTR
+         C     R8,DECDECPT           DOES LIMIT EQUAL NEXT DECB
+         BCR   8,R7                    YES - RETURN
+*
+         L     R9,DECDECPT             NO - GET NEXT DECB POINTER
+         B     RDREAD                    AND GO READ IT
+*
+*
+RDCHECK  CHECK (R9)                CHECK DECB POINTED TO BY R9
+         LA    R0,72
+         LR    R1,R13
+         SR    R1,R0              GET NEXT SAVE AREA IN CHAIN
+         ST    R1,8(R13)          RESET FORWARD PTR
+         TM    CMIOFLGS,CQIOERR    ANY I/O ERRORS
+         BCR   8,R7                  NO - RETURN TO CALLER
+         SPACE
+IOABORT  L     R13,4(R13)            YES - PICK UP PREVIOUS SAVE AREA
+         C     R13,CMFSTSAV            IS THIS THE HIGHEST LEVEL
+         BNE   IOABORT                   NO - GET PREVIOUS TO THIS
+         SPACE
+         RETURN (14,12),T                YES - RETURN TO HIGHEST LEVEL
+         EJECT
+***********************************************************************
+*
+*   PRINT ROUTINE --- ALL OUTPUT TO THE SYSPRINT DATA-SET IS PROCESSED
+*  THROUGH THIS ROUTINE
+*
+*     NO PARAMETERS ARE PASSED OR RETURNED
+*
+*     THE PRINT RECORD ADDRESS IS IN 'CMPUTREC'
+*       AN ASA CARRIAGE CONTROL CHARACTER IS INSERTED BEFORE PRINT.
+*       THE PROPER CODE IS OBTAINED FROM THE 'PRTCNTRL' TABLE VIA
+*       AN INDEX FOUND IN 'CMPRTCTL'.  THIS INDEX IS RESET TO SPACE 1
+*       UNLESS CHANGED BEFORE THE NEXT PRINT.
+*       BEFORE RETURN, 'CMPUTREC' IS UPDATED TO POINT TO A NEW BUFFER.
+*       THE NEW BUFFER IS BLANKED AND 'CMWTBFCT' IS ZEROED.
+*
+*     IF THE SYSPRINT DATA-SET IS NOT OPEN, A DIRECT RETURN IS MADE
+*
+***********************************************************************
+         SPACE 3
+         ENTRY HEWLPRNT
+         USING *,R15
+         SPACE
+HEWLPRNT B     14(0,15)           EXPAND
+         DC    AL1(8)                ENTRY POINT
+         DC    CL8'HEWLPRNT'       IDENTIFIER
+         SPACE
+         TM    CMSTATUS,CQPRTOPN   IS THE SYSPRINT DATA SET OPEN
+         BO    PRNTOPEN              YES - GO PROCESS
+*
+         SR    R15,R15               NO - SET RETURN CODE OK
+         STH   R15,CMWTBFCT            ZERO BYTE COUNT FOR LIST
+         BR    R14                       AND RETURN
+         SPACE 2
+PRNTOPEN SAVE  (14,12)             SAVE CALLERS REGISTERS
+         L     R12,IOCABASE          LOAD CSECT BASE
+         DROP  R15                     DROP ENTRY POINT BASE
+         USING HEWLIOCA,R12       AND IDENTIFY CSECT BASE
+         L     R4,IOCABSE2      LOAD AND IDENTIFY
+         USING HEWLIOCA+4096,R4   SECOND BASE REGISTER
+*
+         L     R13,8(R13)          LOAD POINTER TO NEXT SAVE AREA
+*
+         L     R10,CMWDCBPT        LOAD POINTER TO OUTPUT DCB
+         L     R9,CMWDECPT         LOAD POINTER TO DECB CHAIN
+         USING IHADCB,R10            IDENTIFY DCB BASE
+         USING DECB,R9               IDENTIFY DECB BASE
+         L     R3,CMPUTREC         LOAD POINTER TO LAST RECORD
+         SPACE
+         SR    R7,R7               SET UP FOR
+         SR    R6,R6                 CARRIAGE CONTROL MAINTENANCE
+         LH    R5,CMLNECNT         PICK UP CURRENT LINE-COUNT
+         IC    R7,CMPRTCTL           GET INDEX FOR CONTROL CHARACTER
+         IC    R6,PRTCNTRL+1(R7)       GET SPACE-COUNT
+         SR    R5,R6               SUBTRACT SPACE-COUNT FROM LINE-COUNT
+         BP    PRNOEJCT              NO OVERFLOW IF POSITIVE
+         SPACE
+         LA    R7,CTEJECT            OVERFLOW - GET EJECT INDEX
+         LH    R5,CMMAXLNE           PICK UP MAXIMUM LINE-COUNT
+PRNOEJCT IC    R6,PRTCNTRL(R7)     PICK UP CONTROL CHARACTER
+         STH   R5,CMLNECNT         STORE CURRENT LINE-COUNT
+         LA    R7,CTSPACE1           GET SPACE1 INDEX FOR RESET
+         STC   R6,0(R3)            STORE CONTROL CHARACTER INTO BUFFER
+         STC   R7,CMPRTCTL           STORE RESET INDEX FOR NEXT LINE
+         SPACE
+         AH    R3,DCBLRECL           ADD RECORD LENGTH TO IT
+         L     R2,DECAREA          LOAD BUFFER POINTER
+         AH    R2,DCBBLKSI           ADD BLOCKSIZE TO IT
+         CR    R2,R3               WILL ANOTHER RECORD FIT IN THIS BLK
+         BH    PRNOWRTE              YES - BRANCH AROUND WRITE
+*
+*   THIS BLOCK MUST BE WRITTEN
+*
+         BAL   R7,WTWRITE            NO - WRITE THIS BLOCK
+*
+         L     R9,DECDECPT         PICK UP POINTER TO NEXT DECB
+         BAL   R7,WTCHECK            AND CHECK IT FOR COMPLETION
+*
+PRNOCHK  L     R3,DECAREA          GET POINTER TO BUFFER
+         ST    R9,CMWDECPT         STORE POINTER TO NEW DECB
+*
+PRNOWRTE ST    R3,CMPUTREC         STORE NEW RECORD POINTER
+*
+         LH    R15,CMWLRECL       GET BUFFER LENGTH
+         BCTR  R15,0              DECREMENT FOR
+         BCTR  R15,0                    EXECUTE
+         MVI   0(R3),C' '         BLANK THE
+         EX    R15,PRCLREX            BUFFER
+*
+         SR    R15,R15             ASSUME EVERYTHING OK
+         STH   R15,CMWTBFCT          ZERO BYTE COUNT FOR LIST
+         L     R13,4(R13)          GET POINTER TO CALLERS SAVE AREA
+         RETURN (14,12),T
+PRCLREX  MVC   1(0,R3),0(R3)      CLEARS THE BUFFER
+         SPACE 3
+*   STANDARD LINKAGE TO WRITE AND CHECK ROUTINES PLUS 'WRITE FLAG'
+*   MAINTENANCE
+         SPACE 2
+WTWRITE  MVI   DECDECPT,WRTFLG     SET WRITE FLAG IN DECB
+         WRITE (R9),SF,MF=E          ISSUE THE WRITE
+         LA    R0,72
+         LR    R1,R13
+         SR    R1,R0              GET NEXT SAVE AREA IN CHAIN
+         ST    R1,8(R13)          RESET FORWARD PTR
+         BR    R7                      AND RETURN
+         SPACE 2
+WTCHECK  LA    R9,0(R9)            INSURE HIGH ORDER BYTE CLEAR
+         TM    DECDECPT,WRTFLG     HAS THIS DECB BEEN WRITTEN
+         BCR   8,R7                  NO - NO CHECK REQUIRED
+         CHECK (R9)                  YES - CHECK FOR COMPLETION
+         LA    R0,72
+         LR    R1,R13
+         SR    R1,R0              GET NEXT SAVE AREA IN CHAIN
+         ST    R1,8(R13)          RESET FORWARD PTR
+         NI    DECDECPT,X'FF'-WRTFLG   TURN OFF THE WRITE FLAG
+         BR    R7                        AND RETURN
+         EJECT
+**********************************************************************
+*                                                                     *
+*    SYSTERM PRINT AND OPEN ROUTINE                                   *
+*                                                                     *
+*              NO PARAMETERS ARE PASSED OR RETURNED.                  *
+*              THE DCB IS POINTED TO BY CMTDCBPT.                     *
+*              THE RECORD TO BE PRINTED IS POINTED TO BY              *
+*                  CMTRMREC.  BEFORE RETURN THIS IS UPDATED TO        *
+*                  POINT TO THE OTHER BUFFER, WHICH IS BLANKED.       *
+*              IF SYSTERM WON'T OPEN, THE TERM OPTION IS SET OFF AND  *
+*                  RETURN IS MADE                                     *
+*                                                                     *
+**********************************************************************
+         SPACE 4
+         ENTRY HEWTERM
+         USING *,R15
+HEWTERM  SAVE  (14,12)            SAVE REGISTERS
+         L     R12,IOCABASE        SET UP BASE REGISTER
+         DROP  R15
+         USING HEWLIOCA,R12
+         L     R4,IOCABSE2         SECOND BASE REGISTER
+         USING HEWLIOCA+4096,R4
+         L     R13,8(R13)          SAVE AREA
+         L     R8,CMTRMREC         GET BUFFER POINTER
+         L     R10,CMTDCBPT        GET DCB POINTER
+         USING IHADCB,R10
+         TM    CMFLAG4,CQTRMOPN    IS IT OPEN
+         BO    TRM3                 YES.
+*
+*              OPEN SYSTERM
+*
+         MVC   IHADCB(DCBSIZE),MODELDCB  MOVE IN DCB MODEL
+         MVC   DCBDDNAM(8),CMTERMDD  MOVE IN DDNAME
+         MVC   DCBDSORG(2),DSORGPS  SET DCB SEQUENTION AND
+         MVC   DCBMACR(2),MACRWRTE         OUTPUT
+         O     R10,OPENOUT         OR OPEN BIT INTO LIST
+         ST    R10,CMIOLST1        STORE ADDRESS OF DCB
+         OI    CMIOLST1,X'80'      SET LIST DELIMITER
+         OPEN  MF=(E,CMIOLST1)     OPEN IT
+         TM    DCBOFLGS,DCBOPEN    DID IT OPEN OK
+         BO    TRMOPN              YES.
+         NI    CMPRMFLG,X'FF'-CQTERM NO. SET OFF TERM FLAG       YM3064
+TRMRET   L     R13,4(R13)          RESTORE REGISTER 13
+         RETURN (14,12),T          AND RETURN
+*
+*     THESE VCONS MUST BE WITHIN FIRST 4K OF CSECT.
+*
+IOCABASE DC    A(HEWLIOCA)        CSECT BASE ADDRESS
+IOCABSE2 DC    A(HEWLIOCA+4096)  SECOND BASE REGISTER CONTENTS
+*
+*              ALLOCATE SYSTERM BUFFERS AND DECBS
+*
+TRMOPN   OI    CMFLAG4,CQTRMOPN    SET ON TERM OPEN FLAG
+         LR    R9,R8               BUFFER1 POINTER IN R8 AND R9
+         LA    R9,TRMBUFLN(R9)     DECB1 POINTER IN R9
+         USING DECB,R9
+         XC    DECB(DECBSIZE-4),DECB   CLEAR IT OUT
+         ST    R10,DECDCBAD   STORE DCB ADDRESS
+         ST    R8,DECAREA          STORE BUFFER ADDRESS
+         LR    R6,R8
+         LA    R6,2*TRMBUFLN+DECBSIZE(R6)  GET OTHER DECB POINTER
+         ST    R6,DECDECPT         STORE IT
+         USING DECB,R6
+         MVC   DECB(DECBSIZE-4),0(R9)  INITIALIZE DECB
+         ST    R9,DECDECPT         STORE DECB POINTER
+         LA    R9,DECBSIZE(R9)
+         ST    R9,DECAREA          SOTRE BUFFER ADDR
+*
+*                                  WRITE SYSTERM
+*
+         USING DECB,R9
+TRM3     LR    R9,R8               GET BUFFER POINTER
+         LA    R9,TRMBUFLN(R9)     GET DECB POINTER
+         BAL   R7,WTWRITE          WRITE BUFFER
+         L     R9,DECDECPT         CHECK OTHER DECB
+         BAL   R7,WTCHECK
+         L     R3,DECAREA          STORE POINTER TO NEW BUFFER
+         ST    R3,CMTRMREC         IN COMMUNICATIONS AREA
+         MVI   0(R3),C' '          CLEAN IT OUT
+         MVC   1(TRMRECSZ-1,R3),0(R3)
+         B     TRMRET
+         EJECT
+***********************************************************************
+*                                                                     *
+*   DCB EXIT ROUTINE --- THIS ROUTINE GAINS CONTROL WHEN ANY DCB
+*  IS OPENED AND WHEN CONCATENATION TAKES PLACE ON SYSLIN
+*
+***********************************************************************
+         SPACE 2
+DCBEXIT  DS    0F                  DCB EXIT ADDRESS
+         DC    X'85'
+         DC    AL3(OPENEXIT)
+         SPACE 2
+OPENEXIT EQU   *
+         LA    R2,72
+         LR    R3,R13                  PRESENT PTR TO SAVE AREA
+         SR    R3,R2                   PICK UP NEW PTR
+         ST    R3,8(R13)               RESET  FORWARD PTR
+         L     R13,8(R13)              RESET R13
+         SAVE  (14,12)               SAVE REGISTERS
+         L     R13,8(R13)          PICK UP NEXT SAVE FOR ERROR PRINT
+         SPACE
+         LA    R10,0(R1)           MOVE DCB POINTER AND CLEAR TOP BYTE
+         USING IHADCB,R10            IDENTIFY IT
+         SPACE
+         L     R9,CMERLIST         GET POINTER TO ERROR MSG LIST
+         OI    CMSTATUS,CQRETURN     AND SET RETURN REQ FROM ERROR
+*
+         C     R10,CMWDCBPT        IS THIS THE SYSPRINT DCB
+         BE    EXPRINT               YES - ASSUME FIXED
+         C     R10,CMTDCBPT        IS IT SYSTERM
+         BE    EXTERM              YES. BRANCH
+*
+         OI    CMIOFLGS,CQEOCB     SET END OF CONCATENATION ON INPUT
+         TM    CMLIBFLG,CQAUTOC    IS THE AUTO-CALL FLAG ON
+         LA    R1,CMLINDD                    POINT TO SYSLIN DDNAME
+         BZ    EXLIN                 NO - IT'S SYSLIN
+         LA    R1,CMLIBDD            YES - IT'S SYSLIB
+         SPACE
+EXLIN    TM    DCBRECFM,UNDEFINE   IS RECFM UNDEFINED
+         BO    EXUNDEF               YES - PROCESS FOR LOAD MODULE
+*
+         TM    DCBRECFM,FIXED      IS RECFM FIXED
+         BO    EXINFIX               YES - PROCESS FIXED
+*
+         TM    DCBRECFM,VARIABLE   IS RECFM VARIABLE
+         BZ    EXINFIX               NO - ASSUME FIXED
+*
+*   AN INPUT DATA SET HAS VARIABLE RECORD FORMAT -- TERMINAL ERROR
+*
+         LA    R0,ERIOUT3          LOAD ERROR CODE
+         BAL   R8,EXMSGPRT           GO LOG THE MESSAGE
+         OI    CMIOFLGS,CQIOERR        SET I/O ERROR FLAG
+         B     EXRETURN                  AND RETURN
+*
+*
+EXPRINT  MVI   DCBRECFM,FBSA       FORCE RECFM=FBSA AND
+         LH    R5,CMWLRECL         R5 = LOGICAL RECORD LENGTH
+         DEVTYPE CMPRNTDD,CMXDBLWD     DEVTYPE MACRO FOR PRNT   ZA01334
+         LTR   R15,R15                 TEST FOR SUCCESS         ZA01334
+         BNZ   NOPRINT                 IF NOT,GO GIVE MESSAGE   ZA01334
+         TM    CMXDBLWD+2,X'A0'        TEST FOR UNIT RECORD     ZA01334
+         BM    BLKOK                   NOT UNIT RECORD          ZA01334
+         STH   R5,DCBBLKSI             SET BLOCKSIZE=LRECL      ZA01334
+BLKOK    EQU   *                                                ZA01334
+         LA    R1,CMPRNTDD             POINT TO SYSPRINT DDNAME
+         B     EXLRECL             GO CHECK BUFNO
+NOPRINT  EQU   *                                                ZA01334
+         NI    DCBOFLGS,X'EF'          TURN OFF OPEN FLAG       ZA01334
+         B     EXFINISH                BRANCH TO FINISH         ZA01334
+         SPACE
+EXINFIX  OI    DCBRECFM,FB         SET FB (S MAY ALSO BE PRESENT)
+         NI    DCBRECFM,X'FF'-STANDARD  TURN OFF STANDARD
+         LH    R5,DCBLRECL      PICK UP LRECL
+         LTR   R5,R5              IS IT DEFINED
+         BNZ   EXFIXED                 YES - LEAVE IT ALONE
+         SPACE
+         LA    R5,80                NO - DEFAULT TO 80
+EXLRECL  STH   R5,DCBLRECL      STORE LRECL
+         SPACE
+EXFIXED  SR    R2,R2               PICK UP NUMBER
+         IC    R2,DCBBUFNO           OF BUFFERS
+         LA    R3,2                IS IT EQUAL TO
+         CR    R2,R3                 OR GREATER THAN 2
+         BH    EXNCP                   YES - ITS OK
+*
+         LR    R2,R3                   NO - FORCE TO 2
+*
+EXNCP    STC   R2,DCBNCP           FORCE NCP TO BUFNO
+*
+         LH    R7,DCBBLKSI           PICK UP BLKSIZE
+         LTR   R7,R7                   IS IT DEFINED
+         BNZ   EXTRNKCK                  YES - CHECK IF MULTIPLE OF REC
+*
+         STH   R5,DCBBLKSI          NO - DEFAULT TO LRECL
+         B     EXFINISH                    AND GO FINISH UP
+*
+EXTRNKCK SR    R6,R6               DIVIDE BLKSIZE
+         DR    R6,R5              BY LRECL
+         LTR   R6,R6               IS THE REMAINDER ZERO
+         BZ    EXFINISH              YES - ALL OK
+*
+         LA    R7,1(R7)              NO - ROUND UP TO
+         MR    R6,R5              MEXT HIGHEST MULTIPLE
+         STH   R7,DCBBLKSI               AND STORE INTO DCB
+EXERR    LA    R0,ERINPT1          LOG ERROR
+         BAL   R8,EXMSGPRT             'INVALID BLKSIZE'
+         B     EXFINISH            GO FINISH UP
+*
+*
+EXTERM   MVI   DCBRECFM,FSA        FORCE FIXED FORMAT
+         LA    R5,TRMRECSZ         GET RECORD SIZE
+         LA    R1,CMTERMDD
+         STH   R5,DCBLRECL         FORCE RECORD SIZE
+         STH   R5,DCBBLKSI             FORCE BLOCKSIZE
+         MVI   DCBNCP,2            FORCE 2 BUFFERS
+         B     EXFINISH                GO TO FINISHING CODE
+EXUNDEF  MVI   DCBNCP,2            FORCE NCP=2 FOR LOAD MODULES
+*
+*
+EXFINISH EQU   *
+EXZERO   MVI   DCBBUFNO,X'00'          ZERO BUFNO IN DCB
+EXRETURN NI    CMSTATUS,X'FF'-CQRETURN  TURN OFF RETURN REQ BIT
+         L     R13,4(R13)                 LOAD PREV SAVE AREA POINTER
+         LM    R14,R12,12(R13)     RELOAD REGISTERS
+         L     R13,4(R13)            LOAD PREV SAVE AREA POINTER
+         BR    R14                       AND RETURN
+         SPACE 2
+EXMSGPRT TM    CMSTATUS,CQMSGSAV   SHOULD MESSAGE BE SAVED
+         BZ    EXPRTMSG              NO - GO PRINT IT
+         SPACE
+         OI    CMSTATUS,CQOPNERR     YES - INDICATE ONE SAVED
+         STM   R0,R1,0(R9)             SAVE INFO ABOUT MESSAGE
+         BR    R8                            AND RETURN TO PROCESSING
+         SPACE
+EXPRTMSG L     R15,ADRERROR        GET POINTER TO ERROR ROUTINE
+         BALR  R14,R15               AND GO LOG THE ERROR
+         BR    R8                  RETURN TO PROCESSING
+         SPACE 2
+EODAD    OI    CMIOFLGS,CQEOFB+CQEOCB   SET EOF AND EOC ON INPUT
+         BR    R14
+         EJECT
+***********************************************************************
+*                                                                     *
+*   SYNAD EXIT ROUTINE -- THIS ROUTINE GAINS CONTROL WHEN A           *
+*  SYNCHRONOUS I/O ERROR OCCURRS.  IT PRINTS THE ERROR, ACCEPTS       *
+*  THE ERROR AND RETURNS CONTROL.                                     *
+*                                                                     *
+***********************************************************************
+         SPACE 3
+SYNAD    EQU   *
+         LA    R0,72
+         LR    R5,R13
+         SR    R5,R0                   GET NEXT SAVE AREA IN CHAIN
+         USING IHADCB,R10          IDENTIFY DCB
+         OI    CMSTATUS,CQRETURN     SET RETURN REQUEST FROM ERROR
+         LA    R2,8
+         L     R3,DECIOBPT         GET THE RIGHT IOB POINTER
+         L     R6,DCBIOBA         SAVE CONTENTS OF THIS SLOT
+         SR    R3,R2                   DECRIMENT BY 8
+         ST    R3,DCBIOBA                AND STORE FOR SYNADAF
+         TM    DCBDSORG,X'02'      IS DCB PARTITIONED ORGANIZATION
+         BO    SYNBPAM               YES - GO AROUND
+         SPACE
+         SYNADAF ACSMETH=BSAM        NO - GIVE SYNAD MACRO FOR BSAM
+         B     SYNSAVE                 AND GO PRINT ERROR
+         SPACE
+SYNBPAM  SYNADAF ACSMETH=BPAM        GIVE SYNAD MACRO FOR BPAM
+         SPACE
+SYNSAVE  ST    R5,8(R13)           INSERT THE SYNAD PROVIDED
+         ST    R13,4(R5)             SAVE AREA INTO LOADER CHAIN
+         SAVE  (14,12)             SAVE REGISTERS
+         LR    R13,R5              GET NEXT SAVE AREA
+         SPACE
+         SPACE
+         LA    R0,ERIOUT2          LOAD ERROR MESSAGE NUMBER
+         LA    R1,59(R1)           ADDRESS OF SYNAD MESSAGE
+         L     R15,ADRERROR             ADDRESS OF ERROR ROUTINE
+         BALR  R14,R15                    AND GO LOG THE ERROR
+         SPACE
+         L     R13,4(R13)          GET PREVIOUS SAVE AREA
+         LM    14,12,12(13)          RELOAD REGISTERS
+         ST    R6,DCBIOBA       RESTORE IOB POINTER FOR DATA MGMT
+         SPACE
+         SYNADRLS                      RELEASE SYNAD STORAGE
+         SPACE
+         ST    R5,8(R13)           RE-CHAIN THE
+         ST    R13,4(R5)             LOADER SAVE AREAS
+         OI    CMIOFLGS,CQIOERR        IDENTIFY I/O ERROR
+         BR    R14                     AND RETURN FOLLOWING CHECK
+         EJECT
+PARMLIST EQU   *
+         SPACE
+NEGATE   EQU   *
+VPNOMAP  DC    C'NO'
+VPMAP    DC    C'MAP'
+VPNOLET  DC    C'NO'
+VPLET    DC    C'LET'
+VPNOCALL DC    C'NO'
+VPCALL   DC    C'CALL'
+VPNCAL   DC    C'NCAL'
+VPNORES  DC    C'NO'
+VPRES    DC    C'RES'
+VPNOPRNT DC    C'NO'
+VPPRINT  DC    C'PRINT'
+VPSIZE   DC    C'SIZE='
+VPEP     DC    C'EP='
+VPNAME   DC    C'NAME='
+VPTERM   DC    C'TERM'
+VPNOTERM DC    C'NOTERM'
+         EJECT
+ORINDEX  EQU   ORPARM-SETPARM
+ANDINDEX EQU   ANDPARM-SETPARM
+SIZEINDX EQU   SIZEPARM-SETPARM
+EPINDEX  EQU   EPPARM-SETPARM
+NAMEINDX EQU   NAMEPARM-SETPARM
+CQFF     EQU   X'FF'
+         SPACE 2
+PRMMAP   EQU   VPMAP-PARMLIST      INDEX TO OPTION MAP
+PRMNOMAP EQU   VPNOMAP-PARMLIST    INDEX TO OPTION NOMAP
+PRMLET   EQU   VPLET-PARMLIST      INDEX TO OPTION LET
+PRMNOLET EQU   VPNOLET-PARMLIST    INDEX TO OPTION NOLET
+PRMCALL  EQU   VPCALL-PARMLIST     INDEX TO OPTION CALL
+PRMNOCAL EQU   VPNOCALL-PARMLIST   INDEX TO OPTION NOCALL
+PRMPRINT EQU   VPPRINT-PARMLIST    INDEX TO OPTION PRINT
+PRMNOPRT EQU   VPNOPRNT-PARMLIST   INDEX TO OPTION NOPRINT
+PRMRES   EQU   VPRES-PARMLIST      INDEX TO OPTION RES
+PRMNORES EQU   VPNORES-PARMLIST    INDEX TO OPTION NORES
+PRMEP    EQU   VPEP-PARMLIST       INDEX TO OPTION EP
+PRMNAME  EQU   VPNAME-PARMLIST         INDEX TO OPTION HNAME'
+PRMSIZE  EQU   VPSIZE-PARMLIST     INDEX TO OPTION SIZE
+PRMNCAL  EQU   VPNCAL-PARMLIST     INDEX TO OPTION NCAL
+PRMTERM  EQU   VPTERM-PARMLIST    INDEX TO OPTION TERM
+PRMNOTRM EQU   VPNOTERM-PARMLIST  INDEX TO OPTION NOTERM
+         EJECT
+***********************************************************************
+*                                                                     *
+*   LIST USED FOR SCANNING VALID OPTIONS PASSED IN THE PARAMETER LIST *
+*                                                                     *
+*     EACH ENTRY IS 4 BYTES LONG                                      *
+*       FIRST BYTE  -- INDEX FROM 'PARMLIST' TO VALID OPTION NAME     *
+*       SECOND BYTE -- MASK USED FOR SETTING OR CLEARING OPTION FLAG  *
+*       THIRD BYTE  -- LENGTH-1 OF OPTION NAME                        *
+*       FORTH BYTE  -- INDEX INTO EXECUTE LIST FOR PERFORMING OPERAT'N*
+*                                                                     *
+***********************************************************************
+         SPACE 3
+SCANLIST DS    0F
+         DC    AL1(PRMMAP),AL1(CQMAP),AL1(2),AL1(ORINDEX)
+         DC    AL1(PRMLET),AL1(CQLET),AL1(2),AL1(ORINDEX)
+         DC    AL1(PRMSIZE),AL1(0),AL1(3),AL1(SIZEINDX)
+         DC    AL1(PRMEP),AL1(0),AL1(1),AL1(EPINDEX)
+         DC    AL1(PRMNAME),AL1(0),AL1(3),AL1(NAMEINDX)
+         DC    AL1(PRMNCAL),AL1(CQFF-CQCALL-CQRES),AL1(3),AL1(ANDINDEX)
+         DC    AL1(PRMNOMAP),AL1(CQFF-CQMAP),AL1(4),AL1(ANDINDEX)
+         DC   AL1(PRMNOCAL),AL1(CQFF-CQCALL-CQRES),AL1(5),AL1(ANDINDEX)
+         DC    AL1(PRMNORES),AL1(CQFF-CQRES),AL1(4),AL1(ANDINDEX)
+         DC    AL1(PRMNOPRT),AL1(CQFF-CQPRINT),AL1(6),AL1(ANDINDEX)
+         DC    AL1(PRMPRINT),AL1(CQPRINT),AL1(4),AL1(ORINDEX)
+         DC    AL1(PRMRES),AL1(CQRES+CQCALL),AL1(2),AL1(ORINDEX)
+         DC    AL1(PRMCALL),AL1(CQCALL),AL1(3),AL1(ORINDEX)
+         DC    AL1(PRMNOLET),AL1(CQFF-CQLET),AL1(4),AL1(ANDINDEX)
+         DC    AL1(PRMTERM),AL1(CQTERM),AL1(3),AL1(ORINDEX)
+         DC    AL1(PRMNOTRM),AL1(CQFF-CQTERM),AL1(5),AL1(ANDINDEX)
+LISTEND  EQU   *
+SCANCTRL DC    A(SCANLIST),F'4',A(LISTEND-4)
+         EJECT
+***********************************************************************
+*                                                                     *
+*   LIST USED FOR RECONSTRUCTING OPTIONS SPECIFIED
+*
+*     EACH ENTRY IS 4 BYTES LONG
+*        FIRST BYTE      -- MASK USED FOR TESTING IF OPTION PRESENT
+*        SECOND BYTE     -- LENGTH-1 OF OPTION NAME
+*        THIRD AND FORTH -- INDEX FROM 'PARMLIST' TO OPTION NAME
+*                                                                     *
+***********************************************************************
+         SPACE 2
+OPUSELST DS    0F
+         DC    AL1(CQPRINT),AL1(4),AL2(PRMPRINT)
+         DC    AL1(CQMAP),AL1(2),AL2(PRMMAP)
+         DC    AL1(CQLET),AL1(2),AL2(PRMLET)
+         DC    AL1(CQCALL),AL1(3),AL2(PRMCALL)
+         DC    AL1(CQRES),AL1(2),AL2(PRMRES)
+         DC    AL1(CQTERM),AL1(3),AL2(PRMTERM)
+ENDOPUSE EQU   *
+         SPACE
+OPTCNTRL DC    A(OPUSELST),F'4',A(ENDOPUSE-4)
+         EJECT
+         SPACE 2
+***********************************************************************
+*                                                                     *
+*   ASA CARRIAGE CONTROL CHARACTER DEFINITIONS
+*     THEY MUST REMAIN IN THE ORDER DEFINED IN THE 'CTPRTCTL'
+*     DSECT EXPANDED WITH IEWLOCOM
+*                                                                     *
+***********************************************************************
+         SPACE 3
+PRTCNTRL DS    0F
+         SPACE
+         DC    C' ',AL1(1)         SPACE 1
+         DC    C'0',AL1(2)         SPACE 2
+         DC    C'-',AL1(3)         SPACE 3
+         DC    C'1',AL1(60)        EJECT
+         EJECT
+ADRERROR DC    V(HEWERROR)        ERROR ROUTINE ENTRY POINT
+ADRBUFFR DC    A(HEWBUFFR)        ADDRESS OF BUFFER ALLOCATION
+ADRPRIME DC    A(HEWPRIME)        ADDRESS OF OBJECT BUFFER PRIME
+ADRPRNT  DC    A(HEWLPRNT)        PRINT ROUTINE ENTRY POINT
+ADROMPRC DC    V(HEWLRELO)        ADDRESS OF OBJECT MODULE PROCESSOR
+ADRLMPRC DC    V(HEWLODE)      ADDRESS OF LOAD MODULE PROCESSOR
+ADRACALL DC    V(HEWACALL)        ADDRESS OF AUTO-CALL PROCESSOR
+ADRABTMP DC    V(HEWBTMAP)        BIT MAP PROCESSOR ENTRY POINT
+ADRCDE   DC    V(HEWLIDEN)        ADDRESS OF CDE CONSTRUCTOR
+DFLTMIN  DC    A(MINREQ)           MINIMUM STORAGE REQUEST
+DFLTNAME DC    C'**GO    '
+DFLTTERM DC    C'SYSTERM '         DEFAULT DIAGNOSTIC DDNAME
+         EXTRN HEWLDDEF
+DFLTBASE DC    A(HEWLDDEF)        DEFAULT OPTIONS CSECT
+         SPACE
+DUMMYDCB EQU   0
+OPENIN   OPEN  (DUMMYDCB,(INPUT,DISP)),MF=L
+OPENOUT  OPEN  (DUMMYDCB,(OUTPUT,DISP)),MF=L
+CLOSE    CLOSE (DUMMYDCB,DISP),MF=L
+EXTR     EXTRACT   EXTR,'S',FIELDS=(TSO),MF=L
+TCBTSTSK EQU   X'80'               TIMESHARING FLAG IN TCBTSFLG FIELD
+         SPACE
+DBLMASK  DS    0F
+         DC    X'00FFFFF8'         DOUBLE WORD MASK
+FULMSK   DS    0F
+         DC    X'00FFFFFC'               FULLWORD MASK
+ENTFLG2  DC    X'FF000000'
+         SPACE
+DSORGPS  DC    BL2'0100000000000000'    PHISICAL SEQUENTIAL
+DSORGPO  DC    BL2'0000001000000000'    PARTITIONED ORGANIZATION
+MACRREAD DC    BL2'0010000000000000'    READ
+MACRWRTE DC    BL2'0000000000100000'    WRITE
+         SPACE
+LOADHEAD DC    C' VS LOADER   '                                  YM3465
+HDGLNGTH EQU   *-LOADHEAD
+OKOPTHDG DC    C'OPTIONS USED -'
+OKOPTLNG EQU   *-OKOPTHDG
+REJOPT   DC    C'OPTIONS REJECTED -'
+REJOPTLG EQU   *-REJOPT
+MAPHEAD  DC    C'NAME  TYPE  ADDR'
+MAPHDLNG EQU   *-MAPHEAD
+ENTRYSZ  EQU   24                  SIZE OF MAP ENTRY
+         SPACE
+*
+*              81 CHARACTER RECORD
+*              THESE THREE FIELDS MOVED TO CMMAPLIN,CMWLRECL,CMMAXLST
+*                 IF TSO IS OPERATING.
+*
+         DS    0H
+PRNT81   DC    AL2(LN81)           LENGTH OF MAP LINE
+LN81     EQU   3*ENTRYSZ           THREE ENTRIES PER LINE
+         DC    H'81'               LENGTH OF RECORD
+         DC    H'60'                LENGTH OF INVALID OPTIONS
+*
+*                                  121 CHARACTER RECORD
+*              THESE THREE FIELDS MOVED TO CMMAPLIN,CMWLRECL,CMMAXLST
+*                 IF TSO IS NOT OPERATING.
+*
+PRNT121  DC    AL2(LN121)          LENGTH OF MAP LINE
+LN121    EQU   5*ENTRYSZ           FIVE ENTRIES PER LINE
+         DC    H'121'              LENGTH OF RECORD
+         DC    H'100'              LENGTH OF INVALID OPTIONS
+*
+         SPACE
+DMSIZE   EQU   6144                INITMAIN REQUEST SIZE         A42698
+MINREQ   EQU   2048                MINIMUM VC REQUEST SIZE
+NUMSAVES EQU   9                   NUMBER OF SAVE AREAS ALLOCATED
+TRMBUFLN EQU   88        LENGTH OF SYSTERM BUFFER (DBLWRDS)
+TRMRECSZ EQU   81        LENGTH OF SYSTERM RECORD
+RLDSIZE  EQU   256
+FSA      EQU   B'10001100'         FIXED,STANDARD,ASA
+FBSA     EQU   B'10011100'         FIXED,BLOCKED,STANDARD,ASA
+FB       EQU   B'10010000'         FIXED, BLOCKED
+STANDARD EQU   B'00001000'         STANDARD BLOCKS ONLY
+UNDEFINE EQU   X'C0'               UNDEFINED RECFM IN DCB
+FIXED    EQU   X'80'               FIXED RECORD FORMAT IN DCB
+VARIABLE EQU   X'40'               VARIABLE RECORD FORMAT IN DCB
+CHAINED  EQU   X'20'               CHAINED SCHED IN OPTCD OF DCB
+WRTFLG   EQU   X'80'               DECB WRITTEN BUT NOT CHECKED
+DCBOPEN  EQU   X'10'               BIT SET IF OPEN WAS SUCCESSFUL
+UNLKATRB EQU   X'08'               UNLIKE ATTRIBUTES BIT IN DCBOFLGS
+         SPACE 2
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+MAINTAIN DS    40F                 MAINTENANCE AREA
+         SPACE 2
+         EJECT
+         DS    0D
+MODELDCB DCB   DDNAME=SYSPRINT,EODAD=EODAD,EXLST=DCBEXIT,SYNAD=SYNAD,  X
+               DEVD=DA,DSORG=PS,MACRF=(W)
+         DS    0D
+DCBSIZE  EQU   *-MODELDCB
+         EJECT
+         DCBD  DSORG=BS,DEVD=DA
+         EJECT
+         HEWLDCOM
+         EJECT
+***********************************************************************
+*                                                                     *
+*    DATA EVENT CONTROL BLOCK DEFINITION                              *
+*                                                                     *
+*      IF THE DECB IS CHANGED BY DATA MANAGEMENT, THIS DSECT MUST     *
+*      BE CHANGED.                                                    *
+*                                                                     *
+*      ONE EXTRA WORD HAS BEEN ADDED AT THE END OF THE NORMAL DECB    *
+*      FOR CONTROLLING MULTIPLE BUFFERS.                              *
+*                                                                     *
+***********************************************************************
+         SPACE 3
+DECB     DSECT
+         SPACE
+DECSDECB DC    F'0'                EVENT CONTROL BLOCK
+DECTYPE  DC    H'0'                I/O MACRO TYPE
+DECLNGTH DC    H'0'                LENGTH OF DATA
+DECDCBAD DC    A(0)                ADDRESS OF DCB
+DECAREA  DC    A(0)                ADDRESS OF BUFFER
+DECIOBPT DC    A(0)                ADDRESS OF IOB
+DECDECPT DC    A(0)                ADDRESS OF NEXT DECB
+DECBSIZE EQU   *-DECB
+         EJECT
+***********************************************************************
+*                                                                     *
+*    DSECT OF 'IEWLDDEF' CSECT -- DEFAULT OPTIONS DEFINITION          *
+*                                                                     *
+*        IF THE SYSGEN MACRO 'SGIEW050' IS ALTERED TO CAUSE A CHANGE  *
+*        IN THE DISPLACEMENTS OF ANY OF THE FOLLOWING DEFINITIONS,    *
+*        THIS DSECT MUST BE CORRESPONDINGLY ALTERED.                  *
+*                                                                     *
+***********************************************************************
+         SPACE 3
+DEFAULTS DSECT
+         SPACE
+DFLTDDNM EQU   *
+DFLTPRNT DC    CL8'SYSPRINT'       DIAGNOSTIC MESSAGE DATA SET
+DFLTLIN  DC    CL8'SYSLIN'         PRIMARY INPUT DATA SET
+DFLTLIB  DC    CL8'SYSLIB'         AUTO-CALL LIBRARY DATA SET
+         SPACE
+DFLTSIZE DC    F'102400'           DEFAULT SIZE
+         SPACE
+DFLTFLAG DC    B'00010101'         SELF-DEFINING KEYWORD OPTIONS
+DFLTXTRA DC    B'00000000'         RESERVED FOR EXPANSION
+         EJECT
+*    DSECT FOR INITIAL MAIN STORAGE (UNCONDITIONAL) REQUEST
+         SPACE
+INITMAIN DSECT
+INITSAVE DS    18F                 INITIAL SAVE AREA
+         SPACE
+*    EVERYTHING IN THE BOX MUST REMAIN TOGETHER AND IN THE SAME ORDER.
+*      IT IS MOVED TO 'CMINITCM' IN ONE PIECE.  IF IT IS CHANGED, THE
+*      CORRESPONDING AREA IN THE COMMUNICATION DSECT MUST BE CHANGED.
+         SPACE
+INITCMCM EQU   *           ********************************************
+INITMADR DS    F           *  VC MAIN STORAGE ADDRESS                 *
+INITMSIZ DS    F           *  VC MAIN STORAGE SIZE                    *
+INITDDNM EQU   *           *                                          *
+INITPRNT DS    8C          *  DDNAME FOR PRINT                        *
+INITLIN  DS    8C          *  DDNAME FOR THE PRIMARY INPUT            *
+INITLIB  DS    8C          *  DDNAME FOR THE LIBRARY                  *
+INITTERM DS    8C          *  DDNAME FOR DIAGNOSTICS                  *
+INITNAME DS    8C          *  PARAMETER LIST ENTRY POINT NAME         *
+INITPGMN DS    8C          *  PROGRAM NAME                            *
+INLINDCB DS    F           *  ADDR OF PASSED SYSLIN DCB               *
+INLIBDCB DS    F           *  ADDR OF PASSED SYSLIB DCB               *
+INITPARM DS    H           *  PARAMETER FLAGS AND ERROR FLAGS         *
+INFLAG3  DS    X           *  ASSORTED FLAGS                          *
+INFLAG4  DS    X           *  ASSORTED FLAGS                          *
+INITCMSZ EQU   *-INITCMCM  ********************************************
+INITSPIE DS    F              POINTER TO PREVIOUS SPIE FOR 'SIZE=' SCAN
+INITSCAN DS    F              SCAN POINTER SAVE AREA FOR 'SIZE=' SPIE
+INITDUM  DS    F                   SAVE WORD FOR REGISTER DURING SIZE
+*                                             PROCESSING
+INITREJL DS    F                   END OF REJECTED OPTIONS LIST
+INITRMIN DS    F              MINIMUM SIZE REQUEST FOR VC
+INITRMAX DS    F              MAXIMUM SIZE REQUEST FOR VC
+INITGTML GETMAIN MF=L         LIST FOR VC GETMAIN
+INITEXTR EXTRACT INITEXAD,'S',FIELDS=(TSO),MF=L  LIST FOR EXTRACT
+EXTRLEN  EQU   *-INITEXTR
+INITEXAD DS    F                   EXTRACT WILL PUT ADDRESS OF TSO
+*                                       FIELD HERE
+INITDBLW DS    0D                  DOUBLE WORD FOR
+         DS    7X                    PARM 'SIZE' CONVERT
+INITSIGN DS    X                   SIGN POSITION FOR PACKED FORMAT
+INITRTAB DS    32D
+INITREJP EQU   *                   REJECTED OPTIONS BUFFER
+INITSIZE EQU   *-INITMAIN
+         END   HEWLIOCA

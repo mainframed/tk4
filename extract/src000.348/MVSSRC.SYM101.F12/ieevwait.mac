@@ -1,0 +1,1574 @@
+         TITLE 'IEEVWAIT MASTER SCHEDULER WAIT ROUTINE'
+***********************************************************************
+* MODULE NAME   = IEEVWAIT                                            *
+*                                                                     *
+* LOAD MODULE   = IEEVWAIT                                            *
+*                                                                     *
+* DESCRIPTION   = MASTER SCHEDULER WAIT PROCESSOR                     *
+*                                                                     *
+* COPY RIGHT    = NONE                                                *
+*                                                                     *
+*STATUS        = OS-VS/2- DUMPING IMPROVEMENTS                @ZA29984*
+*                                                                     *
+* FUNCTION      = IT IS THE RESPONSIBILITY OF THIS MODULE TO          *
+*                 ISSUE MASTER'S MAJOR WAIT.  UPON BEING FREED        *
+*                 FROM THAT WAIT, THE ECBS ARE CHECKED TO SEE         *
+*                 IF THEY WERE POSTED TO PROCESS FOR A COMMAND        *
+*                 OR TO COMPLETE THE SYSTEM INITIALIZATION            *
+*                 AND RELEASE THE SERIALIZATION RESOURCES.            *
+*                 A GETMAIN IS ISSUED FOR THE CORE TO BE USED         *
+*                 AS THE WORK AND ESTAE PARM AREA.  IF IT IS A        *
+*                 POST FROM THE PRIMARY SUBSYSTEM, THEN THE           *
+*                 SYSTEM TRACE FUNCTION IS SHUT OFF AND THE           *
+*                 TRACE TABLE IS FREED, AND THEN THE SUBSYSTEM        *
+*                 SERIALIZATION RESOURCES ARE RELEASED.               *
+*                 IF IT IS A POST FOR A COMMAND, THE CSCB CHAIN       *
+*                 IS SCANNED FOR THE COMMAND TO BE SERVICED.  A       *
+*                                                                     *
+* OPERATION     = IEEVWAIT OPERATES UNDER THE PROTECTION OF           *
+*                 A ESTAE ENVIRONMENT.  ESTAE PROVIDES INTERVENTION   *
+*                 IN CASE OF AN ABEND CONDITION.  IF AN ABEND         *
+*                 CONDITION OCCURS, ABEND PROCESSES NORMALLY          *
+*                 UNTIL THE ESTAE INTERFACE ROUTINE SYNCHES           *
+*                 TO THE EXIT ROUTINE (STAE0000).  WHEN THE           *
+*                 ESTAE EXIT COMPLETES, IT RETURNS TO THE STAE        *
+*                 ROUTINE WITH AN INDICATOR THAT RETRY WILL           *
+*                 BE ATTEMPTED.  STAE THEN MODIFIES THE RESUME        *
+*                 PSW IN THE RB TO POINT TO THE ADDRESS INDICATED.    *
+*                 THE ESTAE ROUTINE'S OPERATION IS AS FOLLOWS:        *
+*                  . SAVE ABEND'S REGISTERS.                          *
+*                  . SET UP THE ENVIRONMENT FOR RETRY.                *
+*                  . INDICATE RETRY WITHIN THE ESTAE PROCESSOR.       *
+*                  . IF IT WAS A TRACE TABLE ABEND, DO A FREEPAGE.    *
+*                  . TAKE A DUMP FOR ALL BUT PERCOLATION AND          *
+*                    MACHINE CHECK ENTRIES.                  @YM3505P *
+*                  . INFORM OPERATOR OF FAILURE/DUMP STATUS.          *
+*                  . VERIFY THE VALIDITY OF THE CSCB CHAIN AND        *
+*                    IF FOUND TO BE BAD, TRUNCATE IT AND INFORM THE   *
+*                    OPERATOR.                                        *
+*                  . IF REENTERED WITH THE INTERNAL FAILURE           *
+*                    INDICATOR BIT ON, CONTINUE WITH THE NEXT         *
+*                    FUNCTION INDICATED BY THE PROCESS CODE.          *
+*                    SUCH REENTRY IS POSSIBLE SINCE THE               *
+*                    RETRY CODE IS PROTECTED BY ESTAE.                *
+*                  . IF ENTERED WITH EXTERNAL RECURSION       @ZA29984*
+*                    INDICATOR ON, TEST FOR TRACE OFF         @ZA29984*
+*                    PROCESSING COMPLETE. IF COMPLETED,       @ZA29984*
+*                    CONTINUE WITH THE ABEND.                 @ZA29984*
+*                    IF NOT COMPLETED, FREE THE FIXED PAGE    @ZA29984*
+*                    AND ATTEMPT RE-TRY AT SYSLOG             @ZA29984*
+*                    INITIALIZATION.                          @ZA29984*
+*                 THE MASTER WAIT ROUTINE AFTER BASIC SETUP           *
+*                 WILL ISSUE A WAIT ON A LIST OF TWO ECBS.  THE       *
+*                 FIRST IS THE MASTER WAIT ECB AND THE OTHER          *
+*                 IS THE PRIMARY SUBSYSTEM INITIALIZATION ECB.        *
+*                 THE SUBSYSTEM ECB WILL BE POSTED TO INDICATE        *
+*                 THAT IT HAS COMPLETED INITIALIZATION AND IS         *
+*                 READY TO PROCESS.  THE MASTER WILL THEN             *
+*                 RELEASE THE SUBSYSTEM SERIALIZATION RE-             *
+*                 SOURCES.  IF THE MASTER ECB WAS POSTED THEN         *
+*                 THE CSCB CHAIN WILL BE SCANNED, LOOKING FOR         *
+*                 A PENDING CSCB, AND IF FOUND, IT WILL BE PROCESSED. *
+*                                                                     *
+* NOTES:                                                              *
+*  CHARACTER-                                                         *
+*   CODE        = MAY BE ASSEMBLED WITH ANY CODE SET                  *
+*  DEPENDENCIES = NONE                                                *
+*  RESTRICTIONS = NONE                                                *
+*  REGISTER-                                                          *
+*  CONVENTIONS  = NONE                                                *
+*  PATCH-LABEL  = VPATCH                                              *
+*                                                                     *
+* MODULE TYPE:                                                        *
+*  PROCESSOR    = ASSEMBLER                                           *
+*  MODULE SIZE  = X '9C9'                                     @ZA29984*
+*  ATTRIBUTES   = REENTRANT                                           *
+*                 SUPERVISOR MODE                                     *
+*                 ZERO PSW PROTECT KEY                                *
+*                 PAGED LPA                                           *
+*                                                                     *
+* ENTRY POINT   = IEEVWAIT                                            *
+*  PURPOSE      = MASTER WAIT ISSUANCE                                *
+*  LINKAGE      = XCTL FROM IEEMB860                                  *
+*  INPUT DATA   = NONE                                                *
+*                                                                     *
+* ENTRY POINT   = STAE0000                                            *
+*  PURPOSE      = MASTER SCHEDULER WAIT RECOVERY                      *
+*  LINKAGE      = SYNCH TO FROM ASIR                                  *
+*  INPUT DATA   = ESTAE DIAGNOSTIC WORKAREA (REGISTER 1)              *
+*                 ESTAE PARM LIST (ESTAE DIAGNOSTIC WORK AREA)        *
+*                                                                     *
+* REGISTER USAGE:                                                     *
+*  SAVED        = NONE                                                *
+*  CONTAINED    = REGISTER 0  = UNPREDICTABLE                         *
+*                 REGISTER 1  = UNPREDICTABLE                         *
+*                 REGISTER 2  = UNPREDICTABLE                         *
+*                 REGISTER 3  = UNPREDICTABLE                         *
+*                 REGISTER 4  = CSCB BASE REGISTER                    *
+*                 REGISTER 5  = LAGGING CSCB BASE REGISTER            *
+*                 REGISTER 6  = PARAMETER LIST ADDR FOR ATTACH        *
+*                 REGISTER 7  = CVT BASE REGISTER                     *
+*                 REGISTER 8  = WORKER BASE REGISTER                  *
+*                 REGISTER 9  = BASEA BASE REGISTER                   *
+*                 REGISTER 10 = UNPREDICTABLE                         *
+*                 REGISTER 11 = UNPREDICTABLE                         *
+*                 REGISTER 12 = IEEVWAIT BASE REGISTER                *
+*                 REGISTER 13 = UNPREDICTABLE                         *
+*                 REGISTER 14 = UNPREDICTABLE                         *
+*                 REGISTER 15 = UNPREDICTABLE                         *
+*  RESTORED     = NONE                                                *
+*                                                                     *
+* COMMANDS      = DISPLAY ACTIVE                   START              *
+*                 DISPLAY CONSOLES                 MOUNT              *
+*                 DISPLAY UNITS                    SEND               *
+*                 DISPLAY C,K                      HALT EOD           *
+*                 DISPLAY PFK                      SWITCH SMF         *
+*                 DISPLAY M                        SET IPS            *
+*                 DISPLAY JOBS                     UNLOAD             *
+*                 DISPLAY TS                       RESET              *
+*                 DISPLAY DMN                      PAGEADD    @Z40BPSV*
+*                 DISPLAY DUMP                                @G33CPMR*
+*                 TRACK   ACTIVE                   DUMP               *
+*                 VARY    PATH                     QUIESCE            *
+*                 VARY    CHANNEL                  LOGON              *
+*                 VARY    CPU                                         *
+*                 VARY    STORAGE                                     *
+*                 VARY    ONLINE                                      *
+*                 VARY    OFFLINE                                     *
+*                 VARY    CONSOLES                                    *
+*                 VARY    CN                                  @Y02668P*
+*                                                                     *
+* PROGRAM FLOW  = SET UP ESTAE ENVIRONMENT                            *
+*                 ENQUEUE ON THE SERIALIZATION RESOURCE               *
+*                 ENQUEUE SHR ON THE CSCB CHAIN                       *
+*                 SCAN THE CSCB CHAIN                                 *
+*                 CHECK EACH CSCB FOR ASSIGNMENT PENDING BIT          *
+*                 WHEN CSCB WITH PENDING BIT ON IS FOUND:             *
+*                   IF OTHER THAN 'START' 'MOUNT' OR 'LOGON'          *
+*                   DECHAIN THE CSCB AND ATTACH THE COMMAND IN        *
+*                   MASTER REGION.  IF ONE OF THE ABOVE IS FOUND,     *
+*                   ATTACH THE MEMORY CREATE FUNCTION EXCEPT FOR      *
+*                   LOGON, THEN ATTACH THE TIOC PROCESSOR.            *
+*                   PRIOR TO DECHAINING THE CSCB THE CSCB RESOURCE    *
+*                   IS DEQUEUED.                                      *
+*                 CONTINUE SCANNING CSCB CHAIN AND PROCESSING         *
+*                 ALL CSCB'S WITH ASSIGNMENT PENDING BIT ON.          *
+*                 WHEN NO MORE PENDING CSCB'S ARE LEFT, REISSUE       *
+*                 WAIT.  WHEN POSTED, CHECK WHICH ECB WAS POSTED.     *
+*                 IF THE MASTER ECB WAS THEN POSTED, REPEAT THE       *
+*                 ABOVE PROCESSING.  IF IT WAS THE SUBSYSTEM ECB,     *
+*                 SHUT OFF THE TRACE FUNCTION, FREE THE TABLE, THEN   *
+*                 RELEASE THE SERIALIZATION RESOURCE AND REISSUE      *
+*                 THE WAIT.  THE WAIT WILL NEVER BE ISSUED WHILE      *
+*                 ENQUEUED ON THE CSCB CHAIN.                         *
+*                                                                     *
+* NOTES:        = FOR START COMMANDS, THE INTERPRETER COUNTER         *
+*                 WITHIN MASTER RESIDENT CORE IS INCREMENTED          *
+*                 BY ONE.  THE COUNTER IS ALSO PASSED TO THE          *
+*                 READER IN THE CSCB-CHINC FIELD.                     *
+*                 WITH SU33, THIS MODULE HAS BEEN             @G33CPMR*
+*                 RECONSTRUCTED SO THAT THE SEARCH FOR THE    @G33CPMR*
+*                 MODULES TO BE ATTACHED ARE TABLE DRIVEN.    @G33CPMR*
+*                                                                     *
+* EXIT - NORMAL = NONE                                                *
+*  CONDITIONS   = NONE                                                *
+*  OUTPUT DATA  = NONE                                                *
+*  RETURN CODE  = NONE                                                *
+*                                                                     *
+* EXIT - ERROR  = ENTER A WAIT STATE OR RESTART MASTER SCHEDULER      *
+*  CONDITIONS   = RECURSIVE EXTERNAL ABEND OR NORMAL ABEND/FAILURE    *
+*  OUTPUT DATA  = NONE                                                *
+*  RETURN CODE  = NONE                                                *
+*                                                                     *
+* EXTERNAL:                                                           *
+*  REFERENCES   = NONE                                                *
+*  ROUTINES     = IEEVEMCR (START, MOUNT)                             *
+*                 IEEDAY3  (LOGON)                                    *
+*                 IEE3603D (VARY ONLINE, OFFLINE, CONSOLES)           *
+*                 IEECB800 (DISPLAY ACTIVE, TRACK ACTIVE)             *
+*                 IEEVSEND (SEND)                                     *
+*                 IEEPALTR (DISPLAY PFK, DISPLAY C,K, DISPLAY UNITS)  *
+*                 IEECB866 (DUMP)                                     *
+*                 IEE70110 (HALT, SWITCH)                             *
+*                 IEEXEDNA (DISPLAY CONSOLES)                         *
+*                 IEEMB813 (UNLOAD)                                   *
+*                 IEEVPTH  (VARY PATH)                                *
+*                 IEEVCH   (VARY CHANNEL)                             *
+*                 IEEVCPU  (VARY CPU)                                 *
+*                 IEEMPVST (VARY STOR)                                *
+*                 IEEMPS03 (QUIESCE)                                  *
+*                 IEEMPDM  (DISPLAY MATRIX)                           *
+*                 IEEMB810 (RESET)                                    *
+*                 IEEMB811 (SET)                                      *
+*                 IEEMB803 (LOG - AT IPL TIME ONLY)                   *
+*                 IEECB900 (VARY 'CN' SYNTAX CHECKER)         @Y02668P*
+*                 IEEPGEXP (PAGEADD)                          @Z40WPSS*
+*                 IEEDISPD (DISPLAY DMN)                      @Z40BPSV*
+*                 IEECB905 (SLIP)                             @G17SPTJ*
+*                 IEECB907 (DISPLAY SLIP)                     @G17SPTJ*
+*                 IEECB910 (DISPLAY DUMP)                     @G33CPMR*
+*                                                                     *
+*  DATA AREAS   = ATTACH WORK AREA                                    *
+*                 STAE PARAMETER WORK AREA                            *
+*                                                                     *
+*  CONTROL BLOCK= COMMUNICATIONS VECTOR TABLE (CVT)            R      *
+*                 MASTER RESIDENT CORE (BASEA)                 R,U    *
+*                 COMMAND SCHEDULING CONTROL BLOCK (CSCB)      R,U    *
+*                 ESTAE DIAGNOSTIC WORK AREA (SDWA)            R,U    *
+*                 SECONDARY COMMUNICATION VECTOR TABLE (SCVT)  R,U    *
+*                 PHYSICAL CONFIGURATION COMMUNICATION AREA           *
+*                                                       (PCCA) R      *
+*                 PCCA VECTOR TABLE (PCCAT)                    R      *
+*                 PREFIXED SAVE AREA (PSA)                     R,U    *
+*                 COMMON SYSTEM DATA AREA (CSD)                R      *
+*                 I/O SUPERVISOR COMMUNICATION AREA            R,U    *
+*                                                                     *
+*                 R=REFERENCE     U=UPDATE                            *
+*                                                                     *
+*  TABLES       = ESTAE PARAMETER LIST                                *
+*                 COMMAND TABLE (MODTABLE)                    @G33CPMR*
+*                 BRANCH TABLE (BRTABLE)                      @G33CPMR*
+*                                                                     *
+*  MACROS       = MODID       MODULE IDENTIFICATION                   *
+*                 GETMAIN     X'08' BYTES FROM SUBPOOL 251            *
+*                 GETMAIN     STAE WORK AREA SIZE FROM SUBPOOL 253    *
+*                 ESTAE       CREATE ESTAE ENVORONMENT                *
+*                 GETMAIN     X'08' BYTES FROM SUBPOOL 251            *
+*                 ENQ         SUBSYSTEM SERIALIZATION FOR STC         *
+*                 ENQ         SUBSYSTEM SERIALIZATION FOR TSO         *
+*                 WAIT        ECB = BALAD                             *
+*                             ECB = BASUBECB                          *
+*                 ENQ         ON THE CSCB CHAIN                       *
+*                 DEQ      X  OFF THE SERIALIZATION FOR STC           *
+*                 DEQ      X  OFF THE SERIALIZATION FOR TSO           *
+*                 PGFIX    X  IEEVWAIT ACROSS SETLOCK                 *
+*                 WAIT     X  ECB=FIXECB                              *
+*                 SETLOCK  X  OBTAIN THE DISPATCHER LOCK              *
+*                 SETLOCK  X  RELEASE THE DISPATCHER LOCK             *
+*                 PGFREE   X  IEEVWAIT                                *
+*                 FREEMAIN X  THE SYSTEM TRACE TABLE FROM SP 245      *
+*                 ATTACH      OF/FOR COMMANDS                         *
+*                 DEQ         OFF THE CSCB CHAIN                      *
+*                 MGCR        DECHAIN OR FREE THE CSCB                *
+*                 SETRP    *  RETURN TO ASIR                          *
+*                 DEQ      *  OFF THE CSCB CHAIN                      *
+*                 PGFREE  X*  IEEVWAIT                                *
+*                 SDUMP    *  TO SYS1.DUMP DATA SET                   *
+*                 WTO      *  MESSAGE IEE481I, OR IEE479W             *
+*                 ENQ      *  ON THE CSCB CHAIN                       *
+*                 DEQ      *  OFF THE CSCB CHAIN                      *
+*                 DEQ      *  OFF THE CSCB CHAIN                      *
+*                 WTO      *  MESSAGE IEE513I                         *
+*                 WTO      *  MESSAGE IEE482E                         *
+*                         '*' INDICATES ERROR PROCESSING              *
+*                         'X' INDICATES SUBSYSTEM PROCESSING          *
+*                                                                     *
+*  ENQUEUED                                                           *
+*   RESOURCES   = QUEUE 10 (CSCB)                                     *
+*                 SHR IN MAINLINE                                     *
+*                 EXCLUSIVE IN RECOVERY                               *
+*                 SUBSYSTEM SERIALIZATION FOR STC                     *
+*                 SUBSYSTEM SERIALIZATION FOR TSO                     *
+*                                                                     *
+*  LOCKS        = A DISPATCHER LOCK IS OBTAINED JUST AFTER THE        *
+*                 PAGEFIX FOR TRACE TABLE DELETIONS AND IS RELEASED   *
+*                 BEFORE THE PAGEFREE                                 *
+*                                                                     *
+*  SYSGEN       = IN ITS OWN LOAD WITH NO ALIASES                     *
+*                                                                     *
+*  LIBRARIES    = NONE                                                *
+*                                                                     *
+*  CHANGE LEVEL = Y02669, Y02653, Y02668, Z40WPSS, Z40BPSV            *
+*                 G17SPTJ, G33CPMR, ZA29984                   @ZA29984*
+*                                                                     *
+* MESSAGES      = IEE481I MASTER SCHEDULER ABEND XXX, DUMPED,         *
+*                                                   RESTARTING        *
+*                                                                     *
+*                 IEE479W MASTER SCHEDULER FAILED, DUMPED, REIPL      *
+*                                                                     *
+*                 IEE513I COMMAND PROCESSING LIMITED                  *
+*                                                                     *
+*                 IEE482E MASTER SCHEDULER RESTART FAILED, ABEND      *
+*                                                   RECURSION, REIPL  *
+*                                                                     *
+*                      'XXX' IS THE ABEND CODE                        *
+*                      'DUMPED' WILL APPEAR ONLY IF A DUMP WAS TAKEN  *
+***********************************************************************
+* C (WAIT0060) MOVE SETTING BTRACE TO TRACE TERMINATION       @ZA29984*
+* C (STAE0030) CHANGE RECURSIVE ABEND BRANCH TARGET           @ZA29984*
+* C (STAE0215) NEW LABEL.TEST TRACE OFF PROCESSING            @ZA29984*
+         EJECT
+***********************************************************************
+*                                                                     *
+*        REGISTER  EQUATES                                            *
+*                                                                     *
+***********************************************************************
+IEEVWAIT  CSECT
+R0       EQU  0                   RETURN CODE REGISTER FROM STAE Y01043
+R1       EQU  1                   PARAMETER REGISTER             Y01043
+R2       EQU  2
+R3       EQU  3
+R4       EQU  4                   CSCB BASE REGISTER             Y01043
+R5       EQU  5                   LAGGING CSCB ADDRESS           Y01043
+R6       EQU  6                   PARAMETER LIST ADDR FOR ATTACH Y01043
+R7       EQU  7                   CVT BASE REGISTER              Y01043
+R8       EQU  8                   TCB BASE REGISTER              Y01043
+R9       EQU  9                   RESIDENT CORE BASE REGISTER    Y01043
+R10      EQU  10                  STAE WORK AREA BASE REGISTER   Y01043
+R11      EQU  11
+R12      EQU  12                  IEEVWAIT BASE REGISTER         Y01043
+R13      EQU  13
+R14      EQU  14
+R15      EQU  15
+         EJECT
+***********************************************************************
+*                                                                     *
+*        EQUATES                                                      *
+*                                                                     *
+***********************************************************************
+D0       EQU   0
+D1       EQU   1
+D2       EQU   2                  LENGTH FOR MOVE TO CVT         Y02669
+D3       EQU   3
+D4       EQU   4
+D5       EQU   5
+D8       EQU   8
+D12      EQU   12
+D16      EQU   16                 LOOP CONTROL FOR PCCA SCAN     Y02669
+D29      EQU   29                                                Y01043
+D128     EQU   128                HIGH ORDER BIT SETTER          Y02669
+XFF      EQU   X'FF'
+BLNK     EQU   C' '               BLANK FOR MESSAGE BUILDING     Y01043
+COMA     EQU   C','               COMMA FOR MESSAGE BUILDING     Y01043
+POSTBIT  EQU   X'40'              FOR TESTING IF ECB IS POSTED   Y02669
+         EJECT
+***********************************************************************
+*                                                                     *
+*        START PROCESSING                                             *
+*                                                                     *
+***********************************************************************
+WAIT00   EQU   *                                                 Y02669
+         BALR  R12,R0             ESTABLISH ADDRESSABILITY
+         USING *,R12              USE REGISTER 12 FOR IEEVWAIT BASE
+         MODID BRANCH=YES                                        Y01886
+         EJECT
+***********************************************************************
+*        ISSUE ESTAE                                                  *
+***********************************************************************
+         L    R0,ATCHINF          SP/SIZE OF ATTACH AREA         Y02669
+         GETMAIN R,LV=(0)                                        Y02669
+         LR    R6,R1              SAVE ADDR ACROSS GETMAIN       Y01043
+         L     R0,PARMAR          SP/SIZE OF STAE WORKAREA       Y01043
+         GETMAIN R,LV=(0)         GET STAE PARAMETER AREA        Y01043
+         USING PARMAREA,R4        BASE THE STAE PARAMETER AREA   Y02653
+         LR    R4,R1              SET PARAMETER ADDRESS FOR STAE Y02653
+         XC    PARMAREA(ENDAREA-STRTAREA),PARMAREA             @YM3526P*
+                                  ZERO ESTAE PARMAREA          @YM3526P
+         LR    R10,R4             SAVE PARMAREA ADDRESS          Y02669
+         ST    R6,PASSER          PASS ADDRESS TO RETRY          Y01043
+         USING PSA,R0                                          @YM3529P
+         MVC   TRACEPTR(D4),FLCTRACE  SAVE ADDR OF TRACE TABLE @YM3529P
+         DROP  R0                                              @YM3529P
+         MVC   MSGAREA(STAEL),LSTAE                                    *
+                                  MOVE IN THE LIST FORM OF STAE  Y01043
+         LA    R3,STAE0000        ADDRESS OF STAE EXIT           Y02653
+         LA    R1,MSGAREA         ADDRESS OF STAE LIST FORM      Y02653
+         ESTAE (3),RECORD=YES,PARAM=(4),MF=(E,(1))               Y02669
+         LTR   R15,R15            STAE O.K.?                     Y01043
+         BZ    WAIT0000           YES, CONTINUE                  Y02653
+         OI    INDCATOR,BFAIL     NO, INDICATE BRANCH ENTRY      Y02653
+         OI    INDCATOR,BDUMP     INDICATE DUMP TO BE TAKEN      Y02653
+         DROP  R4                 RELEASE BASE FOR PARAMETER AREAY02653
+         LR    R2,R4              PASS PARAMETER AREA ADDRESS    Y01043
+         B     STAE0020           TAKE DUMP/ISSUE MESSAGE        Y02653*
+                                       AND ENTER PERMANENT WAIT  Y02653
+         EJECT
+***********************************************************************
+*        TWO RESOURCES ARE ENQUEUED ON:                               *
+*            STCQUE - STARTED TASK CONTROL                            *
+*            TSOQUE - TIME SHARING                                    *
+*        THE ENQS ISSUED HERE ARE DEQUEUED AFTER THE PRIMARY          *
+*        JOB ENTRY SUBSYSTEM HAS BEEN INITIALIZED.  SINCE THESE       *
+*        NAMES ARE ALSO ENQUEUED ON BY STC AND TSO LOGON,             *
+*        RESPECTIVELY, REQUESTS FOR SUBSYSTEM SERVICES ARE            *
+*        PREVENTED FROM REACHING THE SUBSYSTEM UNTIL IT IS            *
+*        INITIALIZED.                                                 *
+***********************************************************************
+         SPACE 2
+WAIT0000 EQU   *                                                 Y02653
+         L     R0,WORKINF         SP/SIZE OF WORKER AREA         Y02669
+         GETMAIN R,LV=(0)         GET THE WORKER                 Y02669
+         LR    R8,R1              SET ADDRESS OF GOTTEN AREA     Y02669
+         USING WORKER,R8          BASE THE WORK AREA FOR LIFE    Y02669
+         MVC   SENQDEQ(ENQLEN),SENQSTC                                 *
+                                  SET ENQ LIST FOR SUBSYSTEM STC Y02669
+         LA    R1,SENQDEQ         GET ADDRESS OF ENQ LIST        Y02669
+         ENQ   MF=(E,(1))         ENQ ON SERIALIZATION RESOURCE  Y02669
+         MVC   SENQDEQ(ENQLEN),SENQTSO                                 *
+                                  SET ENQ LIST FOR SUBSYSTEM TSO Y02669
+         LA    R1,SENQDEQ         GET ADDRESS OF ENQ LIST        Y02669
+         ENQ   MF=(E,(1))         ENQ ON SERIALIZATION RESOURCE  Y02669
+         EJECT
+**************************************************************** Y01012
+*        SET UP THE BASE REGISTERS REQUIRED FOR EXECUTION.       Y02669
+*        SET UP THE ENQ, DEQ, AND ATTACH LISTS FORMS             Y02669
+**************************************************************** Y01012
+         SPACE
+         USING PARMAREA,R4        BASE THE ESTAE PARAMETER AREA  Y02653
+         LA    R8,D0(R0,R8)       ZERO HIGH ORDER BYTE         @YM3527P
+         ST    R8,PASSER1         SAVE WORKER ADDRESS FOR RESTARTY02653
+         L     R3,PASSER          GET ADDRESS OF ATTACH AREA     Y02669
+         DROP  R4                 RELEASE PARAMETER AREA BASE    Y02653
+         USING ATTACHDC,R3        SET BASE FOR ATTACH DSECT      Y02669
+         MVC   ENQLIST(ENQLEN),LISTENQ                                 *
+                                  SET UP ENQ LIST FORM           Y02669
+         MVC   DEQLIST(DEQLEN),LISTDEQ                                 *
+                                  SET UP DEQ LIST FORM           Y02669
+         MVC   ATCHEXP(ATCHLEN),ATCHLST                                *
+                                  SET UP ATTACH LIST FORM        Y02669
+         L     R7,CVTPTR          GET CVT ADDRESS                Y02669
+         USING CVTSECT,R7         BASE THE CVT                   Y02669
+         L     R9,CVTMSER         GET BASEA ADDRESS              Y01012
+         USING BASE,R9            BASE THE MASTER RESIDENT DATA  Y01012*
+                                      AREA                       Y01012
+         LA    R1,BALAD           GET ADDRESS OF COMMAND ECB     Y02669
+         ST    R1,WAITECB         COMMAND PROCESS ECB SETUP      Y02669
+         LA    R1,BASUBECB        GET ADDRESS OF SUBSYSTEM ECB   Y02669
+         ST    R1,SSYSECB         SUBSYSTEM ECB ADDRESS SETUP    Y02669
+         OI    SSYSECB,D128       INDICATE END OF LIST           Y02669
+         EJECT
+***********************************************************************
+*        ISSUE  WAIT                                                  *
+***********************************************************************
+WAITING  EQU   *                                                 Y02669
+         LA    R1,ECBLIST         LOAD ADDRESS OF ECB LIST       Y02669
+         WAIT  ,ECBLIST=(R1)      WAIT ON EVENT                  Y02669
+         TM    BALAD,POSTBIT      WAS WAIT ECB POSTED?           Y02669
+         BZ    WAIT0055           DO SUBSYSTEM INITIALIZATION  @YM02665
+         XC    BALAD(D4),BALAD    ZERO THE WAIT ECB              Y02669
+         B     WAIT0030           SCAN CSCB CHAIN                Y02669
+WAIT0010 EQU   *                                                 Y02669
+         LR    R10,R6             RESTORE PARMAREA ADDRESS     @YM3524P
+         L     R7,CVTPTR          CVT ADDRESSABILITY             YM3821
+         L     R9,CVTMSER         @ MASTER RESIDENT DATA AREA
+         NI    BASPBYTE,XFF-BAMSSTAR                                   *
+                                  INDICATE STAE PROCESS OK       Y01043
+         B     WAIT0030           SCAN CSCB CHAIN                Y02669
+         EJECT
+***********************************************************************
+*        RESTART POINT                                           Y02653
+***********************************************************************
+WAIT0020 EQU   *                                                 Y02653
+         USING PARMAREA,R4        BASE THE ESTAE PARMAREA      @YM3528P
+         XC    PROSCDE(D3),PROSCDE ZERO ESTAE RECURSION CODE   @YM3467P*
+                                     AND PROCESSING INDICATORS @YM3467P
+         DROP  R4
+         LTR   R8,R8              IS THERE A WORKER?             Y02653
+         BZ    WAIT0000           NO, THEN DO BASE INITIAL       Y02653
+         EJECT
+***********************************************************************
+*        SCAN CSCB CHAIN                                              *
+***********************************************************************
+WAIT0030 EQU   *                                                 Y02669
+         LA    R1,ENQLIST         SET ADDRESS OF LIST FORM ENQ   Y02651
+         ENQ   MF=(E,(1))         ENQ SHR ON CSCB CHAIN          Y02651
+         L     R4,BACHN           ADDRESS CSCB CHAIN
+         USING CHN,R4             BASE REGISTER FOR CSCB CHAIN
+         LA    R5,BACHN           INITIALIZE LAGGING CSCB ADDR
+WAIT0040 EQU   *                                                 Y02669
+         LTR   R4,R4              IS CSCB ADDRESS 0?
+         BZ    WAIT0050           YES, STOP CSCB SCAN            Y02669
+         TM    CHSTS,CHAP         NO, TEST ASSIGN PENDING BIT
+         BO    WAIT0070           IF ON, BRANCH AND PROCESS      Y02669
+         LR    R5,R4              IF NOT, UPDATE LAGGING CSCB ADDRESS
+         L     R4,CHPTR           UPDATE CSCB POINTER
+         B     WAIT0040           BRANCH AND TEST THIS CSCB      Y02669
+WAIT0050 EQU   *                                                 Y02669
+         BAL   R11,WAIT0510       GET OFF THE CSCB CHAIN         Y02669
+         B     WAITING            REWAIT FOR MORE WORK           Y02669
+         EJECT
+***********************************************************************
+*        SYSTEM INITIALIZATION                                   Y02669
+*        SUBSYSTEM SERIALIZATION RESOURCE PROCESSING             Y02669
+***********************************************************************
+WAIT0055 EQU   *
+         LR    R10,R6            RESTORE STAE PARMAREA POINTER @YM02665
+WAIT0060 EQU   *                                                 Y02668
+         LR    R11,R10            GET PARMAREA ADDRESS           Y02669
+         USING PARMAREA,R11       BASE THE PARMAREA              Y02669
+         XC    PROSCDE(D3),PROSCDE ZERO ESTAE RECURSION CODE   @YM3467P*
+                                     AND PROCESSING INDICATORS @YM3467P
+         XC    BASUBECB(D4),BASUBECB                                   *
+                                  ZERO THE SERIALIZATION ECB     Y02668
+         TM    MSFLAGS,MSSUBUP    SUBSYSTEM ALREADY UP?        @YM3467P
+         BO    WAIT0010           YES DON'T REATTEMPT,         @YM3467P*
+                                  GO SCAN CSCB CHAIN INSTEAD   @YM3467P
+         MVC   SENQDEQ(DEQLEN),SDEQSTC                           Y02669*
+                                  MOVE IN SUBSYSTEM DEQ LIST STC Y02669
+         LA    R1,SENQDEQ         SET POINTER TO DEQ LIST        Y02669
+         DEQ   MF=(E,(1))         GET OFF SERIALIZATION RESOURCE Y02669
+         MVC   SENQDEQ(DEQLEN),SDEQTSO                           Y02669*
+                                  MOVE IN SUBSYSTEM DEQ LIST TSO Y02669
+         LA    R1,SENQDEQ         SET POINTER TO DEQ LIST        Y02669
+         DEQ   MF=(E,(1))         GET OFF SERIALIZATION RESOURCE Y02669
+         EJECT
+***********************************************************************
+*        THE FOLLOWING WILL TERMINATE IPL/NIP TRACE TABLE             *
+*        MAINTENANCE BY INVOKING A DISPATCHER LOCK WHICH DISABLES THE *
+*        SIGNAL INTERRUPTS, THUS ASSURING THE INTEGRITY OF THE        *
+*        CSDCPUAL BITS.  THIS, IN TURN, ASSURES THAT ANY PCCA/PSA'S   *
+*        REFERENCED IS NOT FREED WHILE THIS CODE IS PROCESSING IT.    *
+***********************************************************************
+         OI    INDCATOR,BTRACE    TURN TRACE TABLE BIT ON      @ZA29984
+         TM    BASPBYTE,BATRACE   SYSTEM TRACE TO CONTINUE?    @Y02669P
+         BO    WAIT0069           YES - DON'T TURN OFF TRACE   @Y02669P
+         MVC   CVTTRACE(D2),TRACEOFF                                   *
+                                  SHUT OFF THE TRACE FUNCTION    Y02669
+         LA    R4,FIXECB          SET ECB REGISTER FOR PAGEFIX   Y02669
+         PGFIX R,A=STARTFIX,EA=ENDFIX,ECB=(R4),LONG=N            Y02669
+         WAIT  ECB=FIXECB                                        Y02669
+         LA    R13,LOCKSAV        POINTER TO SETLOCK SAVE AREA   Y02669
+STARTFIX EQU   *                                                 Y02669
+LOCKON   SETLOCK OBTAIN,TYPE=DISP,MODE=UNCOND,REGS=SAVE,         Y02669*
+               RELATED=(PCCA,IEEVWAIT(LOCKOFF))                  Y02669
+         EJECT
+***********************************************************************
+*        THE FOLLOWING WILL TURN OFF THE TRACE TABLE POINTERS IN      *
+*        THREE PLACES: IN THIS IEEVWAIT ENVIRONMENT - LOW CORE        *
+*                      IN THE SECONDARY CVT                           *
+*                      IN EACH CPU'S PSA.                             *
+*                                                                     *
+*        IN THE LOOP STARTING AT THE 'WAIT0063' LABEL, THE CPU'S      *
+*        ARE REPRESENTED BY A 16-BIT CONFIGURATION FROM THE COMMON    *
+*        SYSTEM DATA AREA WHICH IS LOADED INTO THE HIGH ORDER 2 BYTES *
+*        OF REGISTER 10.  THE 'LTR' AND BNM' TESTS EACH HIGH ORDER    *
+*        BIT FOR EACH 'ALIVE' CPU BIT IN A LOOP WHICH SHIFTS OFF EACH *
+*        BIT 16 TIMES.                                                *
+***********************************************************************
+         USING PSA,R0             BASE THE LOW CORE              Y02669
+         SR    R1,R1              SET TO ZERO                    Y02669
+         ST    R1,FLCTRACE        ZERO THE TRACE TABLE POINTER   Y02669*
+                                      IN THE LOW CORE            Y02669
+         DROP  R0                 RELEASE LOW CORE BASE          Y02669
+         USING SCVTSECT,R1        BASE THE SECONDARY CVT         Y02669
+         L     R1,CVTABEND        GET ADDRESS OF SECONDARY CVT   Y02669
+         SR    R0,R0              SET TO ZERO                    Y02669
+         ST    R0,SCVTRPTR        ZERO THE TRACE TABLE POINTER   Y02669*
+                                      IN THE SECONDARY CVT       Y02669
+         ST    R0,CVTTRCA     ZERO ADDR OF TRACE TABLE HEADER  @Z40WPSS
+         DROP  R1                 RELEASE SCVT BASE              Y02669
+         LA    R6,D16             SET THE LOOP CONTROL COUNTER   Y02669
+         L     R4,CVTPCCAT        GET ADDRESS OF PCCA VECTOR     Y02669*
+                                      TABLE                      Y02669
+         USING CSD,R1             BASE THE COMMON SYSTEM DATA    Y02669*
+                                      AREA                       Y02669
+         L     R1,CVTCSD          GET THE CSD                    Y02669
+         SR    R10,R10            ZERO OUT THE ICM REGISTER      Y02669
+         ICM   R10,D12,CSDCPUAL   OBTAIN THE CPU 'ALIVE' BITS    Y02669
+         DROP  R1                 RELEASE CSD BASE               Y02669
+WAIT0063 EQU   *                                                 Y02669
+         LTR   R10,R10            CURRENT CPU'S 'ALIVE' BIT ON?  Y02669
+         BNM   WAIT0065           NO, GET NEXT CPU'S 'ALIVE' BIT Y02669
+         L     R5,D0(R4)          YES, PICK UP POINTER TO PCCA   Y02669
+         LTR   R5,R5              IS THERE A PCCA TO PROCESS?    Y02669
+         BZ    WAIT0065           NO, CONTINUE WITH THE LOOP     Y02669
+         USING PCCA,R5            YES, BASE THE PCCA             Y02669
+         L     R5,PCCAPSAV        PICK UP THE ADDRESS OF PSA     Y02669
+         DROP  R5                 RELEASE PCCA BASE              Y02669
+         USING PSA,R5             BASE THE PSA                   Y02669
+         SR    R0,R0              SET TO ZERO                    Y02669
+         ST    R0,FLCTRACE        ZERO THE TRACE TABLE POINTER   Y02669*
+                                      IN THE PSA                 Y02669
+         DROP  R5                 RELEASE PSA BASE               Y02669
+WAIT0065 EQU   *                                                 Y02669
+         SLL   R10,D1             BUMP TO NEXT CPU'S 'ALIVE' BIT Y02669
+         LA    R4,D4(R4)          BUMP TO NEXT CPU'S PCCA POINTERY02669
+         BCT   R6,WAIT0063        ANY MORE PCCA'S TO PROCESS?    Y02669
+         EJECT
+***********************************************************************
+*        THE FOLLOWING WILL RELEASE THE LOCK AND FREE THE PAGE        *
+***********************************************************************
+LOCKOFF  SETLOCK RELEASE,TYPE=DISP,REGS=SAVE,                    Y02669*
+               RELATED=(PCCA,IEEVWAIT(LOCKON))                   Y02669
+ENDFIX   EQU   *                                                 Y02669
+         PGFREE R,A=STARTFIX,EA=ENDFIX                           Y02669
+         L     R1,TRACEPTR        GET ADDR OF TRACE TABLE      @YM3529P
+         L     R0,D12(R1)         SP/LENGTH OF TRACE TABLE       Y02669
+         FREEMAIN R,LV=(0),A=(1)  FREE THE TRACE TABLE           Y02669
+         EJECT
+***********************************************************************
+*        THE FOLLOWING WILL DEACTIVATE MF/1 I/O STATISTICS AND        *
+*        SIO SUPERVISOR TRACE ENTRIES.                                *
+***********************************************************************
+         L     R1,CVTIXAVL        GET THE IOS COMMUNICATION AREA Y02669
+         USING IOCOM,R1           BASE THE IOS                   Y02669
+         L     R5,IOCMFCNT        TRACE ACTIVATOR POINTER        Y02669
+         LA    R5,D4(R5)          INCREMENT TO THE FOUR-BYTE     Y02669*
+                                      INSTRUCTION ADDRESS        Y02669
+         L     R6,IOCMFHK         TRACE DEACTIVATOR POINTER      Y02669
+         MVC   D0(D4,R6),D0(R5)   MOVE THE INSTRUCTION TO THE    Y02669*
+                                      DEACTIVATOR ADDRESS        Y02669
+         LR    R6,R11             RESTORE PARMAREA POINTER     @YM3467P
+         DROP  R1                 RELEASE IOS BASE               Y02669
+         EJECT
+***********************************************************************
+*        THE FOLLOWING WILL PREPARE FOR THE ATTACH TO THE SYSTEM      *
+*        LOG MODULE - IEEMB803.                                       *
+***********************************************************************
+WAIT0069 EQU   *
+         SR    R4,R4              ZERO OUT PARAMETER LIST        Y02669*
+                                      ADDRESS FOR ATTACH         Y02669
+         LA    R10,LOGGER         GET LOG MODULE NAME            Y02669
+         MVC   PMODID(D3),IEE     PUT MODULE PREFIX IN PARAMETER Y02669
+         NI    BASPBYTE,XFF-BAMSSTAR                             Y02669*
+                                  TURN OFF STAE RECURSION BIT    Y02669
+         NI    INDCATOR,XFF-BTRACE                               Y02669*
+                                  TURN OFF TRACE TABLE BIT       Y02669
+         OI    MSFLAGS,MSSUBUP    TURN ON BIT INDICATING       @YM3467P*
+                                  SUBSYSTEM INITIALIZED        @YM3467P
+         DROP  R11                RELEASE PARMAREA BASE          Y02669
+         B     WAIT0495           GO AND ATTACH LOG              Y02668
+         EJECT
+***********************************************************************
+*                                                                     *
+*        DETERMINE VERB CODE AND SET MODULE TO BE ATTACHED            *
+*                                                                     *
+***********************************************************************
+WAIT0070 EQU   *                                                 Y02669
+         LR    R6,R10             SAVE STAE PARMAREA POINTER   @YM02665
+         NI    CHSTS,255-CHAP     TURN OFF ASSIGN PENDING BIT
+         MVC   PMODID(D3),IEE     PUT MODULE PREFIX IN PARAMETER
+         LA    R11,MODTABLE       ESTABLISH MODULE TABLE       @G33CPMR
+         USING TABLEDEF,R11                                    @G33CPMR
+WAIT0080 EQU   *                                               @G33CPMR
+         CLC   CHVCD(D1),VERBCODE HIT THE DESIRED VERB CODE?   @G33CPMR
+         BE    WAIT0090           YES, GET OUT OF LOOP         @G33CPMR
+         LA    R11,TABENT(R11)    NO, BUMP TO NEXT TABLE ENTRY @G33CPMR
+         CLC   VERBCODE(4),TABLEND END OF TABLE REACHED?       @G33CPMR
+         BE    WAIT0100           YES, NO ENTRY FOUND - EXIT   @G33CPMR
+         B     WAIT0080           NO, CONTINUE SCAN            @G33CPMR
+WAIT0090 EQU   *                                               @G33CPMR
+         LA    R10,MODULEID       SAVE MODULE NAME ADDRESS     @G33CPMR
+         SR    R15,R15            CLEAR BRANCH POINTER         @G33CPMR
+         IC    R15,BRANCHID       OBTAIN BRANCH ELEMENT        @G33CPMR
+         DROP  R11                                             @G33CPMR
+         LA    R11,BRTABLE        ESTABLISH BRANCH TABLE       @G33CPMR
+         LA    R15,D0(R11,R15)    COMPILE BRANCH ADDRESS       @G33CPMR
+         L     R15,D0(R15)        GET THE DESIRED ADDRESS      @G33CPMR
+         BR    R15                BRANCH TO DESIRED LOCATION   @G33CPMR
+WAIT0100 EQU   *                                               @G33CPMR
+         BAL   R11,WAIT0510       GET OFF THE CSCB CHAIN         Y02669
+         OI    CHSTS,CHFC         SET THE FREE BIT               Y02669
+         BAL   R11,WAIT0520       GO FREE AND DECHAIN THE CSCB   Y02669
+         B     WAIT0010           CONTINUE CSCB SCAN             Y02669
+         EJECT
+***********************************************************************
+*        MEMORY CREATING COMMAND ATTACH SETUP                         *
+***********************************************************************
+WAIT0460 EQU   *                                                 Y02669
+         LH    R2,BAICTR          LOAD INTERPRETER COUNTER
+         LA    R2,D1(R2)          ADD ONE TO COUNTER              M6201
+         STH   R2,BAICTR          STORE COUNTER IN MASTER CORE
+         STH   R2,CHINC           STORE COUNTER IN CSCB
+WAIT0470 EQU   *                                                 Y02669
+         BAL   R11,WAIT0510       DEQUEUE THE CSCB               Y02669
+         LA    R4,CHASID          PASS ADDR OF ASID TO MEM CR    Y02669
+         SR    R11,R11            SET LPMOD VALUE                Y02669
+         SR    R9,R9              SET DPMOD VALUE                Y02669
+         B     WAIT0500           DO REGULAR ATTACH              Y02669
+         EJECT
+**************************************************************** Y02669
+*        TASK CREATING COMMAND ATTACH SETUP                      Y02669
+**************************************************************** Y02669
+WAIT0480 EQU   *                                                 Y02669
+         OI    CHTYPE,CHDSTAT     SET THE SYSTEM STATUS BIT ON   21002
+WAIT0490 EQU   *                                                 Y02669
+         BAL   R11,WAIT0510       DEQ THE CSCB                   Y02669
+         BAL   R11,WAIT0520       DECHAIN THE CSCB               Y02669
+WAIT0495 EQU   *                                                 Y02669
+         LA    R11,D3             SET LPMOD VALUE
+         LCR   R9,R11             SET DPMOD VALUE: -3
+         EJECT
+**************************************************************** Y02669
+*        ATTACH CODE FOR THIS MODULE                             Y02669
+**************************************************************** Y02669
+WAIT0500 EQU  *                                                  Y02669
+         MVC   PMODID+D3(D5),D0(R10)                                   *
+                                  SET UP NAME TO BE ATTACHED     Y02669
+         LR    R1,R4              SET PARM ADDRESS IN REG 1      Y02669
+         LA    R15,ATCHEXP        ADDRESS OF ATTACH LIST FORM    Y02669
+         ATTACH EPLOC=(R3),LPMOD=(R11),DPMOD=(R9),MF=(E,(1)),          *
+               SF=(E,(15))                                       Y02669
+         B     WAIT0010           CONTINUE CSCB SCAN             Y02669
+         DROP  R4                 RELEASE BASE FOR THE CSCB      Y02669
+         DROP  R7                 RELEASE BASE FOR THE CVT       Y02669
+         DROP  R9                 RELEASE BASE FOR BASEA         Y02669
+         EJECT
+**************************************************************** Y02669
+*        THIS RTN GETS CONTROL WHEN A CMD HAS BEEN IDENTIFIED    Y01012
+*        -A MATCH HAS BEEN FOUND AGAINST CSCB COMMAND CODE       Y01012
+*        -A MATCH HAS BEEN FOUND AGAINST CSCB COMMAND PARAMETERS Y01012
+*        THIS ROUTINE IS ENTERED ENQUEUED ON THE CSCB CHAIN      Y02669
+*        INPUT - REG  4 - CSCB POINTER                           Y01012
+*                REG 11 - CALLER'S RETURN ADDRESS                Y01012
+*        OUTPUT- CSCB HAS BEEN DEQUEUED                          Y02669
+*                CSCB HAS BEEN DECHAINED                         Y02669
+**************************************************************** Y02669
+WAIT0510 EQU   *                                                 Y02669
+         USING CHN,R4             SET BASE FOR THE CSCB          Y02669
+         LA    R1,DEQLIST         SET ADDRESS OF DEQ LIST        Y02651
+         DEQ   MF=(E,(1))         GET OFF CSCB CHAIN             Y02651
+         BR    R11                RETURN TO CALLER               Y02669
+WAIT0520 EQU   *                                                 Y02669
+         OI    CHSTS,CHDL         SET DECHAIN INDICATOR          Y01012
+         MGCR  (4),CHAIN          DECHAIN THE CSCB               Y02669
+         BR    R11                RETURN TO CALLER               Y01012
+         DROP  R4                 RELEASE BASE FOR THE CSCB      Y02669
+         DROP  R8                 RELEASE BASE FOR WORKER        Y02669
+         EJECT
+***********************************************************************
+*                                                                     *
+*        DEFINED CONSTANTS                                            *
+*                                                                     *
+***********************************************************************
+         DS    0F                                                Y01043
+WORKINF  DC    AL1(255)           SUBPOOL FOR WORKER             Y02669
+         DC    AL3(WORKSIZ)       SIZE OF WORKER                 Y02669
+ATCHINF  DC    AL1(251)           SUBPOOL FOR ATTACH AREA        Y02669
+         DC    AL3(D8)            SIZE OF AREA                   Y02669
+IEE      DC    CL3'IEE'           MODULE PREFIX                  Y02669
+LOGGER   DC    CL5'MB803'         LOG (IEEMB803)               @G33CPMR
+MAJOR    DC    CL8'SYSIEFSD'      SYSTEM MAJOR NAME              Y02669
+STCMIN   DC    CL8'STCQUE'        SUBSYSTEM MINOR NAME STC       Y02669
+TSOMIN   DC    CL8'TSOQUE'        SUBSYSTEM MINOR NAME TSO       Y02669
+MICSCB   DC    CL8'Q10'           CSCB MINOR NAME                Y02669
+TRACEOFF BR    R11                USED TO SHUT OFF TRACE TABLE   Y02669
+         EJECT
+***********************************************************************
+*                                                                     *
+*                       BRANCH TABLE                                  *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+BRTABLE  DS    0F                                              @G33CPMR
+         DC    A(WAIT0460)         BRANCH TO 'WAIT0460' LABEL  @G33CPMR
+         DC    A(WAIT0470)         BRANCH TO 'WAIT0470' LABEL  @G33CPMR
+         DC    A(WAIT0480)         BRANCH TO 'WAIT0480' LABEL  @G33CPMR
+         DC    A(WAIT0490)         BRANCH TO 'WAIT0490' LABEL  @G33CPMR
+         EJECT
+***********************************************************************
+*                                                                     *
+*                      COMMAND TABLE                                  *
+*                                                                     *
+*  EACH ENTRY IN THIS TABLE IS COMPOSED OF THREE ELEMENTS AS FOLLOWS: *
+*     A) ONE BYTE VERB CODE COMPARAND ASSIGNED IN SVC 34              *
+*     B) FIVE BYTE MODULE NAME SUFFIX                                 *
+*     C) ONE BYTE BRANCH TABLE INDEX                                  *
+*                                                                     *
+*  THE TABLE IS ORDERED BY VERB CODE WITH THE EXCEPTION OF COMMANDS   *
+*  WHOSE FREQUENCY OF INVOCATION REQUIRES THAT THE TABLE SEARCH FOR   *
+*  THEM BE AS SHORT AS POSSIBLE.                                      *
+*                                                                     *
+***********************************************************************
+         SPACE
+MODTABLE DS    0F                                              @G33CPMR
+         SPACE
+***********************************************************************
+*                                                                     *
+*             PERFORMANCE ORDERED GROUP                               *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+***********************************************************************
+         SPACE
+         DC    X'04'                                           @G33CPMR
+         DC    CL5'VEMCR'         START (IEEVEMCR)             @G33CPMR
+         DC    X'00'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'0C'                                           @G33CPMR
+         DC    CL5'VEMCR'         MOUNT (IEEVEMCR)             @G33CPMR
+         DC    X'04'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'68'                                           @G33CPMR
+         DC    CL5'CB800'         DISPLAY ACTIVE (IEECB800)    @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'98'                                           @G33CPMR
+         DC    CL5'DAY3 '         LOGON (IEEDAY3)              @G33CPMR
+         DC    X'04'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         EJECT
+***********************************************************************
+*                                                                     *
+*             VERB CODE ORDERED GROUP                                 *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+***********************************************************************
+         SPACE
+         DC    X'24'                                           @G33CPMR
+         DC    CL5'MB811'         SET (IEEMB811)               @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'28'                                           @G33CPMR
+         DC    CL5'3603D'         VARY ONLINE, VARY CONSOLES,  @G33CPMR*
+                                    VARY OFFLINE (IEE3603D)    @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'2C'                                           @G33CPMR
+         DC    CL5'MB813'         UNLOAD (IEEMB813)            @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'2E'                                           @G33CPMR
+         DC    CL5'PALTR'         DISPLAY C,K (IEEPALTR)       @G33CPMR
+         DC    X'08'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'32'                                           @G33CPMR
+         DC    CL5'MPDM '         DISPLAY MATRIX (IEEMPDM)     @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'34'                                           @G33CPMR
+         DC    CL5'70110'         SWITCH (IEE70110)            @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         EJECT
+***********************************************************************
+         SPACE
+         DC    X'36'                                           @G33CPMR
+         DC    CL5'PALTR'         DISPLAY PFK (IEEPALTR)       @G33CPMR
+         DC    X'08'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'3C'                                           @G33CPMR
+         DC    CL5'70110'         HALT (IEE70110)              @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'3E'                                           @G33CPMR
+         DC    CL5'XEDNA'         DISPLAY CONSOLES (IEEXEDNA)  @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'50'                                           @G33CPMR
+         DC    CL5'VPTH '         VARY PATH (IEEVPTH)          @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'52'                                           @G33CPMR
+         DC    CL5'PALTR'         DISPLAY U (IEEPALTR)         @G33CPMR
+         DC    X'08'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'54'                                           @G33CPMR
+         DC    CL5'VCPU '         VARY CPU (IEEVCPU)           @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'58'                                           @G33CPMR
+         DC    CL5'VCH  '         VARY CHANNEL (IEEVCH)        @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'5C'                                           @G33CPMR
+         DC    CL5'MPVST'         VARY STORAGE (IEEMPVST)      @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         EJECT
+***********************************************************************
+         SPACE
+         DC    X'60'                                           @G33CPMR
+         DC    CL5'MPS03'         QUIESCE (IEEMPS03)           @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'74'                                           @G33CPMR
+         DC    CL5'MB810'         RESET (IEEMB810)             @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'78'                                           @G33CPMR
+         DC    CL5'CB900'         VARY CN (IEECB900)           @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'7C'                                           @G33CPMR
+         DC    CL5'PGEXP'         PAGEADD (IEEPGEXP)           @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'80'                                           @G33CPMR
+         DC    CL5'CB905'         SLIP (IEECB905)              @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'88'                                           @G33CPMR
+         DC    CL5'DISPD'         DISPLAY DMN (IEEDISPD)       @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'A0'                                           @G33CPMR
+         DC    CL5'VSEND'         SEND (IEEVSEND)              @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'A8'                                           @G33CPMR
+         DC    CL5'CB907'         DISPLAY SLIP (IEECB907)      @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         EJECT
+***********************************************************************
+         SPACE
+         DC    X'AC'                                           @G33CPMR
+         DC    CL5'CB866'         DUMP (IEECB866)              @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'B0'                                           @G33CPMR
+         DC    CL5'CB910'         DISPLAY DUMP (IEECB910)      @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+         DC    X'C4'                                           @G33CPMR
+         DC    CL5'CB800'         TRACK ACTIVE (IEECB800)      @G33CPMR
+         DC    X'0C'                                           @G33CPMR
+         SPACE
+***********************************************************************
+         SPACE
+TABLEND  DC    X'FFFF'                                         @G33CPMR
+         EJECT
+***********************************************************************
+*                                                                     *
+*           DSECT TO DEFINE LABELS IN MAINLINE CODE                   *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+TABLEDEF DSECT                                                 @G33CPMR
+TABSTART EQU   *                  TABLE ENTRY START            @G33CPMR
+VERBCODE DS    CL1                ONE BYTE VERB CODE COMPARAND @G33CPMR
+MODULEID DS    CL5                FIVE BYTE MODULE COMPLETER   @G33CPMR
+BRANCHID DS    CL1                ONE BYTE BRANCH INDEX        @G33CPMR
+TABEND   EQU   *                  TABLE ENTRY END              @G33CPMR
+TABENT   EQU   TABEND-TABSTART    TABLE ENTRY SIZE             @G33CPMR
+         EJECT
+IEEVWAIT CSECT                                                 @G33CPMR
+         DS    0F                                                Y02669
+ENQST    EQU   *                                                 Y02669
+LISTENQ  ENQ   (MAJOR,MICSCB,S,3,SYSTEM),RET=HAVE,MF=L           Y02669
+ENQEND   EQU   *                                                 Y02669
+DEQST    EQU   *                                                 Y02669
+LISTDEQ  DEQ   (MAJOR,MICSCB,3,SYSTEM),RET=HAVE,MF=L             Y02669
+DEQEND   EQU   *                                                 Y02669
+SENQSTC  ENQ   (MAJOR,STCMIN,E,6,SYSTEM),RET=HAVE,MF=L           Y02668
+SENQTSO  ENQ   (MAJOR,TSOMIN,E,6,SYSTEM),RET=HAVE,MF=L           Y02668
+         EJECT
+SDEQSTC  DEQ   (MAJOR,STCMIN,6,SYSTEM),RET=HAVE,MF=L             Y02668
+SDEQTSO  DEQ   (MAJOR,TSOMIN,6,SYSTEM),RET=HAVE,MF=L             Y02668
+ATCHST   EQU   *                                                 Y02669
+ATCHLST  ATTACH SF=L,SM=SUPV,SZERO=NO,JSTCB=YES,SVAREA=NO,KEY=ZERO
+ATCHEND  EQU   *                                                 Y02669
+         EJECT
+***********************************************************************
+*                                                                     *
+*         THE STAE EXIT ROUTINE WILL SET UP AND RETRY UPON ENTRY.     *
+*         THE FUNCTION FOR THIS RETRY ROUTINE IS AS FOLLOWS:          *
+*                                                                     *
+*              .TAKE A DUMP OF THE SYSTEM, IF APPLICABLE              *
+*              .INFORM OPERATOR OF THE ABEND AND DUMP STATUS          *
+*         IEE481I MASTER SCHEDULER ABEND XXX, DUMPED, RESTARTING      *
+*         IEE479W MASTER SCHEDULER FAILED, DUMPED, REIPL              *
+*                 'XXX' IS THE ABEND CODE                             *
+*                 'DUMPED' WILL APPEAR ONLY IF A DUMP WAS TAKEN       *
+*                                                                     *
+*              .SCAN THE CSCB CHAIN AND TRUNCATE IF BAD (ABEND ONLY)  *
+*         IEE513I COMMAND PROCESSING LIMITED                          *
+*                                                                     *
+*              .ATTEMPT MASTER SCHEDULER RESTART (ABEND ONLY)         *
+*              .KILL THE MASTER SCHEDULER IF RESTART FAILS            *
+*         IEE482E MASTER SCHEDULER RESTART FAILED, ABEND RECURSION,   *
+*                                                               REIPL *
+*                                                                     *
+*         RECURSION THROUGH FAILING RECOVERY FUNCTIONS IS PREVENTED   *
+*         THROUGH THE USE OF A PROCESS CODE WHICH IS INCREMENTED BY   *
+*         FOUR ON ENTRY TO EACH RECOVERY PROCESS. THE PROCESS CODE IS *
+*         USED AS AN INDEX INTO THE BRANCH TABLE WHICH DETERMINES     *
+*         WHICH RECOVERY PROCESS WILL BE PERFORMED FIRST.             *
+*                                                                     *
+*         IF THE RECOVERY CODE IS ENTERED WITH BASEA BIT BAMSSTAR     *
+*         ON, A FAILURE HAS OCCURED DURING AN ATTEMPT TO RESTART      *
+*         THE MASTER.  (RESTART OCCURS AFTER THE RECOVERY CODE IN     *
+*         THIS SECTION EXECUTES AND CONSISTS OF AN ATTEMPT TO SCAN    *
+*         THE CSCB CHAIN, PROCESS ANY PENDING CSCB'S, AND WAIT.  ONCE *
+*         THIS WAIT IS SATISFIED, THE RESTART IS CONSIDERED SUCCESS-  *
+*         FUL AND BAMSSTAR IS TURNED OFF.)  A FAILURE IN RESTART WILL *
+*         RESULT IN ISSUANCE OF THE LAST MESSAGE ABOVE, FOLLOWED BY   *
+*         ENTRY INTO A NEVER-ENDING WAIT.  THIS PROCESSING ALSO       *
+*         OCCURS IF RECURSION OCCURS ON THE RECOVERY CODE WHICH       *
+*         SETS UP THE RESTART.                                        *
+*                                                                     *
+*         IF THE BRANCH ENTRY TO RECOVERY IS ENTERED, A DUMP WILL     *
+*         BE TAKEN, A MESSAGE ISSUED AND A NEVER ENDING WAIT WILL     *
+*         BE ENTERED.                                                 *
+***********************************************************************
+STAE0000 EQU   *                  START OF ESTAE EXIT ROUTINE    Y02653
+         BALR  R12,R0             GET THIS ADDRESS               Y01043
+         LA    R15,STAE0000-WAIT00                                     *
+                                  DIFFERENCE FROM BEGINNING      Y02653
+         SR    R12,R15            SET BASE TO BEGINNING          Y01043
+         C     R0,TWELVE          STAE WORKAREA PASSED?          Y02653
+         BE    STAE0005           NO, REQUIRED INFO IN REGISTERS Y02653
+         LR    R11,R1             SET ESTAE PARMAREA ADDRESS     Y02653
+         USING SDWA,R11           BASE FOR ABEND WORKAREA        Y02653
+         USING PARMAREA,R2        SET BASE TO PARMAREA           Y02653
+         L     R2,SDWAPARM        ADDRESS OF PARMAREA            Y02653
+         L     R1,SDWAABCC        GET ABEND CODE                 Y02653
+         ST    R2,SDWASR01        PASS PARM ADDRESS PAST ASIR    Y02653
+         TM    SDWAERRC,SDWAPERC  IS IT PERCOLATION?             Y02653
+         BO    STAE0010           YES, BYPASS DUMP INDICATOR     Y02653
+         TM    SDWAERRA,SDWAMCHK  IS FAILURE A MACHINE CHECK?  @YM3505P
+         BO    STAE0010           YES, BYPASS INDICATING DUMP  @YM3505P
+STAE0005 EQU   *                                                 Y02653
+         OI    INDCATOR,BDUMP     INDICATE DUMP REQUIRED         Y02653
+         DROP  R11                RELEASE SDWA BASE              Y02653
+STAE0010 EQU   *                                                 Y02653
+         OI    INDCATOR,BABND     INDICATE ABEND CODE SUPPLIED   Y02653
+         ST    R1,PABEND          STORE ABEND CODE IN AREA       Y02653
+         ST    R12,PASSER2        PASS BASE ADDRES PAST ASIR     Y02653
+         C     R0,TWELVE          WAS WORK AREA PASSED?          Y02653
+         BE    STAE0013           NO, DO QUICK RETRY             Y02653
+         LR    R1,R11             SET SDWA ADDRESS FOR EXIT      Y02653
+         SETRP RETADDR=STAE0015,RECORD=YES,RETREGS=YES,                *
+               RECPARM=LRECINF,RC=4,FRESDWA=YES,DUMP=NO        @YM3507P
+         BR    R14                RETURN TO ASIR                 Y02653
+STAE0013 EQU   *                                                 Y02653
+         LA    R0,STAE0015        SET RETRY ADDRESS              Y02653
+         LA    R15,D4             INDICATE RETRY                 Y02653
+         BR    R14                RETURN TO ASIR                 Y02653
+         EJECT
+STAE0015 EQU   *                  ESTAE RETRY POINT              Y02653
+         LR    R2,R1              SET PARMAREA ADDRESS           Y02653
+         L     R12,PASSER2        SET BASE REGISTER              Y02653
+         L     R6,PASSER1         ADDRESS OF WORKER              Y02653
+         LTR   R6,R6              WAS WORKER GOTTEN BEFORE ABEND?Y02653
+         BZ    STAE0030           NO, THEN BYPASS THE DEQ        Y02653
+         USING WORKER,R6          BASE THE WORKER                Y02653
+         LA    R1,DEQLIST         ADDRESS OF DEQ LIST            Y02653
+         DEQ   MF=(E,(1))         RELEASE THE CSCB CHAIN         Y02653
+         DROP  R6                 RELEASE BASE FOR WORKER        Y02653
+         B     STAE0030           GO TO COMMON CODE              Y02653
+STAE0020 EQU   *                                                 Y02653
+STAE0030 EQU   *                                                 Y02653
+         LH    R4,PROSCDE         GET RECURSION CODE             Y01043
+         L     R5,CVTPTR          ADDRESS OF CVT                 Y01043
+         USING CVTSECT,R5         BASE CVT                       Y01043
+         L     R5,CVTMSER         ADDRESS OF MASTER DATA AREA    Y01043
+         DROP  R5                 RELEASE BASE FOR CVT           Y02653
+         USING BASE,R5            BASE MASTER DATA AREA          Y01043
+         TM    BASPBYTE,BAMSSTAR  ABEND OUT OF STAE?             Y01043
+         BO    STAE0215           YES, TEST FOR TRACE OFF      @ZA29984
+         B     STAE0040(R4)       START STAE PROCESSING          Y02653
+STAE0040 EQU   *                                                 Y02653
+         B     STAE0045           TEST FOR PSA PAGEFREE          Y02669
+         B     STAE0050           DUMP SYSTEM                    Y02653
+         B     STAE0070           INFORM OPERATOR                Y02653
+         B     STAE0140           CLEAN UP CHAINS                Y02653
+         B     STAE0160           GO RETRY                       Y02653
+         B     STAE0220           KILL SYSTEM                    Y02653
+         EJECT
+***********************************************************************
+*                                                                     *
+*        THE FOLLOWING WILL TEST FOR THE PSA-TRACE TABLE 'IN PROCESS' *
+*        BIT AND IF IT IS ON, DO A 'PAGEFREE' BEFORE DOING FURTHER    *
+*        RECOVERY PROCEDURES.                                         *
+*                                                                     *
+***********************************************************************
+STAE0045 EQU   *                                                 Y02669
+         LH    R4,PROSCDE         GET CURRENT PROCESSING CODE    Y02669
+         LA    R4,D4(R4)          BUMP PROCESSING CODE           Y02669
+         STH   R4,PROSCDE         STORE IN PARAMETER AREA        Y02669
+         TM    INDCATOR,BTRACE    TRACE TABLE BIT ON?            Y02669
+         BNO   STAE0050           NO, NOT AN ABEND FROM PSA      Y02669
+         PGFREE R,A=STARTFIX,EA=ENDFIX                           Y02669
+         EJECT
+**************************************************************** Y02653
+*                                                              * Y02653
+*        THE FOLLOWING WILL DETERMINE IF A DUMP IS NECESSARY.  * Y02653
+*        IF ENTERED BECAUSE OF PERCOLATION FROM A LOWER LEVEL  * Y02653
+*        ESTAE EXIT, A DUMP WILL NOT BE TAKEN.                 * Y02653
+*        NOTE:  IF EXECUTION OF THIS CODE HAS PREVIOUSLY BEEN  * Y02653
+*        ATTEMPTED FOR THE CURRENT MAINLINE FAILURE, IT WILL   * Y02653
+*        BE BYPASSED.                                          * Y02653
+*                                                              * Y02653
+**************************************************************** Y02653
+STAE0050 EQU   *                                                 Y02653
+         LH    R4,PROSCDE         GET CURRENT PROCESSING CODE    Y02669
+         LA    R4,D4(R4)          BUMP PROCESS CODE              Y02653
+         STH   R4,PROSCDE         PUT IN PARAMETER AREA          Y01043
+         TM    INDCATOR,BDUMP     DUMP REQUIRED?                 Y02653
+         BNO   STAE0070           NO, BYPASS DUMP                Y02653
+         MVC   MSGAREA(DUMPL),DUMPPARM                                 *
+                                  MOVE IN LIST FORM OF DUMP      Y02653
+         LA    R1,MSGAREA         ADDRESS OF LIST FORM           Y01043
+         SDUMP MF=(E,(1))         TAKE DUMP                      Y01043
+         LR    R10,R15            SAVE RETURN CODE               Y01043
+         B     STAE0080           INFORM OPERATOR                Y02653
+         EJECT
+***********************************************************************
+*        THE FOLLOWING CODE WILL FORMAT AND ISSUE THE MESSAGE         *
+*        DESCRIBING THE FAILURE.                                      *
+*        NOTE:  IF EXECUTION OF THIS CODE HAS PREVIOUSLY BEEN         *
+*        ATTEMPTED FOR THE CURRENT MAINLINE FAILURE, IT WILL          *
+*        BE BYPASSED.                                                 *
+***********************************************************************
+         SPACE 2
+STAE0070 EQU   *                  RECURSIVE ABEND MESSAGE ENTRY  Y02653
+         LA    R10,D4             INDICATE DUMP NOT TAKEN        Y02653
+STAE0080 EQU   *                  NORMAL MESSAGE ENTRY           Y02653
+         LH    R4,PROSCDE         GET CURRENT PROCESSING CODE    Y02669
+         LA    R4,D4(R4)          INDICATE MESSAGE ATTEMPTED     Y01043
+         STH   R4,PROSCDE         RETURN TO AREA                 Y01043
+         TM    INDCATOR,BABND     IS THERE AN ABEND CODE?        Y02653
+         BO    STAE0090           YES, SET ABEND MESSAGE         Y02653
+         MVC   MSGAREA(MSGLEN12),ABMSG1                          Y02653*
+                                  MOVE IN FAILED MESSAGE         Y02653
+         B     STAE0100           CONTINUE CONSTRUCTION          Y01043
+STAE0090 EQU   *                                                 Y02653
+         L     R9,PABEND          PICK UP ABEND CODE             Y02653
+         MVC   MSGAREA(MSGLEN5),ABMSG                                  *
+                                  MOVE IN BASE ABEND MESSAGE     Y02653
+         N     R9,MASK1           TURN OFF DUMP BIT              Y01043
+         SRL   R9,D12             SHIFT TO LOW ORDER BYTES       Y01043
+         STH   R9,CODE            PUT IT IN WORKAREA             Y01043
+         UNPK  ABEND1(D5),CODE(D3)                                     *
+                                  UNPACK FOR TRANSLATE           Y02653
+         TR    ABEND2(D3),TABLE   TRANSLATE FOR PRINT            Y01043
+         MVI   ABEND1,BLNK        BLANK FIRST PART               Y01043
+         MVI   ABEND5,COMA        ADD COMMA TO END               Y01043
+STAE0100 EQU   *                                                 Y02653
+         LA    R5,MSGAREA         ADDRESS OF MESSAGE START       Y01043
+         LR    R6,R5              ADDRESS OF MESSAGE START       Y01043
+         AH    R6,MSGLEN          BUMP TO NEXT POSITION IN BUFFERY01043
+         LTR   R10,R10            DUMP SUCCESSFUL?               Y01043
+         BNZ   STAE0110           NO, BYPASS DUMPED PART         Y02653
+         MVC   D0(MSGLEN0,R6),INCERT0                                  *
+                                  MOVE IN GOODDUMP MESSAGE       Y02653
+         LA    R6,MSGLEN0(R6)     BUMP TO NEXT POSITION IN BUFFERY01043
+STAE0110 EQU   *                                                 Y02653
+         TM    INDCATOR,BFAIL     IS THIS A BRANCH ENTRY?        Y02653
+         BNO   STAE0120           NO, INDICATE RESTARTING        Y02653
+         MVC   D0(MSGLEN9,R6),INCERT5                                  *
+                                  SET UP REIPL PART OF MESSAGE   Y02653
+         LA    R6,MSGLEN9(R6)     BUMP TO END OF BUFFER          Y01043
+         MVC   D0(D4,R6),RETCDE1  MOVE IN ROUTING CODES          Y02653
+         B     STAE0135           CONTINUE                       Y02653
+         EJECT
+STAE0120 EQU   *                                                 Y02653
+         MVC   D0(MSGLEN4,R6),INCERT4                                  *
+                                  SET UP LAST PART OF MESSAGE    Y01043
+         LA    R6,MSGLEN4(R6)     BUMP TO END OF BUFFER          Y01043
+         MVC   D0(D4,R6),RETCDE   MOVE IN ROUTING CODES          Y01043
+STAE0135 EQU   *                                                 Y02653
+         SR    R6,R5              CALCULATE LENGTH OF MESSAGE    Y01043
+         STH   R6,MSGLEN          PUT LENGTH IN MESSAGE          Y01043
+         LA    R1,MSGAREA         ADDRESS OF MESSAGE             Y01043
+         WTO   MF=(E,(1))         PUT OUT MESSAGE                Y01043
+         EJECT
+**************************************************************** Y02653
+*                                                                Y02653
+*        THE FOLLOWING WILL VERIFY THE VALIDITY OF THE CSCB      Y02653
+*        CHAIN.  THE ADDRESS OF EACH CSCB IS CHECKED TO SEE IF   Y02653
+*        IT IS WITHIN THE BOUNDS OF SQA AND ON A DOUBLE WORD     Y02653
+*        BOUNDARY.                                               Y02653
+*                                                                Y02653
+*        BRANCH ENTRY IS POSSIBLE ONLY ON FAILURE TO OBTAIN      Y02653
+*        AN ESTAE ENVIRONMENT.  SINCE FAILURE AT THAT TIME COULD Y02653
+*        NOT HAVE BEEN INDUCED BY AN INVALID CSCB CHAIN, THE     Y02653
+*        CHAIN SCAN IS BYPASSED.                                 Y02653
+*                                                                Y02653
+*        NOTE:  IF EXECUTION OF THIS CODE HAS PREVIOUSLY BEEN    Y02653
+*        ATTEMPTED FOR THE CURRENT MAINLINE FAILURE, IT WILL     Y02653
+*        BE BYPASSED.                                            Y02653
+*                                                                Y02653
+**************************************************************** Y02653
+STAE0140 EQU   *                                                 Y02653
+         LH    R4,PROSCDE         GET CURRENT PROCESSING CODE    Y02669
+         LA    R4,D4(R4)          INDICATE SCAN ATTEMPTED        Y01043
+         STH   R4,PROSCDE         PUT IT IN AREA                 Y01043
+         TM    INDCATOR,BFAIL     BRANCH ENTRY ?                 Y02653
+         BO    STAE0240           YES WAIT, NO CSCB'S TO CHECK   Y02653
+         L     R8,PASSER1         ADDRESS OF THE WORKER          Y02653
+         LTR   R8,R8               WAS WORKER OBTAINED?        @YM3527P
+         BZ    STAE0160            NO - ATTEMPT NEXT FUNCTION  @YM3527P
+         USING WORKER,R8          BASE THE WORKER FOR ENQ/DEQ    Y02653
+         MVC   ENQLIST(ENQLEN),LISTENQ                                 *
+                                  SET UP THE LIST FORM OF ENQ    Y02653
+         LA    R1,ENQLIST         SET ADDRESS OF ENQ LIST        Y02653
+         ENQ   (,,E,,),MF=(E,(1)) ENQ EXCLUSIVE ON CSCB CHAIN    Y02653
+         L     R4,CVTPTR          ADDRESS OF CVT                 Y02653
+         USING CVTSECT,R4         BASE THE CVT                   Y02653
+         L     R7,CVTGDA          OBTAIN THE GDA ADDRESS         Y02653
+         L     R4,CVTMSER         ADDRESS OF MASTER DATA AREA    Y02653
+         DROP  R4                 RELEASE BASE ADDRESS           Y02653
+         USING GDA,R7             BASE THE GDA                   Y02653
+         L     R7,SQASPQEP        OBTAIN THE SPQE ADDRESS        Y02653
+         USING SPQESECT,R7        BASE THE SPQE                  Y02653
+         L     R7,SPDQEPTR        OBTAIN THE DQE ADDRESS         Y02653
+         USING DQESECT,R7         BASE THE DQE                   Y02653
+         EJECT
+STAE0150 EQU   *                                                 Y02653
+         L     R3,DQELNTH         GET LENGTH OF SQA              Y02653
+         L     R6,DQEBLKAD        GET START OF SQA               Y02653
+         LA    R6,D0(R6)          CLEAR THE HIGH ORDER BYTE      Y02653
+         LR    R10,R7             SAVE BASE DQE ADDRESS          Y02653
+         ST    R6,LOW             SET START OF SQA               Y02653
+         AR    R6,R3              FIND END OF SQA                Y02653
+         ST    R6,HIGH            SET END OF SQA                 Y02653
+         USING CHN,R5             BASE THE CSCB                  Y02653
+         L     R5,D0(R4)          ADDRESS OF CSCB TO CHECK       Y01043
+         LA    R5,D0(R5)          ZERO HIGH ORDER BYTE           Y01043
+         LTR   R5,R5              END OF CSCB CHAIN?             Y01043
+         BZ    STAE0160           YES, DO NEXT FUNCTION          Y02653
+STAE0155 EQU   *                                                 Y02653
+         C     R5,LOW             IS IT ABOVE SQA LOW ADDRESS?   Y01043
+         BL    STAE0158           NO, CHECK NEXT DQE             Y02653
+         C     R5,HIGH            IS IT BELOW SQA HIGH ADDRESS?  Y01043
+         BNL   STAE0158           NO, CHECK NEXT DQE             Y02653
+         LR    R0,R5              PUT ADDRESS IN WORK REGISTER   Y02653
+         SLL   R0,D29             SHIFT OUT UNWANTED BITS        Y02653
+         LTR   R0,R0              ON DOUBLE WORD BOUNDRY?        Y02653
+         BNZ   STAE0210           NO, CHOP OFF CHAIN             Y02653
+         LR    R4,R5              PICK UP NEXT CSCB              Y02653
+         B     STAE0150           GO AND CHECK NEXT CSCB         Y02653
+STAE0158 EQU   *                                                 Y02653
+         DROP  R7                                                Y02653
+         USING DQESECT,R10        ESTABLISH DQE ADDRESSABILITY   Y02653
+         L     R10,DQEPTR         GET ADDRESS OF NEXT DQE        Y02653
+         LA    R10,D0(R10)        ZERO OUT THE HIGH ORDER BYTE   Y02653
+         LTR   R10,R10            ANY MORE SQA DQE'S?            Y02653
+         BZ    STAE0210           NO, ERROR CONDITION            Y02653
+         L     R3,DQELNTH         GET LENGTH OF SQA SEGMENT      Y02653
+         L     R6,DQEBLKAD        GET START OF SQA SEGMENT       Y02653
+         LA    R6,D0(R6)          ZERO OUT THE HIGH ORDER BYTE   Y02653
+         ST    R6,LOW             SET END OF LSQA                Y02653
+         AR    R6,R3              FIND HIGH ADDRESS OF SQA       Y02653
+         ST    R6,HIGH            SET HIGH ADDRESS OF SQA        Y02653
+         B     STAE0155                                          Y02653
+         EJECT
+***********************************************************************
+*                                                                Y02653
+*        THIS CODE WILL DEQ OFF THE CSCB CHAIN RESOURCE AND      Y02653
+*        INITIALIZE THE REGISTERS REQUIRED TO RESTART THE        Y02653
+*        MASTER.  AFTER INDICATING THAT A RESTART IS IN PROCESS, Y02653
+*        IT BRANCHES BACK TO THE MAINLINE.                       Y02653
+*                                                                Y02653
+***********************************************************************
+STAE0160 EQU   *                                                 Y02653
+         LH    R4,PROSCDE         GET THE RECURSION INDICATOR    Y02653
+         LA    R4,D4(R4)          INDICATE RETRY ATTEMPTED       Y02653
+         STH   R4,PROSCDE         PUT IT IN AREA                 Y02653
+         L     R8,PASSER1          SET ADDRESS OF WORKER       @YM3527P
+         LTR   R8,R8               WAS WORKER OBTAINED         @YM3527P
+         BZ    STAE0165            NO - SKIP DEQ               @YM3527P
+         MVC   DEQLIST(DEQLEN),LISTDEQ                                 *
+                                  SET UP THE LIST FORM OF DEQ    Y02653
+         LA    R1,DEQLIST         SET ADDRESS OF DEQ LIST        Y02653
+         DEQ   MF=(E,(1))         DEQ OFF THE CSCB CHAIN         Y02653
+STAE0165 EQU   *                                               @YM3527P
+         L     R3,PASSER          SET ADDRESS OF ATTACH AREA     Y02653
+         L     R7,CVTPTR          GET THE ADDRESS OF THE CVT     Y02653
+         USING CVTSECT,R7         BASE THE CVT                   Y02653
+         L     R9,CVTMSER         SET ADDRESS OF BASEA           Y02653
+         USING BASE,R9            BASEA ADDRESSIBILITY           Y02653
+         OI    BASPBYTE,BAMSSTAR  INDICATE ESTAE RESTART         Y02653
+         LR    R4,R2              SET PARMAREA ADDRESS           Y02653
+         LR    R10,R4             SAVE PARMAREA ADDRESS        @YM02665
+         TM    INDCATOR,BTRACE    TRACE TABLE ABEND OR SUBSYS-   Y02669*
+                                  TEM INITIALIZATION FAILURE?  @Y02669P
+         BNO   WAIT0020           NO, RESTART MASTER SCHEDULER   Y02669
+         B     WAIT0060           RETRY TRACE TABLE ONCE AGAIN   Y02669
+         DROP  R7                 RELEASE CVT BASE               Y02669
+         DROP  R9                 RELEASE BASEA BASE             Y02669
+         EJECT
+**********************************************************************
+*                                                                Y02653
+*        THIS CODE WILL TRUNCATE THE CSCB CHAIN AND INFORM       Y02653
+*        THE OPERATOR VIA MESSAGE IEE513I THAT THE CHAIN WAS     Y02653
+*        TRUNCATED.                                              Y02653
+*                                                                Y02653
+***********************************************************************
+STAE0210 EQU   *                                                 Y02653
+         SR    R10,R10            ZERO REGISTER FOR CHOP         Y02653
+         ST    R10,D0(R4)         CHOP OFF CSCB CHAIN            Y01043
+         MVC   DEQLIST(DEQLEN),LISTDEQ                                 *
+                                  SET UP THE LIST FORM OF DEQ    Y02653
+         LA    R1,DEQLIST         SET ADDRESS OF DEQ LIST        Y02653
+         DEQ   MF=(E,(1))         DEQ OFF THE CSCB CHAIN         Y02653
+         MVC   MSGAREA(MSGLEN6),CSCBCHOP                               *
+                                  MOVE MESSAGE TO BUFFER         Y02653
+         LA    R1,MSGAREA         ADDRESS OF BUFFER              Y02653
+         WTO   MF=(E,(1))         PUT OUT MESSAGE                Y02653
+         B     STAE0160           END CHAIN SCAN                 Y02653
+         EJECT
+***********************************************************************
+*                                                             @ZA29984*
+*        THIS CODE IS EXECUTED FOR ABEND RECURSIONS. IF TRACE @ZA29984*
+*        PROCESSING IS COMPLETED, THE ABEND PATH WILL BE      @ZA29984*
+*        CONTINUED. OTHERWISE, SET UP TO ATTEMPT RE-TRY AT    @ZA29984*
+*        SYSTEM LOG INITIALIZATION.                           @ZA29984*
+*                                                             @ZA29984*
+***********************************************************************
+STAE0215 EQU   *                                               @ZA29984
+         USING BASE,R5            SET MSRDA ADDRESSIBILITY     @ZA29984
+         TM    INDCATOR,BTRACE    TRACE PROCESS COMPLETE       @ZA29984
+         BNO   STAE0220           YES, CONTINUE TERMINATION    @ZA29984
+         NI    BASPBYTE,XFF-BAMSSTAR                           @ZA29984
+*                                 TURN OFF STAE RECURSION BIT  @ZA29984
+         DROP  R5                                              @ZA29984
+         NI    INDCATOR,XFF-BTRACE                             @ZA29984
+*                                 TURN OFF TRACE TABLE BIT     @ZA29984
+         PGFREE R,A=STARTFIX,EA=ENDFIX FREE FIXED PAGE         @ZA29984
+         L     R3,PASSER          GET ATTACH LIST AREA         @ZA29984
+         LR    R8,R6              SET UP WORKER REG            @ZA29984
+         LR    R6,R2              SET PARMAREA ADDRESSIBILITY  @ZA29984
+         LR    R9,R5              SET MSRDA BASE REG.          @ZA29984
+         LR    R11,R2             PARMAREA ADDRESS             @ZA29984
+         B     WAIT0069           CONTINUE SUBSYSTEM INIT.     @ZA29984
+         EJECT
+***********************************************************************
+*                                                                Y02653
+*        THIS CODE WILL INFORM THE OPERATOR OF A RECURSIVE       Y02653
+*        ABEND CONDITION.  IT WILL ALSO INDICATE TO THE          Y02653
+*        OPERATOR THAT THE MASTER SCHEDULER COULD NOT BE         Y02653
+*        RESTARTED.  UPON COMPLETION OF THIS PROCESS, IT         Y02653
+*        WILL PUT THE ABENDED TASK INTO A HARD WAIT.             Y02653
+*                                                                Y02653
+***********************************************************************
+STAE0220 EQU   *                                                 Y02653
+         MVC   MSGAREA(MSGLEN8),KILLMSG                                *
+                                  MOVE KILL MSG TO BUFFER        Y02653
+         LA    R1,MSGAREA         ADDRESS OF BUFFER              Y01043
+         WTO   MF=(E,(1))         PUT OUT MESSAGE                Y01043
+STAE0240 EQU   *
+         XC    MSGAREA(D4),MSGAREA CLEAR ECB                     Y02653
+         LA    R1,MSGAREA         ADDRESS OF THE WORK AREA       Y02653
+         WAIT  ECB=(1)            PUT THE SYSTEM INTO WAIT       Y02653
+         DROP  R2                 RELEASE BASE FOR PARM AREA     Y02653
+         DROP  R8                 RELEASE BASE FOR THE WORKER    Y02653
+         EJECT
+***********************************************************************
+*                                                                     *
+*        CONSTANTS FOR STAE                                           *
+*                                                                     *
+***********************************************************************
+         SPACE
+         DS    0F                                                Y02653
+TWELVE   DC    F'12'              ESTAE WORKAREA TESTER          Y02653
+RETCDE   DC    X'10004040'        MESSAGE ROUTING CODES          Y01043
+RETCDE1  DC    X'80004040'        MESSAGE ROUTING CODES          Y02653
+MASK1    DC    X'7FFFFFFF'        AND MASK                       Y01043
+PARMAR   DC    AL1(253)           SP/SIZE OF PARMAREA            Y02669
+         DC    AL3(ENDAREA-STRTAREA)                             Y02669
+LRECINF  DC    CL8'IEEVWAIT'      MODULE NAME FOR LOGREC         Y02653
+         DC    CL8'IEEVWAIT'      CSECT NAME FOR LOGREC          Y02653
+         DC    CL8'        '      PADDING FOR LOGREC WRITE       Y02653
+TABLE    EQU   *-240              TRANSLATE TABLE                Y01043
+         DC    C'0123456789ABCDEF'                               Y01043
+         EJECT
+***********************************************************************
+*                                                                     *
+*        MESSAGES FOR STAE                                            *
+*                                                                     *
+***********************************************************************
+         SPACE
+         DS    0F                                                Y01043
+STRT0    EQU   *                                                 Y01043
+INCERT0  DC    C' DUMPED,'        SUCESSFUL DUMP MESSAGE         Y01043
+END0     EQU   *                                                 Y01043
+STRT4    EQU   *                                                 Y01043
+INCERT4  DC    C' RESTARTING'     INDICATE RESTART               Y02653
+END4     EQU   *                                                 Y01043
+STRT9    EQU   *                                                 Y01043
+INCERT5  DC    C' REIPL'          INDCIATE REIPL REQUIRED        Y01043
+END9     EQU   *                                                 Y01043
+         DS    0F                                                Y01043
+         EJECT
+STRT5    EQU   *                                                 Y01043
+ABMSG    WTO   'IEE481I MASTER SCHEDULER ABEND     ',                  *
+               MF=L,ROUTCDE=(2,10),DESC=(4)                      Y01043
+END5     EQU   *                                                 Y01043
+         DS    0F                                                Y01043
+STRT12   EQU   *                                                 Y01043
+ABMSG1   WTO   'IEE479W MASTER SCHEDULER FAILED,',                     *
+               MF=L,ROUTCDE=(2,10),DESC=(1)                      Y01043
+END12    EQU   *                                                 Y01043
+         DS    0F                                                Y01043
+STRT6    EQU   *                                                 Y01043
+CSCBCHOP WTO   'IEE513I COMMAND PROCESSING LIMITED',                   *
+               MF=L,ROUTCDE=(2,10),DESC=(4)                      Y01043
+END6     EQU   *                                                 Y01043
+         DS    0F                                                Y01043
+STRT8    EQU   *                                                 Y01043
+KILLMSG  WTO   'IEE482E MASTER SCHEDULER RESTART FAILED, ABEND RECURSIO*
+               N, REIPL',MF=L,ROUTCDE=(2,10),DESC=(1)            Y02653
+END8     EQU   *                                                 Y02653
+         DS    0F                                              @ZA29984
+VPATCH   DC    5CL25'** IEEVWAIT PATCH AREA**'                @ZA29984
+         EJECT
+***********************************************************************
+*                                                                     *
+*        MACRO LIST FORMS FOR STAE                                    *
+*                                                                     *
+***********************************************************************
+         DS    0F                                                Y01043
+STRT10   EQU   *                                                 Y01043
+LSTAE    ESTAE  MF=L                                             Y02669
+END10    EQU   *                                                 Y01043
+STRT11   EQU   *                                                 Y01043
+DUMPPARM SDUMP HDR='IEEVWAIT',SDATA=(SQA,PSA,NUC,LSQA,RGN,LPA,TRT,CSA),*
+               MF=L    DUMP OPTIONS FOR STAE DUMP              @YM3522P
+END11    EQU   *                                                 Y01043
+         EJECT
+***********************************************************************
+*                                                                     *
+*        LENGTH EQUATES                                               *
+*                                                                     *
+***********************************************************************
+         SPACE
+MSGLEN0  EQU   END0-STRT0                                        Y01043
+MSGLEN4  EQU   END4-STRT4                                        Y01043
+MSGLEN5  EQU   END5-STRT5                                        Y01043
+MSGLEN6  EQU   END6-STRT6                                        Y01043
+MSGLEN8  EQU   END8-STRT8                                        Y01043
+MSGLEN9  EQU   END9-STRT9                                        Y01043
+MSGLEN12 EQU   END12-STRT12                                      Y01043
+STAEL    EQU   END10-STRT10                                      Y01043
+DUMPL    EQU   END11-STRT11                                      Y01043
+ENQLEN   EQU   ENQEND-ENQST       LENGTH OF ENQ LIST             Y02669
+DEQLEN   EQU   DEQEND-DEQST       LENGTH OF DEQ LIST             Y02669
+ATCHLEN  EQU   ATCHEND-ATCHST     LENGTH OF ATCH LIST            Y02669
+WORKSIZ  EQU   ENQLEN*2+DEQLEN+ATCHLEN+D8+STAEL                  Y02669
+         EJECT
+***********************************************************************
+*                                                                     *
+*        DSECT FOR STAE WORKAREA                                      *
+*                                                                     *
+***********************************************************************
+         SPACE
+PARMAREA DSECT                                                   Y01043
+STRTAREA EQU   *                  PARMAREA STARTING ADDRESS      Y02669
+LOCKSAV  DC    5F'0'              SETLOCK 5 WORD SAVEAREA        Y02669
+FIXECB   DC    F'0'               ECB FOR PAGEFIX                Y02669
+PROSCDE  DS    H                  STAE RECURSION INDICATOR       Y01043
+INDCATOR DS    C                  INDICATOR BYTE                 Y02653
+BFAIL    EQU   X'80'              INDICATES FAILURE ENTRY        Y02653
+BABND    EQU   X'40'              INDICATES ABEND CODE PRESENT   Y02653
+BDUMP    EQU   X'20'              INDICATES DUMP REQUIRED        Y02653
+BTRACE   EQU   X'10'              INDICATES TRACE TABLE          Y02669*
+                                      PROCESSING                 Y02669
+MSFLAGS  DS    C                  M/S FLAGS                    @YM3467P
+MSSUBUP  EQU   X'80'              SUBSYSTEM ALREADY UP         @YM3467P
+PASSER   DS    F                  AREA FOR VWAIT WORK ADDRESS    Y01043
+PASSER1  DS    F                  ADDRESS OF WORKER              Y02653
+PASSER2  DS    F                  ROUTINE BASE ADDRESS           Y02653
+PABEND   DS    F                  ABEND CODE IF SUPPLIED         Y02653
+MSGAREA  DS    0F                 MESSAGE BUFFER                 Y01043
+MSGLEN   DS    H                  LENGTH OF MESSAGE              Y01043
+MSGFLG   DS    H                  WTO FLAGS                      Y01043
+         DS    CL30               FIRST PART OF MESSAGE          Y01043
+ABEND1   DS    C                  FIRST BYTE OF ABEND CODE       Y01043
+ABEND2   DS    C                  SECCOND BYTE OF ABEND CODE     Y01043
+ABEND3   DS    C                  THIRD BYTE OF ABEND CODE       Y01043
+ABEND4   DS    C                  FOURTH BYTE OF ABEND CODE      Y01043
+ABEND5   DS    C                  LAST BYTE OF ABEND CODE        Y01043
+         DS    CL37               END OF MESSAGE BUFFER          Y01043
+HIGH     DS    F                  HIGH ADDRESS OF SQA            Y01043
+LOW      DS    F                  LOW ADDRESS OF SQA             Y01043
+SVREN    DS    F                  RETURN ADDRESS                 Y01043
+CODE     DS    H                  FOR ABEND CONVERSION           Y02653
+TRACEPTR DS    F                  TRACE TABLE POINTER(LOC54)   @YM3529P
+ENDAREA  EQU   *                  PARMAREA ENDING ADDRESS        Y02669
+         EJECT
+**************************************************************** Y02669
+*                                                                Y02669
+*        DSECT FOR VWAIT WORKER                                  Y02669
+*                                                                Y02669
+**************************************************************** Y02669
+WORKER   DSECT                                                   Y02669
+ENQLIST  ENQ   (MAJOR,MICSCB,E,3,SYSTEM),RET=HAVE,MF=L           Y02669
+DEQLIST  DEQ   (MAJOR,MICSCB,3,SYSTEM),RET=HAVE,MF=L             Y02669
+SENQDEQ  ENQ   (MAJOR,STCMIN,E,6,SYSTEM),RET=HAVE,MF=L           Y02669
+ECBLIST  DS    0F                 ECB LIST ADDRESS               Y02669
+WAITECB  DS    F                  COMMAND PROCESS ECB ADDRESS    Y02669
+SSYSECB  DS    F                  SUBSYSTEM ECB ADDRESS          Y02668
+         EJECT
+ATCHEXP  ATTACH SF=L,SZERO=NO,JSTCB=YES,KEY=0,SM=SUPV,SVAREA=NO  Y02669
+*                                                                Y02669
+STAELIST ESTAE MF=L               ESTAE LIST FORM SPACE          Y02653
+         EJECT
+         IHAGDA
+         EJECT
+         IHASPQE
+         EJECT
+         IHADQE
+         EJECT
+CVTSECT  DSECT                                                   Y01012
+         CVT
+         EJECT
+         IEEBASEA
+         EJECT
+CHN      DSECT
+         IEECHAIN
+         EJECT
+         IHASDWA                                                 Y02669
+         EJECT
+         IHASCVT                                                 Y02669
+         EJECT
+         IHAPSA                                                  Y02669
+         EJECT
+         IHAPCCA                                                 Y02669
+         EJECT
+         IHACSD                                                  Y02669
+         EJECT
+         IHAPCCAT                                                Y02669
+         EJECT
+         IECDIOCM                                                Y02669
+         EJECT
+*****************************************************************
+ATTACHDC DSECT
+PMODID  DS    D                   ATTACH DSECT
+         END

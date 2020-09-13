@@ -1,0 +1,631 @@
+XSUPSCR  CSECT
+**    AUTHORS - ICI (PLASTICS DIVISION)   CONTACT ICI (MOND DIV.)
+***********************************************************************
+*
+*            C O M P A N Y  S T A N D A R D  V E R S I O N            *
+*
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+*                                                                     *
+* THIS PROGRAM SCRATCHES NON-CURRENT DATA SETS FROM DIRECT ACCESS     *
+* VOLUMES.                                                            *
+* VOLUMES TO BE CLEARED ARE FOUND BY SCANNING THE TIOT FOR DDNAMES    *
+* STARTING WITH THE CHARACTERS 'SC'.                                  *
+* THE UCB IS FOUND FROM THE TIOT ENTRY.                               *
+* THE VOLUME'S F4 DSCB IS READ USING THE UCB VTOC POINTER.            *
+* THE VTOC IS THEN SCANNED SEQUENTIALLY UP TO THE HIGH-WATER MARK AND *
+* ALL F1 DSCBS FOUND ARE PASSED ON FOR EVALUATION.                    *
+* VOLUMES CAN BE ANY COMBINATION OF 3330 AND 2314                     *
+* BEFORE SCRATCHING A DATA SET THE NAME IS CHECKED AS FOLLOWS:-       *
+*      A) IF THE DSNAME IS A SYSTEM ASSIGNED TEMPORARY NAME A SEPARATE*
+*         ROUTINE XSUPSCRC IS USED TO DECIDE IF THE JOBNAME WITHIN    *
+*         THE TEMPORARY NAME MATCHES UP WITH A CURRENTLY EXECUTING JOB*
+*         IF A MATCH IS FOUND THE DATA SET IS NOT SCRATCHED.          *
+*      B) IF THE DSNAME IS NOT SYSTEM ASSIGNED AN 'ENQ' IS ATTEMPTED  *
+*         ON THE DSNAME.IF THIS IS UNSUCCESSFUL THE DATA SET IS       *
+*         REFERRED TO WITHIN A CURRENTLY EXECUTING JOB,SO IT IS NOT   *
+*         SCRATCHED.                                                  *
+* WHEN ALL REFERENCED VOLUMES HAVE BEEN CLEARED CONTROL IS PASSED TO  *
+* XSUPSP.THIS ROUTINE ALLOWS THE RESERVATION OF UNITS OF WORK SPACE   *
+* SUCH AS CYLINDER UNITS ON A DEVOTED WORK PACK.THIS IS DONE BY       *
+* RECORDING SUCH RESERVATIONS IN A SPECIAL CATALOGUE ENTRY.           *
+* XSUPSP FIRST READS THE CATALOGUE ENTRY AND FROM IT BUILDS A NEW     *
+* ENTRY BY COPYING ALL FIELDS FROM THE OLD ENTRY PERTAINING TO JOBS   *
+* EXECUTING IN OTHER PARTITIONS.AS THIS IS DONE A TOTAL IS FORMED OF  *
+* RESERVED SPACE.THIS TOTAL IS THEN ADDED TO THE AMOUNT REQUESTED VIA *
+* THE PARM FIELD AND THIS COMPARED WITH A CONSTANT - THE TOTAL        *
+* AVAILABLE SPACE - AND IF THE TOTAL IS GREATER THE OPERATOR IS       *
+* INFORMED AND GIVEN A 'WAIT AND RETRY' OPTION.                       *
+* IF THE TOTAL IS LESS THAN THE CONSTANT A FIELD IS ADDED TO THE NEW  *
+* CATALOGUE ENTRY AND THE NEW ENTRY WRITTEN OUT - RECATALOGUED.       *
+*                                                                     *
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+*                                                                     *
+* NOTE THAT THE EXTENDED VERSION OF THIS PROGRAM ALLOWS THE USING     *
+* INSTALLATION TO PRESENT THE PROGRAM WITH A DATA SET CONTAINING      *
+* DATA SET NAMES OR INDEX LEVEL NAMES TO BE 'PROTECTED' ON PARTICULAR *
+* VOLUMES.A PROGRAM IS AVAILABLE TO CREATE,MAINTAIN AND LIST THIS     *
+* DATA SET.THIS FEATURE IS TO ALLOW THE PROGRAM TO BE USED TO MAINTAIN*
+* THE AVAILIBILITY OF WORK SPACE ON VOLUMES CONTAINING PERMANENT DATA *
+* SETS OR GENERATION DATA GROUPS SUCH AS 'SYSTEM' PACKS.              *
+*                                                                     *
+*                                 A.N.BROWNE                          *
+*                                  TECHNICAL SUPPORT GROUP            *
+*                                  PLASTICS DIVISION                  *
+*                                  WELWYN GARDEN CITY                 *
+*                                                                     *
+***********************************************************************
+         EJECT
+***********************************************************************
+*                                                                     *
+*                     R E G I S T E R  U S A G E                      *
+*                                                                     *
+PRNTREG  EQU   0
+WRKREG   EQU   1
+INCATR   EQU   2
+OLCNT    EQU   3
+CONTREG  EQU   3
+WRKREGC  EQU   4
+TIOTREG  EQU   4
+CYLCNT   EQU   5
+INDXREG  EQU   5
+OTCATR   EQU   6
+UCBREG   EQU   6
+WRKREGA  EQU   7
+WRKREGB  EQU   8
+LCNT     EQU   9
+LNKREGB  EQU   9
+LNKREGA  EQU   10
+TOTREG   EQU   11
+BASE     EQU   12
+*                                                                     *
+***********************************************************************
+*                                                                     *
+* 'WORKSPCE' SPECIFIES THE MAXIMUM AVAILABLE WORK SPACE ON THE WORK   *
+*           PACK IN THE SAME UNITS AS USED BY THE REQUESTORS E.G. CYLS*
+*                                                                     *
+WORKSPCE EQU   400
+*                                                                     *
+***********************************************************************
+         EJECT
+         SAVE  (14,12)                  SAVE REGS.
+         BALR  12,0
+         USING *,12                     SET UP ADDRESSIBILITY
+         LA    11,SAVE
+         ST    13,4(11)
+         ST    11,8(13)
+         LR    13,11
+*                                       END OF HOUSEKEEPING
+         ST    1,SPARM             SAVE PARM PTR
+NOPARM   OPEN  (MESDCB,(OUTPUT))        OPEN MESSAGE DATA SET
+*
+* VOLUMES TO BE CLEARED ARE FOUND VIA THE TIOT,SO FIRST THE TIOT MUST
+*        BE FOUND
+*
+         L     WRKREG,CVTPTR            FIND CVT
+         L     WRKREG,0(WRKREG)         LOAD TCB WORDS ADDRESS
+         L     WRKREG,0(WRKREG)         LOAD CURRENT TCB ADDRESS
+         L     WRKREG,12(WRKREG)        LOAD TIOT ADDRESS
+         LA    TIOTREG,24(WRKREG)       LOOK AT FIRST DD ENTRY
+         B     TIOTESTA
+         EJECT
+TIOTEST  EQU   *
+*
+* THE VTOC IS ENQUEUED UPON BEFORE MODIFICATION AND RELEASED AFTERWARDS
+*
+*        FIRST TIME THROUGH THE DEQUEUE IS SKIPPED.
+*
+         DEQ  (MQN,VOLSER,6,SYSTEM)     RELEASE VTOC
+TIOTESTA DS    0H
+         CLI   0(TIOTREG),X'00'         END OF TIOT?
+         BE    ENDTIOT                  END OF PROGRAM
+         CLC   4(2,TIOTREG),=C'SC'      DDNAME FOR SCRATCHING?
+         BE    GOTONE                   YES - THEN GO PROCESS IT
+         LA    4,20(TIOTREG)            SKIP TO NEXT TIOT ENTRY
+         B     TIOTESTA
+GOTONE   L     UCBREG,16(TIOTREG)       LOAD THIS UCB ADDRESS
+*
+* UCB DEVICE TYPE IS USED TO FILL IN CONSTANTS
+* FIRST CHECK FOR SUPPORTED TYPE
+*
+         TM    UCBTYP+2(UCBREG),X'20'   TEST FOR D.A.
+         BO    TYPOKA
+         ABEND 10,DUMP                  NOT D.A.
+         EJECT
+TYPOKA   DS    0H
+         CLC   UCBVOL(5,UCBREG),=C'XDSCR'    ALLOW ACTION ON
+         BNE   ABND20                        XDSCRA ETC. VOLUMES
+         TM    UCBTYP+3(UCBREG),X'08'   2314 OR 3330?
+         BO    TYPOKB
+ABND20   DS    0H
+         ABEND 20,DUMP                  NOT 2314 OR 3330
+TYPOKB   DS    0H
+         TM    UCBTYP+3(UCBREG),X'01'   3330?
+         BO    TTTY                     YES - THEN BRANCH
+         MVI   TPERC+3,X'14'            FILL IN 'TRKS PER CYL FOR 2314'
+         MVI   DSPERT+2,X'1A'           DSCBS PER TRK - 2314
+         B     TYPOK
+TTTY     DS    0H                       3330 DEVICE TYPE
+         MVI   TPERC+3,X'13'            TRKS PER CYL
+         MVI   DSPERT+2,X'28'           DSCBS PER TRK - 3330
+TYPOK    DS    0H
+         MVC   VOLST+2(4),UCBTYP   SET DEVICE TYPE IN PARAM. LIST
+         MVC   HEAD3+75(6),28(UCBREG)   PUT VOL.SER.NO. INTO PRINT LINE
+         MVC   VOLSER(6),28(UCBREG)     STORE VOL.SER.NO.
+         ENQ  (MQN,VOLSER,E,6,SYSTEM)   GRAB CONTROL OF VTOC
+         BAL   LNKREGA,HEDS             GO START PRINTING
+         MVC   DISKADR+2(4),36(UCBREG)  STORE VTOC ADDRESS - TTR0
+         SR    WRKREGA,WRKREGA          CLEAR COUNTER
+         L     WRKREGB,DISKADR
+VTLOOP   CL    WRKREGB,TPERC            END OF CYL?
+         BL    ENDTTR                   NO - GO READ FORMAT 4 DSCB
+         LA    WRKREGA,1(WRKREGA)       INCREMENT COUNTER
+         S     WRKREGB,TPERC
+         B     VTLOOP
+         EJECT
+ENDTTR   EQU   *
+         STH   WRKREGB,DISKADR+2        STORE HH
+         STH   WRKREGA,DISKADR          STORE CC
+         OBTAIN CAML                    READ FORMAT 4 DSCB
+         BAL   LNKREGA,CHKOB4           CHECK FOR ERRORS
+         MVC   HIGHF1(5),WRKARA+45      STORE HIGH WATER MARK
+         L     WRKREGA,=F'512'          LOAD INITIAL 'R0'
+         B     MOVER+4
+*
+* 'MOVER' IS USED TO FIND THE ADDRESS OF THE NEXT DSCB
+*
+MOVER    LA    WRKREGA,256(WRKREGA)     INCREMENT RECORD NO. ON TRK
+         STH   WRKREGA,DISKADR+4        STORE 'R0'
+         CL    WRKREGA,DSPERT           END OF TRK?
+         BNE   TRKOK                    NO - BRANCH TO PROCESS
+         LA    WRKREGA,256              LOAD INCREMENT FOR 'R0'
+         MVI   DISKADR+4,X'01'          SET R TO FIRST REC. ON TRACK
+         LH    WRKREGB,DISKADR+2        LOAD HH
+         A     WRKREGB,=F'1'            MOVE TO NEXT TRACK
+         STH   WRKREGB,DISKADR+2        STORE HH
+         CL    WRKREGB,TPERC            END OF CYL?
+         BL    TRKOK                    NO - GO PROCESS
+         SR    WRKREGB,WRKREGB
+         STH   WRKREGB,DISKADR+2        STORE ZERO IN HH
+         LH    WRKREGB,DISKADR          LOAD CC
+         A     WRKREGB,=F'1'            INCREMENT CC
+         STH   WRKREGB,DISKADR          STORE CC
+TRKOK    DS    0H
+         CLC   DISKADR(5),HIGHF1        END OF VTOC?
+         BH    ENDVT                    YES - THEN BRANCH
+         EJECT
+         OBTAIN CAML
+         BAL   LNKREGA,CHKOB1           CHECK THE 'OBTAIN'
+         CLI   WRKARA+44,X'F1'          IS THIS FORMAT ONE?
+         BNE   MOVER                    NO - THEN BRANCH
+*
+* A FORMAT ONE DSCB HAS BEEN FOUND
+*
+GOTF1    EQU   *
+         CLC   WRKARA(4),=C'SYS7'       TEMPORARY DATA SET?
+         BNE   SCRATCH                  BRANCH FOR FURTHER CHECKS
+         LA    1,WRKARA                 LOAD DSCB AREA ADDRESS
+         LA    15,XSUPSCRC              LOAD XSUPSCRC E.P.A.
+         BALR  14,15                    GO LOOK AT TEMP DATA SET
+         LTR   15,15                    TEST RETURN
+         BZ    MOVER                    ZERO - SO DO NOT SCRATCH
+         B     SCR                      NOT ZERO - SO GO SCRATCH
+         EJECT
+ENDVT    EQU   *                        END OF VTOC FOUND
+         LA    TIOTREG,20(TIOTREG)      LOAD NEXT TIOT ENTRY ADDRESS
+         B     TIOTEST                  GO LOOK AT ENTRY
+*
+* AN 'ENQ' IS USED TO CHECK IF THE DATA SET IS IN USE
+*
+* BEFORE ISSUING 'ENQ' NAME LENGTH MUST BE FOUND
+*
+SCRATCH  SR    CONTREG,CONTREG          CLEAR COUNTER
+         LA    INDXREG,WRKARA           LOAD DSNAME ADDRESS
+SCROOP   CLI  0(INDXREG),X'40'          END OF DSNAME?
+         BE    SCREND                   YES - THEN BRANCH
+         LA    CONTREG,1(CONTREG)       INCREMENT COUNT AND
+         LA    INDXREG,1(INDXREG)            INDEX REGISTERS
+         B     SCROOP                   GO LOOK AT NEXT CHARACTER
+SCREND   SLL   CONTREG,24               MOVE LENGTH TO HIGH ORDER BYTE
+         ST    CONTREG,MIN              STORE LENGTH
+         MVC   MIN+1(44),WRKARA         MOVE DSNAME
+         ENQ   (MAJQ,MIN,,0,SYSTEM),RET=TEST
+         LTR   15,15                    CHECK ENQ TEST
+         BNZ   MOVER                    NOT ZERO - SO DO NOT SCRATCH
+         EJECT
+SCR      EQU   *
+         MVC   DSN(44),WRKARA           SET UP SCRATCH
+         MVC   VOLSERN(6),VOLSER             PARAMETERS
+         SCRATCH SCRCAM                 ISSUE SCRATCH MACRO
+         B     CHKSCR                   GO CHECK SCRATCH
+         EJECT
+*
+* 'HEDS' PRINTS PAGE HEADINGS
+* TIME AND DATE ARE PUT INTO HEADING FIRST TIME THROUGH
+HEDS     NOP   HEDSA
+         OI    HEDS+1,X'F0'             SET FOR SUBSEQUENT BRANCH
+         TIME  DEC                      ISSUE TIME MACRO
+         ST    1,WRK                    STORE 00YYDDDF
+         OI    WRK+3,X'0F'
+         UNPK  DATE+1(5),WRK+1(3)       FILL
+         MVC   DATE(2),DATE+1                IN
+         MVI   DATE+2,X'61'                       YY/DDD
+         ST    0,WRK                    STORE HHMMSSTH
+         OI    WRK+3,X'0F'              ADD A SIGN
+         UNPK  TIME+2(7),WRK(4)         FORMAT
+         MVC   TIME+1(4),TIME+2              AND
+         MVI   TIME+5,X'4B'                       FILL
+         MVC   TIME(2),TIME+1                          IN
+         MVI   TIME+2,X'4B'                                 TIME
+         MVI   TIME+8,X'40'
+HEDSA    EQU   *                        PRINT PAGE HEADINGS
+         LA    PRNTREG,HEAD1            HEADING LINE ONE
+         SR    WRKREGB,WRKREGB          ZEROISE LINE COUNT
+         BAL   LNKREGB,PUTIT+4          GO PRINT
+         LA    PRNTREG,HEAD2            HEADING LINE TWO
+         BAL   LNKREGB,PUTIT            GO PRINT
+         LA    PRNTREG,UNLINE           UNDERLINE
+         BAL   LNKREGB,PUTIT                      HEAD2
+         LA    PRNTREG,HEAD3            HEADING LINE THREE
+         LR    LNKREGB,LNKREGA          SET DIRECT RETURN FROM PUTIT
+         B     PUTIT                    GO PRINT
+         EJECT
+***********************************************************************
+*       PUTIT STARTS THE MESSAGE PRINT SECTION                        *
+*                                                                     *
+PUTIT    L     WRKREGB,LINES            LOAD LINE COUNT
+         PUT   MESDCB                   PRINT LINE FROM REG 0
+         LA    WRKREGB,1(WRKREGB)       INCREMENT LINE COUNT
+         ST    WRKREGB,LINES            STORE LINE COUNT
+         CL    WRKREGB,=F'50'           END OF PAGE?
+         BCR   4,LNKREGB                IF NOT RETURN
+         LA    WRKREGB,2
+         ST    WRKREGB,LINES            STORE LINE COUNT
+         PUT   MESDCB,HEAD1             PRINT HEADINGS
+         PUT   MESDCB,HEAD2
+         BR    LNKREGB
+         EJECT
+CHKOB4   EQU   *
+         LTR   15,15
+         BCR   8,LNKREGA
+         LA    PRNTREG,TEXT2            LOAD MESSAGE ADDRESS
+         BAL   LNKREGB,PUTIT            GO PUT ERROR MESSAGE
+         LA    TIOTREG,20(TIOTREG)      LOAD ADDRESS OF NEXT ENTRY
+         B     TIOTEST                  GO PROCESS ENTRY
+CHKOB1   LTR   15,15
+         BCR   8,LNKREGA
+         CL    15,=F'20'
+         BE    ENDVT
+         LA    PRNTREG,TEXT3            LOAD ERROR MESSAGE ADDRESS
+         BAL   LNKREGB,PUTIT            GO PUT ERROR MESSAGE
+         B     MOVER                    GO PROCESS NEXT DSCB
+CHKSCR   MVC   TEXT4+29(44),WRKARA      MOVE DSNAME INTO PRINT LINE
+         CL    15,=F'0'                 CHECK SCRATCH RETURN CODE
+         BE    SCROK
+         LA    PRNTREG,TEXT5            LOAD ERROR MESSAGE ADDRESS
+         BAL   LNKREGB,PUTIT            GO PUT ERROR MESSAGE
+SCREX    LA    PRNTREG,TEXT4            LOAD PRINT LINE ADDRESS
+         BAL   LNKREGB,PUTIT            GO PRINT
+         B     MOVER
+SCROK    LA    PRNTREG,TEXT6            LOAD PRINT LINE ADDRESS
+         BAL   LNKREGB,PUTIT            GO PRINT
+         B     SCREX
+*
+* END OF TIOT SCAN
+*
+ENDTIOT  LA    PRNTREG,TEXT7            LOAD PRINT LINE ADDRESS
+         BAL   LNKREGB,PUTIT            GO PRINT
+         CLOSE (MESDCB)                 CLOSE MESSAGE DATASET
+         L     1,SPARM             RELOAD REG 1
+         LA    15,XSUPSP           LOAD E.P.A. INTO REG 15
+         BALR  14,15               GO RESERVE SPACE
+         L     13,4(13)
+         RETURN (14,12),,RC=0
+         EJECT
+XSUPSCRC DS    0H
+*       THIS ROUTINE DECIDES WHETHER A SYSTEM ASSIGNED DATA SET
+*              SHOULD BE SCRATCHED
+*
+*        ENTRY:-    VIA BALR 14,15 FROM CALLING ROUTINE
+*        EXIT :-    TO CALLING ROUTINE WITH BR 14
+*        PARAMETER:-ADDRESS OF DSNAME IN R.1
+*        RETURNED:- ZERO IN R15 IF DATA SET IS REFERRED TO IN CURRENT
+*              JOB
+*
+         SAVE  (14,12)
+         BALR  12,0                     SET UP ADDRESSIBILITY
+         USING *,12
+         LA    11,SAVA
+         ST    13,4(11)
+         ST    11,8(13)
+         LR    13,11
+         L     2,CVTPTR                 FIND CVT
+         L     2,124(2)                 LOAD IOS FREELIST PTR ADDR
+         LA    2,4(2)                   LOAD TCB LIST ADDR
+         L     2,0(2)                   LOAD TCB LIST ADDRESS
+TCBLOP   L     3,0(2)                   LOAD TCB ADDRESS
+         LA    3,0(3)                   CLEAR POSSIBLE END OF LIST FLAG
+         LTR   3,3                      END OF TCB LIST?
+         BZ    SAVIT+2
+         L     4,124(3)                 LOAD PIB ADDRESS
+         LA    4,0(4)                   CLEAR H/O BYTE
+         LTR   4,4                      IS THERE A PIB?
+         BZ    COMP+14                  NO - NOT A P.P. PARTITION
+         L     4,20(4)                  LOAD CONTROL CSCB ADDRESS
+         LTR   4,4                      IS THERE A CSCB?
+         BZ    COMP+14                  NO - PARTITION MUST BE IDLE
+         LA    4,16(4)                  FIND JOBNAME WITHIN CSCB
+         LA    5,23(1)                  LOAD ADDRESS OF JOBNAME IN DSN
+         LR    7,5                      SAVE ADDRESS
+BRNCH    NOP   COMP
+         SR    6,6
+NAMLOP   CLI   0(5),X'4B'               FULL STOP?
+         BE    *+16                     YES THEN BRANCH
+         LA    5,1(5)
+         LA    6,1(6)
+         B     NAMLOP
+         BCT   6,*+4
+         STC   6,COMP+1                 STORE LENGTH IN 'CLC'
+COMP     CLC   0(0,7),0(4)              COMPARE NAMES
+         BE    SAVIT                    IF MATCH DO NOT SCRATCH
+         MVI   BRNCH+1,X'F0'
+         LA    2,4(2)                   MOVE TO NEXT TCB
+         B     TCBLOP                   GO LOOK
+SAVIT    XR    15,15
+         MVI   BRNCH+1,X'00'
+         L     13,4(13)
+         RETURN (14,12),,RC=(15)
+         EJECT
+CVTPTR   EQU   16
+SPARM    DC    F'0'
+MQN      DC    CL8'SYSVTOC'
+HEAD3    DC    X'11'
+         DC    CL41' '
+         DC    CL49'********* VOLUME SERIAL NUMBER =        *********'
+         DC    CL42' '
+HEAD1    DC    X'8B'
+UNLINE   DC    X'19'
+         DC    6CL19'-*-*-*-*--*-*-*-*-'
+         DC    CL18'-*-*-*-*--*-*-*-*-'
+HEAD2    DC    X'11'
+         DC    CL28' '
+         DC    CL79'X S U P S C R - S T A N D A R D  V E R S I O N'
+TIME     DC    CL12' '
+DATE     DC    CL13' '
+LINES    DC    F'0'
+MAJQ     DS    0F
+         DC    CL8'SYSDSN  '
+MIN      DS    CL45
+TEXT2   DC     X'09'
+         DC    CL132'    ERROR READING VTOC DSCB'
+TEXT3    DC    X'09'
+         DC    CL132'    ERROR READING DATA SET DSCB'
+TEXT7    DC    X'09'
+         DC    CL53' '
+         DC    CL79'E N D  O F  X S U P S C R'
+TEXT6    DC    X'09'
+         DC    CL132'    DATA SET SCRATCHED'
+TEXT5    DC    X'09'
+         DC    CL132'    ERROR IN SCRATCH OPERATION'
+TEXT4    DC    X'09'
+         DC    CL132'                    DSNAME='
+WRK      DC    F'0'
+SAVA     DC    18F'0'
+SAVE     DC    18F'0'
+VOLSER   DS    CL6
+INREC    DC    F'0'
+DISKADR  DC    X'000000000000'
+WRKARA   DS    0D
+         DS    CL350
+CAML     CAMLST SEEK,DISKADR,VOLSER,WRKARA
+HIGHF1   DS    CL6
+SCRCAM   CAMLST SCRATCH,DSN,,VOLST
+DSN      DC    CL44' '
+VOLST    DC    H'1'
+         DC    X'30C02008'
+VOLSERN  DC    CL6' '
+         DC    H'0'
+MESDCB   DCB   DSORG=PS,DDNAME=SOUT,MACRF=(PM)
+TPERC    DC    F'0'
+DSPERT   DC    F'0'
+UCBTYP   EQU   16
+UCBVOL   EQU   28
+         LTORG
+         EJECT
+*
+* XSUPSP USES A CATALOGUE ENTRY TO MAINTAIN A LIST OF RESERVED SPACE
+*
+XSUPSP   DS    0H
+          SAVE  (14,12)
+         BALR  BASE,0
+         USING *,BASE
+         LA    WRKREGC,SAVAR
+         ST    13,4(WRKREGC)
+         ST    WRKREGC,8(13)
+         LA    13,SAVAR
+         LA    TOTREG,WORKSPCE          LOAD TOTAL AVAILABLE SPACE
+         L     WRKREGC,0(1)        PICK UP PARM
+*        THE FOLLOWING CODE WAS MODDED IN JUNE 1973
+*
+         LH    WRKREG,0(WRKREGC)   LOAD PARM. LENGTH
+         LTR   WRKREG,WRKREG       ZERO LENGTH?
+         BZ    BADPARM             YES - THEN GO ABEND
+         L     WRKREGA,ZEROS       CLEAR WORK REGISTER
+         LA    WRKREGB,4
+PLUP     TM    2(WRKREGC),X'F0'    CHECK FOR NUMERIC
+         BNO   BADPARM             INVALID? - THEN GO ABEND
+         CLI   2(WRKREGC),C'9'     TEST FOR GT X'F9'
+         BH    BADPARM             INVALID? - THEN GO ABEND
+         IC    WRKREGA,2(WRKREGC)  PICK UP VALIDATED CHAR.
+         BCT   WRKREG,*+8          DECREMENT LENGTH
+         B     NDPARM              END OF PARM FIELD
+         BCT   WRKREGB,*+12        DECREMENT COUNTER
+         CLI   3(WRKREGC),C'*'     END OF MULTIPLIER?
+         BNE   BADPARM             NO? - THEN GO ABEND
+         LA    WRKREGC,1(WRKREGC)    MOVE TO NEXT CHAR
+         CLI   2(WRKREGC),C'*'     MULTIPLICATION?
+         BE    *+12                YES - THEN BRANCH
+         SLL   WRKREGA,8           SHIFT LEFT ONE CHAR.
+         B     PLUP                GO BACK TO START
+         NC    MULT(4),MULT        HAS MULTIPLIER ALREADY BEEN STORED?
+         BNZ   BADPARM             YES - THEN GO ABEND
+         ST    WRKREGA,MULT        STORE MULTIPLIER
+         L     WRKREGA,ZEROS       CLEAR WORK REGISTER
+         LA    WRKREGB,4
+         LA    WRKREGC,1(WRKREGC)  MOVE TO NEXT CHAR
+         BCT   WRKREG,PLUP         GO LOOP
+BADPARM  DS    0H
+         ABEND 30,DUMP
+MULT     DC    F'0'
+ZEROS    DS    0F
+         DC    4C'0'
+NDPARM   NC    MULT(4),MULT        MULTIPLIER SPECIFIED?
+         BZ    NDPARMA             NO - THEN BRANCH
+         PACK  DUB+5(3),MULT(4)    PACK AND CONVERT MULTIPLIER
+         CVB   WRKREG,DUB            TO BINARY
+         XC    DUB(8),DUB          CLEAR WORK AREA
+         MVI   NDPARMB+1,X'00'     SET BRANCH TO NOP
+NDPARMA  ST    WRKREGA,MULT        PACK AND
+         PACK  DUB+5(3),MULT(4)      CONVERT QUANTITY
+         CVB   WRKREGA,DUB             TO BINARY
+         LA    WRKREGB,WORKSPCE    LOAD LIMIT
+         CR    WRKREGB,WRKREGA     CHECK QUANTITY AGAINST LIMIT
+         BL    BADPARM             GO ABEND IF TOO BIG
+NDPARMB  B     NDPARMC             BRANCH/NOP
+         CR    WRKREGB,WRKREG      CHECK MULTIPLIER SIZE
+         BL    BADPARM             GO ABEND IF TOO BIG
+         ST    WRKREG,MULT         MULTIPLY QUANTITY
+         MH    WRKREGA,MULT+2        BY MULTIPLIER
+         CR    WRKREGB,WRKREGA     CHECK PRODUCT SIZE
+         BL    BADPARM             GO ABEND IF TOO BIG
+NDPARMC  LTR   WRKREGA,WRKREGA     NULL REQUEST?
+         BZ    END                 YES - THEN DO NOT PROCESS
+         STH   WRKREGA,CLSTA+12    STORE
+         SRL   WRKREGA,16            FINAL
+         STH   WRKREGA,CLSTA+10        QUANTITY
+*
+*        END OF JUNE 1973 MODS
+*
+*
+* AN 'ENQ' IS USED TO PREVENT SIMULTANEOUS ACCESS TO CATLG ENTRY
+*
+ENQ      ENQ   (Q,R,E,7,SYSTEM)
+         LOCATE READC                   READ CATLG ENTRY
+         LTR   15,15               LOCATE OK?
+         BZ    LOCOK               YES - THEN BRANCH
+         CL    15,=F'8'            ENTRY NOT FOUND?
+         BE    NOENTRY             BRANCH IF NOT FOUND
+         ABEND 40,DUMP
+         EJECT
+NOENTRY  L     WRKREG,CVTPTR       FIND CVT
+         L     WRKREG,0(WRKREG)    FIND TCB WORDS
+         L     WRKREG,4(WRKREG)    LOAD 'OLD'
+         L     WRKREG,12(WRKREG)   FIND TIOT
+         MVC   CLSTA+2(8),0(WRKREG) STORE MY JOBNAME
+         CATALOG CATA              CATALOGUE ENTRY
+         LTR   15,15               DID IT WORK?
+         BZ    END                 YES - THEN GO TO END
+         ABEND 50,DUMP
+LOCOK    DS    0H                  OLD ENTRY READ SUCCESSFULLY
+         L     WRKREG,CVTPTR
+         L     WRKREGB,0(WRKREG)   FIND TCB WORDS
+         L     WRKREGB,4(WRKREGB)  LOAD 'OLD' ADDRESS
+         L     WRKREGB,12(WRKREGB) FIND TIOT
+         L     WRKREG,124(WRKREG)  FIND IOS FREELIST PTR
+         L     WRKREG,4(WRKREG)    SKIP A WORD TO FIND TCB LIST
+TCBS     L     WRKREGA,0(WRKREG)   FIND A TCB
+         TM    124(WRKREGA),X'C0'  P.P. PARTITION?
+         BO    *+12
+         LA    WRKREG,4(WRKREG)    LOOK AT NEXT LIST ENTRY
+         B     TCBS
+*
+* WRKREG POINTS TO 1ST P.P. TCB PTR IN TCB LIST
+*
+         XR    LCNT,LCNT           CLEAR LIST COUNTER
+         LA    OTCATR,CLSTB+2      SET OUTPUT PTR TO OUTPUT AREA
+         LA    INCATR,LOCREA+2     SET INPUT PTR TO INPUT AREA
+         LH    OLCNT,LOCREA        LOAD INPUT ENTRY COUNT
+         XR    CYLCNT,CYLCNT       CLEAR ACCUMULATOR
+         XR    WRKREGC,WRKREGC     CLEAR INDEX REG.
+         EJECT
+* AT THIS STAGE WRKREG POINTS TO THE FIRST P.P. TCB PTR IN THE TCB LIST
+*
+*               LCNT,THE OUTPUT ENTRY COUNTER,CONTAINS ZERO
+*
+*               OLCNT CONTAINS THE NUMBER OF INPUT ENTRIES
+*
+*               INCATR POINTS TO THE FIRST INPUT ENTRY
+*
+*               OTCATR POINTS TO THE FIRST OUTPUT ENTRY
+*
+*               CYLCNT,THE TOTAL RESERVED CYL COUNT CONTAINS ZERO
+*
+LUPIN    L     WRKREGA,0(WRKREGC,WRKREG) PICK UP TCB PTR
+         LA    WRKREGA,0(WRKREGA)  CLEAR H/O BYTE
+         LTR   WRKREGA,WRKREGA     TCB?
+         BZ    LAST                NO - THEN BRANCH
+         L     WRKREGA,124(WRKREGA)     LOAD PIB ADDRESS
+         LA    WRKREGA,0(WRKREGA)       CLEAR H/O BYTE
+         LTR   WRKREGA,WRKREGA          IS THERE A PIB?
+         BZ    NXTTCB                   NO.- NOT A P.P. PARTITION
+         L     WRKREGA,20(WRKREGA)      LOAD CONTROL CSCB ADDRESS
+         LTR   WRKREGA,WRKREGA          IS THERE A CONTROL CSCB?
+         BZ    NXTTCB                   NO - PARTITION IS IDLE
+         LA    WRKREGA,16(WRKREGA)      FIND JOBNAME WITHIN CSCB
+         CLC   0(8,WRKREGA),0(WRKREGB) MY JOBNAME?
+         BE    NXTTCB              SPACE MUST BE RE-RESERVED
+         CLC   0(8,WRKREGA),0(INCATR) CHECK FOR MATCHING JOBNAME
+         BNE   NXTTCB              NO MATCH - THEN GO FIND NEXT TCB
+         AH    CYLCNT,10(INCATR)   ADD RESERVED CYLS TO ACCUMULATOR
+         LA    LCNT,1(LCNT)        INCREMENT OUTPUT ENTRY COUNTER
+         MVC   0(12,OTCATR),0(INCATR) TRANSFER ENTRY
+         LA    OTCATR,12(OTCATR)   MOVE OUTPUT PTR
+LAST     LA    INCATR,12(INCATR)   MOVE INPUT PTR
+         XR    WRKREGC,WRKREGC     ZEROISE INDEX TO START AT FIRST TCB
+         BCT   OLCNT,LUPIN         IF NOT LAST INPUT ENTRY - BRANCH
+         MVC   0(8,OTCATR),0(WRKREGB) FILL IN NEW ENTRY JOBNAME
+         MVC  10(2,OTCATR),CLSTA+12 FILL IN NO. OF CYLS WANTED
+         EJECT
+* NEW CATALOGUE ENTRY HAS BEEN SET UP EXCEPT FOR 1ST 1/2 WORD
+*
+* NOW CHECK IF THERE IS SPACE FOR THIS JOBS WORK SPACE
+*
+         LH    WRKREG,CLSTA+12     LOAD NO. OF CYLS. FROM PARM
+         AR    WRKREG,CYLCNT       NEW TOTAL
+         CLR   WRKREG,TOTREG            COMPARE ACCUMULATED WITH TOTAL
+         BH    NOROOM
+         LA    LCNT,1(LCNT)        NEW ENTRY NUMBER
+         STH   LCNT,CLSTB          STORE NEW COUNT
+         CATALOG CATB              RECATALOGUE ENTRY
+         LTR   15,15
+         BZ    END
+         ABEND 60,DUMP
+         EJECT
+NOROOM  WTO   'XSUPSCR - WORK SPACE REQUESTED NOT AVAILABLE'
+         DEQ   (Q,R,7,SYSTEM)
+         WTOR  'EITHER CANCEL JOB OR REPLY ANY CHAR. FOR RETRY',REP,1,E
+         WAIT  ECB=E
+         XC    E(4),E              CLEAR ECB
+         B     ENQ                 TRY AGAIN
+NXTTCB   LA    WRKREGC,4(WRKREGC)  INCREMENT INDEX
+         B     LUPIN
+END      DS    0H
+         L     13,4(13)
+         RETURN (14,12),,RC=0
+         EJECT
+SAVAR    DC    18F'0'
+Q        DC    CL8'XSUPSCR'
+R        DC    CL7'XSUPSCR'
+REP      DC    C' '
+DUB      DC    D'0'
+READC    CAMLST NAME,XS,,LOCREA
+XS       DC    CL44'XSUPSCR'
+LOCREA   DS    0D
+         DS    265C
+CATA     CAMLST CAT,XS,,CLSTA
+CLSTA    DC    H'1'
+          DC    6H'0'
+E        DC    F'0'
+CATB     CAMLST RECAT,XS,,CLSTB
+CLSTB    DC    61F'0'
+         LTORG
+         END

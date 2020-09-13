@@ -1,0 +1,744 @@
+    TITLE     'DSCBISAM -RESPOND''S ANSWER TO ISAM ALLOCATION PROBLEMS'
+TSGLISAM CSECT
+*
+*  FOR DESCRIPTION OF TSGLISAM SEE TSGLROOT AND ALSO THE SEPARATE
+*  DOCUMENTATION FOR TSGLINK.
+*
+*
+*   THIS PROGRAM CONVERTS ANY COLLECTION OF PREVIOUSLY CREATED DSCBS
+*   INTO A SET OF DSCBS DESCRIBING A SINGLE ISAM DATA SET..
+*   TO DO THIS IT TAKES THE ISAM DCB DATA FROM A NAMED JFCB, EXTENT
+*   DESCRIPTIONS FROM EXISTING DSCBS, AND EXTENT TYPES FROM USER INPUT
+*   CARDS.  UNWANTED DSCBS ARE OVERWRITTEN WITH ZEROS, AN F2 DSCB IS
+*   CREATED IN A PREVIOUSLY ZERO DSCB, AND THE COUNT OF BLANK DSCBS IS
+*   ADJUSTED IN THE F4 DSCB.  VTOC INTEGRITY IS PRESERVED BY ENQ ON
+*   'SYSVTOC' AND VOL SER NO.
+*
+*   THE USER IDENTIFIES THE DSCBS TO BE USED, AND THE FUNCTION THEIR
+*   EXTENTS ARE TO PLAY IN THE ISAM DATA SET, BY CARD INPUT.  EACH CARD
+*   MUST CONTAIN.............
+*        COLS  1 -  7   TSGLINK
+*        COLS 10 - 17   SCATALOC
+*        COLS 20 - 27   ISINDEX   .....OR,
+*                       ISPRIME   .....OR,
+*                       ISOVFLOW
+*        COLS 30 - 37   THE DDNAME OF A CARD SUBMITTED WITH THIS STEP
+*                       IDENTIFYING THE DSCB TO BE CONVERTED.
+*
+*   THE FOLLOWING RULES APPLY.....
+*        1    THE SINGLE ISINDEX CARD MUST COME FIRST.  IT IS FOLLOWED
+*             BY UP TO 10 ISPRIME CARDS, AND A SINGLE ISOVFLOW CARD
+*             MARKS THE END OF THE DEFINITION FOR ONE ISAM DATA SET.
+*             THE SAME PATTERN MAY BE REPEATED TO CREATE ANY NUMBER OF
+*             ISAM DATA SETS IN ONE RUN.
+*        2    THE DDCARD NAMED BY THE ISINDEX CARD MUST CONTAIN THE
+*             COMPLETE ISAM DCB DATA FOR THE NEW DATA SET, INCLUDING
+*             DSORG=IS.  THE EXTENT FOR THE INDEX IS OBTAINED BY A
+*             NORMAL JCL REQUEST FOR SEQUENTIAL SPACE WITH DISP =5EEP,
+*             EITHER IN THIS OR IN  A PREVIOUS STEP, AND THE ISAM DCB
+*             DATA GOES IN ANOTHER DD CARD QUOTING THE SAME DSNAME AND
+*             POINTED TO BY THE ISINDEX CARD, WITH ...DISP=SHR,
+*             DCB=(DSORG=IS...ETC
+*        3    THE FOLLOWING LIMITS APPLY TO THE EXTENTS DEFINED.
+*             A.   IF THE DSCBS DEFINED AS INDEX OR OVERFLOW HAVE MORE
+*                  THAN ONE EXTENT ONLY THE FIRST EXTENT IS USED (AND
+*                  THE F5 DSCB WILL BECOME INCORRECT)  ALWAYS USE
+*                  CONTIG WHEN REQUESTING THESE AREAS.
+*             B.   IF A DSCB DEFINED AS A PRIME AREA HAS MORE THAN
+*                  THREE EXTENTS THE CREATION OF THAT DATA SET WILL
+*                  BE ENDED WITH A 'CARD FORMAT' ERROR MESSAGE.
+*             C.   THE TOTAL NUMBER OF EXTENTS COLLECTED TOGETHER ON
+*                  ONE PACK FOR THE ISAM DATA SET MAY NOT EXCEED 13.
+*
+*   NOTES.
+*        1    ANY FAILURES OR ABENDS WHILE THIS PROGRAM IS RUNNING MAY
+*             LEAVE THE F5 DSCB WITH AN INCORRECT DESCRIPTION OF THE
+*             SPACE AVAILABLE ON IT.  ONLY ONE PACK CAN BE CORRUPT,
+*             BUT IF IT IS THE CALCF5 PROGRAM SHOULD BE RUN IMMEDIATELY
+*             IT HAS BEEN FOUND THAT IF TWO DSCBS DESCRIBE THE SAME
+*             EXTENT, AND BOTH ARE SCRATCHED, THE RESULT FROM SCRATCH
+*             IS NORMAL BUT THE F5 'LOSES' SPACE.
+*        2    THE INPUT CARD FORMAT IS GOVERNED BY RULES FOR THE
+*             TSGLINK PROGRAM, AND THE TSGLISAM VERSION OF THIS PROGRAM
+*             IS LINKED TO BY TSGLINK WHEN REQUIRED.
+*        3    ERROR HANDLING IS PRIMITIVE AND THE PROGRAM REQUIRES
+*             CAREFUL SET-UP.  ERRORS RESULT IN A PRINTED MESSAGE THAT
+*             THE NAMED ISAM DATA SET WAS NOT CREATED BECAUSE OF EITHER
+*             'CARD FORMAT' (ANY USER ERROR) OR 'I/O ERROR' (ANY SYSTEM
+*             ERROR).  THE REASON IS PREFIXED BY A NUMBER OBTAINED
+*             FROM THE 'DUMPID' FIELDWHICH IS SET TO A UNIQUE VALUE ON
+*             ENTRY TO EACH SECTION OF THE PROGRAM INVOLVING A
+*             POTENTIAL ERROR.  THE ACTUAL CAUSE OF ERROR CAN BE
+*             FOUND BY FINDING THAT NUMBER IN THE PROGRAM LISTING.
+*             AFTER AN ERROR CARDS ARE SKIPPED UP TO THE NEXT ISINDEX
+*             CARD (OR EOF).
+*        4    CONFIRMATION OF GOOD RESULTS IS PRINTED FOR EACH INPUT
+*             CARD.  A SYSPRINT DD CARD IS REQUIRED.
+*        5    ONE SYSVTOC DD IS REQUIRED FOR OPERATIONS ON THE VTOCS.
+*             INITIALLY IT CAN REFER TO ANY AVAILABLE PACK.
+*
+*   JCL REQUIRED (EXAMPLE)
+*
+*        //SYSPRINT DD  SYSOUT=...
+*        //SYSVTOC DD   VOL=REF=SYS1.SVCLIB,DISP=SHR
+*        //SEQIND  DD   DSN=X.Y.ISAM,DISP=(,KEEP),VOL=REF=A,
+*        //             SPACE=(TRK,5,,CONTIG)
+*        //ISIND   DD   DSN=X.Y.ISAM,DISP=SHR,VOL=REF=A,
+*        //             DCB=(DSORG=IS,...ALL ISAM DCB DATA ..)
+*        //SQPRIMEA DD  DISP=(,KEEP),VOL=REF=A,SPACE=(CYL,10,,CONTIG)
+*        //SQPRIMEB DD  DISP=(,KEEP),VOL=REF=B,SPACE=(CYL,50,,CONTIG)
+*        //SQPRIMEC DD  DISP=(,KEEP),VOL=REF=C,SPACE=(CYL,10,,CONTIG)
+*        //SQOVFLOW DD  DISP=(,KEEP),VOL=REF=C,SPACE=(TRK,15,,CONTIG)
+*        //SYSIN   DD   *
+*        TSGLINK   SCATALOC  ISINDEX   ISIND
+*        TSGLINK   SCATALOC  ISPRIME   SQPRIMEA
+*        TSGLINK   SCATALOC  ISPRIME   SQPRIMEB
+*        TSGLINK   SCATALOC  ISPRIME   SQPRIMEC
+*        TSGLINK   SCATALOC  ISOVFLOW  SQOVFLOW
+*        /*
+*
+*   PROGRAM OPERATION IS AS FOLLOWS....
+*        1    OPEN SYSIN AND SYSPRINT.  RDJFCB FOR SYSVTOC AND PLACE
+*             44X'04' IN ITS DSNAME.
+*        2    ('NEWFILE') IDENTIFY FIRST CARD AS INDEX AND PLACE ITS
+*             DDNAME IN 'IDDN', READ ISPRIME CARDS AND KEEP THEIR
+*             DDNAMES IN 'PDDN', AND WHEN AN ISOVFLOW CARD IS READ
+*             PUT ITS DDNAME IN 'ODDN' AND STOP READING.
+*        3    ('LC')  ENSURE THERE IS A SYSVTOC DD IN THE TIOT, THEN
+*             FIND FROM THE TIOT THE UCBS FOR THE STORED DDNAMES.
+*        4    ('ALLFND')  RDJFCB FOR INDEX, OBTAIN ITS DSCB AND SAVE
+*             ITS DISK ADDRESS, OPEN THE VTOC ON THIS VOLUME, AND ENQ
+*             ON THE VTOC.
+*             ZERO OUT THE F1, F2, AND F3 AREAS IN CORE.
+*             MOVE ISAM DCB DATA FROM THE JFCB TO THE F1 AND F2 AREAS
+*             AND SET 'F2IND' SO THAT THE F2 WILL BE WRITTEN WHEN
+*             IN 'CLEANUPV' FOR THIS VOLUME..
+*             MOVE INDEX EXTENT AND TYPE TO F1 AREA.
+*        5    ('TELLOK')  PRINT CONFIRMATION OF (INDEX) SET UP AND
+*             SEARCH FOR ANY PRIME OR (FAILING THAT) OVERFLOW AREAS
+*             TO BE SET UP ON THIS SAME VOLUME.  FOR PRIME AREAS
+*             RDJFCB AND OBTAIN DSCB AND....
+*        6    ('SEQSTORE')  STORE EXTENT TYPE AND AREA IN NEXT
+*             AVAILABLE POSITION IN F1 OR F3.  RETURN VIA REG 6.
+*        7    ('MOREPRIM')  RE-ENTER 'SEQSTORE' ONCE OR TWICE MORE TO
+*             RECORD UP TO THREE PRIME EXTENTS FROM ONE DSCB, THEN...
+*        8    ('DELF1')  OVER-WRITE THE LAST DSCB OBTAINED WITH ZEROS
+*             NOW THAT ITS EXTENTS HAVE BEEN TRANSFERRED TO F1 OR F3
+*             AND RETURN VIA REG 6.
+*        9    ('TRYO')  IF THE OVERFLOW AREA IS DEFINED ON THIS VOLUME
+*             REPEAT THE RDJFCB/OBTAIN/SEQSTORE/DELF1/PRINT ROUTINES
+*             BUT USE THE CORRECT EXTENT TYPE AND IGNORE ALL BUT THE
+*             FIRST EXTENT AREA.
+*        10   ('CLEANUPV')  THIS ROUTINE DOES ALL THE WRITING TO THE
+*             VTOC FOR ONE VOLUME WHEN OTHER PROCESSING FOR THAT VOLUME
+*             IS COMPLETE.
+*          A  IF AN F3 IS TO BE WRITTEN AN XDAP IS MODIFIED TO DO A
+*             MULTIPLE TRACK SEARCH FOR THE FIRST EMPTY DSCB IN THE
+*             VTOC.  NORMAL XDAP WI IS THEN USED TO WRITE THE F3.
+*          B  ('NOF3EXT')  IF AN F2 IS TO BE WRITTEN THE SAME
+*             PROCEDURE AS FOR F3 IS USED.
+*          C  ('WRITEF1')  THE F1 IS WRITTEN BACK TO THE SAME ADDRESS
+*             FROM WHICH THE FIRST DSCB WAS OBTAINED ON THIS VOLUME.
+*             THE F4 IS THEN READ AND UPDATED BY ADDING 'F0CNTP' AND
+*             SUBTRACTING 'F0CNTM' BEFORE WRITING IT BACK.  THE PROGRAM
+*             DEQ'S AND CLOSES THE VTOC AND THEN GOES TO 'NEXTVOL' OR
+*             'NEWFILE'.
+*        11   ('NEXTVOL')  THIS ROUTINE IS SIMILAR TO 'NEWFILE' BUT
+*             HAS NO PRELIMINARY SET UP FROM CARD INPUT AND NO INDEX
+*             PROCESSING.
+*
+*   NOTE....  ERRORS OCCURRING AFTER ENQ ON A VTOC ARE NOT DEQ'D.
+*             AN ENQ TEST WITH DEQ DEPENDING ON THE RESULT SHOULD BE
+*             ADDED TO THE IOSKIP ROUTINE.
+*
+*        BEGIN BASE=(11,12)  (TSG RESPOND MACRO)
+         STM  14,12,12(13)
+         BALR 11,0
+         USING     *,11,12
+IHB1     EQU   *
+         L     12,IHB1A
+         CNOP 0,4
+         BAL  15,*+76
+         DC   18F'0'
+         ST   15,8(13)
+         ST   13,4(15)
+         LR   13,15
+         B     IHB1B
+IHB1A    DC    A(IHB1+4096)
+IHB1B    EQU   *
+         ST    1,PARAMS
+         RDJFCB  (VTOC)
+         MVC   JFCBV(44),F4
+         SP    DDCNT,DDCNT
+         XC    IDDN(120),IDDN
+         NI    FC+1,15
+         LA    4,PDDN
+         B     APRESGET
+         EJECT
+GET      L     10,PARAMS               A(PARMLIST)
+         L     10,0(10)                A(FOUR)
+         L     10,0(10)                R10 = R4
+         L     1,12(10)                A(CDATA)
+         L     15,48(1)
+         BALR  14,15                   GET CDATA
+         LR    3,1
+         L     2,24(10)                A(CDCTR)
+         AP    0(2,2),=P'1'
+APRESGET AP    DDCNT,=P'1'
+         USING CARD,3
+         MVC   SAVECID,ID3
+         MVI   DUMPID,1
+         CLC   ID1,=C'TSGLINK'
+         BNE   CFSKIP
+         CLC   ID2,=C'SCATALOC'
+         BNE   CFSKIP
+FC       B     NOTF
+         CLC   ID3,=CL8'ISINDEX'
+         BNE   CFSKIP
+         MVC   IDDN,SEQDDN
+         OI    FC+1,240
+         B     GET
+NOTF     CLC   ID3,=CL8'ISOVFLOW'
+         BE    LC
+         CLC   ID3,=CL8'ISPRIME'
+         BNE   CFSKIP
+         MVC   0(8,4),SEQDDN
+         LA    4,8(4)
+         C     4,ADEPDDN
+         BL    GET
+         MVI   DUMPID,2
+         B     CFSKIP
+LC       MVC   ODDN,SEQDDN
+         LA    4,IDDN
+         LA    5,IUCB
+         SR    6,6
+         L     1,16
+         L     1,0(1)
+         L     1,4(1)
+         L     1,12(1)
+         BC    0,NEXTLOOP
+         OI    *-3,240
+         LA    7,24(1)
+         MVI   DUMPID,3
+PRETLOOP IC    6,0(7)
+         LTR   6,6
+         BZ    CFSKIP
+         CLC   4(8,7),=CL8'SYSVTOC'
+         BE    VDDFND
+         AR    7,6
+         B     PRETLOOP
+VDDFND   ST    7,VTOCDDAD
+         MVI   DUMPID,4
+NEXTLOOP LA    7,24(1)
+TIOTLOOP IC    6,0(7)
+         LTR   6,6
+         BZ    CFSKIP
+         CLC   4(8,7),0(4)
+         BNE   NEXTT
+         MVC   0(2,5),18(7)
+         LA    5,2(5)
+         LA    4,8(4)
+         CLI   0(4),0
+         BE    ALLFND
+         B     NEXTLOOP
+NEXTT    AR    7,6
+         B     TIOTLOOP
+NEWFILE  L     1,PARAMS
+         L     9,8(1)
+         PUT   (9),SPACEUP
+*        GOBACK    (TSG RESPOND MACRO)
+         L    13,4(13)
+         LM   14,12,12(13)
+         MVI  12(13),255
+         LA   15,0
+    BR   14
+         SPACE 3
+         EJECT
+ALLFND   MVC   READJ+40(8),IDDN
+         RDJFCB  (READJ)
+         OBTAIN  CAMLSTA
+         MVI   DUMPID,5
+         LTR   15,15
+         BNZ   IOSKIP
+         MVC   SAVEAD,OBTAREA+96
+         SPMODE  PROB,0
+         L     1,VTOCDDAD
+         MVC   18(2,1),IUCB
+         SPMODE  PROB,*
+         LH    1,IUCB
+         MVC   JFCBV+118(6),28(1)
+         OPEN  (VTOC,(OUTPUT)),TYPE=J
+         ENQ   (SYSVTOC,JVOL,E,6,SYSTEM)
+         SP    DDCNT,=P'1'         FOR INDEX
+         MVI   F2IND,255
+         SP    F0CNTP,F0CNTP
+         SP    F0CNTM,F0CNTM
+         MVC   CYLOFL,JCYLOFL
+         MVC   NTM,JNTM
+         XC    LINK2,LINK2
+         XC    F1(140),F1
+         MVC   DSN,JDSN
+         MVI   F1ID,C'1'
+         MVC   VOLONE,JVOL
+         MVI   VOLSEQ+1,1
+         MVC   CREATED,JFCB+80
+         MVC   DSORG(8),JDSORG
+         MVC   KEYL,JKEYLEN
+         MVC   RKP,JRKP
+         MVC   SECALT,JSECALT
+         XC    F3EXT(136),F3EXT
+         MVI   F3ID,C'3'
+         LA    8,EXTYP
+         USING EXTENT,8
+         MVI   ETYPE,4
+         SR    10,10
+         STC   10,ESEQ
+         LA    10,1(10)
+         STC   10,ESEQNO
+         MVC   ELL(8),OBTAREA+63
+         LA    8,10(8)
+         MVC   LELM+1(5),=C'INDEX'
+TELLOK   MVC   LDSN,DSN
+         MVC   LVOL,JVOL
+         LA    5,LINEG
+         BAL   6,PRINT
+         BAL   6,SRCHUCBS
+         LTR   2,2
+         BZ    TRYO
+         XC    0(2,2),0(2)
+         SP    DDCNT,=P'1'
+         MVC   READJ+40(8),0(3)
+         RDJFCB  (READJ)
+         OBTAIN  CAMLSTA
+         MVI   DUMPID,6
+         LTR   15,15
+         BNZ   IOSKIP
+         MVI   EXTTYPE,1
+         LA    6,MOREPRIM
+***  RULES FOR EXTENTS ON THE SEQ DSCBS (INPUT)
+*        1  INDEX  -  ONLY ONE EXTENT PROCESSED
+*        2  OVFLOW  -  ONLY ONE EXTENT PROCESSED
+*        3  PRIME  -  UP TO THREE EXTENTS PROCESSED PER DD
+***
+SEQSTORE CLI   ESEQNO,3
+         BL    STORSEQ
+         BH    TRY7
+         LA    8,F3EXT
+         B     STORSEQ
+TRY7     CLI   ESEQNO,7
+         BL    STORSEQ
+         BH    TRY16
+         LA    8,1(8)
+         B     STORSEQ
+TRY16    CLI   ESEQNO,16
+         MVI   DUMPID,7
+         BNL   CFSKIP
+STORSEQ  MVC   ETYPE,EXTTYPE
+         IC    10,ESEQNO
+         STC   10,ESEQ
+         LA    10,1(10)
+         STC   10,ESEQNO
+         MVC   ELL(8),OBTAREA+63
+         LA    8,10(8)
+         BR    6
+MOREPRIM CLI   OBTAREA+73,0
+         BE    NOMP
+         MVI   DUMPID,8
+         NC    OBTAREA+91(5),OBTAREA+91
+         BNZ   CFSKIP
+         MVC   OBTAREA+63(20),OBTAREA+73
+         MVI   OBTAREA+83,0
+         B     SEQSTORE
+NOMP     MVC   LELM+1(5),=C'PRIME'
+         LA    6,TELLOK
+DELF1    AP    F0CNTP,=P'1'
+         MVC   CCHHR,OBTAREA+96
+         XC    OBTAREA(96),OBTAREA
+         XDAP  ECBJ,WI,VTOC,ZKEY,140,,BLOCKID
+         MVI   DUMPID,9
+         WAIT  ECB=ECBJ
+         CLI   ECBJ,127
+         BNE   IOSKIP
+         BR    6
+         EJECT
+TRYO     CLC   OUCB,IUCB
+         BNE   CLEANUPV
+         XC    OUCB,OUCB
+         SP    DDCNT,=P'1'         FOR OVFLOW
+         MVC   READJ+40(8),ODDN
+         RDJFCB  (READJ)
+         OBTAIN  CAMLSTA
+         MVI   DUMPID,10
+         LTR   15,15
+         BNZ   IOSKIP
+         MVI   EXTTYPE,2
+         BAL   6,SEQSTORE
+         BAL   6,DELF1
+         MVC   LELM+1(5),=C'OFLOW'
+         MVC   LDSN,DSN
+         MVC   LVOL,JVOL
+         LA    5,LINEG
+         BAL   6,PRINT
+         EJECT
+CLEANUPV L     1,VTOC+44
+         MVC   CCHHR,38(1)
+         MVI   CCHHR+4,0
+         NC    F3EXT(10),F3EXT
+         BZ    NOF3EXT
+         LA    1,SRCH0CP
+         ST    1,ECBK+20
+         XDAP  ECBK,RI,VTOC,ZKEY,140,,BLOCKID
+         MVI   DUMPID,11
+         WAIT  ECB=ECBK
+         CLI   ECBK,127
+         BNE   IOSKIP
+         MVC   CCHHR,OBTAREA
+         XDAP  ECBL,WI,VTOC,F3,140,,BLOCKID
+         MVI   DUMPID,12
+         WAIT  ECB=ECBL
+         CLI   ECBL,127
+         BNE   IOSKIP
+         AP    F0CNTM,=P'1'
+         XC    F3EXT(136),F3EXT
+         MVI   F3ID,C'3'
+         MVC   LINK,CCHHR
+         CLI   F2IND,0
+         BE    WRITEF1
+         MVC   LINK2,CCHHR
+         SPACE 3
+NOF3EXT  CLI   F2IND,0
+         BE    WRITEF1
+         LA    1,SRCH0CP
+         ST    1,ECBM+20
+         XDAP  ECBM,RI,VTOC,ZKEY,140,,BLOCKID
+         MVI   DUMPID,13
+         WAIT  ECB=ECBM
+         CLI   ECBM,127
+         BNE   IOSKIP
+         MVC   CCHHR,OBTAREA
+         XDAP  ECBN,WI,VTOC,F2,140,,BLOCKID
+         MVI   DUMPID,13
+         WAIT  ECB=ECBN
+         CLI   ECBN,127
+         BNE   IOSKIP
+         AP    F0CNTM,=P'1'
+         MVI   F2IND,0
+         MVC   LINK,CCHHR
+         SPACE 3
+WRITEF1  MVC   CCHHR,SAVEAD
+         SR    1,1
+         IC    1,ESEQNO
+         STC   1,NEXTS
+         XDAP  ECBO,WI,VTOC,F1,140,,BLOCKID
+         MVI   DUMPID,14
+         WAIT  ECB=ECBO
+         CLI   ECBO,127
+         BNE   IOSKIP
+         L     1,VTOC+44
+         MVC   CCHHR,38(1)
+         MVI   CCHHR+4,0
+         XDAP  ECBP,RK,VTOC,OBTAREA,96,(F4,44),BLOCKID
+         MVI   DUMPID,15
+         WAIT  ECB=ECBP
+         CLI   ECBP,127
+         BNE   IOSKIP
+         ZAP   DW,F0CNTP
+         CVB   3,DW
+         ZAP   DW,F0CNTM
+         CVB   4,DW
+         SR    5,5
+         LH    5,OBTAREA+6
+         AR    5,3
+         SR    5,4
+         STH   5,OBTAREA+6
+         XDAP  ECBQ,WK,VTOC,OBTAREA,96,(F4,44),BLOCKID
+         MVI   DUMPID,16
+         WAIT  ECB=ECBQ
+         CLI   ECBQ,127
+         BNE   IOSKIP
+         SPACE 3
+         DEQ   (SYSVTOC,JVOL,6,SYSTEM)
+         CLOSE (VTOC)
+         SP    F0CNTP,F0CNTP
+         SP    F0CNTM,F0CNTM
+         XC    EXTYP(35),EXTYP
+         IC    10,VOLSEQ+1
+         LA    10,1(10)
+         STC   10,VOLSEQ+1
+         CP    DDCNT,=P'1'
+         BNL   NEXTVOL
+         B     NEWFILE
+         EJECT
+CFSKIP   MVC   LBREASON,=CL11'CARD FORMAT'
+         B     *+10
+IOSKIP   MVC   LBREASON,=CL11'I/O ERROR'
+         MVC   LBDSN,DSN
+         SR    10,10
+         IC    10,DUMPID
+         CVD   10,DW
+         UNPK  LBDSN+40(3),DW+6(2)
+         OI    LBDSN+42,240
+         LA    5,LINEB
+         BAL   6,PRINT
+         B     NEWFILE
+         EJECT
+NEXTVOL  XC    IUCB,IUCB
+         NI    WBACKBR+1,15
+         OI    SCRATCH+1,240
+         LA    2,PUCB
+         LA    3,10
+         LA    4,PDDN
+COMPZ    CLC   IUCB,0(2)
+         BNE   ONEFND
+         LA    2,2(2)
+         LA    4,8(4)
+         BCT   3,COMPZ
+         NC    OUCB,OUCB
+         BZ    NEWFILE
+         LA    4,ODDN
+         LA    2,OUCB
+         NI    PBR+1,15
+         MVI   EXTTYPE,2
+         B     OUFND
+ONEFND   MVI   EXTTYPE,1
+         OI    PBR+1,240
+OUFND    MVC   IUCB,0(2)
+         SPMODE  PROB,0
+         L     1,VTOCDDAD
+         MVC   18(2,1),IUCB
+         SPMODE  PROB,*
+         LH    1,IUCB
+         MVC   JFCBV+118(6),28(1)
+         STM   2,4,CONTSRCH
+         XC    0(2,2),0(2)
+         SP    DDCNT,=P'1'
+OPNEXT   MVC   READJ+40(8),0(4)
+         RDJFCB  (READJ)
+         OBTAIN  CAMLSTA
+         MVI   DUMPID,17
+         LTR   15,15
+         BNZ   IOSKIP
+WBACKBR  BC    0,WHACKBK
+         MVC   SAVEAD,OBTAREA+96
+         OI    WBACKBR+1,240
+         OPEN  (VTOC,(OUTPUT)),TYPE=J
+         ENQ   (SYSVTOC,JVOL,E,6,SYSTEM)
+         LA    8,EXTYP
+         SR    10,10
+         STC   10,ESEQNO
+WHACKBK  BAL   6,SEQSTORE
+         MVC   LELM+1(5),=C'PRIME'
+PBR      B     *+10
+         MVC   LELM+1(5),=C'OFLOW'
+         MVC   LDSN,DSN
+         MVC   LVOL,JVOL
+         LA    5,LINEG
+         BAL   6,PRINT
+SCRATCH  B     *+8
+         BAL   6,DELF1
+         NI    SCRATCH+1,15
+         LM    2,4,CONTSRCH
+         B     CONTNEXT
+CONTINUE CLC   IUCB,0(2)
+         BE    TWOFND
+CONTNEXT C     4,=A(ODDN)
+         BE    CLEANUPV
+         LA    2,2(2)
+         LA    4,8(4)
+         BCT   3,CONTINUE
+         B     SUBTRYO
+TWOFND   STM   2,4,CONTSRCH
+         XC    0(2,2),0(2)
+         SP    DDCNT,=P'1'
+         B     OPNEXT
+         SPACE 3
+SUBTRYO  CLC   OUCB,IUCB
+         BNE   CLEANUPV
+         NC    OUCB,OUCB
+         BZ    NEWFILE
+         XC    OUCB,OUCB
+         SP    DDCNT,=P'1'
+         NI    PBR+1,15
+         MVI   EXTTYPE,2
+         LA    4,ODDN
+         STM   2,4,CONTSRCH
+         B     OPNEXT
+         EJECT
+PRINT    L     1,PARAMS                A(PARMLIST)
+         L     1,0(1)                  A(FOUR)
+         L     14,0(1)                 R14 = R4
+         CLI   28(14),0                TSGLPRSW
+         BCR   8,6                     NO TSGLPRNT DD
+         L     1,PARAMS
+         L     10,4(1)                 A(LINEHDR)
+         L     9,8(1)                  A(TSGLIST)
+         L     14,24(14)               A(CDCTR)
+         LA    14,4(14)                A(LINECTR)
+         SP    0(2,14),=P'2'
+         BP    PUTL
+         ZAP   0(2,14),=PL2'55'
+         PUT   (9),NP                  NEW PAGE
+         PUT   (9),(10)                HEADER LINE
+PUTL     PUT   (9),(5)                 DATA LINE
+         BR    6
+         SPACE 3
+SRCHUCBS LA    2,PUCB
+         LA    3,PDDN
+SUCB     CLC   0(2,2),IUCB
+         BCR   8,6
+         LA    2,2(2)
+         LA    3,8(3)
+         C     3,ADEPDDN
+         BL    SUCB
+         SR    2,2
+         BR    6
+         EJECT
+READJ    DCB   MACRF=(E),DSORG=PS,DDNAME=XYZ,EXLST=XLIST
+XLIST    DC    X'87',AL3(JFCB)
+VTOC     DCB   DDNAME=SYSVTOC,MACRF=(E),DSORG=DA,EXLST=YLIST
+YLIST    DC    X'87',AL3(JFCBV)
+         EJECT
+DW       DC    D'0'
+SRCH0CP  CCW   26,OBTAREA,X'70',5      READ HATO START
+         CCW   146,OBTAREA,X'60',8     READ COUNT
+         CCW   169,ZKEY,X'60',44       SEARCH KEY EQ TO ZERO
+         CCW   8,SRCH0CP+8,X'60',1
+         CCW   3,*,X'20',1
+CONTSRCH DC    3F'0'
+ADEPDDN  DC    A(EPDDN)
+VTOCDDAD DC    F'0'
+PARAMS   DC    F'0'
+         EJECT
+CAMLSTA  CAMLST  SEARCH,JDSN,JVOL,OBTAREA
+         CNOP  4,8
+ZKEY     DC    44X'00'
+OBTAREA  DS    352C
+BLOCKID  DC    X'000000'
+CCHHR    DC    X'0000000000'
+         EJECT
+F1       DS    0CL140
+DSN      DS    CL44
+F1ID     DS    C
+VOLONE   DS    CL6
+VOLSEQ   DS    CL2
+CREATED  DS    CL6
+NEXTS    DS    C
+         DS    CL22
+DSORG    DS    CL2
+RECFM    DS    C
+OPTCD    DS    C
+BLKSIZE  DS    CL2
+LRECL    DS    CL2
+KEYL     DS    C
+RKP      DS    CL2
+LVPIND   DS    C
+SECALT   DS    C
+SECALQ   DS    CL3
+LSTRB    DS    CL7
+EXTYP    DS    C
+EXTSEQ   DS    C
+EXTLL    DS    CL4
+EXTUL    DS    CL4
+         DS    CL20
+LINK     DS    CL5
+         SPACE 3
+F2       DS    0CL140
+         DC    X'02'
+         DC    XL44'F2'
+         DC    XL7'00'
+CYLOFL   DC    X'00'
+         DC    XL13'00'
+NTM      DC    X'00'
+         DC    XL68'00'
+LINK2    DC    XL5'00'
+         SPACE 3
+F3       DS    0CL140
+         DC    4X'03'
+F3EXT    DS    CL40
+F3ID     DS    C
+         DS    CL95
+         EJECT
+JFCB     DS    0CL176
+JDSN     DS    CL44
+         DS    CL49
+JKEYLEN  DS    C
+         DS    CL4
+JDSORG   DS    CL2
+JRECFM   DS    C
+JOPTCD   DS    C
+JBLKSIZE DS    CL2
+JLRECL   DS    CL2
+         DS    C
+JNTM     DS    C
+JRKP     DS    CL2
+JCYLOFL  DS    C
+         DS    CL7
+JVOL     DS    CL6
+         DS    CL31
+JSECALT  DS    C
+         DS    CL30
+         SPACE 3
+JFCBV    DS    CL176
+         SPACE 3
+         EJECT
+NP       DC    X'8B'
+         SPACE 2
+SPACEUP  DC    X'0B'
+         SPACE 2
+LINEG    DC    X'09'
+         DC    C'DSN = '
+LDSN     DC    CL44' '
+LELM     DC    C'(ABCDE) '
+         DC    C'CREATED ON '
+LVOL     DC    C'123456'
+         DC    CL10' '
+         SPACE 2
+LINEB    DC    X'09'
+         DC    C'DSN = '
+LBDSN    DC    CL44' '
+         DC    C' NOT CREATED - '
+LBREASON DC    CL11' '
+         SPACE 2
+LINET    DC    X'19'
+         DC    CL26' '
+         DC    CL59'TSG UTILITY TO CREATE ISAM DSCBS'
+         EJECT
+         DS    0F
+IDDN     DC    CL8' '
+ODDN     DC    CL8' '
+PDDN     DC    10CL8' '
+EPDDN    EQU   *
+         SPACE 2
+IUCB     DC    CL2' '
+OUCB     DC    CL2' '
+PUCB     DC    10CL2' '
+         SPACE 3
+SAVEAD   DC    XL5'00'
+LINECNT  DC    PL2'0'
+SAVECID  DC    CL3' '
+F4       DC    44X'04'
+F2IND    DC    X'00'
+F0CNTP   DC    PL2'0'
+F0CNTM   DC    PL2'0'
+DDCNT    DC    PL2'0'
+SYSVTOC  DC    CL8'SYSVTOC'
+DUMPID   DC    X'00'
+ESEQNO   DC    X'00'
+EXTTYPE  DC    X'00'
+         EJECT
+CARD     DSECT
+ID1      DS    CL7
+         DS    CL2
+ID2      DS    CL8
+         DS    CL2
+ID3      DS    CL8
+         DS    CL2
+SEQDDN   DS    CL8
+         DS    CL42
+         SPACE 3
+EXTENT   DSECT
+ETYPE    DS    C
+ESEQ     DS    C
+ELL      DS    CL4
+EUL      DS    CL4
+         END

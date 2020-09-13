@@ -1,0 +1,699 @@
+UADSDUMP TITLE 'UADSDUMP -- UADS UNLOAD PROGRAM'
+**********************************************************************
+*                                                                    *
+*  MODULE NAME -                                                     *
+*                                                                    *
+*     UADSDUMP -- UADS UNLOAD PROGRAM                                *
+*                                                                    *
+*  FUNCTION -                                                        *
+*                                                                    *
+*     THIS PROGRAM READS THE SYS1.UADS DATASET AND OUTPUTS ACCOUNT   *
+*     CONTROL CARDS TO BE USED TO REBUILD SYS1.UADS.                 *
+*                                                                    *
+*  ATTRIBUTES -                                                      *
+*                                                                    *
+*     REENTRANT.                                                     *
+*                                                                    *
+*  ENTRY CONDITIONS -                                                *
+*                                                                    *
+*     R15 - ENTRY ADDRESS (UADSDUMP)                                 *
+*     R14 - RETURN ADDRESS                                           *
+*     R13 - ADDRESS OF A STANDARD SAVE AREA                          *
+*                                                                    *
+*  EXIT CONDITIONS -                                                 *
+*                                                                    *
+*     NONE.                                                          *
+*                                                                    *
+*  REGISTER USAGE -                                                  *
+*                                                                    *
+*     R15 - WORK                                                     *
+*     R14 - WORK                                                     *
+*     R13 - ADDRESS OF SAVE (WORK) AREA                              *
+*     R12 - BASE ADDRESS (UADSDUMP)                                  *
+*     R11 - DCB ADDRESS                                              *
+*     R10 - DIRECTORY LIST ENTRY                                     *
+*     R9  - DIRECTORY BLOCK ENTRY                                    *
+*     R8  - ADDRESS OF UADS ENTRY                                    *
+*     R7  - ADDRESS OF THE UADS PASSWORD OFFSET BLOCK (DPOB)         *
+*     R6  - INTERNAL SUBROUTINE LINKAGE                              *
+*     R5  - ADDRESS OF THE UADS ACCOUNT OFFSET BLOCK (DNOB)          *
+*     R4  - ADDRESS OF THE UADS PROCEDURE OFFSET BLOCK (DROB)        *
+*     R3  - WORK                                                     *
+*     R2  - WORK                                                     *
+*     R1  - WORK                                                     *
+*     R0  - WORK                                                     *
+*                                                                    *
+*  RESTRICTIONS -                                                    *
+*                                                                    *
+*     PRESENTLY, THIS PROGRAM PROCESSES SINGLE-BLOCK UADS ENTRIES    *
+*     ONLY.  ANY MULTIPLE-BLOCK ENTRIES ARE SKIPPED AND A WARNING    *
+*     MESSAGE IS PRINTED (THE FIRST BLOCK IS, HOWEVER, PROCESSED).   *
+*     ALSO, THIS PROGRAM ASSUMES THAT THE UADS IS IN THE EXTENDED    *
+*     (TSO/E) FORMAT.                                                *
+*                                                                    *
+*  OPERATION -                                                       *
+*     1.  PROGRAM INITIALIZATION IS PERFORMED AND THE MESSAGE DATASET*
+*         IS OPENED.  FAILURE TO OPEN THE MESSAGE DATASET FORCES AN  *
+*         ABEND.                                                     *
+*     2.  THE UADS DIRECTORY IS OPENED AND AN IN-STORAGE MEMBER LIST *
+*         IS BUILT FROM THE DIRECTORY.                               *
+*     3.  THE UADS IS OPENED (AS A PDS) AND A BUFFER IS OBTAINED     *
+*         BASED ON THE BLOCKSIZE.  THE ACCOUNT CARD FILE IS OPENED.  *
+*     4.  EACH UADS MEMBER IN THE MEMBER LIST IS READ FROM THE UADS  *
+*         DATASET.  AS THE MEMBERS ARE READ, ACCOUNT CONTROL CARDS   *
+*         ARE WRITTEN TO THE ACCOUNT DATASET.                        *
+*     5.  ONCE THE LAST MEMBER HAS BEEN PROCESSED, THE UADS AND      *
+*         ACCOUNT DATASETS ARE CLOSED.                               *
+*                                                                    *
+*  SAMPLE JCL -                                                      *
+*                                                                    *
+*    //JOBNAME  JOB (ACCOUNTING DATA),'PROGRAMMER NAME',             *
+*    //         CLASS=X,MSGCLASS=X,NOTIFY=XXXXXX                     *
+*    //UADSDUMP EXEC PGM=UADSDUMP                                    *
+*    //SYSPRINT  DD  SYSOUT=*                                        *
+*    //SYSUDUMP  DD  SYSOUT=*                                        *
+*    //PDS       DD  DSN=SYS1.UADS,DISP=SHR                          *
+*    //*ACCOUNT   DD  DSN=USERID.UADS.SOURCE,DISP=(,CATLG),          *
+*    //*             SPACE=(CYL,(20,2),RLSE),UNIT=3380,              *
+*    //*             DCB=(RECFM=FB,LRECL=80,BLKSIZE=3120)            *
+*    //ACCOUNT   DD  SYSOUT=*,DCB=(RECFM=F,BLKSIZE=80)               *
+*                                                                    *
+***  WHERE THE 'ACCOUNT' DDNAME IS THE OUTPUT DESTINATION,           *
+***            'PDS' DDNAME IS THE INPUT SOURCE UADS DATASET         *
+*                                                                    *
+*                                                                    *
+*  CHANGE HISTORY -                                                  *
+*                                                                    *
+*     WRITTEN 03/86 BY BILL SOMERVILLE, MCI.                         *
+*     CHANGED 10/86 BY BILL SOMERVILLE - SUPPORT DIFFERENT BLOCKSIZES*
+*        FOR THE VARIOUS TYPES OF SYS1.UADS.                         *
+*                                                                    *
+**********************************************************************
+         EJECT
+         USING SAVEAREA,R13
+         USING UADSDUMP,R12
+         USING IHADCB,R11
+         USING ENTLIST,R10
+         USING DIRENT,R9
+         USING DHED,R8
+UADSDUMP CSECT
+         SAVE (14,12),,'UADSDUMP&SYSDATE.&SYSTIME'     SAVE REGISTERS
+         LR    R12,R15             ESTABLISH BASE REGISTER
+         GETMAIN R,LV=WORKSIZE     OBTAIN A WORK AREA
+         ST    R1,SAVENEW          FORWARD CHAIN
+         ST    R13,SAVEOLD-SAVEAREA(,R1)     BACKWARD CHAIN
+         LR    R13,R1              SAVE THE WORK AREA POINTER
+**********************************************************************
+*  INITIALIZE THE WORK AREA AND OPEN THE MESSAGE DATASET.            *
+**********************************************************************
+         XC    ENTLISTH(4),ENTLISTH     CLEAR ENTRY LIST HEAD
+         XC    ENTNUM(4),ENTNUM    CLEAR NUMBER OF ENTRIES
+         XC    RETCODE(4),RETCODE  CLEAR THE RETURN CODE
+         XC    BUFSIZE(4),BUFSIZE  CLEAR THE BUFFER SIZE
+         MVC   DIRECTRY(DIRSKELN),DIRSKEL    COPY SKELETON DCB
+         MVC   PDS(PDSSKELN),PDSSKEL    COPY SKELETON DCB
+         LA    R11,PDS             GET THE PDS DCB ADDRESS
+         LA    R1,UADSJFCB         GET THE JFCB ADDRESS
+         ST    R1,PDSEXLST         SAVE THE JFCB ADDRESS
+         MVI   PDSEXLST,X'87'      INDICATE JFCB ADDRESS + END OF LIST
+         LA    R1,PDSEXLST         GET THE EXIT LIST ADDRESS
+         STCM  R1,B'0111',DCBEXLSA SAVE THE EXIT LIST ADDRESS
+         MVC   ACCOUNT(ACCSKELN),ACCSKEL     COPY SKELETON DCB
+         MVC   SYSPRINT(SYSSKELN),SYSSKEL    COPY SKELETON DCB
+         MVC   OPENPARM(OPENSKLN),OPENSKEL   COPY SKELETON OPEN
+         MVC   CLOSPARM(CLOSSKLN),CLOSSKEL   COPY SKELETON CLOSE
+         MVI   USERLNTH,1          INITIALIZE THE USERID LENGTH
+         MVC   USERID(8),=CL8' '   CLEAR THE USERID
+         OPEN  (SYSPRINT,OUTPUT),MF=(E,OPENPARM)  OPEN SYSPRINT
+         LA    R11,SYSPRINT        GET THE DCB ADDRESS
+         TM    DCBOFLGS,DCBOFOPN   DID SYSPRINT OPEN?
+         BO    OPENDIR             YES, START PROCESSING
+         ABEND X'B40'              NO, ABEND
+         EJECT
+**********************************************************************
+*  READ THE DIRECTORY OF THE PDS AND BUILD AN IN-STORAGE MEMBER LIST.*
+**********************************************************************
+OPENDIR  OPEN  (DIRECTRY,INPUT),MF=(E,OPENPARM)   OPEN THE DIRECTORY
+         LA    R2,=CL8'DIRECTRY'   GET TEXT ADDRESS TO INSERT INTO MSG
+         LA    R11,DIRECTRY        GET THE DCB ADDRESS
+         TM    DCBOFLGS,DCBOFOPN   DID THE DIRECTORY OPEN?
+         BNO   OPENERR             NO, ISSUE ERROR MESSAGE AND EXIT
+         LA    R1,1                ISSUE OPEN SUCCESSFUL MESSAGE
+         BAL   R6,MESSAGE
+         XR    R10,R10             CLEAR THE ENTRY LIST POINTER
+READDIR  GET   DIRECTRY,DIRBLOCK   READ A DIRECTORY RECORD
+         LH    R2,DIRBLOCK         GET THE RECORD LENGTH
+         LA    R9,DIRBLOCK+2       POINT TO THE FIRST ENTRY
+         AR    R2,R9               POINT TO THE END OF THE BLOCK
+         S     R2,=F'2'
+DEBLOCK  CR    R2,R9               ARE WE PAST THE END OF THE BLOCK?
+         BNH   READDIR             YES, GO READ A NEW RECORD
+         CLC   DIRNAME(8),=8X'FF'  IS THIS THE LAST MEMBER?
+         BE    DIREOF              YES, SIGNAL EOF
+         L     R1,ENTNUM           GET THE NUMBER OF ENTRIES
+         LA    R1,1(,R1)           INCREMENT THE ENTRY COUNT
+         ST    R1,ENTNUM           SAVE THE NEW ENTRY COUNT
+         GETMAIN R,LV=ENTLSIZE     OBTAIN STORAGE FOR A LIST ENTRY
+         C     R10,=F'0'           IS THERE AN ENTRY IN THE LIST?
+         BNE   CHAINENT            YES, CHAIN THE NEW ENTRY
+         ST    R1,ENTLISTH         MAKE THE NEW ENTRY THE FIRST
+         B     MAKECURR            MAKE THE NEW ENTRY THE CURRENT
+CHAINENT ST    R1,ENTNEXT          CHAIN THE NEW ENTRY INTO THE LIST
+MAKECURR LR    R10,R1              MAKE THE NEW ENTRY CURRENT
+         MVC   ENTNAME(8),DIRNAME  MOVE THE ENTRY NAME
+         MVC   ENTTTR(3),DIRTTR    MOVE THE ENTRY TTR
+         XC    ENTTTR+3(1),ENTTTR+3     CLEAR THE LAST BYTE
+         XC    ENTNEXT(4),ENTNEXT  CLEAR THE NEXT ENTRY POINTER
+         IC    R1,DIRFLAGS         GET THE DIRECTORY ENTRY FLAGS
+         N     R1,=X'0000001F'     CLEAR FLAGS
+         SLL   R1,1                MULTIPLY BY TWO TO GET LENGTH
+         A     R1,=F'12'           ADD LENGTH OF NAME AND TTRN
+         AR    R9,R1               POINT TO THE NEXT ENTRY
+         B     DEBLOCK             GO GET THE NEXT DIRECTORY ENTRY
+DIREOF   CLOSE (DIRECTRY),MF=(E,CLOSPARM)    CLOSE THE DIRECTORY
+         L     R1,ENTNUM           GET THE NUMBER OF ENTRIES
+         CVD   R1,CVDWORK          CONVERT ENTRIES TO DECIMAL
+         UNPK  CVEWORK(8),CVDWORK+4(4)  CONVERT ENTRIES TO EBCDIC
+         OI    CVEWORK+7,X'F0'     MASK OUT SIGN
+         LA    R1,3                ISSUE NUMBER OF MEMBERS MESSAGE
+         LA    R2,CVEWORK          INSERT NUMBER OF ENTRIES
+         BAL   R6,MESSAGE
+         B     OPENPDS             OPEN THE PDS FOR PROCESSING
+OPENERR  LA    R1,2                ISSUE OPEN FAILURE MESSAGE
+         BAL   R6,MESSAGE
+         MVC   RETCODE(4),=F'16'   SET THE RETURN CODE
+         B     EXIT                EXIT
+JFCBERR  CVD   R15,CVDWORK         CONVERT RETURN CODE TO DECIMAL
+         UNPK  CVEWORK(8),CVDWORK+4(4)  CONVERT RETURN CODE TO EBCDIC
+         OI    CVEWORK+7,X'F0'     MASK OUT SIGN
+         LA    R2,CVEWORK          POINT TO THE EBCDIC RETURN CODE
+         LA    R1,6                ISSUE JFCB READ FAILED MESSAGE
+         BAL   R6,MESSAGE
+         MVC   RETCODE(4),=F'16'   SET THE RETURN CODE
+         B     EXIT                EXIT
+         EJECT
+**********************************************************************
+*  OPEN THE PDS FOR INPUT PROCESSING AND THE ACCOUNT FILE FOR OUTPUT *
+*  PROCESSING (FOR ACCOUNT CONTROL CARDS).                           *
+**********************************************************************
+OPENPDS  OPEN  (PDS,INPUT),MF=(E,OPENPARM)   OPEN THE PDS
+         LA    R2,=CL8'PDS'        GET TEXT ADDRESS TO INSERT INTO MSG
+         LA    R11,PDS             GET THE PDS DCB ADDRESS
+         TM    DCBOFLGS,DCBOFOPN   DID THE PDS OPEN?
+         BNO   OPENERR             NO, ISSUE OPEN FAILURE MESSAGE
+         LA    R1,1                ISSUE OPEN SUCCESSFUL MESSAGE
+         BAL   R6,MESSAGE
+         RDJFCB (PDS),MF=(E,OPENPARM)   READ THE PDS JFCB
+         LTR   R15,R15             DID THE JFCB READ GO AS PLANNED?
+         BNZ   JFCBERR             NO, ISSUE JFCB READ FAILURE MESSAGE
+         LA    R1,UADSJFCB         GET THE JFCB ADDRESS
+         USING JFCB,R1
+         LH    R0,JFCBLKSI         GET THE UADS BLOCK SIZE
+         ST    R0,BUFSIZE          SAVE THE BUFFER SIZE
+         DROP  R1
+         GETMAIN R,LV=(0)          OBTAIN A BUFFER
+         LR    R8,R1               SAVE THE BUFFER ADDRESS
+         OPEN  (ACCOUNT,OUTPUT),MF=(E,OPENPARM)   OPEN THE ACCOUNT FILE
+         LA    R2,=CL8'ACCOUNT'    GET TEXT ADDRESS TO INSERT INTO MSG
+         LA    R11,ACCOUNT         GET THE ACCOUNT DCB ADDRESS
+         TM    DCBOFLGS,DCBOFOPN   DID THE ACCOUNT FILE OPEN?
+         BNO   OPENERR             NO, ISSUE OPEN FAILURE MESSAGE
+         LA    R1,1                ISSUE OPEN SUCCESSFUL MESSAGE
+         BAL   R6,MESSAGE
+         L     R10,ENTLISTH        GET THE ENTRY LIST HEAD POINTER
+         EJECT
+**********************************************************************
+*  FOR EACH ENTRY IN THE MEMBER LIST, READ THE UADS RECORD AND WRITE *
+*  CONTROL CARDS TO BE USED AS INPUT TO ACCOUNT.                     *
+**********************************************************************
+READUADS C     R10,=F'0'           IS THERE AN ENTRY TO BE PROCESSED?
+         BE    READDONE            NO, CLOSE FILES AND EXIT
+         FIND  PDS,ENTTTR,C        LOCATE THE MEMBER
+         READ  READDECB,SF,PDS,DHED,'S',MF=(E,READPARM)     READ UADS
+         CHECK READDECB            CHECK STATUS OF READ OPERATION
+         OI    DUMPFLGS,DUMPFUSR   INDICATE NEW USER BEING PROCESSED
+         LA    R1,7                GET THE USERID LENGTH
+         LA    R2,UADSUSER+7       POINT TO THE LAST CHARACTER
+USERLOOP CLI   0(R2),C' '          IS THIS THE LAST CHARACTER?
+         BNE   TESTUSER            YES, COPY THE USERID FROM UADS
+         BCTR  R2,R0               DECREMENT THE ADDRESS
+         BCT   R1,USERLOOP         CHECK THE NEXT CHARACTER
+TESTUSER STC   R1,USERLNTH         SAVE THE USERID LENGTH
+         BCTR  R1,R0               DECREMENT LENGTH FOR MOVE/COMPARE
+         EX    R1,USERCOMP         IS THIS A NEW USERID?
+         BNE   MOVEUSER            YES, MOVE NEW USERID OVER
+         LA    R1,5                ISSUE WARNING FOR EXTENSION BLOCK
+         LA    R2,USERID           INSERT USERID INTO MESSAGE
+         BAL   R6,MESSAGE
+         MVC   RETCODE(4),=F'4'    SET THE RETURN CODE
+         B     NEXTUSER            GO READ THE NEXT USER ENTRY
+MOVEUSER MVC   USERID(8),=CL8' '   CLEAR THE USERID
+         EX    R1,USERMOVE         MOVE OVER THE USERID
+         MVC   PASSWORD(8),=CL8'*' INITIALIZE PASSWORD FIELD
+         MVI   ACNTLNTH,1          INITIALIZE ACCOUNT FIELD LENGTH
+         MVC   ACNTDATA(1),=CL1'*' INITIALIZE ACCOUNT FIELD
+         L     R7,UADSPWD1         GET THE PASSWORD OFFSET BLOCK OFFSET
+NEXTPSWD AR    R7,R8               ADD THE BUFFER ADDRESS
+         TM    DUMPFLGS,DUMPFUSR   FIRST PASS FOR THIS USER?
+         BNO   GETDPOBD            NO, CONTINUE
+         ST    R7,LASTDPOB         SAVE THE DPOB POINTER
+         USING DPOB,R7
+GETDPOBD ICM   R5,B'1111',UADSPDAT IS THERE A PASSWORD DATA BLOCK?
+         BZ    ACCTLOOP            NO, BYPASS PASSWORD PROCESSING
+         AR    R5,R8               ADD THE BUFFER ADDRESS
+         USING DPOBD,R5
+         MVC   PASSWORD(8),UADSPPWD     MOVE OVER THE PASSWORD
+         DROP  R5
+ACCTLOOP L     R5,UADSPSUB         GET THE ACCOUNT OFFSET BLOCK
+NEXTACNT AR    R5,R8               ADD THE BUFFER ADDRESS
+         TM    DUMPFLGS,DUMPFUSR   FIRST PASS FOR THIS USER?
+         BNO   GETDNOBD            NO, CONTINUE
+         ST    R5,LASTDNOB         SAVE THE DNOB POINTER
+         USING DNOB,R5
+GETDNOBD ICM   R4,B'1111',UADSADAT IS THERE AN ACCOUNT DATA BLOCK?
+         BZ    PROCLOOP            NO, BYPASS ACCOUNT PROCESSING
+         AR    R4,R8               ADD THE BUFFER ADDRESS
+         USING DNOBD,R4
+         XR    R1,R1               CLEAR R1
+         IC    R1,UADSALEN         GET THE ACCOUNT NUMBER LENGTH
+         STC   R1,ACNTLNTH         SAVE THE ACCOUNT NUMBER LENGTH
+         BCTR  R1,R0               DECREMENT ACCOUNT NUMBER FOR MOVE
+         LA    R2,ACNTDATA         GET THE DESTINATION ADDRESS
+         LA    R3,UADSANUM         GET THE SOURCE ADDRESS
+         EX    R1,VARMOVE          MOVE THE ACCOUNT NUMBER
+         DROP  R4
+PROCLOOP ICM   R4,B'1111',UADSASUB IS THERE A PROCEDURE OFFSET BLOCK?
+         BZ    PROCERR             NO, THINGS MUST BE MESSED UP
+NEXTPROC AR    R4,R8               ADD THE BUFFER ADDRESS
+         USING DROB,R4
+         ICM   R3,B'1111',UADSRDAT IS THERE A PROCEDURE DATA BLOCK?
+         BZ    PROCERR             NO, THINGS MUST BE MESSED UP
+         AR    R3,R8               ADD THE BUFFER ADDRESS
+         USING DROBD,R3
+         MVC   PROCNAME(8),UADSRNAM     MOVE OVER THE PROCEDURE NAME
+         MVC   PROCUNIT(8),UADSUNAM     MOVE OVER THE ESOTERIC UNITNAME
+         MVC   PROCSIZE(4),UADSRSIZ     GET THE PROCEDURE SIZE
+         DROP  R3
+         BAL   R6,GENERATE         GENERATE THE CONTROL CARD(S)
+         NI    DUMPFLGS,X'FF'-DUMPFUSR  INDICATE FIRST CARD GENERATED
+         TM    UADSRFLG,FLGR01     ARE THERE ANY MORE PROCEDURES?
+         BO    TESTACNT            NO, GET THE NEXT ACCOUNT NUMBER
+         ICM   R4,B'0111',UADSRNEX GET THE NEXT OFFSET BLOCK
+         B     NEXTPROC            PROCESS THE NEXT OFFSET BLOCK
+         DROP  R4
+PROCERR  LA    R1,4                ISSUE PROCEDURE NOT FOUND MESSAGE
+         LA    R2,USERID           INSERT THE USERID INTO THE MESSAGE
+         BAL   R6,MESSAGE
+         MVC   RETCODE(4),=F'8'    SET RETURN CODE
+         B     NEXTUSER            CONTINUE WITH THE NEXT USER ENTRY
+TESTACNT TM    UADSAFLG,AFLG01     ARE THERE ANY MORE ACCOUNT NUMBERS?
+         BO    TESTPSWD            NO, GET THE NEXT PASSWORD
+         ICM   R5,B'0111',UADSANEX GET THE NEXT OFFSET BLOCK
+         B     NEXTACNT            PROCESS THE NEXT OFFSET BLOCK
+         DROP  R5
+TESTPSWD TM    UADSPFLG,PFLG01     ARE THERE ANY MORE PASSWORDS?
+         BO    NEXTUSER            NO, READ THE NEXT USER ENTRY
+         ICM   R7,B'0111',UADSPNEX GET THE NEXT OFFSET BLOCK
+         B     NEXTPSWD            PROCESS THE NEXT OFFSET BLOCK
+         DROP  R7
+NEXTUSER L     R10,ENTNEXT         POINT TO THE NEXT USER ENTRY
+         B     READUADS            READ THE NEXT USER ENTRY FROM UADS
+READDONE CLOSE (PDS),MF=(E,CLOSPARM)    CLOSE THE UADS
+         CLOSE (ACCOUNT),MF=(E,CLOSPARM)     CLOSE THE ACCOUNT FILE
+         EJECT
+EXIT     ICM   R0,B'1111',BUFSIZE  SHOULD THE BUFFER BE FREED?
+         BZ    EXITDONE            NO, CONTINUE
+         FREEMAIN R,LV=(0),A=(R8)  FREE THE BUFFER
+EXITDONE LR    R1,R13              GET THE SAVE AREA POINTER
+         L     R2,SAVEOLD          GET CALLER'S SAVE AREA
+         MVC   SAVER15-SAVEAREA(4,R2),RETCODE     SET THE RETURN CODE
+         FREEMAIN R,LV=WORKSIZE,A=(R1)  FREE THE WORK AREA
+         LR    R13,R2              MAKE THE CALLER'S SAVE AREA CURRENT
+         XC    SAVENEW(4),SAVENEW  CLEAR FORWARD CHAIN
+         RETURN (14,12)            RESTORE REGISTERS AND RETURN
+         EJECT
+**********************************************************************
+*  SUBROUTINE NAME -                                                 *
+*                                                                    *
+*     MESSAGE                                                        *
+*                                                                    *
+*  FUNCTION -                                                        *
+*                                                                    *
+*     THIS SUBROUTINE TAKES A MESSAGE NUMBER PASSED IN THROUGH R1 AND*
+*     AN OPTIONAL TEXT ADDRESS PASSED IN THROUGH R2 AND WRITES A     *
+*     MESSAGE TO THE SYSPRINT DATASET (WITH OPTIONAL TEXT INSERTION).*
+**********************************************************************
+MESSAGE  SLL   R1,2                MULTIPLY NUMBER BY 4 TO GET INDEX
+         L     R3,=A(MSGTEXT)      GET THE MESSAGE TEXT CSECT ADDRESS
+         L     R3,0(R3,R1)         GET THE MESSAGE TEXT ADDRESS
+         XR    R1,R1               CLEAR R1
+         IC    R1,0(,R3)           GET THE MESSAGE LENGTH
+         BCTR  R1,R0               DECREMENT LENGTH FOR MOVE
+         MVI   MSGBUF,C' '         CLEAR THE MESSAGE BUFFER
+         MVC   MSGBUF+1(L'MSGBUF-1),MSGBUF
+         EX    R1,MSGMOVE          MOVE THE MESSAGE TEXT
+         LTR   R2,R2               IS THERE ANYTHING TO INSERT?
+         BZ    MSGWRITE            NO, GO AHEAD AND WRITE THE MESSAGE
+         LA    R1,MSGBUF+1(R1)     POINT TO THE END OF THE MESSAGE
+         MVC   0(8,R1),0(R2)       INSERT THE TEXT
+MSGWRITE PUT   SYSPRINT,MSGBUF     WRITE THE MESSAGE
+         BR    R6                  RETURN
+         EJECT
+**********************************************************************
+*  SUBROUTINE NAME -                                                 *
+*                                                                    *
+*     GENERATE                                                       *
+*                                                                    *
+*  FUNCTION -                                                        *
+*                                                                    *
+*     THIS SUBROUTINE GENERATES THE ACCOUNT CONTROL CARDS FROM THE   *
+*     INFORMATION PROVIDED IN THE WORK AREA AND THE UADS HEADER.     *
+**********************************************************************
+GENERATE MVI   ACNTCARD,C' '       CLEAR THE ACCOUNT CARD
+         MVC   ACNTCARD+1(L'ACNTCARD-1),ACNTCARD
+         NI    DUMPFLGS,X'FF'-(DUMPCONT+DUMPDATA) CLEAR FLAGS
+         LA    R2,ACNTCARD         GET THE ACCOUNT CARD ADDRESS
+         MVC   0(5,R2),=C'ADD ('   MOVE IN INITIAL STRING
+         LA    R2,5(,R2)           INCREMENT PAST STRING
+         XR    R1,R1               CLEAR R1
+         IC    R1,USERLNTH         GET THE USERID LENGTH
+         BCTR  R1,R0               DECREMENT LENGTH FOR MOVE
+         LA    R3,USERID           GET THE USERID ADDRESS
+         EX    R1,VARMOVE          MOVE IN THE USERID
+         LA    R2,1(R2,R1)         INCREMENT PAST USERID
+         C     R7,LASTDPOB         IS THIS A NEW PASSWORD?
+         BE    GENPSWD             NO, CONTINUE
+         OI    DUMPFLGS,DUMPDATA   INDICATE DATA INSERTED
+         ST    R7,LASTDPOB         SAVE THE NEW DPOB
+         MVC   0(8,R2),=C') DATA ('     MOVE IN DATA STRING
+         LA    R2,7(,R2)           INCREMENT PAST DATA STRING
+GENPSWD  MVC   1(8,R2),PASSWORD    MOVE IN THE PASSWORD
+         LA    R2,9(,R2)           INCREMENT PAST PASSWORD
+         C     R5,LASTDNOB         IS THIS A NEW ACCOUNT?
+         BE    GENACNT             NO, CONTINUE
+         ST    R5,LASTDNOB         SAVE THE NEW DNOB
+         TM    DUMPFLGS,DUMPDATA   DATA ALREADY INSERTED?
+         BO    GENACNT             YES, CONTINUE
+         OI    DUMPFLGS,DUMPDATA   INDICATE DATA INSERTED
+         MVC   0(8,R2),=C') DATA ('     MOVE IN DATA STRING
+         LA    R2,7(,R2)           INCREMENT PAST DATA STRING
+GENACNT  XR    R1,R1               CLEAR R1
+         IC    R1,ACNTLNTH         GET THE ACCOUNT LENGTH
+         BCTR  R1,R0               DECREMENT LENGTH FOR MOVE
+         LA    R2,1(,R2)           INCREMENT TO NEXT CHARACTER
+         LA    R3,ACNTDATA         GET THE ACCOUNT ADDRESS
+         EX    R1,VARMOVE          MOVE IN THE ACCOUNT
+         LA    R2,1(R2,R1)         INCREMENT PAST ACCOUNT
+         TM    DUMPFLGS,DUMPFUSR+DUMPDATA    FIRST CARD OR DATA DONE?
+         BNZ   GENPROC             YES, COPY PROCEDURE NAME
+         MVC   0(8,R2),=C') DATA ('     MOVE IN DATA STRING
+         LA    R2,7(,R2)           INCREMENT PAST DATA STRING
+GENPROC  MVC   1(8,R2),PROCNAME    MOVE IN THE PROCEDURE
+         MVI   9(R2),C')'          CLOSE THE PARENTHESIS
+         LA    R2,11(,R2)          INCREMENT PAST THE COMMAND
+         TM    DUMPFLGS,DUMPFUSR   IS THIS THE FIRST CARD FOR A USER?
+         BO    GENCONT             YES, CONTINUE ANYWAY
+         CLC   PROCSIZE(4),=F'0'   IS THERE A SIZE PARAMETER?
+         BNE   GENCONT             YES, GO OUTPUT CARD AND CONTINUE
+         CLI   PROCUNIT,C' '       IS THERE A UNIT PARAMETER?
+         BE    FIRSTOUT            NO, GO OUTPUT CARD
+GENCONT  MVI   0(R2),C'+'          INDICATE CONTINUATION
+         OI    DUMPFLGS,DUMPCONT
+FIRSTOUT PUT   ACCOUNT,ACNTCARD    OUTPUT THE CARD
+         TM    DUMPFLGS,DUMPCONT   WAS THERE A CONTINUATION?
+         BNOR  R6                  NO, RETURN
+         MVI   ACNTCARD,C' '       CLEAR THE ACCOUNT CARD
+         MVC   ACNTCARD+1(L'ACNTCARD-1),ACNTCARD
+         LA    R2,ACNTCARD         GET THE ACCOUNT CARD ADDRESS
+         ICM   R1,B'1111',PROCSIZE IS THERE A SIZE PARAMETER?
+         BZ    TESTUNIT            NO, CHECK FOR A UNIT PARAMETER
+         CVD   R1,CVDWORK          CONVERT THE SIZE TO DECIMAL
+         UNPK  CVEWORK(8),CVDWORK+4(4)  CONVERT THE SIZE TO EBCDIC
+         OI    CVEWORK+7,X'F0'     MASK OUT SIGN
+         MVC   0(6,R2),=C'SIZE ('  INSERT SIZE STRING
+         LA    R2,6(,R2)           INCREMENT PAST STRING
+         MVC   0(7,R2),CVEWORK+1   MOVE IN SIZE VALUE
+         MVI   7(R2),C')'          CLOSE SIZE PARAMETER
+         LA    R2,9(,R2)           INCREMENT PAST SIZE PARAMETER
+TESTUNIT CLI   PROCUNIT,C' '       IS THERE A UNIT PARAMETER?
+         BE    FIRSTTST            NO, CHECK TO SEE IF WE'RE DONE
+         MVC   0(6,R2),=C'UNIT ('  INSERT UNIT STRING
+         LA    R2,6(,R2)           INCREMENT PAST STRING
+         MVC   0(8,R2),PROCUNIT    MOVE IN UNIT VALUE
+         MVI   8(R2),C')'          CLOSE UNIT PARAMETER
+         LA    R2,10(,R2)          INCREMENT PAST UNIT PARAMETER
+FIRSTTST TM    DUMPFLGS,DUMPFUSR   IS THIS THE FIRST CARD FOR A USER?
+         BNO   GENLAST             NO, GENERATE THE LAST CARD
+         TM    UADSATTR,USATR00    DOES USER HAVE OPER AUTHORITY?
+         BNO   CHEKACCT            NO, CHECK FOR ACCT AUTHORITY
+         MVC   0(4,R2),=C'OPER'    INDICATE OPER AUTHORITY
+         LA    R2,5(,R2)           INCREMENT PAST STRING
+CHEKACCT TM    UADSATTR,USATR01    DOES USER HAVE ACCT AUTHORITY?
+         BNO   CHEKJCL             NO, CHECK FOR JCL AUTHORITY
+         MVC   0(4,R2),=C'ACCT'    INDICATE ACCT AUTHORITY
+         LA    R2,5(,R2)           INCREMENT PAST STRING
+CHEKJCL  TM    UADSATTR,USATR02    DOES USER HAVE JCL AUTHORITY?
+         BNO   CHEKMNT             NO, CHECK FOR MOUNT AUTHORITY
+         MVC   0(3,R2),=C'JCL'     INDICATE JCL AUTHORITY
+         LA    R2,4(,R2)           INCREMENT PAST STRING
+CHEKMNT  TM    UADSATTR,USATR03    DOES USER HAVE MOUNT AUTHORITY?
+         BNO   CHEKRCVR            NO, CHECK FOR RECOVER AUTHORITY
+         MVC   0(5,R2),=C'MOUNT'   INDICATE MOUNT AUTHORITY
+         LA    R2,6(,R2)           INCREMENT PAST STRING
+CHEKRCVR TM    UADSATTR,USATR04    DOES USER HAVE RECOVER AUTHORITY?
+         BNO   USERDATA            YES, PROCESS USERDATA
+         MVC   0(8,R2),=C'NORECOVER'    INDICATE NO RECOVER AUTHORITY
+         LA    R2,9(,R2)           INCREMENT PAST STRING
+USERDATA ICM   R1,B'0011',UADSINST GET THE USERDATA HALFWORD
+         MVC   0(9,R2),=C'USERDATA('    INSERT USERDATA STRING
+         LA    R2,9(,R2)           INCREMENT PAST STRING
+         BAL   R3,CVTBH            INSERT HEX USERDATA INTO COMMAND
+         MVI   4(R2),C')'          CLOSE THE USERDATA STRING
+         MVI   6(R2),C'+'          INDICATE CONTINUATION
+         PUT   ACCOUNT,ACNTCARD    OUTPUT THE CONTINUATION CARD
+         MVI   ACNTCARD,C' '       CLEAR THE ACCOUNT CARD
+         MVC   ACNTCARD+1(L'ACNTCARD-1),ACNTCARD
+         LA    R2,ACNTCARD         GET THE ACCOUNT CARD ADDRESS
+**********************************************************************
+*  PROCESS THE PERFORMANCE GROUP MASK.  THIS MASK IS A 32 BYTE BIT-  *
+*  MASK OF PERFORMANCE GROUPS (1-256).                               *
+**********************************************************************
+         ICM   R3,B'1111',UADSPERP IS THERE A PERFORM OFFSET?
+         BZ    CHEKDEST            NO, GO CHECK DESTINATION
+         MVC   0(8,R2),=C'PERFORM('     INSERT PERFORM STRING
+         LA    R2,8(,R2)           INCREMENT PAST STRING
+         AR    R3,R8               ADD THE BUFFER ADDRESS
+         LA    R14,32              NUMBER OF BYTES IN PERFORM MASK
+NEXTBYTE CLI   0(R3),X'00'         QUICK CHECK, ANYTHING TO PROCESS?
+         BZ    NEXTRNGE            NO, GO INCREMENT TO THE NEXT BYTE
+         LA    R15,8               NUMBER OF BITS PER BYTE
+         LA    R1,X'80'            INITIAL MASK FOR THIS BYTE
+         LA    R0,32               COMPUTE PERFORMANCE RANGE
+         SR    R0,R14              PR = (8 * (32 - BYTE)) + 8
+         SLL   R0,3
+         AR    R0,R15
+         ST    R0,PERFRNGE         SAVE THE PERFORMANCE RANGE
+BYTELOOP EX    R1,PERFTEST         CHECK THIS PERFORMANCE GROUP
+         BNO   NEXTMASK            NO PERFORMANCE GROUP FOR THIS MASK
+         L     R0,PERFRNGE         GET THE PERFORMANCE RANGE
+         SR    R0,R15              SUBTRACT BIT OFFSET TO GET GROUP
+         A     R0,=F'1'            INCREMENT FOR ZERO ORIGIN
+         MVC   0(4,R2),=X'40202120'     INSERT EDIT MASK INTO BUFFER
+         CVD   R0,CVDWORK          CONVERT PERFORMANCE GROUP TO DECIMAL
+         ED    0(4,R2),CVDWORK+6   CONVERT PERFORMANCE GROUP TO EBCDIC
+         LA    R2,4(,R2)           INCREMENT PAST PERFORMANCE GROUP
+         LA    R0,ACNTCARD+L'ACNTCARD-4 SHOULD WE WRITE A CARD YET?
+         SR    R0,R2
+         BP    NEXTMASK            NO, GO PROCESS THE NEXT GROUP
+         MVI   1(R2),C'+'          INDICATE CONTINUATION
+         PUT   ACCOUNT,ACNTCARD    OUTPUT THE CONTINUATION CARD
+         MVI   ACNTCARD,C' '       CLEAR THE ACCOUNT CARD
+         MVC   ACNTCARD+1(L'ACNTCARD-1),ACNTCARD
+         LA    R2,ACNTCARD         GET THE ACCOUNT CARD ADDRESS
+NEXTMASK SRL   R1,1                SHIFT MASK RIGHT TO GET NEXT MASK
+         BCT   R15,BYTELOOP        CHECK THE NEW PERFORMANCE GROUP
+NEXTRNGE LA    R3,1(,R3)           INCREMENT TO NEXT BYTE
+         BCT   R14,NEXTBYTE        GO PROCESS THE NEXT RANGE
+         MVI   0(R2),C')'          CLOSE PARENTHESES
+         MVI   2(R2),C'+'          INDICATE CONTINUATION
+         PUT   ACCOUNT,ACNTCARD    OUTPUT THE CONTINUATION CARD
+         MVI   ACNTCARD,C' '       CLEAR THE ACCOUNT CARD
+         MVC   ACNTCARD+1(L'ACNTCARD-1),ACNTCARD
+         LA    R2,ACNTCARD         GET THE ACCOUNT CARD ADDRESS
+CHEKDEST CLI   UADSDEST,X'00'      IS THERE A DESTINATION?
+         BE    CHEKSUBH            NO, CHECK FOR HOLD CLASS
+         MVC   0(5,R2),=C'DEST('   INSERT DEST STRING
+         LA    R2,5(,R2)           INCREMENT PAST STRING
+         MVC   0(8,R2),UADSDEST    MOVE OVER THE DESTINATION
+         MVI   8(R2),C')'          CLOSE PARENTHESES
+         LA    R2,10(,R2)          INCREMENT PAST DESTINATION
+CHEKSUBH CLI   UADSSUBH,X'00'      IS THERE A HOLD CLASS?
+         BE    CHEKSUBC            NO, CHECK FOR JOB CLASS
+         MVC   0(5,R2),=C'HOLD('   INSERT HOLD STRING
+         LA    R2,5(,R2)           INCREMENT PAST STRING
+         MVC   0(1,R2),UADSSUBH    MOVE OVER THE HOLD CLASS
+         MVI   1(R2),C')'          CLOSE PARENTHESES
+         LA    R2,3(,R2)           INCREMENT PAST HOLD CLASS
+CHEKSUBC CLI   UADSSUBC,X'00'      IS THERE A JOB CLASS?
+         BE    CHEKSUBM            NO, CHECK FOR MESSAGE CLASS
+         MVC   0(9,R2),=C'JOBCLASS('    INSERT JOBCLASS STRING
+         LA    R2,9(,R2)           INCREMENT PAST STRING
+         MVC   0(1,R2),UADSSUBC    MOVE OVER THE JOB CLASS
+         MVI   1(R2),C')'          CLOSE PARENTHESES
+         LA    R2,3(,R2)           INCREMENT PAST JOB CLASS
+CHEKSUBM CLI   UADSSUBM,X'00'      IS THERE A MESSAGE CLASS?
+         BE    CHEKSOUT            NO, CHECK FOR SYSOUT CLASS
+         MVC   0(5,R2),=C'MSGCLASS('    INSERT MSGCLASS STRING
+         LA    R2,9(,R2)           INCREMENT PAST STRING
+         MVC   0(1,R2),UADSSUBM    MOVE OVER THE MESSAGE CLASS
+         MVI   1(R2),C')'          CLOSE PARENTHESES
+         LA    R2,3(,R2)           INCREMENT PAST MESSAGE CLASS
+CHEKSOUT CLI   UADSSOUT,X'00'      IS THERE A SYSOUT CLASS?
+         BE    CHEKMAXC            NO, CHECK FOR MAX SIZE
+         MVC   0(7,R2),=C'SYSOUT(' INSERT SYSOUT STRING
+         LA    R2,7(,R2)           INCREMENT PAST STRING
+         MVC   0(1,R2),UADSSOUT    MOVE OVER THE SYSOUT CLASS
+         MVI   1(R2),C')'          CLOSE PARENTHESES
+         LA    R2,3(,R2)           INCREMENT PAST SYSOUT CLASS
+CHEKMAXC ICM   R1,B'1111',UADSMAXC IS THERE A MAXIMUM SIZE?
+         BZ    MAXCNOLM            NO, INSERT NOLIM STRING
+         MVC   0(8,R2),=C'MAXSIZE('     INSERT MAXSIZE STRING
+         LA    R2,8(,R2)           INCREMENT PAST STRING
+         CVD   R1,CVDWORK          CONVERT MAXSIZE TO DECIMAL
+         UNPK  CVEWORK(8),CVDWORK+4(4)  CONVERT MAXSIZE TO EBCDIC
+         OI    CVEWORK+7,X'F0'     MASK OUT SIGN
+         MVC   0(7,R2),CVEWORK+1   MOVE OVER MAXSIZE
+         MVI   7(R2),C')'          CLOSE PARENTHESES
+         LA    R2,9(,R2)           INCREMENT PAST MAXSIZE
+         B     GENLAST             OUTPUT LAST CARD
+MAXCNOLM MVC   0(5,R2),=C'NOLIM'   INSERT NOLIM STRING
+         LA    R2,7(,R2)           INCREMENT PAST NOLIM
+GENLAST  PUT   ACCOUNT,ACNTCARD    OUTPUT THE CONTINUATION CARD
+         BR    R6                  RETURN
+         EJECT
+***********************************************************************
+*  SUBROUTINE NAME -                                                  *
+*                                                                     *
+*     CVTBH                                                           *
+*                                                                     *
+*  FUNCTION -                                                         *
+*                                                                     *
+*     CONVERT THE DATA IN THE RIGHTMOST 4 NIBBLES OF R1 TO EBCDIC HEX *
+*     AND INSERT INTO THE BUFFER POINTED TO BY R2.                    *
+***********************************************************************
+CVTBH    LA    R14,3               GET NUMBER OF DIGITS TO CONVERT - 1
+CVTLOOP  LA    R15,X'0F'           LOAD MASK INTO R15
+         NR    R15,R1              MASK OUT ALL BUT LOW DIGIT
+         IC    R15,EBCDHEX(R15)    GET THE EBCDIC DIGIT
+         STC   R15,0(R14,R2)       PUT EBCDIC DIGIT INTO BUFFER
+         SRL   R1,4                SHIFT NEXT DIGIT DOWN
+         S     R14,=F'1'           DECREMENT INDEX
+         BNM   CVTLOOP             BRANCH BACK FOR NEXT DIGIT
+         BR    R3                  RETURN
+         EJECT
+MSGMOVE  MVC   MSGBUF(*-*),1(R3)   EXECUTED MESSAGE MOVE
+VARMOVE  MVC   0(*-*,R2),0(R3)     EXECUTED STRING MOVE
+USERCOMP CLC   USERID(*-*),UADSUSER     EXECUTED USERID COMPARE
+USERMOVE MVC   USERID(*-*),UADSUSER     EXECUTED USERID MOVE
+PERFTEST TM    0(R3),X'00'         EXECUTED PERFORMANCE GROUP TEST
+         PRINT ON,NOGEN
+DIRSKEL  DCB   DSORG=PS,MACRF=GM,DDNAME=PDS,RECFM=U,BLKSIZE=256,       X
+               EODAD=DIREOF
+DIRSKELN EQU   *-DIRSKEL
+PDSSKEL  DCB   DSORG=PO,MACRF=R,DDNAME=PDS,RECFM=U,EXLST=0
+PDSSKELN EQU   *-PDSSKEL
+ACCSKEL  DCB   DSORG=PS,MACRF=PM,DDNAME=ACCOUNT,RECFM=FB,BLKSIZE=3120, X
+               LRECL=80
+ACCSKELN EQU   *-ACCSKEL
+SYSSKEL  DCB   DSORG=PS,MACRF=PM,DDNAME=SYSPRINT,RECFM=FB,LRECL=80
+SYSSKELN EQU   *-SYSSKEL
+OPENSKEL OPEN  (,),MF=L
+OPENSKLN EQU   *-OPENSKEL
+CLOSSKEL CLOSE (),MF=L
+CLOSSKLN EQU   *-CLOSSKEL
+         PRINT ON,GEN
+EBCDHEX  DC    C'0123456789ABCDEF'
+         EJECT
+         LTORG
+         EJECT
+MSGTEXT  CSECT
+MSGVECT  DS    F                   MESSAGE ADDRESS VECTOR
+         DC    A(MSG001)           OPEN SUCCESSFUL FOR FILE: XXXXXXXX
+         DC    A(MSG002)           OPEN FAILURE FOR FILE: XXXXXXXX
+         DC    A(MSG003)           NUMBER OF ENTRIES READ: XXXXXXXX
+         DC    A(MSG004)           PROCEDURE NOT FOUND FOR USER: XXXX
+         DC    A(MSG005)           UADS EXTENSION BLOCK SKIPPED FOR ...
+         DC    A(MSG006)           JFCB READ FAILED, RC = XXXXXXXX
+MSG001   DC    AL1(MSG002-MSG001-1)
+         DC    C'OPEN SUCCESSFUL FOR FILE: '
+MSG002   DC    AL1(MSG003-MSG002-1)
+         DC    C'OPEN FAILURE FOR FILE: '
+MSG003   DC    AL1(MSG004-MSG003-1)
+         DC    C'NUMBER OF ENTRIES READ: '
+MSG004   DC    AL1(MSG005-MSG004-1)
+         DC    C'PROCEDURE NOT FOUND FOR USER: '
+MSG005   DC    AL1(MSG006-MSG005-1)
+         DC    C'UADS EXTENSION BLOCK SKIPPED FOR USER: '
+MSG006   DC    AL1(MSGTEXTE-MSG006-1)
+         DC    C'JFCB READ FAILED, RC = '
+MSGTEXTE EQU   *
+         EJECT
+         REGS
+         EJECT
+WORKAREA DSECT                     REENTRANT WORK AREA
+         SAVEAREA DSECT=NO
+CVDWORK  DS    D                   BINARY TO DECIMAL WORK AREA
+ENTNUM   DS    F                   NUMBER OF ENTRIES IN THE DIRECTORY
+RETCODE  DS    F                   RETURN CODE
+PROCSIZE DS    F                   PROCEDURE SIZE FIELD
+BUFSIZE  DS    F                   UADS BUFFER SIZE FIELD
+PERFRNGE DS    F                   PERFORMANCE GROUP RANGE
+ENTLISTH DS    A                   DIRECTORY LIST HEAD
+LASTDPOB DS    A                   LAST DPOB ADDRESS
+LASTDNOB DS    A                   LAST DNOB ADDRESS
+DIRECTRY DS    0F,CL(DIRSKELN)     PDS DIRECTORY DCB
+PDS      DS    0F,CL(PDSSKELN)     PDS DATA DCB
+ACCOUNT  DS    0F,CL(ACCSKELN)     ACCOUNT CARD FILE DCB
+SYSPRINT DS    0F,CL(SYSSKELN)     SYSPRINT DCB
+OPENPARM DS    0F,CL(OPENSKLN)     OPEN PARAMETER LIST
+READPARM READ  READDECB,SF,MF=L    READ PARAMETER LIST
+CLOSPARM DS    0F,CL(CLOSSKLN)     CLOSE PARAMETER LIST
+UADSJFCB DS    0F,CL(JFCBSIZE)     JFCB FOR SYS1.UADS
+PDSEXLST DS    F                   EXIT LIST FOR PDS DCB
+DIRBLOCK DS    CL256               DIRECTORY BLOCK BUFFER
+ACNTCARD DS    CL80                ACCOUNT CARD BUFFER
+MSGBUF   DS    CL80                MESSAGE BUFFER
+CVEWORK  DS    CL8                 DECIMAL TO EBCDIC WORK AREA
+USERLNTH DS    AL1                 USERID LENGTH
+USERID   DS    CL8                 USERID FIELD
+PASSWORD DS    CL8                 PASSWORD FIELD
+PROCNAME DS    CL8                 PROCEDURE NAME FIELD
+PROCUNIT DS    CL8                 PROCEDURE UNIT NAME FIELD
+ACNTLNTH DS    AL1                 ACCOUNT NUMBER FIELD LENGTH
+ACNTDATA DS    CL40                ACCOUNT NUMBER FIELD
+DUMPFLGS DS    XL1                 FLAGS
+DUMPFUSR EQU   X'80'               FIRST CALL TO GENERATE FOR THIS USER
+DUMPCONT EQU   X'40'               CONTINUATION CARD HAS BEEN USED
+DUMPDATA EQU   X'20'               DATA CARD HAS BEEN INSERTED
+WORKSIZE EQU   *-WORKAREA          WORK AREA LENGTH IN BYTES
+         EJECT
+ENTLIST  DSECT                     DIRECTORY LIST ENTRY
+ENTNAME  DS    CL8                 ENTRY NAME
+ENTTTR   DS    XL4                 ENTRY TTR
+ENTNEXT  DS    A                   NEXT DIRECTORY LIST ENTRY
+ENTLSIZE EQU   *-ENTLIST           DIRECTORY LIST ENTRY SIZE IN BYTES
+         EJECT
+DIRENT   DSECT                     DIRECTORY BLOCK ENTRY
+DIRNAME  DS    CL8                 ENTRY NAME
+DIRTTR   DS    XL3                 ENTRY TTR
+DIRFLAGS DS    XL1                 ENTRY FLAGS
+         EJECT
+         DCBD  DSORG=PS,DEVD=DA
+         EJECT
+         IKJEFUAD DSPL,ALL
+         EJECT
+JFCB     DSECT
+         IEFJFCBN LIST=YES
+JFCBSIZE EQU   *-JFCB
+         EJECT
+         END   UADSDUMP

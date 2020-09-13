@@ -1,0 +1,2370 @@
+         PRINT ON,NOGEN
+         AIF   (NOT &$EXINT).EINONE                                   L
+         TITLE '*** ECBRSTKD - DSECT FOR THE EXT-D INT BRANCH STACK'
+**--> DSECT: ECBRSTKD       SINGLE ENTRY FOR THE BRANCH STACK . . . . .
+*.                                                                    .
+*.       THIS DSECT MIRRORS THE ECSTACKD DSECT BUT IS                 .
+*.       USED BY THE EXTENDED INTERPRETER FOR THE                     .
+*.       SUCCESSFUL-BRANCH STACK.                                     .
+*.                                                                    .
+*.. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+         SPACE 2
+ECBRSTKD DSECT
+ECBSTENT DS    0CL16               BRANCH STACK ENTRY
+ECBSLINK DS    F                   @ OF THE NEXT STACK ENTRY (LINK)
+ECBSIADD DS    F                   BRANCH INSTRUCTION ADDRESS
+ECBSCCPM DS    H                   CC AND PM
+         SPACE
+ECBSINST DS    0CL6                UP TO 6 BYTES OF INSTRUCTION
+ECBSOP   DS    C                   OPCODE
+ECBSB2   DS    C                   2ND BYTE OF INSTRUCTION
+ECBSBD   DS    H                   1ST OR ONLY BASE/DISPLACEMENT
+ECBSB2D2 DS    H                   2ND BASE/DISPLACEMENT
+         TITLE '*** EXECUT- EXTENDED INTERPRETER SECTION'
+**--> CSECT: EXECUT       EXTENDED INTERPRETER SECTION  . . . . . . . .
+*.                                                                    .
+*.             EXTENDED INTERPRETER FOR ASSIST                        .
+*.                                                                    .
+*.. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+         SPACE 5
+******************   REGISTER USAGE IN EXECUT   ***********************
+*                                                                     *
+*        REG #                     USAGE IN EXECUT                    *
+*        -----                     ---------------                    *
+*                                                                     *
+*        R0             GENERAL WORK REG                              *
+*        R1             TEMPORARY BASE / GENERAL WORK REG             *
+*        R2             BYTE REG / TEMPORARY WORK REG                 *
+*        R3             BASE REG FOR THE INSTRUCTION STACK            *
+*        R4             INSTRUCTION ADDRESS REGISTER & OPERAND        *
+*                       ADDRESS REGISTER                              *
+*        R5             CONDITION CODE REG                            *
+*        R6             BASE REGISTER FOR DSECT -> ECONTROL           *
+*        R7-R9          DECODING AND GENERAL WORK REGS                *
+*        R10            DECODING REG & OPERAND ADDRESS REGISTER       *
+*        R11            CONTAINS RELOCATION VALUE (RARELY USED AS     *
+*                       A WORK REG - BUT ALWAYS RESTORED)             *
+*        R12 & R13      BASE REGISTERS FOR EXECUT                     *
+*        R14            WORK REG / INTERNAL LINKAGE REG               *
+*        R15            CONTAINS OPCODE OF CURRENT INSTRUCTION        *
+*                                                                     *
+***********************************************************************
+EXECUT CSECT
+RWK0     EQU   R0
+RWK1     EQU   R1
+RSTK     EQU   R3
+RIA      EQU   R4
+RAD1     EQU   RIA
+RAD2     EQU   R10
+RCC      EQU   R5
+REC      EQU   R6
+RMEM     EQU   R11
+RLINK    EQU   R14
+RWK14    EQU   R14
+ROP      EQU   R15
+         TITLE '*** EXECUT - INITIALIZATION PHASE'
+***********************************************************************
+*                                                                     *
+*              INITIALIZATION CODE FOR EXECUT                         *
+*                                                                     *
+***********************************************************************
+         SPACE 5
+         $SAVE RGS=(R14-R12),BR=(R13,R12),SA=EIECSAVE
+         LR    REC,R10             MOVE ECONTROL POINTER OVER
+         USING ECONTROL,REC        NOTE ECONTROL USAGE
+         SPACE 2
+*              INSTRUCTION STACK ZEROING AND CHAINING
+         SR    R1,R1               CLEAR FOR ZEROING
+         SR    R2,R2               DITTO
+         SR    R3,R3               DITTO
+         LA    R4,L'ECSTENT        VAL OF SINGLE STACK ENTRY
+         LA    R5,ECINSTAC+L'ECINSTAC*(EC$STACK-1)  GET ENDING LIMIT
+         LA    R7,ECINSTAC         GET BEGINNING @ OF STACK AREA
+         USING ECSTACKD,R7         SET UP TEMPORARY USING
+         LA    R0,ECINSTAC+L'ECINSTAC  GET @ OF THE 2ND ELEMENT
+EINITIST EQU   *
+         STM   R0,R3,ECSTENT       ZERO ONE TABLE ENTRY
+         LR    R7,R0               UPDATE POINTER TO STACK ENTRY
+         BXLE  R0,R4,EINITIST      CONTINUE LOOPING
+         SPACE
+         LA    R0,ECINSTAC         ADDRESS FOR WRAP-AROUND
+         STM   R0,R3,ECSTENT       STORE IN LAST ENTRY
+         ST    R7,ECRSTK           SAVE WHERE CAN BE PICKED UP
+         DROP  R7                  DROP TEMP REG
+         SPACE 2
+*              BRANCH STACK ZEROING AND CHAINING
+         LA    R4,L'ECBSTENT       VAL OF SINGLE BRANCH STACK ENTRY
+         LA    R5,ECBRSTAC+L'ECBRSTAC*(EC$BRSTC-1)  GET ENDING LIMIT
+         LA    R7,ECBRSTAC         GET BEGINNING @ OF STACK AREA
+         USING ECBRSTKD,R7         SET UP TEMPORARY USING
+         LA    R0,ECBRSTAC+L'ECBSTENT   GET @ OF 2ND ELEMENT
+EINITBST EQU   *
+         STM   R0,R3,ECBSTENT      ZERO ONE TABLE ENTRY
+         LR    R7,R0               UPDATE POINTER TO STACK ENTRY
+         BXLE  R0,R4,EINITBST      CONTINUE LOOPING
+         SPACE
+         LA    R0,ECBRSTAC         ADDRESS FOR WRAP-AROUND
+         STM   R0,R3,ECBSTENT      STORE IN LAST ENTRY
+         ST    R7,ECBSTK           SAVE WHERE CAN BE PICKED UP
+         ST    R7,ECBCUR           SAVE FOR EIFINB LIST MANIPULATION
+         DROP  R7                  DROP TEMP REG
+         SPACE 2
+*              MORE INITIALIZATION
+         MVC   ECILCMSK(4),ECFENTER MAKE ENTRY POINT THE PSW
+         MVC   ECR14SAV,ECREG14    SAVE FOR ORIGINAL RETURN @
+         MVC   ECILIMT,ECILIMP     MOVE PERMENANT TO TEMPORARY        L
+         SPACE 2
+*              ADDRESS CALCULATION SECTION
+*              THE BELOW FAKE HIGH ADDRESS CALCULATION IS A DUPLICATION
+*              OF THE ADDRESS CALCULATIONS DONE IN ASSIST MAIN CONTROL
+*              REMOVING THIS CODE HOWEVER CAUSES THE HIGH ADDRESS TO
+*              TO END UP VERY WRONG WHEN IT GETS TO THE INTERPRETER
+EICONTIN EQU   *
+         L     R0,ECRADH           GET REAL HIGH ADDRESS LIMIT
+         S     R0,ECRADL           GET LENGTH OF USER PROGRAM
+         A     R0,ECFADL           ADD TO FAKE LOW ADDRESS
+         ST    R0,ECFADH           STORE IN FAKE HIGHEST ADDR
+         SPACE 2
+*              SET UP SPIE CODE
+EISPIEGO EQU   *
+         TM    ECFLAG0,$ECSPIEA    IS OUR SPIE ALREADY IN EFFECT
+         BO    EISPIEA             YES, WE DON'T HAVE TO RE-SPIE
+         $SPIE EISPIERT,((1,15)),CE=EISPIEXT,ACTION=CR CATCH ALL INTRP
+         ST    R1,ECPICA           SAVE PREVIOUS PICA, IF ANY
+         OI    ECFLAG0,$ECSPIEA    SHOW OUR SPIE IS IN CONTROL
+         SPACE 2
+EISPIEA  EQU  *
+*        INITIALIZE THE PRCB FOR THIS RUN
+*        (ALL DEFAULT ADDRESSES, FLAGS, ETC SET)
+         MVC   ECPRFLG1(8),EIDFAULT  MOVE DEFAULT VALS TO PRCB
+         MVC   ECPRWORK(4),ECFADL  SET UP HIGH AND LOW DEFAULT        M
+         MVC   ECPRWORK+4(4),ECFADH    ADDRESSES IN WORK AREA         M
+         MVC   ECPRTRAL(8),ECPRWORK  SET TRACE LIMIT ADDRS            M
+         MVC   ECPRMODL(8),ECPRWORK  SET MOD CHK LIMIT ADDRS          M
+         MVC   ECPRICL(8),ECPRWORK   SET IECF LIMIT ADDRESSES         M
+         MVC   ECPRCLOK(4),ECILIMP   SET INSTR COUNTER (CLOCK)
+         MVC   ECPRCMPR(4),=F'-1'  DISARM INTERRUPT CLOCK
+         MVI   EITSTMSK+1,ECEM370  ITIALIZE INVALID OP CODE TEST
+         SPACE 2
+*              SET UP USINGS, REGS, ETC. FOR THIS RUN
+         L     RSTK,ECRSTK         GET PTR TO STACK FOR BASE
+         USING ECSTACKD,RSTK       SET UP PERMANENT USING
+         L     RMEM,ECRELOC        GET RELOCATION VAL IN REG
+         SR    R2,R2               CLEAR BYTE REG
+         STH   R2,ECINTCOD         SET THE INTERRUPT CODE TO 0
+         SR    ROP,ROP             CLEAR OPCODE REG FOR CONSTANT IC'S
+         L     RIA,ECILCMSK        LOAD INSTR @ REG FOR EIFINB
+         LR    RCC,RIA             PLACE CC AND MASK OVER
+         SPM   RCC                 INIT REAL CC = FAKE CC
+         AIF   (NOT &$FLOTE).EINOFL1  SKIP IF NOT DOING FL
+         LD    F0,ECFPREGS         GET FP REG
+         LD    F2,ECFPREGS+8       GET FP REG
+         LD    F4,ECFPREGS+16      GET FP REG
+         LD    F6,ECFPREGS+24 GET FP REG
+.EINOFL1 ANOP
+         B     EIFINB              BEGIN MAIN LOOP INTERPRETATION
+         SPACE 5
+*              DEFAULT PRCB FLAGS
+EIDFAULT DC    AL1(0)              ECPRFLG1 DEFAULT
+         DC    AL1(ECEM370+ECALNCHK)  ECPRFLG2 DEFAULT
+         DC    XL6'0'              ECPRFLG3-ECPRFLG8 DEFAULT
+         EJECT
+* * * * * * * * * * *  OCX  INTERRUPT  EXITS  * * * * * * * * * * * * *
+***********************************************************************
+         SPACE 2
+EIOC1    EQU   *
+         LA    R0,1                SHOW OPERATION INTERRUPT
+         B     EIEXITI             EXIT POINT FOR INTERRUPTS
+EIOC2    EQU   *
+         LA    R0,2                SHOW PRIVILEGED OPERATION
+         B     EIEXITI             EXIT POINT FOR INTERRUPTS
+EIOC3    EQU   *
+         LA    R0,3                EXECUTE INTERRUPT
+         B     EIEXITI             EXIT POINT FOR INTERRUPTS
+EIOC4    EQU   *
+         LA    R0,4                PROTECTION INTERRUPT
+         B     EIEXITI             EXIT POINT FOR INTERRUPTS
+*EIOC5   EQU   *
+*        LA    R0,5                ADDRESSING INTERRUPT
+*        B     EIEXITI             EXIT POINT FOR INTERRUPTS
+EIOC6A   EQU   *                  NO NEED FOR SEPARATE CASES    CEH
+EIOC6    EQU   *
+         LA    R0,6                SPECIFICATION INTERRUPT
+         B     EIEXITI             EXIT POINT FOR INTERRUPTS
+*EIOC7   EQU   *
+*        LA    R0,7                DATA EXCEPTION
+*        B     EIEXITI             EXIT POINT FOR INTERRUPTS
+EIOCA    EQU   *
+         LA    R0,10               DECIMAL OVERFLOW
+         B     EIEXITI             EXIT POINT FOR INTERRUPTS
+         SPACE 5
+*              ENTERED WHEN PROGRAM BRANCHES OUT OF RANGE
+EIIAOUT  EQU   *
+         MVI   ECFLAG1,$ECBRN14    HOPE FOR NORMAL RETURN
+         L     R14,ECR14SAV        GET RETURN @, ORIGINAL
+         LA    R14,0(R14)          REMOVE LEADING BYTE
+         CR    RIA,R14             WAS BRANCH TO THIS ADDR ?
+         BE    EIITAILC            YES, PERFORM A NORMAL RETURN       M
+         MVI   ECFLAG1,$ECBROUT    WAS ACTUAL BRANCH OUT OF PROG
+         LA    R1,EICCBROU         SHOW @ BRANCHED OUT
+         NI    ECPRFLG3,ECNOSPI    MAKE SURE SPIE IS OFF FOR SAFETY
+         B     EIITIA              GO, HAVE @ STORED, QUIT            M
+         EJECT
+***********************************************************************
+*                                                                     *
+*              INTERRUPT HANDLER                                      *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+EISPIEXT EQU   *
+         USING *,R15
+         MVC   ECINTCOD(2),2(R1)   SAVE INTERRUPT CODE
+         BR    R14                 RETURN TO OS CONTROL
+         DROP  R15                 DROP TEMP REG
+         SPACE
+         SPACE 5
+***********************************************************************
+*                   EXIT AND RETURN CODE                              *
+***********************************************************************
+         SPACE 2
+EIEXITI  EQU   *
+         STH   R0,ECINTCOD         SAVE INTO INTERRUPT CODE
+EISPIERT EQU   *
+         MVI   ECFLAG1,0           RESET, NEEDED BY REPLACE MONITOR
+         LH    R1,ECINTCOD  NOTE:NEED THIS WHEN ENTERED AT EISPIERT   L
+         ALR   R1,R1               DOUBLE FOR HALFWORD INDEX          L
+         LH    R1,EICOFFS(R1)      GET OFFSET TO MESSAGE BLOCK
+         LA    R1,EICC0(R1)        GET @ OF MESSAGE
+EIITIA   EQU   *
+         ST    R1,ECERRAD          STORE @ IN ECONTROL
+         MVC   ECBSTK(4),ECBCUR    SAVE THE CURRENT BR STK PNTR
+         ST    RSTK,ECRSTK         SAVE THE STACK POINTER
+        N      RCC,=XL4'3F000000'  REMOVE @ & ILC (WHICH IS WRONG)
+         L     RIA,EIRIA          RELOAD ADDR. OF NEXT INSTR.   CEH
+         ALR   RCC,RIA             PUT THE @ AND CC TOGETHER
+         IC    RIA,EICTB2          GET ILC FROM LAST INST             L
+         SLL   RIA,29              SHIFT ILC TO EXTREME LEFT          L
+         OR    RCC,RIA             COMPLETE PSW IN RCC                L
+         ST    RCC,ECILCMSK        SAVE INTO THE PSW
+         SPACE 5
+*              THIS SECTION TESTS FOR AN XOPC SPIE BEING SET
+*              IF AN INTERRUPT OCCURS AND AN XOPC SPIE HAS NOT BEEN
+*              SET ABNORMAL USER TERMINATION IS PERFORMED.  IF A SPIE
+*              HAS BEEN SET AND THE INTERPRETER IS NOT ALREADY CATCH-
+*              ING AN INTERRUPT, THE SPIE EXIT ADDRESS BECOMES THE
+*              ADDRESS OF THE NEXT INSTRUCTION AND EXECUTION CONTINUES
+EITSTST  EQU   *
+         TM    ECPRFLG3,ECINHDST   TEST IF ALREADY HANDLING AN INTERUPT
+         BO    EIITAILC            IF SO, GO AHEAD AND TERMINATE
+         TM    ECPRFLG3,ECSPISET   TEST IF CATCHING INTERRUPTS
+         BNO   EIITAILC            IF NO SPIE SET, TERMINATE
+         LH    R1,ECINTCOD         GET THE INTERRUPT CODE IN A REGISTER
+         LA    R1,16(R1)           SHIFT 16 MORE THAN INTRPT CODE
+         STC   R1,EISPISFT+3       STORE INTERRUPT CODE IN SHIFT INSTR
+         L     R1,ECPRSCDE         GET THE INT CODES TO BE CAUGHT
+EISPISFT SLL   R1,$                SHIFT TO SEE IF THIS INT CAUGHT
+         LTR   R1,R1               COMPARE SHIFTED REGISTER TO ITSELF
+         BNM   EIITAILC            IF RESULT NOT MINUS DO NOT CATCH
+         MVC   ECPRIRGS(8),ECREG0  SAVE USER REGS 0 AND 1
+         MVC   ECREG0(8),ECPSW     SAVE PSW IN USER REGS 0 AND 1
+         L     RIA,ECPRSPIE        PUT SPIE EXIT ADDR FOR BRANCH
+         OI    ECPRFLG3,B'01000000' NOW IN INTERRUPT HANDLING STATE
+         B     EIFINB              TREAT AS HAVING EXECUTED BRANCH INST
+EIITAILC EQU   *
+         AIF   (NOT &$FLOTE).EINOFL3  SKIP IF NO FLOATINGS
+         STD   F0,ECFPREGS         STORE FP REGS
+         STD   F2,ECFPREGS+8       STORE FP REGS
+         STD   F4,ECFPREGS+16      STORE FP REGS
+         STD   F6,ECFPREGS+24      STORE FP REGS
+.EINOFL3 ANOP
+         TM    ECFLAG0,$ECSPIEB    DO WE NEED TO UNDO SPIE
+         BZ    EIECRET             NO, RETURN
+         L     R1,ECPICA           GET PICA ADDR BACK
+         $SPIE ACTION=(RS,(1))     RESTORE PREVIOUS XSPIEBLK
+         NI    ECFLAG0,255-$ECSPIEA  WE WILL HAVE TO RESPIE
+EIECRET  EQU   *
+         $RETURN RGS=(R14-R12)
+         TITLE '*** EXECUT - MAIN INSTRUCTION FETCH AND DECODING LOOP'
+***********************************************************************
+*                                                                     *
+*                  MAIN INTERPRETER LOOP HEAD                         *
+*                                                                     *
+*        ALL SUCCESSFUL BRANCHES PASS THROUGH EIFINB, WHERE           *
+*        CHECKING FOR ILLEGAL BRANCHES IS DONE.  CHECKING IS          *
+*        ALSO DONE FOR TIMER RUNOUT.                                  *
+*                                                                     *
+*        OTHER INSTRUCTIONS (UNSUCCESSFUL BRANCHES INCLUDED)          *
+*        PASS THROUGH EIFIN OR EIFINRR AS APPROPRIATE.                *
+*                                                                     *
+***********************************************************************
+         SPACE 4
+EIFINB   EQU   *
+*              MOVE INSTRUCTION TO BRANCH STACK
+         L     R1,ECBCUR           GET POINTER TO PRES STK SLOT
+         USING ECBRSTKD,R1         SET UP TEMPORARY USING
+         L     R1,ECBSLINK         GET POINTER TO NEXT AVAILABLE SLOT
+         MVC   ECBSTENT+4(L'ECBSTENT-4),ECSTENT+4  MOVE ENTRY OVER
+         ST    R1,ECBCUR           SAVE ADDRESS OF THIS SLOT FOR LATER
+         DROP  R1                  DROP TEMP REG
+         SPACE
+*              CHECK IF BRANCH IS LEGAL
+         LA    RIA,0(RIA)          REMOVE 1ST BYTE OF BRANCH @
+         ST    RIA,EIRIA          SAVE CURRENT INSTR. ADDR.     CEH
+         C     RIA,ECFADL          CMPR FOR BELOW LOWEST FAKE
+         BL    EIIAOUT             BRANCH IF OUT OF RANGE - ERROR
+         C     RIA,ECFADH          CMPR FOR OVER HIGHEST FAKE
+         BNL   EIIAOUT             BRANCH IF OUT OF RANGE - ERROR
+         AIF   (NOT &$ALIGN).EIFT1 SKIP IF MACHINE REQUIRES ALIGNMENT
+         ST    RIA,ECTSAVE         SAVE @: MUST DO CHECK SLOW WAY
+         TM    ECTSAVE+3,EIALHALF  DO WE HAVE HALFWORD ALIGN ?
+         BO    EIOC6               NO - SPEC. ERROR
+         AGO   .EIFT2              SKIP OTHER ALIGN CODE
+.EIFT1   ANOP
+         LH    R0,0(RIA,RMEM)      QUICK ALIGN CHECK
+.EIFT2   ANOP
+         SPACE
+*              IF TIMER RUNOUT OCCURS, ASSIST SETS ECFLAG1=$ECTIMEX.
+*              EXECUT DISCOVERS THIS NEXT TIME BRANCH IS SUCCESSFUL.
+         AIF   (&$TIMER EQ 0).EINOTOA  SKIP IF NO TIMER AT ALL
+         CLI   ECFLAG1,$ECTIMEX    IS TIMER RUNOUT FLAG SET ?
+         BNE   EIFINRR             NO - FETCH AND PROCESS INSTR AT NEW X
+                                   BRANCH ADDRESS
+*              TIMER RUNOUT HAS OCCURRED - FLAG IT.  ECFLAG1
+*              ALREADY SET.
+         LA    R1,EICCTIMB         SHOW @ OF OVER TIME MESSAGE
+         B     EIITIA              JUMP TO EXIT SECTION               M
+         AGO   .EINOTOB
+.EINOTOA ANOP
+         B     EIFINRR             BRANCH TO FETCH AND PROCESS INSTR
+.EINOTOB ANOP
+         SPACE 4
+***********************************************************************
+*                                                                     *
+*              HERE BEGINS THE PRIMARY INSTR FETCH AND                *
+*              DECODING SECTION.                                      *
+*                                                                     *
+***********************************************************************
+         SPACE 3
+*              CHECK FOR EXCEEDING TOTAL INSTRUCTION COUNT --
+*
+*              CONTROL IS PASSED TO EIFIN AFTER INTERPRETATION OF
+*              ALL INSTRUCTIONS EXCEPT SUCCESSFUL BRANCHES AND RR
+*              INSTRUCTIONS.  CONTROL IS PASSED TO EIFINRR AFTER
+*              RR'S, AND TO EIFINB AFTER SUCCESSFUL BRANCHES.
+EIFIN    EQU   *
+         L     RIA,EIRIA           RESTORE INSTR @ REG
+EIFINRR  EQU   EIFIN              RR NOW MERGES WITH OTHER      CEH
+         L     R0,ECILIMT          GET INSTRUCTION COUNTER
+         BCT   R0,EIGO             DECREMENT COUNTER
+*              COUNTER LIMIT EXCEEDED -- BR TO INTERRUPT ROUTINE
+EICNTINT EQU   *
+         ST    R0,ECILIMT          RESTORE INSTR LIMIT FOR STATS
+         MVI   ECFLAG1,$ECTIMEX    SHOW INSTR LIMIT EXCEEDED
+         LA    R1,EICCTIME         GET @ OF TIME MESSAGE
+         NI    ECPRFLG3,ECNOSPI    MAKE SURE SPIE IS OFF FOR SAFETY
+         B     EIITIA              BR TO EXIT ROUTINE                 M
+EIGO     EQU   *
+         C     R0,ECPRCMPR         CMPR CLOCK AGAINST USER LIMIT
+         BNE   EICLKOK             CONTINUE ON IF NO COUNT LIMIT EXCEED
+         TM    ECPRFLG4,ECLKADR    TEST TO SEE IF CLOCK EXIT ADDR GIVEN
+         BNO   EICNTINT            IF NO ADDR GIVEN - DO TIMER EXIT
+         L     RIA,ECPRCLEA        PREPARE BRANCH TO GIVEN EXIT ADDR
+         MVC   ECPRCMPR(4),=F'-1'  DISARM THE CLOCK FROM FURTHER INTRPS
+         B     EIFINB              TREAT AS BR INST SINCE CAUSE OF INTR
+EICLKOK  EQU   *                   NO CLOCK INTERRUPT HAS OCCURED
+         ST    R0,ECILIMT          RESTORE COUNTER
+         SPACE 2
+*              PRIMARY INSTRUCTION FETCH
+         LA    RWK14,0(RIA,RMEM)   OBTAIN PHYSICAL REAL ADDRESS
+         L     RSTK,ECSTLINK       OBTAIN ADDRESS OF NEXT STACK SLOT
+         STM   RIA,RCC,ECSTIADD    SAVE INSTRUCTION ADDRESS, CC, MASK
+         MVC   ECSTINST,0(RWK14)   MOVE 6 BYTES INTO THE NEXT SLOT
+         IC    ROP,ECOP            GET OPCODE INTO A REGISTER
+         SPACE 2
+*              FETCH MAIN TABLE ENTRY BY OPCODE INDEXING
+EIEXPEN  EQU   *
+         SR    R1,R1               R1 IS ZERO FOR IC
+         IC    R1,EIOPCDTB(ROP)    FETCH POINTER TO MAIN TABLE
+         SLL   R1,3                MULTIPLY BY 8 FOR MAIN TAB INDEX
+         LA    R1,EICONTAB(R1)     GET @ OF CONTROL TABLE ENTRY
+         MVC   EICTNTRY(EICTE$L),0(R1)    MOVE TABLE ENTRY TO WORK AREA
+         TM    EICTB1,EIEXOPCD     DOES OPCODE TELL ALL ?
+         BZ    EICHKF$A            IF YES, BR TO CHK FACILITIES ON
+         SPACE 2
+*              OPCODE DOES NOT TELL ALL - - - GET TABLE ENTRY
+*              FOR EXTENDED OPCODE INSTRUCTION
+         L     R1,EIEXTTAB         GET ADDRESS OF TOP SEC TABLE
+         MVC   EISHFTIN+3(1),EI#SHIFT(R1) PUT SHIFT # INTO INST.      L
+         IC    R2,ECOPEX           GET OPCODE EXTENSION BYTE
+*              THE FOLLOWING SHIFT INSTRUCTION WILL BE MODIFIED DURING
+*              EXECUTION TO SHIFT THE CORRECT AMOUNT FOR EACH
+*              DIFFERENT EXTENDED OPCODE.
+EISHFTIN SRL   R2,$                SHIFT FOR INDEX INTO BYTE TABLE
+         C     R2,EIMAXIND(R1)     CMPR SHFT VALUE TO MAX
+         BH    EIOC1               BR IF OPCODE IS BAD
+         IC    R2,EICTE$L(R2,R1)   GET BYTE TABLE ENTRY
+         LTR   R2,R2               TEST FOR LEGAL EXTENDED OP CODE
+         BZ    EIOC1               BRANCH IF INVALID OPCODE
+         LA    R1,0(R2,R1)         GET ADDRESS OF TABLE ENTRY
+         MVC   EICTNTRY(EICTE$L),0(R1)  FETCH EXTENDED OPCD TAB ENTRY
+         SPACE 2
+*              CHECK FOR INSTRUCTION TRACE AND IECF
+EICHKF$A EQU   *
+         TM    ECPRFLG1,ECPROPON   CHECK IF ANY OPTIONS = ON
+         BNZ   EITRIC              BRANCH IF TRACE OR IECF ON
+         SPACE 2
+*              INCREMENT INSTRUCTION ADDRESS REGISTER
+*
+*              ** NOTE ** DO NOT CHANGE THE ORDER OF THE NEXT FEW
+*              INSTRUCTIONS WITHOUT FIRST SEEING AND MODIFYING THE
+*              EX INSTR CODE (EIEX)
+EIINCPSW EQU   *
+         SR    R2,R2               ZERO FOR IC INST                   L
+         IC    R2,EICTB2           GET THE LENGTH OF THE INSTRUCTION
+         AR    RIA,R2              INCREMENT INSTRUCTION ADDRESS REG
+         SPACE 2
+*              CHECK IF OPCODE IS LEGAL ON THE MACHINE
+*              PRESENTLY BEING EMULATED
+*              NOTE:  THE MASK FOR THE FOLLOWING TM INSTRUCTION WAS
+*              INSERTED EARLIER, EITHER AT INITIALIZATION (AS 370)
+*              OR WHEN EVER AN XOPC INSTRUCTION IS EXECUTED WHICH COULD
+*              CHANGE THE MACHINE EMULATION FLAGS IN THE PRCB
+EITSTMSK TM    EICTB1,$            TEST TAB ENTRY FOR VALID OP CODE
+         ST    RIA,EIRIA          SAVE FOR RESTORING LATER      CEH
+         BZ    EIOC1               BRANCH TO INTER ROUTINE IF INVALID
+         SPACE 2
+*              CHECK IF THIS IS A PRIVILEGED INSTRUCTION
+EIOPOK   EQU   *
+         TM    EICTB1,EIPRIVOP     IS THIS A PRIV INSTR ?
+         BO    EICHKST             IF YES, BRANCH TO CHECK STATE
+         SPACE 2
+*              THE FOLLOWING SECTION DECODES THE SECOND BYTE OF THE
+*              INSTRUCTION AND PERFORMS A MULTI-WAY BRANCH TO GET
+*              THE NEEDED INFORMATION IN THE PROPER PLACES
+*              EXPECTED LATER IN THE SPECIAL ROUTINES.
+EI2BDECD EQU   *
+         CLI   ECOP,X'E1'          CHECK FOR ONLY REGISTER XDUMP
+         BE    EIXIOSR             SKIP EXTRANEOUS DECODEING FOR XDUMPR
+         SR    R7,R7               CLEAR BYTE REGISTER
+         IC    R7,ECI2             GET 2ND BYTE OF INSTR
+         TM    EICTB3,EIB2IORL     TEST TO DETERMINE DECODING NEEDED
+         BZ    EIRRX4              2 REGS - MULT BY 4 FOR INDEX
+         BO    EI2BMERG            IF IMMED OR LENGTH, DONE
+         SPACE 2
+*              PROCESS 2ND BYTE AS LL X 1
+         LR    R9,R7               COPY 2ND BYTE OF INSTR
+         SRL   R7,4                R7 = L1
+         N     R9,=XL4'0F'         R9 = L2
+         B     EI2BMERG            BRANCH TO MERGE BACK
+         SPACE 2
+*              PROCESS 2ND BYTE AS RR X 4
+*              (EVEN/ODD REGISTER CHECKING DONE ALSO)
+EIRRX4   EQU   *
+         SPACE 2
+*              THIS SECTION TESTS FOR EVEN ODD REGISTERS WHEN
+*              THEY ARE NEEDED IN AN INSTRUCTION.
+         MVC   *+7(1),EICTB5       MOVE TABLE BYTE 5 INTO TM INST
+         TM    ECR1R2,$            TEST EVEN/ODD REG ** MASK MOVED IN**
+         BNZ   EIOC6               IF RESULT NOT ZERO SOC 6 INT
+EIRRX4A  EQU   *
+         LR    R9,R7               COPY 2ND BYTE OF INSTR
+         N     R9,=F'15'           REMOVE 1ST REG, LEAVING 2ND ONLY
+         SLL   R9,2                GET R2 FIELD*4 FOR INDEXING
+         SRL   R7,4                GET R1 FIELD*4
+         SLL   R7,2                FOR INDEXING
+         L     R8,ECREGS(R7)       GET VALUE IN USER REG (R1)
+         L     R10,ECREGS(R9)      GET VALUE IN USER REG (R2)
+         SPACE 2
+***********************************************************************
+*                                                                     *
+*        AT THIS POINT IN THE DECODING, THE FOLLOWING INFORMATION     *
+*        IS CONTAINED IN REGISTERS R7 - R10:                          *
+*                                                                     *
+*      --2 REGS SPECIFIED IN INSTR+1                                  *
+*                                                                     *
+*              R7 = # OF THE 1ST REG MULT BY 4                        *
+*              R8 = CONTENTS OF THE 1ST REG                           *
+*              R9 = # OF THE 2ND REG MULT BY 4                        *
+*             R10 = CONTENTS OF THE 2ND REG                           *
+*                                                                     *
+*      --2 LENGTHS OR IMMED FIELDS SPEC IN INSTR+1                    *
+*                                                                     *
+*              R7 = THE 1ST LENGTH OR IMMED FIELD                     *
+*              R8 = UNUSED                                            *
+*              R9 = THE 2ND LENGTH OR IMMED FIELD                     *
+*             R10 = UNUSED                                            *
+*                                                                     *
+*      --1 LENGTH OR IMMED FIELD SPEC IN INSTR+1                      *
+*                                                                     *
+*              R7 = THE LENGTH OR IMMED FIELD                         *
+*              R8 = UNUSED                                            *
+*              R9 = UNUSED                                            *
+*             R10 = UNUSED                                            *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+*              MERGE BACK AFTER 2ND BYTE DECODING -- CHECK IF
+*              THIS IS AN RR INSTR; IF SO, BRANCH TO PROCESS
+EI2BMERG EQU   *
+         TM    EICTB1,EIRR         IS THIS AN RR INSTR ?
+         BNO   EI2HDECD            IF NOT, BR TO DECODE 2ND HALFWORD
+         LH    R1,EICTDISP         GET DISP TO SPECIAL ROUTINE
+         B     EISPEJMP(R1)        BRANCH TO SPECIAL ROUTINE
+         SPACE 2
+*              DECODE 2ND HALFWORD OF THE INSTRUCTION.  INFORMATION
+*              IS PUT WHERE EXPECTED LATER.  ADDRESS IS CHECKED FOR
+*              ALIGNMENT ERROR.
+EI2HDECD EQU   *
+         LH    RWK0,ECBD           LOAD 1ST B1D1 IN WORK REG FOR INSUB
+         BAL   RLINK,EIBASDSP      HAVE INSUB EVALUATE B1D1
+         LR    RAD1,RWK0           COPY ADDR INTO 1ST ADDR REG
+         TM    EICTB3,EIH2NODX     CHECK IF INDEX REG NEEDED
+         BO    EINODX              BRANCH IF B/D ONLY
+         LTR   R9,R9               TEST IF INDEX REG = 0
+         BZ    EINODX              BRANCH IF ZERO
+         LA    RAD1,0(RAD1,R10)    ZERO OUT HIGH ORDER BYTE
+         SPACE 2
+*              THIS SECTION CHECKS FOR AND PERFORMS OPERAND ALIGNMENT
+*              CHECKING IF NEEDED
+EINODX   EQU   *
+         TM    ECPRFLG2,ECALNCHK   IS ALIGNMENT CHECKING = ON ?
+         BNO   EINOCHK             BRANCH IF NOT
+         MVC   EITSMK+1(1),EICTB4    MOVE MASK INTO TM INSTR
+         STC   RAD1,EIWORK         ST LOW ORDER BYTE OF @ IN WORK AREA
+EITSMK   TM    EIWORK,$            TEST FOR ALGN ERR **MASK MOVED IN**
+         BNZ   EIOC6A              BRANCH & RESET RIA ON ALGN ERROR   L
+         SPACE 2
+*              CHECK 1ST OPRND ADDR FOR PROPER RANGE AND
+*              STORAGE MODIFICATION.
+EINOCHK  EQU   *
+         MVC   EIWORK(1),EICTB3   STORE CONTROL BYTE IN WORK  CPP
+         TM    EICTB1,EINOCNOW     DO WE CHECK MOD STOR RANGE NOW
+         BNO   EI2HEND             BRANCH IF NOT
+         IC    R2,EICTB6           GET MOD STORE LENGTH BYTE
+         LTR   RWK0,R2             GET LENGTH IN RIGHT REG
+         BNZ   EIHAVLEN            BRANCH IF RWK0 HAS LENGTH
+         LA    RWK0,1(R7)          GET LENGTH FROM THE INSTR
+EIHAVLEN EQU   *
+         LR    RWK1,RAD1           COPY ADDR TO BE CHECKED
+         BAL   RLINK,EIMSFCHK      BR TO ADDR CHECKING ROUTINE
+         SPACE 2
+***********************************************************************
+*                                                                     *
+*        AT THIS POINT IN THE DECODING PROCESS, THE FOLLOWING         *
+*        INFORMATION IS CONTAINED IN THE SPECIFIED REGISTERS:         *
+*                                                                     *
+*        (NOTE:  NO RR-TYPE INSTRS IF HERE)                           *
+*                                                                     *
+*          R7 - SAME AS IN COMMENT BLOCK ABOVE                        *
+*          R8 - SAME AS IN COMMENT BLOCK ABOVE                        *
+*          R9 - SAME AS IN COMMENT BLOCK ABOVE                        *
+*         R10 - SAME AS IN COMMENT BLOCK ABOVE                        *
+*        RAD1 - CONTAINS THE CALCULATED RELATIVE ADDRESS FROM THE     *
+*               2ND HALFWORD OF THE INSTR (B1-D1  OR  I1-B1-D1)       *
+*                                                                     *
+*        NOTE:  RAD1 IS RELOCATED TO REAL IFF THIS IS NOT A BRANCH    *
+*               INSTRUCTION.                          ---             *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+EI2HEND  EQU   *
+         TM    EICTB2,EILEN6       IS INSTR LENGTH = 6 ?
+         BO    EI3HDECD            BRANCH IF YES
+         TM    EICTB3,EIBRINST     IS THIS A BRANCH INSTRUCTION ?
+         BO    EI4JUMP             YES - DON'T RELOCATE RAD1
+         ALR   RAD1,RMEM           RELOCATE ADDRESS TO REAL
+         AIF   (&$S370 NE 2).EITRX SKIP IF ON A REAL 370
+*
+*              IF FAKING ALIGNMENT IS NECESSARY, DO IT !
+*
+         TM    ECPRFLG2,ECALNCHK   IS ALIGNMENT CHECKING ON ?
+         BZ    EI4JUMP             NO - SKIP FAKING CODE
+         TM    EICTB4,EIALDOBL     DOES THIS INSTR NEED ALIGN ?
+         BZ    EI4JUMP             NO - SKIP FAKING CODE
+         CLI   ECOP,X'90'         IS THIS A STM?                CPP
+         BE    EI4JUMP            IF YES SKIP FAKING CODE       CPP
+         CLI   ECOP,X'98'         IS THIS AN LM?                CPP
+         BE    EI4JUMP            IF YES, SKIP FAKING CODE      CPP
+         CLI   ECOP,X'44'         IS THIS AN EX?                CPP
+         BE    EI4JUMP            IF YES, SKIP FAKING CODE      CPP
+         LTR   RWK14,RAD1          SAVE FOR LATER, SET CC ›= 0
+         MVC   EIDUBLWD(8),0(RAD1) MOVE A MAX OF 8 BYTES OVER
+         LA    RAD1,EIDUBLWD       LOAD @ OF ALIGNED FIELD
+.EITRX   ANOP
+EI4JUMP  EQU   *
+         LH    RWK1,EICTDISP       GET DISP FOR BR TO SPECIAL ROUTINE
+         B     EISPEJMP(RWK1)      BRANCH TO SPECIAL ROUTINE
+         AIF   (&$S370 NE 2).EITRXA  SKIP IF ON A REAL 370
+EIDUBLWD DC    D'0'                USED FOR FAKING 360 ALIGNMENT
+.EITRXA  ANOP
+         SPACE 2
+*              THIS SECTION DECODES THE THIRD HALFWORD OF THE 6 BYTE
+*              SS-TYPE INSTRUCTION, AND THEN BRANCHES TO A SPECIAL
+*              ROUTINE TO COMPLETE PROCESSING.
+EI3HDECD EQU   *
+         LH    RWK0,ECB2D2         GET 3RD HALFWORD OF THE INSTR
+         BAL   RLINK,EIBASDSP      CALCULATE RELATIVE ADDR (B2D2)
+         LR    RAD2,RWK0           COPY ADDR INTO 2ND ADDR REG
+         SPACE 2
+*              CHECK 2ND OPRND ADDRESS FOR PROPER RANGE
+         TM    ECFLAG0,$ECPROT     IS ABSOLUTE PROTECT FLAG ON ?
+         BZ    EI3HEND             IF NOT, BRANCH AROUND INSUB CALL
+         CLI   ECOP,X'E0'          IS THIS AN X-PSEUDO INSTR ?
+         BE    EI3HEND             YES - DON'T CHECK THIS ADDRESS
+         LR    RWK1,RAD2           COPY ADDRESS FOR CHECKING
+         LR    RWK0,R7             ASSUME ONE LENGTH FOR OPERANDS
+         TM    EICTB3,EIB2IORL     TEST TO FIND LENGTH TYPE
+         BO    *+6                 IF ONE LENGTH BRANCH AROUND
+         LR    RWK0,R9             GET RIGHT LENGTH
+         ALR   RWK0,RWK1           GET @ OF HIGHEST BYTE ACCESSED
+         BAL   RLINK,EIFTHCHK      CHECK ADDR FOR FETCH RANGE
+***********************************************************************
+*                                                                     *
+*        REGISTER USAGE FOR SS-TYPE INSTRUCTIONS IS AS FOLLOWS:       *
+*                                                                     *
+*          R7 - CONTAINS EITHER:                                      *
+*              A.  THE LENGTH OR IMMED FIELD AS A FULL BYTE, OR       *
+*              B.  THE 1ST OF 2 LENGTHS OR IMMED FIELDS               *
+*          R8 - IS UNUSED                                             *
+*          R9 - IS EITHER UNUSED OR CONTAINS THE 2ND OF 2 LENGTHS OR  *
+*               IMMEDIATE FIELDS                                      *
+*        RAD1 - CONTAINS THE 1ST RELATIVE ADDRESS (B1D1)              *
+*        RAD2 - CONTAINS THE 2ND RELATIVE ADDRESS (B2D2)              *
+*                                                                     *
+*        NOTE: THE ADDRESSES IN RAD1 AND RAD2 ARE RELOCATED FOR       *
+*              ASSIST.                        ---                     *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+EI3HEND  EQU   *
+         AR    RAD1,RMEM           RELOCATE 1ST FAKE @ TO REAL
+         AR    RAD2,RMEM           RELOCATE 2ND FAKE @ TO REAL
+         MVC   EIQSS(2),ECOP       MOVE OPCODE & LENGTH(S) INTO INSTR
+         LH    RWK1,EICTDISP       GET DISP FOR BR TO SPECIAL ROUTINE
+         B     EISPEJMP(RWK1)      BRANCH TO SPECIAL ROUTINE
+         SPACE 1
+EIRIA    DC    F'0'                SAVE AREA FOR INSTRUCTION ADDR
+         SPACE 5
+EISPEJMP EQU   *                   USED TO CALCULATED JUMP ADDRESS
+*
+*------------> THIS MARKS THE END OF THE PRIMARY FETCH/DECODE LOOP
+         TITLE '*** EXECUT - CODE CALLED FROM MAIN FETCH/DECODE LOOP'
+*              THE FOLLOWING CODE COMPRISES SOME OUT-OF-LINE
+*              ROUTINES BRANCHED TO FROM THE ABOVE PRIMARY FETCH
+*              AND DECODING LOOP:
+         SPACE 2
+*              CHECK STATE  ----  PRIV OPCODE WAS ENCOUNTERED
+EICHKST  EQU   *
+         TM    ECPRFLG2,ECSUPRST   ARE WE IN SUPERVISOR STATE ?
+         BO    EI2BDECD            IF IN SUPER STATE BRANCH TO DECODE
+         B     EIOC2               IF NOT IN SUPER STATE SOC 2 FLAGGED
+         SPACE 2
+*              THIS SECTION PROCESSES INSTRUCTION TRACE AND
+*              COUNTING FACILITIES
+         SPACE 2
+*              INCREMENT THE INSTRUCTION EXECUTION COUNT FACILITY
+*              COUNTERS
+EITRIC   EQU   *
+         TM    ECPRFLG1,ECPRIECF   IS THE IECF ACTIVE NOW?
+         BNO   EITRICB             IF NOT ON GO SEE IF TRACE IS ON
+         C     RIA,ECPRICH         CMPR INSTR @ WITH HIGH ADDR LIMIT
+         BH    EITRICB             BRANCH IF OUT OF RANGE
+         C     RIA,ECPRICL         CMPR INSTR @ WITH LOW ADDR LIMIT
+         BL    EITRICB             BRANCH IF OUT OF RANGE
+         LR    RWK1,RIA            MOVE INSTR @ REG TO WORKABLE REG
+         S     RWK1,ECFADL         SUBTRACT FOR INSTRUCTION OFFSET
+         L     R7,ECPRICA          GET BEGINNING ADDRESS OF COUNT AREA
+         LH    RWK14,0(RWK1,R7)    LOAD THE PROPER HALFWORD COUNTER
+         LA    RWK14,1(RWK14)      INCREMENT THE INSTRUCTION COUNTER
+         STH   RWK14,0(RWK1,R7)    RESTORE THE INCREMENTED COUNTER
+*              PROCESS ---->  TRACE FACILITY
+EITRICB  EQU   *
+         TM    ECPRFLG1,ECPRTRCE   IS THE TRACE FACILITY ON
+         BNO   EIINCPSW            BRANCH IF FACILITY NOT ON
+         C     RIA,ECPRTRAH        COMPARE INSTR @ WITH HIGH LIMIT
+         BH    EIINCPSW            BRANCH IF OUT OF RANGE
+         C     RIA,ECPRTRAL        CMPR INSTR @ WITH LOW LIMIT
+         BL    EIINCPSW            BRANCH IF OUT OF RANGE
+         MVC   EITRMSIN+4(10),EIBLANKS   BLANK OUT INSTR AREA
+         XHEXO RIA,EITRMSAD        CONVERT INSTR @ TO HEX
+         MVC   EITRMSAD(2),EIBLANKS      BLANK OUT 1ST TWO BYTE OF @
+         LM    R0,R1,ECSTCCPM      FETCH INSTR FROM INSTR STACK
+         SLDL R0,16                RR AND RX CODE IN REG 0
+         XHEXO R0,EIWORK           CONVERT INSTR TO HEX (4 BYTES)
+         TM    ECSTINST,EISSINST   IS THIS AN SS INSTR ?
+         BNO   EINOTSS             BRANCH IF NOT
+         XHEXO R1,EIWORK+8         CONVERT INSTR TO HEX (LAST 2 BYTES)
+EINOTSS  EQU   *
+         LA    RWK1,EITRMSIN       GET @ OF HEX INSTR
+         BAL   R2,EIMOVINS         MOVE HEX INSTR INTO FORMAT
+         $PRNT EITRMSG,EITRMSGL,EICNTEXC  PRINT INSTR FOR TRACE AND BR X
+                                          OUT IF LINE COUNT EXCEEDED
+         B     EIINCPSW            RETURN TO MAIN PROGRAM LOOP
+*              WORK AREAS USED BY THE TRACE FACILITY
+EITRMSG  DC    C' TRACE-->   INSTR ADDR:'  TRACE MESSAGE
+EITRMSAD DC    8C' '               TRACE MESSAGE
+         DC    C'   INSTR:  '       TRACE MESSAGE
+EITRMSIN DC    14C' '              TRACE MESSAGE
+EITRMSGL EQU   *-EITRMSG           LENGTH OF THE TRACE MESSAGE
+EIWORK   DC    16C' '              WORK AREA
+EIBLANKS DC    10C' '              BLANKS USED IN TRACE
+         TITLE '*** EXECUT - RR PROCESSING ROUTINES'
+***********************************************************************
+*                                                                     *
+*              RR INSTRUCTION PROCESSING ROUTINES                     *
+*                                                                     *
+***********************************************************************
+         SPACE 5
+*        ********** NORMAL RR INSTRUCTION PROCESSING **********
+*
+*              2 ENTRIES TO SEQUENCE -->
+*              LR   SEPARATE SINCE CURRENT CC NOT CHANGED
+*              NR,CLR,OR,XR,CR,AR,SR,ALR,SLR,LPR,LNR,LCR,LTR    NORMAL
+         SPACE 1
+EILR     EQU   *                   LOAD REGISTER INST
+         ST    R10,ECREGS(R7)      LOAD R1 WITH VALUE FROM R2
+         B     EIFINRR             RETURN FOR NEXT INSTR
+         SPACE 1
+EINORMRR EQU   *                   NORMAL RR INSTRS
+         STC   ROP,EIQRR           PLACE ACTUAL OPCODE INTO INSTR
+EIQRR    LR    $+R8,R10            EXECUTE RIGHT INSTRUCTION           X
+                                   ***** OPCODE MOVED IN *****
+         ST    R8,ECREGS(R7)       SAVE RESULT IN OPERAND LOCATION
+         BAL   RCC,EIFINRR         GET CC, RETURN FOR NEXT INSTR
+         SPACE 2
+*              THIS SECTION PROCESSES THE BALR INSTRUCTION
+EIBALR   EQU   *
+         LR    RWK1,RIA            COPY ADDR NEXT INSTR OVER
+         N     RCC,=XL4'3F000000'  LEAVE ONLY CC-PM IN RCC
+         AL    RCC,=XL4'40000000'  ADD ILC INTO PSW BEING BUILT
+         ALR   RWK1,RCC            NOW HAVE ILC-CC-PM-IA FIELDS
+         ST    RWK1,ECREGS(R7)     FAKE REGISTER GETS BUILT PSW
+         LTR   R9,R9               TEST FOR NO BRANCHING R2 = 0
+         BZ    EIFINRR             NO BRANCH TREAT AS REG RR GET NEXT  X
+                                                 INSTRUCTION
+         LR    RIA,R10             PUT BRANCH ADDRESS IN PROPER REG
+         B     EIFINB              PROCESS SUCCESSFUL BRANCH
+         SPACE 2
+*              BRANCH ON COUNT REGISTER  (BCTR)
+EIBCTR   EQU   *
+         BCTR  R8,0                DECREMENT VALUE IN FAKE R1
+         ST    R8,ECREGS(R7)       RESTORE VALUE TO FAKE REG
+         LTR   R9,R9               IS R2 = 0 ?
+         BZ    EIFINRR             IF ZERO, NO BRANCH
+         LTR   R8,R8               IS DECREMENTED VALUE = 0 ?
+         BZ    EIFINRR             IF ZERO, NO BRANCH
+         LR    RIA,R10             PUT BRANCH @ IN RIGHT REG
+         B     EIFINB              PROCESS SUCCESSFUL BRANCH
+         SPACE 2
+*              BRANCH ON CONDITION REGISTER (BCR)
+EIBCR    EQU   *
+         LTR   R9,R9               IS R2 = 0 ?
+         BZ    EIFINRR             IF ZERO, NO BRANCH
+         SLL   R7,2                GET MASK IN RIGHT SPOT
+         STC   R7,EIQBCR+1         STORE MASK INTO INSTR
+         LR    RWK1,RIA            COPY @ OF NEXT SEQ INSTR
+         LR    RIA,R10             PUT BRANCH ADDR IN RIGHT REG
+         SPM   RCC                 SET REAL CC = FAKE CC
+EIQBCR   BC    $,EIFINB            *** MASK STORED IN ***
+         LR    RIA,RWK1            RESTORE INSTR @ REG
+         B     EIFINRR             BRANCH FAILED
+         SPACE 1
+*              CHECK FOR FLOATING-POINT INSTR OR EXT FLOATING POINT
+         AIF   (&$FLOTEX).EIXFPRR  GO GENER CODE IF XFP IS OK
+EIXFPRR  EQU   EIOC1               NOTE XFP INVAL OP IF NOT ALLOWED
+         AIF   (&$FLOTE).EIFPRR    GO GENERATE IF FLOAT PNT INST OK
+EIFPRR   EQU   EIOC1               NOTE NOT ALLOWING FLOATINGS
+         AGO   .EIFPRR2
+.EIXFPRR ANOP
+EIXFPRR  EQU   *                   CODE FOR XFP SAME AS FOR REGULAR FP
+.EIFPRR  ANOP
+         SPACE 2
+*              RR FLOATING POINT INSTRUCTIONS EXECUTED
+EIFPRR   EQU   *                   FLOATING-PNT RR'S ENTER HERE
+         SPM   RCC                 SET OUR CC SAME AS USER'S
+         EX    R0,ECOP             EXECUTE ACTUAL INSTR FROM THE STACK
+         BAL   RCC,EIFINRR         GET CC AND RETURN FOR NEXT INSTR
+.EIFPRR2 ANOP
+         SPACE 2
+*              THE FOLLOWING CODE PROCESSES THE CLCL, MVCL
+*              INSTRUCTIONS
+*
+*              ADDRESS CHECKING CODE FOR CLCL AND MVCL
+EILONG   EQU   *
+         L     RWK0,ECREGS+4(R7)   GET LENGTH VALUE OF REG 2 PAIR 1
+         N     R8,EILONGMK         ZAP OUT UPPER BYTE OF ADDRESS
+         N     RWK0,EILONGMK       ZAP OUT UPPER BYTE OF LENGTH
+         BZ    EILONG1             IF LENGTH = 0 DON'T CHECK ADDRESS
+         MVC   EIWORK(1),EICTB3    STORE CONTROL BYTE IN WORK AREA
+         LR    RWK1,R8             COPY ADDRESS TO BE CHECKED
+         BAL   RLINK,EIMSFCHK      BRANCH TO ROUTINE CHECK FIRST @
+         SPACE 2
+*              FIRST ADDRESS IS OKAY ---  CHECK THE SECOND
+EILONG1  EQU   *
+         L     RWK0,ECREGS+4(R9)   GET VALUE (LENGTH) OF 2ND REG PAIR 2
+         N     R10,EILONGMK        ZAP OUT UPPER BYTE OF SECOND ADDRESS
+         N     RWK0,EILONGMK       ZAP OUT UPPER BYTE OF SECONG LENGTH
+         BZ    EILONG2             IF LENGTH 0 DON'T CHECK ADDRESS
+         IC    RWK1,EICTB3         GET CONTROL BYTE
+         SLL   RWK1,2              SHIFT BECAUSE WOKING ON SECOND OPRND
+         STC   RWK1,EIWORK         PUT TAB ENTRY IN INSUB WORK AREA
+         LR    RWK1,R10            PUT ADDR WHERE INSUB EXPECTS IT
+         BAL   RLINK,EIMSFCHK      BRANCH TO INSUB CHECK 2ND ADDRESS
+         SPACE 2
+*              BOTH ADDRESSES ARE OK  --- RELOCATE THEM AND PERFORM
+*              THE APPROPRIATE COMMAND
+EILONG2  EQU   *
+         ALR   R8,RMEM             RELOCATE 1ST ADDRESS TO REAL ADDRESS
+         ALR   R10,RMEM            RELOCATE 2ND ADDRESS TO ACTUAL
+         SPACE 2
+         AIF   (&$S370 NE 1).EILONG1    SKIP IF NOT ON REAL 370
+         STC   ROP,EIQLONG         STORE OPCODE IN INSTRUCTION
+         LR    RWK1,R9             SAVE SECOND OPERAND REG NUMBER
+         LR    RWK0,RMEM           SAVE RELOCATION REGISTER
+         L     R9,ECREGS+4(R7)     GET LENGTH OF FIRST OPERAND
+         L     R11,ECREGS+4(RWK1)  GET LENGTH OF SECOND OPERAND
+EIQLONG  CLCL  R8,R10              **** OPCODE MOVED IN DURING EXEC***
+         BALR  RCC,0               PICK UP THE CONDITION CODE
+         SLR   R8,RWK0             DE-RELOCATE FINAL ADDRESSES
+*              *** THE INSTRUCTIONS ON EITHER SIDE OF THIS COMMENT
+*              *** BLOCK ARE USING RWK0 INSTEAD OF RMEM DUE TO
+*              *** TEMPORARY REGISTER SHIFTING *****
+         SLR   R10,RWK0            DE-RELOCATE FINAL ADDRESSES
+         N     R8,EILONGMK         ZAP UPPER BYTE OF ADDRESS REG
+         N     R10,EILONGMK        ZAP UPPER BYTE OF ADDRESS REGISTER
+         ST    R8,ECREGS(R7)       PUT REGISTERS BACK INTO CORE
+         ST    R9,ECREGS+4(R7)     PUT REGISTERS BACK INTO CORE
+         ST    R10,ECREGS(RWK1)    PUT REGISTERS BACK INTO CORE
+         ST    R11,ECREGS+4(RWK1)  PUT REGISTERS BACK INTO CORE
+         LR    RMEM,RWK0           RELOAD RELOCATION REGISTER
+         B     EIFINRR            GET NEXT INSTR                PSU.
+         AGO   .EILONG2
+.EILONG1 ANOP
+         SPACE 2
+*              CHECK WHICH INSTRUCTION TO SIMULATE (MVCL OR CLCL)
+         LA    RWK14,1             SET UP INCREMENT REGISTER
+         IC    RWK1,ECREGS+4(R9)   GET PAD BYTE FROM INSTR
+         STC   RWK1,EIPAD          STORE PAD BYTE IN WORK AREA
+         L     RWK1,ECREGS+4(R7)   GET 1ST OPERAND LENGTH
+         L     R2,ECREGS+4(R9)     GET SECOND OPERAND LENGTH
+         N     RWK1,EILONGMK       ZAP OUT HIGH ORDER BYTE LENGTH 1
+         N     R2,EILONGMK         ZAP OUT HIGH ORDER BYTE LENGTH 2
+         CLI   ECOP,X'0E'          IS THIS AN MVCL COMMAND
+         BE    EIMVCL              IF SO BRANCH TO ROUTINE
+         SPACE 2
+*              CODE FOR THE CLCL COMMAND
+EICLCL   EQU   *
+         LTR   R2,R2               TEST SECOND LENGTH = 0?
+         BZ    EICLCL6             BRANCH IF SECOND LENGTH 0
+         LTR   RWK1,RWK1           TEST 1ST LENGTH = 0 ?
+         BZ    EICLCL2             YES, BRANCH TO USE PAD AND OPRND 2
+EICLCL1  EQU   *
+         CLC   0(1,R8),0(R10)      COMPARE A CHARACTER FROM EACH FIELD
+         BNE   EICLCL5             IF NOT EQUAL WE ARE DONE BRANCH
+         AR    R10,RWK14           INCREMENT POINTERS
+         AR    R8,RWK14            INCREMENT POINTERS
+         BCT   RWK1,EICLCL3        DECREMENT 1ST LENGTH - BRANCH ›= 0
+         B     EICLCL7             LENGTH = 0, BRANCH INTO PAD LOOP
+EICLCL2  EQU   *
+         CLC   EIPAD(1),0(R10)     COMPARE PAD TO OPERAND 2
+         BNE   EICLCL5             IF NOT EQUAL WE ARE DONE -- BRANCH
+         AR    R10,RWK14           INCREMENT OPERAND 2 POINTER
+EICLCL7  EQU   *
+         BCT   R2,EICLCL2          DECREMENT 2ND COUNT BR IF ›= 0
+         B     EICLCL5             IF LENGTH = 0 OPRNDS = WE'RE DONE
+EICLCL3  EQU   *
+         BCT   R2,EICLCL1          DECREMENT 2ND LENGTH BR IF ›=0
+EICLCL4  EQU   *
+         CLC   0(1,R8),EIPAD       COMPARE FIRST OPERAND AND PAD CHAR
+         BNE   EICLCL5             IF NOT = WE ARE DONE BRANCH
+         AR    R8,RWK14            INCREMENT POINTER
+         BCT   RWK1,EICLCL4        DECREMENT LENGTH, BRANCH IF ›= 0
+EICLCL5  EQU   *
+         BAL   RCC,EILONG5         CAPTURE CONDITION CODE AND RETURN
+EICLCL6  EQU   *
+         LTR   RWK1,RWK1           FIRST LENGTH = 0?
+         BNZ   EICLCL4             NO, USE 1ST OPRND AND PAD
+         BAL   RCC,EILONG5         GET CC (=0) AND RETURN
+         SPACE 2
+*              CODE FOR THE MVCL COMMAND
+EIMVCL   EQU   *
+         LR    RWK0,RWK1           ASSUME FIRST LENGTH SMALLEST
+         CR    RWK1,R2             COMPARE THE LENGTHS
+         BALR  RCC,0               CAPTURE THE CC
+         BL    *+6                 IF 1ST LENGTH LOWER, BRANCH
+         LR    RWK0,R2             2ND LENGTH MUST BE SMALLER
+         LTR   RWK0,RWK0           IS SMALLEST LENGTH = 0?
+         BZ    EIMVCL3             IF SMALLER = 0, BRANCH
+         SPACE 2
+*              FOLLOWING CODE CHECKS FOR DESTRUCTIVE OVERLAP
+         CR    R8,R10              IS FIRST FIELD AFTER 2ND
+         BNH   EIMVCL1             IF NO OVERLAP, BRANCH
+         LR    RWK14,R10           COPY OVER 2ND ADDRESS
+         LA    RWK14,0(R2,RMEM)    COMPUTE HIGHEST @, RELOCATED + 1
+         BCTR  RWK14,0             COMPUTE HIGHEST ADDRESS
+         CR    R8,RWK14            IS 1ST FIELD AFTER END OF SECOND
+         BNL   EIMVCL1             YES -- NO OVERLAP, SO BRANCH
+         TM    *+1,1               SET CC = 3
+         BAL   RCC,EILONG5         GET CC AND RETURN
+         SPACE 2
+EIMVCL1  EQU   *
+         SR    RWK1,RWK0           DECREMENT LENGTH BY SMALLEST
+         SR    R2,RWK0             DECREMENT LENGTH BY SMALLEST
+         LA    RWK14,1             LOAD INCREMENT REGISTER
+EIMVCL2  EQU   *
+         MVC   0(1,R8),0(R10)      MOVE 1 BYTE !!!!!!
+         AR    R8,RWK14            INCREMENT POINTER BY 1
+         AR    R10,RWK14           INCREMENT POINTER BY 1
+         BCT   RWK0,EIMVCL2        DECREMENT LENGTH, ›= 0 BRANCH
+EIMVCL3  EQU   *
+         LTR   RWK1,RWK1           DO WE NEED PADDING
+         BZ    EILONG5             NO --- DONE, SO BRANCH
+EIMVCL4  MVI   0(R8),$             MOVE PAD TO FIRST OPERAND
+         AR    R8,RWK14            INCREMENT POINTER BY 1
+         BCT   RWK1,EIMVCL4        DECREMENT LENGTH, ›= 0 BRANCH
+         SPACE 2
+EILONG5  EQU   *
+         LA    RWK14,ECREGS(R7)    GET ADDRESS OF 1ST REG PAIR
+         XC    5(3,RWK14),5(RWK14) ZAP LOWER PART OF LENGTH IN CORE
+         O     RWK1,4(,RWK14)      PUT UPPER BYTE BACK INTO USER REG
+         LA    RWK14,ECREGS(R9)    GET ADDR OF SECOND REGISTER PAIR
+         XC    5(3,RWK14),5(RWK14) ZAP LOWER PART OF LENGTH IN CORE
+         O     R2,4(,R2)           PUT UPPER BYTE BACK INTO REGISTER
+*              OPERATION COMPLETE ----- RESTORE REGISTERS AND RETURN
+         SLR   R8,RMEM             DE-RELOCATE FINAL ADDRESSES
+         SLR   R10,RMEM            DE-RELOCATE FINAL ADDRESSES
+         N     R8,EILONGMK         ZAP UPPER BYTES OF ADDRESS REGS
+         N     R10,EILONGMK        ZAP UPPER BYTES OF ADDRESS REGS
+         ST    R8,ECREGS(R7)       PUT REGISTERS BACK INTO CORE
+         ST    RWK1,ECREGS+4(R7)   PUT REGISTERS BACK INTO CORE
+         ST    R10,ECREGS(R9)      PUT REGISTERS BACK INTO CORE
+         ST    R2,ECREGS+4(R9)     PUT REGISTERS BACK INTO CORE
+         SR    R2,R2               RESTORE R2 AS A BYTE REGISTER
+         B     EIFINRR            RETURN FOR NEXT INSTR.        CEH
+EIPAD    EQU   EIMVCL4+1           MVCL/CLCL PAD BYTE IS MOVED HERE
+.EILONG2 ANOP
+EILONGMK DC    0F'0',XL4'00FFFFFF' USED TO CLEAR UPPER BYTE OF REGS
+         SPACE 2
+*              THE FOLLOWING CODE PROCESSES SET PROGRAM MASK
+EISPM    EQU   *
+         L     RCC,ECREGS(R7)      PLACE SPECIFIED REG INTO CC REG
+         SPM   RCC                 SET REAL CC-PM TO FAKE CC-PM
+         B     EIFINRR             RETURN FOR NEXT INSTRUCTION
+         SPACE 1
+*              THESE TWO PRIVILEGED INSTRUCTIONS ARE NOT IMPLEMENTED
+*               AT THE PRESENT TIME.  THE HOOKS ARE PROVIDED HOWEVER,
+*              IF IT SHOULD BECOME POSSIBLE TO IMPLEMENT THEM IN THE
+*              FUTURE
+EISSK    EQU   EIOC2
+EIISK    EQU   EIOC2
+         SPACE 2
+*              THE FOLLOWING CODE PROCESSES THE SVC INSTRUCTION
+*              CONTROL IS PASSED HERE FROM THE MAIN DECODONG LOOP
+*              WHEN AN SVC OPCODE IS ENCOUNTERED.  AT THIS POINT
+*              REGISTER 7 CONTAINS THE SECOND BYTE OF THE INSTRUCTION
+*              AND REGISTER ROP CONTAINS THE INSTRUCTION OPCODE.  THIS
+*              INSTRUCTIONS IS PRESENTLY FLAGGED AS AN OC2 EXCEPTION.
+*                 IN THE FUTURE, CODE MAY BE PLACED HERE TO ACTUALLY
+*              PERFORM OR SIMULATE THE SCV.  IT SHOULD BE NOTED THAT
+*              REGISTERS RWK0, RWK1, R8, R9, R10 AND R14 ARE AVAILABLE
+*              FOR USE HERE.  R2 CAN ALSO BE USED AS A BYTE REGISTER OR
+*              RESTORED TO A BYTE REGISTER IF USED FOR ANOTHER PURPOSE.
+*              NO OTHER REGISTERS SHOULD BE USED HERE.
+*                FOLLOWING ANY FUTURE SVC PROCESSING, CONTROL MUST BE
+*              PASSED TO LABEL EIFINRR TO FETCH AND PROCESS THE NEXT
+*              INSTRUCTION.
+         SPACE 2
+EISVC    EQU   EIOC2
+         SPACE 2
+*              THIS CODE IS USED TO PERFORM THE MR AND DR INSTRS
+EIMRDR   EQU   *
+         STC   ROP,EIQMRDR         STORE PROPER OPCODE IN INSTRUCTION
+         LA    RWK1,ECREGS(R7)     GET ADDRESS OF FAKE REGISTER PAIR
+         L     R9,ECREGS+4(R7)     GET CONTENTS OF SECOND REG OF PAIR
+EIQMRDR  MR    $+R8,R10            ****OPCODE MOVED IN DURING EXEC****
+         STM   R8,R9,0(RWK1)       STORE CHANGED REGS INTO FAKE REGS
+         B     EIFINRR             BRANCH AND RETURN FOR NEXT INSTR
+         TITLE '*** EXECUT - RX PROCESSING ROUTINES'
+***********************************************************************
+*                                                                     *
+*              RX TYPE INSTRUCTION INTERPRETING SECTION               *
+*                                                                     *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+*              RX NORMAL PROCESSING                                   *
+*              (IC,CH,AH,SH,MH,N,CL,O,X,C,A,S,AL,SL,L,LH,CVB)         *
+EINORMRX EQU   *
+         STC   ROP,EINRMRX         MOVE PROPER OP CODE TO INSTRUCTION
+         SPM   RCC                 SET OUR CONDITION CODE TO USERS
+EINRMRX  IC    $+R8,0(RAD1)        ** PROPER OP CODE WILL BE MOVED IN**
+         ST    R8,ECREGS(R7)       STORE RESULT IN PROPER USER REGISTER
+         BAL   RCC,EIFIN           GET CC AND RETURN FOR NEXT INSTR
+         SPACE 2
+*              THIS SECTION PROCESSES THE BAL INSTRUCTION
+EIBAL    EQU   *
+         L     RWK1,EIRIA          GET @ OF NEXT SEQUENTIAL INSTR
+         N     RCC,=XL4'3F000000'  LEAVE ONLY CC-PM IN RCC
+         AL    RCC,=XL4'80000000'  ADD ILC TO PSW BEING BUILT
+         ALR   RWK1,RCC            NOW HAVE ILC-CC-PM-IA FIELDS
+         ST    RWK1,ECREGS(R7)     FAKE REGISTER GETS BUILT PSW
+*              ** NOTE ** RAD1 HAS BRANCH ADDRESS VALUE
+         B     EIFINB              PROCESS SUCCESSFUL BRANCH INSTRS
+         SPACE 2
+*              BRANCH ON COUNT (BCT)
+EIBCT    EQU   *
+         BCTR  R8,0                DECREMENT VALUE IN REG
+         ST    R8,ECREGS(R7)       STORE DECREMENTED VALUE IN FAKE REG
+         LTR   R8,R8               VALUE = 0 ?
+         BNZ   EIFINB              IF NOT ZERO, SUCCESSFUL BRANCH
+         B     EIFIN               BRANCH FAILED, GET NEXT INSTR
+         SPACE 2
+*              BRANCH ON CONDITION (BC)
+EIBC     EQU   *
+         SLL   R7,2                GET MASK IN RIGHT SPOT
+         STC   R7,EIQBC+1          STORE MASK INTO INSTR
+         SPM   RCC                 REAL CC = FAKE CC
+EIQBC    BC    $,EIFINB            *** MASK STORED IN ***
+         B     EIFIN               BRANCH FAILED
+         SPACE 2
+*              PROCESS THE LA INSTRUCTION (LOAD ADDRESS)
+EILA     EQU   *
+         SLR   RAD1,RMEM           DE-RELOCATE ADDRESS FOR USER
+         ST    RAD1,ECREGS(R7)     STORE RESULT IN FAKE REG
+         B     EIFIN               BRANCH TO GET NEXT INSTR
+         SPACE 2
+*              INTERPRETATION OF THE EXECUTE INSTRUCTION (EX)
+EIEX     EQU   *
+         CLI   0(RAD1),X'44'       MAKE SURE NOT AN EXECUTE
+         BE    EIOC3               EXECUTE INTERRUPT
+*              FETCH INSTRUCTION AND PUT IN STACK
+         L     RSTK,ECSTLINK       GET @ OF NEXT STACK SLOT
+         ST    RCC,ECSTCCPM        SAVE CC AND PROG MASK IN STACK
+         MVC   ECSTINST,0(RAD1)    GET UP TO 6 BYTES OF INSTR
+         IC    ROP,ECOP            GET OPCODE INTO REGISTER
+         SR    RAD1,RMEM           DE-RELOCATE INSTR ADDR
+         ST    RAD1,ECSTIADD       SAVE INSTR ADDR FOR DUMP
+         MVC   EIINCPSW+2(4),EIEXMBR  ** CHANGE INSTR IN MAIN LOOP TO  X
+                                   RETURN TO EXECUTE CODE **
+*              OR BYTE INTO INSTR AS NEEDED - THEN BRANCH TO PROCESS
+         LTR   R7,R7               CHECK IF BYTE SHOULD BE OR'ED IN
+         BZ    EIEXPEN             BRANCH TO PROCESS IF NOT
+         LA    R9,ECREGS+3(R7)     GET @ OF BYTE TO BE OR'ED IN
+         OC    ECR1R2(1),0(R9)     OR BYTE INTO INSTRUCTION (IN STACK)
+         B     EIEXPEN             BRANCH TO PROCESS INSTR
+*              ***** RETURNED HERE TO FIX UP THE ADDRESS OF THE NEXT
+*              ***** INSTRUCTION (AFTER THE THE INSTR EXECUTED BY THE
+*              ***** EX INSTR)
+EIEXRET  EQU   *
+         L     RIA,EIRIA           RELOAD CORRECT NEXT INSTR @
+         MVC   EIINCPSW+2(4),EIEXRSTR  RESTORE IC INSTR IN MAIN LOOP
+         B     EITSTMSK            BRANCH TO CONTINUE PROCESSING
+*              THE FOLLOWING INSTRUCTIONS ARE MOVED INTO THE MAIN LOOP
+*              TO MODIFY OR RESTORE CODE AS NEEDED BY THE EX INSTR
+EIEXMBR  B     EIEXRET
+EIEXRSTR IC    R2,EICTB2
+         SPACE 2
+*              THIS CODE IS USED TO PERFORM THE M AND D COMMANDS
+EIMD     EQU   *
+         STC   ROP,EIQMD           STORE PROPER OPCODE IN INSTRUCTION
+         LA    RWK1,ECREGS(R7)     GET ADDRESS OF FAKE REGISTER PAIR
+         L     R9,ECREGS+4(R7)     GET CONTENTS OF SECOND REG OF PAIR
+EIQMD    M     $+R8,0(RAD1)        ****OPCODE MOVED DURING EXEC ****
+         STM   R8,R9,0(RWK1)       RESTORE CHANGED REGS INTO FAKE REGS
+         B     EIFIN               BRANCH AND RETURN FOR NEXT INSTR
+         SPACE 2
+*              THIS SECTION PROCESSES RX STORE OPERATIONS
+*              (NO CC SETTING)   (STH,CVD,STC,ST)
+EISTORS  EQU   *
+         STC   ROP,EIQSTORS        STORE OPCODE IN INSTRUCTION
+EIQSTORS ST    $+R8,0(RAD1)        **** OPCODE CHANGED DURING EXEC ****
+         AIF   (&$S370 NE 2).EISTORS    SKIP IF ON S370
+         BZ    EIFIN               IF NOT FAKING ALIGNMENT RETURN
+         MVC   0(8,RWK14),EIDUBLWD PUT ALTERED CORE BACK IN PLACE
+.EISTORS ANOP
+         B     EIFIN               BRANCH BACK FOR NEXT INSTRUCTION
+         SPACE 2
+*              THIS CODE PROCESSES FLOATING POINT RX INSTRUCTIONS
+         AIF   (&$FLOTEX).EIXFPRX  SKIP IF WE HAVE EXTENDED FP
+EIXFPRX  EQU   EIOC1               NOTE XFP INSTRS NOT ALLOWED
+         AIF   (&$FLOTE).EIFPRX    GO GEN IF FLOATINGS ARE ALLOWED
+EIFPRX   EQU   EIOC1               NOTE FLOATINGS NOT ALLOWED
+EIFPRXST EQU   EIOC1               NOTE FLOATINGS NOT ALLOWED
+         AGO   .EIFPRX2            SKIP OVER GENERATION
+.EIXFPRX ANOP
+EIXFPRX  EQU   *
+.EIFPRX   ANOP
+         SPACE 1
+*              THE FLOATING POINT RX INSTRUCTIONS
+EIFPRX   EQU   *
+         STC   ROP,EIQFPRX         STORE OPCODE IN INSTRUCTION
+         SLL   R7,2                GET R1 FIELD BACK INTO PLACE
+         STC   R7,EIQFPRX+1        STORE R1 FIELD INTO INSTRUCTION ALSO
+         SPM   RCC                 SET THE CONDITION CODE
+EIQFPRX  STD   $,0(,RAD1)          ** OPCODE AND R1 FIELDS STORED IN **
+         BAL   RCC,EIFIN           GET CC AND RETURN FOR NEXT INSTR
+         SPACE 2
+*        CODE FOR FLOATING POINT STORES
+         AIF   (&$S370 EQ 2).EIFPRX1   SKIP IF ON A 360
+EIFPRXST EQU   EIFPRX              CODE FOR STORES SAME AS OTHERS
+         AGO   .EIFPRX2            SKIP AROUND CODE GENERATION
+.EIFPRX1 ANOP
+         SPACE 2
+*              CODE FOR FLOATING POINT STORES WHEN FAKING ALIGNMENT
+EIFPRXST EQU   *
+         STC   ROP,EIQFPRXS        STORE OPCODE INTO INSTRUCTION
+         SLL   R7,2                GET R1 FIELD BACK
+         STC   R7,EIQFPRXS+1       STORE R1 FIELD INTO INSTRUCTION ALSO
+EIQFPRXS STD   $,0(,RAD1)          **OPCODE AND R1 FIELDS STORED IN ***
+         BZ    EIFIN               IN NO ALIGNMENT CHECKING, RETURN
+         MVC   0(8,RWK14),EIDUBLWD PUT ALTERED CORE BACK IN PLACE
+         B     EIFIN               RETURN
+.EIFPRX2 ANOP
+         SPACE 2
+         AIF   (NOT &$XIOS).EINOXD SKIP IF NO XMACROS
+*                     XDECO - EXTENDED DECIMAL OUTPUT INSTRUCTION     *
+*              SPECIAL RX INSTRUCTION CONVERTS REGISTER VALUE TO      *
+*              EDITED 12 - BYTE DECIMAL FIELD.  (X'52' OPCODE)        *
+         SPACE 1
+EIXDECO  EQU   *
+         XDECO R8,0(RAD1)          CONVERT AND MOVE THE VALUE
+         B     EIFIN               RETURN FOR THE NEXT INSTR
+         SPACE 2
+*                  XDECI - EXTENDED DECIMAL INPUT INSTRUCTION         *
+*              SPECIAL INPUT CONVERTER, SCANS 1 - 9 DIGITS, SIGNED    *
+*              UNSIGNED DECIMAL NUMBERS WITH ANY # OF PRECEDING       *
+*              BLANKS.  SETS CC TO 0,1,2 ACCORDING TO VALUE OF        *
+*              RESULT.  CC = ; IF > 9 DIGITS OR 1ST CHARACTER         *
+*              NOT +, -, DIGIT, OR + OR - WITHOUT DIGIT FOLLOWING     *
+*              OPCODE IS X'53' WITH THE RX FORMAT                     *
+         SPACE 1
+EIXDECI  EQU   *
+         XDECI RWK0,0(RAD1)        CONVERT AND SCAN THE VALUE
+         BALR  RCC,0               SAVE THE CONDITION CODE
+         BO    *+8                 SKIP STORE IF VALUE WAS BAD
+         ST    RWK0,ECREGS(R7)     SAVE THE CONVERTED VALUE IF OK
+         SR    RWK1,RMEM           DE-RELOCATE THE SCAN PTR VALUE
+         ST    R1,ECREG1           PUT SCAN PTR IN USER REG 1
+         B     EIFIN               RETURN FOR THE NEXT INSTR
+.EINOXD  ANOP
+         AIF   (NOT &$XIOS).EICONT SKIP IF NO XMACROS
+         AIF   (NOT &$HEXI).EINOHXI   SKIP IF NO XHEXI
+         SPACE 2
+*                  XHEXI - EXTENDED HEXADECIMAL INPUT INSTRUCTION     *
+*              SPECIAL INPUT MACRO, SCANS 1-8 DIGITS . SKIPS LEADING  *
+*              BLANKS.  SETS CONDITION CODE TO 3 IF ILLEGAL HEX       *
+*              CHARACTER IS FOUND.  IF GREATER THAN 8 DIGITS FOUND R1 *
+*              POINTS TO THE 9TH ELSE R1 POINTS TO FIRST NON-HEX      *
+*              IN STRING.                                             *
+*              OPCODE IS X'61' IN THE RX FORMAT.                      *
+         SPACE 1
+EIXHEXI  EQU   *
+         XHEXI RWK0,0(RAD1)        CONVERT AND SCAN VALUE
+         BALR  RCC,0               SAVE THE CONDITION CODE
+         BO    *+8                 SKIP STORE IF VALUE WAS BAD
+         ST    RWK0,ECREGS(R7)     STORE CONVERTED VLUE IF OK
+         SR    RWK1,RMEM           DE-RELOCATE SCAN POINTER VALUE
+         ST    RWK1,ECREG1         SAVE SCAN POINTER IN USER REG 1
+         B     EIFIN               RETURN FOR THE NEXT INSTRUCTION
+         AGO   .EICKHXO            CHECK IF XHEXO ALLOWED
+.EINOHXI ANOP
+EIXHEXI  EQU   EIOC1               NOTE XHEXI NOT ALLOWED -- INVALID OP
+.EICKHXO AIF   (NOT &$HEXO).EINOHXO   SKIP IF XHEXO NOT ALLOWED
+         SPACE 2
+*                  XHEXO - EXTENDED HEXADECIMAL OUTPUT MACRO          *
+*              SPECIAL RX INSTRUCTION CONVERTS REGISTER VALUE TO      *
+*              OUTPUT 8 BYTE FORM.  OPCODE IS X'62'.                  *
+         SPACE 2
+EIXHEXO  EQU   *
+         XHEXO R8,0(RAD1)          CONVERT VALUE AND MOVE TO USER AREA
+         B     EIFIN               RETURN FOR THE NEXT INSTRUCTION
+         AGO   .EICONT
+.EINOHXO ANOP
+EIXHEXO  EQU   EIOC1               NOTE XHEXO INVALID OPCODE
+.EICONT  ANOP
+         TITLE '*** EXECUT - SI PROCESSING ROUTINES'
+***********************************************************************
+*                                                                     *
+*              SI  TYPE INSTRUCTION INTERPRETING SECTION              *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+*              SI NORMAL PROCESSING                                   *
+*              (TM,MVI,NI,CLI,OI,XI  -  OP D(B),I2)                   *
+         SPACE 2
+EINORMSI EQU   *
+         STC   ROP,EIQSI           MOVE OPCODE INTO INSTRUCTION
+         STC   R7,EIQSI+1          MOVE I2 FIELD INTO INSTRUCTION
+         SPM   RCC                 SET REAL COND-CODE = TO FAKE ONE
+EIQSI    TM    0(RAD1),$           *** OPCODE AND I2 WILL BE MOVED IN**
+         BAL   RCC,EIFIN           CAPTURE CC, RETURN FOR NEXT INSTR
+         SPACE 1
+*              DIAG - PSEUDO SI INSTRUCTION USED FOR DEBUGGING PURPOSE
+EIDIAG   EQU   *
+         MVC   ECFLAG2,ECI2        SUPPLY CONTROL FLAG TO BYTE
+         B     EIFIN               RETURN FOR NEXT INSTRUCTION
+         SPACE 2
+*              THE FOLLOWING ARE THE GROUP OF S360 / S370 PRIVILEGED
+*              OPERATIONS.  CONTROL IS PASSED HERE FROM THE MAIN
+*              DECODING LOOP WITH ROP CONTAINING THE OPCODE AND R7
+*              CONTAINING THE FIRST REGISTER OR IMMEDIATE FIELD.  AT
+*              THE PRESENT TIME ALL OF THESE INSTRUCTIONS ARE FLAGGED
+*              WITH OC2 EXCEPTIONS.  THE HOOKS ARE ALL PROVIDED HOWEVER
+*              FOR THEIR FUTURE IMPLEMENTATION.
+         SPACE 2
+EILCTL   EQU   EIOC2               NO PRIVILEGED OPS ALLOWED AT PRESENT
+EISTCTL  EQU   EIOC2               NO PRIVILEGED OPS ALLOWED AT PRESENT
+EIP370   EQU   EIOC2               NO PRIVILEGED OPS ALLOWED AT PRESENT
+EISIO    EQU   EIOC2               NO PRIVILEGED OPS ALLOWED AT PRESENT
+EITIO    EQU   EIOC2               NO PRIVILEGED OPS ALLOWED AT PRESENT
+EIHIO    EQU   EIOC2               NO PRIVILEGED OPS ALLOWED AT PRESENT
+EISSM    EQU   EIOC2               NO PRIVILEGED OPS ALLOWED AT PRESENT
+EITCH    EQU   EIOC2               NO PRIVILEGED OPS ALLOWED AT PRESENT
+EILPSW   EQU   EIOC2               NO PRIVILEGED OPS ALLOWED AT PRESENT
+EIWRD    EQU   EIOC2               NO PRIVILEGED OPS ALLOWED AT PRESENT
+EIRDD    EQU   EIOC2               NO PRIVILEGED OPS ALLOWED AT PRESENT
+         SPACE 2
+         AIF   (&$REPL GT 0).EINREPO   SKIP IF REPL OPTION ALLOWED
+EIXREPL  EQU   EIOC1               NO REPLACEMENT:  MAKE ILLEGAL OP
+.EINREPO AIF   (&$REPL EQ 0).EINREPL   SKIP IF NO REPLACEMENT ALLOWED
+         SPACE 2
+*              CODE FOR THE XREPL COMMAND
+EIXREPL  EQU   *
+         CLI   ECI2,0              WAS IT A SET RFLAG TYPE XREPL
+         BH    EIXREPL1            NO, SKIP TO NEXT TYPE
+         MVC   ECRFLAG,0(RAD1)     SET RFLAG FROM USER LOCATION
+         B     EIFIN               RETURN FOR THE NEXT INSTRUCTION
+         SPACE 1
+EIXREPL1 CLI   ECI2,1              WAS IT A FETCH RFLAG TYPE
+         BH    EIXREPL2            O, SKIP TO NEXT TYPE
+         MVC   0(L'ECRFLAG,RAD1),ECRFLAG   FETCH THE FLAG TO USER AREA
+         B     EIFIN               RETURN FOR THE NEXT INSTR
+         SPACE 1
+EIXREPL2 CLI   ECI2,2              WAS IT INSTRUCTION COUNT
+         BH    EIXREPL3            NO, GO ON TO NEXT
+         MVC   0(4,RAD1),ECILIMT   MOVE TEMP INSTR COUNT OVER
+         B     EIFIN               RETURN FOR THE NEXT INSTRUCTION
+EIXREPL3 EQU   EIFIN               ILLEGAL I2 FIELD IGNORE AND RETURN
+.EINREPL ANOP
+         TITLE '*** EXECUT - RS PROCESSING ROUTINES'
+***********************************************************************
+*                                                                     *
+*              RS INSTRUCTION PROCESSING ROUTINES                     *
+*                                                                     *
+***********************************************************************
+         SPACE 5
+*              BRANCH ON INDEX (BXH,BXLE)
+EIRSBX   EQU   *
+         STC   ROP,EIQRSBX         STORE OPCODE INTO INSTRUCTION
+         L     RWK1,ECREGS+4(R9)   GET NEXT REGISTER BEYOND R3
+         LR    RWK0,R10            COPY R3 VALUE IN EXPECTED REGISTER
+         TM    ECR1R3,X'1'         WAS REGISTER ODD
+         BZ    EIQRSBX             IF EVEN REG,SET UP OK SKIP NEXT INST
+         LR    RWK1,RWK0           R3 WAS ODD SO USE SAME VALUE
+EIQRSBX  BXH   R8,RWK0,EIRSBX1     **CHANGED TO EITHER BXH-BXLE *******
+         ST    R8,ECREGS(R7)       BRANCH FAILED BUT STORE REG BACK
+         B     EIFIN               RETURN FOR NEXT INSTR
+EIRSBX1  ST    R8,ECREGS(R7)       BRANCH SUCCESSFULL BUT RESTORE REG
+         B     EIFINB              RETURN TO BR'D TO INSTR
+         SPACE 2
+*              LOAD & STORE MULTIPLE (LM,STM) *CODE MAY NOT BE OBVIOUS
+EILMSTM  EQU   *
+         AIF   (&$S370 NE 2).EILMSTM     CHECK IF NOT ON A 370
+         TM    ECPRFLG2,ECALNCHK   SHOULD ALIGNMENT BE CHECKED
+         BZ    *+8                 NO ALIGNMENT CHECK BRANCH AROUND
+         L     R0,0(RAD1)          QUICK CHECK FOR FULL WORD ALIGNMENT
+.EILMSTM ANOP
+         SLR   RAD1,RMEM           DE-RELOCATE THE ADDRESS
+         LA    RWK0,4(R9)          OBTAIN PART 1 OF LENGTH VALUE
+         LR    RWK1,RAD1           PUT ADDR TO BE CHECKED WHERE EXPECT
+         CR    R7,R9               IS R1 FIELD <= R3 FIELD
+         BNH   EILMSTM1            SKIP OVER IF EASY CASE (R1<R3)
+         SPACE 1
+         LR    R8,RWK0             R8 NOW = 2ND OPER REG VALUE +4
+         LA    RWK0,64             OBTAIN VALUE
+         SR    RWK0,R7             R0 = 64 - 1ST REG NUMBER
+         LR    R2,RWK0             SAVE LENGTH 2
+         AR    RWK0,R8             GET THE TOTAL LENGTH
+         B     EILMSTM2            HAVE LENGTHS IN PROPER PLACE
+EILMSTM1 EQU   *
+         SR    RWK0,R7             RWK0 =(2ND REG)-(1ST REG)+4 1ST ONLY
+         LR    R2,RWK0             PUT 1ST LENGTH WHERE EXPECTED
+EILMSTM2 BAL   RLINK,EIMSFCHK      CHECK FOR PROTECTION VIOLATION
+         ALR   RAD1,RMEM           RELOCATE ADDR TO REAL CORE ADDR
+         LA    R10,ECREGS(R7)      ADDR OF 1ST (OR ONLY) REG SEGMENT
+         SR    RWK1,RWK1           CLEAR FOR USE AS AN INDEX
+         CLI   ECOP,X'90'          WAS INSTRUCTION STM
+         BE    *+8                 YES WAS STM, SO RWK1 SET RIGHT
+         LA    RWK1,6              LM- SET FOR EXECUT INDEX
+         SPACE 1
+         BCTR  R2,0                DECREMENT LENGTH FOR SS MVC
+         EX    R2,EIQLMSTM(RWK1)   EXECUTE MVC IN CORRECT DIRECTION
+         CR    R7,R9               WAS R1 <= R3 FIELD
+         BNH   EIFIN               RETURN IF NO MORE TO DO
+         SPACE 1
+         LA    RAD1,1(R2,RAD1)     2ND CORE SEGMENT ADDRESS
+         LA    R10,ECREGS          ADDR OF 2ND REGISTER SECTION FAKE R0
+         BCTR  R8,0                DECREMENT TO PLEASE MVC
+         EX    R8,EIQLMSTM(RWK1)   EXECUTE PROPER MVC INSTR
+         B     EIFIN               RETURN FOR NEXT INSTR
+         SPACE 1
+EIQLMSTM MVC   0($,RAD1),0(R10)    MVC FOR STM - MEMORY <---- REGISTERS
+         MVC   0($,R10),0(RAD1)    USED FOR LM - REGISTERS <---- MEMORY
+         SPACE 2
+*              CODE FOR ALL SHIFT INSTRUCTIONS ALL ENTER AT SAME PLACE
+*              SHIFT DOUBLES ENTER SAME AS SHIFT SINGLES
+EISHIFT  EQU   *
+         STC   ROP,EIQSHIF         PLACE SHIFT OPCODEINTO INSTRUCTION
+         L     R9,ECREGS+4(R7)     GET SECOND REG IN CASE OF DOUBLE
+         LA    RWK1,ECREGS(R7)     GET USER REG ADDRESS FOR SHIFT INST
+         SPM   RCC                 SET REAL COND CODE = FAKE ONE
+EIQSHIF  SRL   $+R8,0(RAD1)        SHIFT ***CHANGED DURING EXEC****
+         STM   R8,R9,0(RWK1)       REPLACE THE REGISTER PAIR
+         BAL   RCC,EIFIN           CAPTURE CC, RETURN FOR NEXT INSTR
+         SPACE 2
+         AIF   (&$S370 NE 1).EIMASK2   SKIP IF DON'T HAVE S370 HARDWARE
+*              CODE FOR ICM, STCM, AND CLM INSTRUCTIONS ON S/370
+EIICM    EQU   *
+EISTCM   EQU   *
+EICLM    EQU   *
+         STC   ROP,EIQRS370        STORE OPCODE INTO INSTRUCTION
+         SRL   R9,2                TREATED AS RR X 4 MOVE MASK PROPER
+         SPM   RCC                 SET REAL CONDITION CODE TO FAKE ONE
+         EX    R9,EIQRS370         EXECUTE INSTR GIVING MASK
+         ST    R8,ECREGS(R7)       PUT REGISTER BACK IN CORE
+         BAL   RCC,EIFIN           GET COND CODE AND RETURN
+EIQRS370 ICM   R8,0,0(RAD1)        ***OPCODE CHANGED DURING EXECUTION**
+.EIMASK2 AIF   (&$S370 NE 2).EIMASK3   SKIP IF ON A 370
+*              CODE FOR STCM USING 360 HARDWARE
+EISTCM   EQU   *                   CODE FOR STCM COMMAND
+         BAL   RWK14,EIMASK        GO TO COMMON MASK CODE
+         MVC   0(1,RAD1),0(RWK1)   INSTRUCTION EXECUTED BY EXMASK
+         B     EIFIN               WHEN EIMASK RETURNS WE ARE DONE
+         SPACE 2
+*              CODE FOR ICM USING S/360 HARDWARE
+EIICM    EQU   *
+         BAL   RWK14,EIMASK        GO TO COMMON MASK CODE
+         MVC   0($,RWK1),0(RAD1)   INSTRUCTION EXECUTED BY EIMASK
+         SR    RAD1,R10            RAD1 = # OF BYTES MOVED INTO REG
+         BZ    EIICM               IF ZERO, CON CODE IS 0 QUIT
+         TM    0(R10),X'80'        CHECK FOR SIGN BIT ON
+         BO    EIICM2              IF ON, BRANCH TO SET CC TO -
+         BCTR  RAD1,0              GET LENGTH - 1
+         EX    RAD1,EIICM3         ITS + OR - SO COMARE TO ZERO
+EIICM1   BAL   RCC,EIFIN           GET COND CODE AND RETURN
+EIICM2   OI    *+1,1               SET COND COE TO -
+         BAL   RCC,EIFIN           GET COND CODE AND RETURN
+EIICM3   CLC   0(0,R10),=F'0'      INSTRUCTION TO COMPARE BYTES TO 0
+         SPACE 2
+*              CODE FOR CLM COMMAND UNDER S / 360 HARDWARE
+EICLM    EQU   *
+         MVI   EIMSKC,E*16         CHANGE BRANCH TO BE INSTR
+         BAL   RWK14,EIMASK        GO DO COMMON MASK CODE
+         CLC   0(1,RWK1),0(RAD1)   INSTRUCTION EXECUTED BY EIMASK
+         MVI   EIMSKC,X'F0'        RESTORE CHANGED BRANCH INSTRUCTION
+         BAL   RCC,EIFIN           CAPTURE CON CODE FROM EIMASK RETURN
+         SPACE 2
+*              COMMON CODE FOR ICM, STCM AND CLM ALL ON S/360 HARDWARE
+EIMASK   EQU   *
+         MVI   EIMSKC,X'F0'        MAKE SURE BRANCH IS B NOT BNE
+         LR    R10,RAD1            COPY ADDRESS FOR POSSIBLE LATER USE
+         SLL   R9,26               MOVE LEFT MOST MASK BIT TO SIGN POS
+         LA    RWK1,ECREGS-1(R7)   GET ADDRESS OF INCORE USER REGISTER
+         SPACE 2
+EIMSK1   LA    RWK1,1(,RWK1)       INCERMENT REGISTER POINTER
+         ALR   R9,R9               SHIFT MASK LEFT 1 BIT
+         BM    EIMSK1              NO CARRY NZ => MOVE TO DO NR
+         BZ    6(,RWK14)           IF 0, WE ARE ALL DONE RETURN
+         EX    0,0(,RWK14)         PERFORM SUPPLIED OPERATION
+         LA    RAD1,1(RAD1)        INCERMENT CORE AREA POINTER
+EIMSKC   EQU   *+1                 POSITION OF MASK CHANGED BY CLM
+         BC    $+15,EIMSK1         USUALLY BRANCH TO LOOP (BE FOR CLM)
+         B     6(,RWK14)           IF UNEQUAL COMPARE FOR CLM, RETURN
+.EIMASK3 ANOP
+         TITLE '*** EXECUT - SS PROCESSING ROUTINES'
+***********************************************************************
+*                                                                     *
+*              SS  TYPE  INTERPRETING  SECTION                        *
+*                                                                     *
+***********************************************************************
+         SPACE 5
+*              MOVES,TR,PACK,LOGICALS & DECIMALS  (DON'T CHANGE REGS)
+EIMOVES  EQU   *
+EILOGS   EQU   EIMOVES
+EIDECS   EQU   EIMOVES
+         SPM   RCC                 SET REAL CC = FAKE CC
+EIQSS    MVN   0($,RAD1),0(RAD2)   ** OPCODE & LENGTH(S) MOVED IN **
+         BAL   RCC,EIFIN           RETURN FOR NEXT INSTR
+         SPACE 2
+*              TRT AND EDMK - CHANGE CC & POSSIBLY REGS R1 & R2
+EITRT    EQU   *
+EIEDMK   EQU   EITRT
+         LM    R1,R2,ECREG1        GET FAKE R1 & R2
+         LA    R1,0(R1,RMEM)       CLEAR UPPER BYTE & RELOCATE
+         EX    0,EIQSS             EXECUTE TNE INSTRUCTION
+         BALR  RCC,0               SCOOP UP THE CC
+         SLR   R1,RMEM             CONVERT BACK TO FAKE ADDR
+         AIF   (&$S370 NE 1).EITRT1  SKIP IF NOT ON A REAL 370
+         ICM   R1,8,ECREG1         GET 1ST BYTE IF FAKE REG1
+         AGO   .EITRT2
+.EITRT1  ANOP
+         XC    ECREG1+1(3),ECREG1+1  CLEAR 3 BYTES OF FAKE REG1
+         O     R1,ECREG1           GET FAKE REG1 BACK TOGETHER
+.EITRT2  ANOP
+         STM   R1,R2,ECREG1        REPLACE FAKE REGS R1 & R2
+         SR    R2,R2               RECLEAR BYTE REG
+         B     EIFIN               RETURN FOR NEXT INSTR
+         SPACE 2
+*              CODE FOR THE SRP COMMAND (SHIFT AND ROUND)
+EISRP    EQU   *
+         SR    RAD2,RMEM           REMOVE RELOCATION DONE EARLIER
+         IC    R2,ECB2D2           GET B2 BASE REG
+         SRA   R2,4                REMOVE UNNEEDED BITS
+         AIF   (&$S370 NE 1).EISRP1  SKIP IF NOT ON A REAL 370
+         BZ    EIDECS              BRANCH TO EXECUTE THE INSTRUCTION
+         SLL   R2,2                B2 * 4 FOR INDEX
+         S     RAD2,ECREGS(R2)     DON'T WANT VALUE OF BASE REG
+         B     EIDECS              BRANCH TO EXECUTE THE INSTRUCTION
+         AGO   .EISRP2
+.EISRP1  ANOP
+         BZ    EISRPA              NO BASE REG ADDED IN, SKIP OVER
+         SLL   R2,2                B2 * 4 FOR INDEX
+         S     RAD2,ECREGS(R2)     DON'T WANT VALUE OF BASE REG
+EISRPA   EQU   *
+         LR    R8,R7               COPY LENGTH FIELD OVER
+         SLL   R8,4                GET LENGTH * 16
+         OR    R8,R7               SET UP REG WITH 2 LENGTHS
+         SPACE
+         MVO   EISRPRND(1),ECL1I3(1)  MOVE IMMEDIATE OVER
+         ZAP   EISRPRND(1),ECL1I3(1)  CHECK IMMEDIATE
+         EX    R7,EISRPZP1         CHECK USER NUMBER
+         BZ    EISRPLF5            IF NUMBER=0, WERE DONE
+         SPACE
+         SLL   RAD2,26             EXTEND BIT 26 AS IF
+         SRA   RAD2,26                 IT IS A SIGN BIT
+         BZ    EISRPLF3            IF SHIFT IS ZERO, WERE DONE
+         BP    EISRPLF             IF SHIFT IS POS, ITS LEFT
+         SPACE
+*              RIGHT SHIFT CODE
+EISRPRT  EQU   *
+         LPR   RAD2,RAD2           RIGHT SHIFT, GET POS SHIFT
+         B     EISRPRT2            BRANCH INTO LOOP
+EISRPRT1 EQU   *
+         MVO   EISRPSHF(16),EISRPSHF(15)  SHIFT ALL BUT LAST NIBBLE
+EISRPRT2 EQU   *
+         BCT   RAD2,EISRPRT1       CONTINUE LOOP (DECMT COUNT)
+         SLL   R7,4                SHIFT LENGTH TO L1 FIELD
+         MVN   EISRPSHF+15(1),EISRPRND  MAKE SIGN POSITIVE
+         AP    EISRPSHF(16),EISRPRND(1) ADD IN ROUNDING FACTOR
+         EX    R7,EISRPMV1         MOVE TO USER, DOING LAST SHIFT
+         B     EISRPLF3            GO TO SET CC AND RETURN
+         SPACE
+*              LEFT SHIFT CODE
+EISRPLF  EQU   *
+         STC   R8,EISRPLF2+1       PUT LEN INTO MVO INSTR
+         LA    RWK1,0(R7,RAD1)     GET @ OF LAST BYTE OF USER #
+         OI    *+1,0               SET CC = 0
+EISRPLF1 EQU   *
+         BNZ   EISRPLF2            IF OVERFLOW HAS OCCURRED, BRANCH
+         TM    0(RAD1),X'F0'       CHECK 1ST NIBBLE FOR NON ZERO
+EISRPLF2 EQU   *
+         MVO   0($,RAD1),0($,RAD1)    SHIFT LEFT ** LENGTHS STORED IN**
+         MVZ   0(1,RWK1),EISRPPK0  MOVE ZERO TO PROPAGATED SIGN
+         BCT   RAD2,EISRPLF1       DECREMENT COUNT AND BRANCH
+         BNZ   EISRPLF4            OVERFLOW, BRANCH TO CHECK FOR OCA
+EISRPLF3 EQU   *
+         EX    R8,EISRPZP2         SET CC FOR +, - OR 0
+         BAL   RCC,EIFIN           CAPTURE CC AND RETURN FOR NEXT INSTR
+EISRPLF4 EQU   *
+         TM    ECSTCCPM,X'04'      CAPTURE MASK BIT
+         BO    EIOCA               OVERFLOW HAS OCCURRED -- ERROR
+         TM    *+1,1               SET CC TO OVERFLOW
+EISRPLF5 EQU   *
+         BAL   RCC,EIFIN           CAPTURE CC AND RETURN FOR NEXT INSTR
+         SPACE 1
+EISRPZP1 ZAP   EISRPSHF(16),0($,RAD1)    CHECK AND MOVE USER #
+EISRPZP2 ZAP   0($,RAD1),0($,RAD1) SET CC TO +, -, OR 0
+EISRPMV1 MVO   0($,RAD1),EISRPSHF(15)  MOVE BACK TO USER AREA
+         SPACE 1
+EISRPRND DC    PL1'0'              AREA FOR SRP ROUNDING FACTOR
+EISRPSHF DC    PL16'0'             AREA FOR SHIFTING USER #
+EISRPPK0 DC    PL1'0'              USED TO SET SIGN
+.EISRP2  ANOP
+         SPACE 2
+*              CHECK IF GENERATION OF XIO'S IS ON
+         AIF   (&$XIOS).EIXIOS     SKIP TO GENERATE CODE IF EXISTS
+EIXIOS   EQU   EIOC1               THESE INSTRUCTIONS DO NOT EXIST
+         AGO   .EINOXIO
+.EIXIOS  ANOP
+         SPACE 2
+*        PSEUDO RX - SS EXTENDED MNEMONICS - XREAD, XPRNT, XPNCH, IO'S*
+*              PSEUDO DUMP ROUTINE  -  XDUMP                          *
+*        ** NOTE ** BECAUSE OF NO-STANDARD ADDRESSING DONE BY THESE   *
+*        INSTRUCTIONS, THEY DO THEIR OWN ADDRESS CHECKING AND THUS    *
+*        HAVE A PROTECTION BYTE OF X'00' SO THE INITIAL SS SECTION    *
+*        DOESN'T STOP THEM.  THEY THEN FAKE THE PROTECTION BYTES OF   *
+*        EITHER STM (X'C0'-XREAD),OR TM(X'80'-XPRNT,XDUMP,XPNCH).     *
+         SPACE 1
+EIXIOSR  ST    RIA,EIRIA           XDUMPR SHORT CUT                   L
+EIXIOS   EQU   *                   SECTION FOR X-MACRO I/O INSTRS
+         N     RCC,=XL4'3F000000'  REMOVE ALL BUT CC - PM BITS
+         AL    RCC,EIRIA           PUT CC - PM PROG ADDR TOGETHER
+         ST   RCC,ECILCMSK         STORE RESULTING PSW
+         OI    ECILCMSK,X'C0'      SET ILC = 3, FOR LENGTH OF X-INST
+         CLI   ECOP,X'E1'          SEE IF IT WAS A REGS TYPE XDUMP
+         BE    EIXDUMPR            YES, GO DUMP REGS ONLY
+         SR    RAD2,RMEM           REMOVE SPERIOUS RELOCATION
+         BNZ   EIXLOK              LENGTH OK IF NOT ZERO
+         L     RAD2,ECREGS         GET VALUE OF FAKE ZERO
+EIXLOK   EQU   *
+         LR    RWK1,RAD2           SAVE THE LENGTH TO BE DONE
+         SRL   R7,3                GET MASK VALUE IN PLACE FOR INDEX
+         ALR   R7,R7               SHIFT LEFT FOR MULTIPLE OF 2
+         LH    R9,EIXIOJ(R7)       GET ADDRESS VALUE
+         B     EISPEJMP(R9)        GO TO RIGHT SECTION OF CODE
+         SPACE 2
+*              XREAD PREUDO INSTRUCTION
+EIXREAD  EQU   *
+         TM    ECFLAG0,$ECEOF      HAS THERE BEEN AN EOF ALREADY
+         BO    EIXREOF             YES, USER TRYING TO GO PAST
+         $READ 0(RAD1),(RWK1),EIXREOFA   ACTUALLY READ A CARD
+         BAL   RCC,EIFIN           CAPTURE CC AND RETURN FOR NEXT INSTR
+         SPACE 1
+EIXREOFA OI    ECFLAG0,$ECEOF      FLAG END OF FILE
+         BAL   RCC,EIFIN           GET COND CODE AND RETURN
+         SPACE 1
+EIXREOF  MVI   ECFLAG1,$ECREADR    SHOW READ BEYOND END OF FILE
+         LA    R1,EICCREAD         SHOW EOF OCCURRED                  M
+         NI    ECPRFLG3,ECNOSPI    MAKE SURE SPIE IS OFF FOR SAFETY   M
+         B     EIITIA              GO TO EXIT ROUTINE                 M
+         SPACE 2
+*              XPRNT PSEUDO INSTRUCTION  -  PRINT A LINE
+EIXPRNT  EQU   *
+         $PRNT    0(RAD1),(RWK1),EIXRECEX   PRINT THE LINE
+         B      EIFIN              RETURN FOR THE NEXT INSTRUCTION
+         SPACE 2
+*              XPNCH PSEUDO INSTRUCTION  -  PUNCH A CARD
+EIXPNCH  EQU   *
+         $PNCH 0(RAD1),(RWK1),EIXRECEX   PUNCH THE CARD
+         B     EIFIN               RETURN FOR NEXT INST
+         SPACE 2
+         AIF   (&$XXIOS).EIXIOS1   SKIP IF NOT ALLOWED XGET , XP T
+*              XGET PSEUDO INSTRUCTION  INPUT
+EIXGET   EQU   *
+         $GET  0(RAD1),(RAD2)      DO GET INPUT                  CEH
+         BAL   RCC,EIFIN           GET CC AND RETURN
+         SPACE 2
+*              XPUT PSEUDO INSTRUCTION DO OUTPUT
+EIXPUT   EQU   *
+         $PUT  0(RAD1),(RAD2)      DO PUT OUTPUT         CEH
+         BAL   RCC,EIFIN           GET CC AND RETURN FOR NEXT INSTR
+         AGO   .EIXIOS2            SKIP LABEL SAVING
+.EIXIOS1 ANOP
+EIXGET   EQU   EIOC1               MAKE XGET AN ERROR           CPP
+EIXPUT   EQU   EIOC1               MAKE XPUT AN ERROR           CPP
+.EIXIOS2 ANOP
+         SPACE 2
+EIXRECHK CLI   ECFLAG1,$ECRECEX    DID XXXXSNAP SET FLAG?
+         BNE   EIFIN               NO,SO DON'T BOMB USER OUT
+EIXRECEX MVI   ECFLAG1,$ECRECEX    SET RECORDS EXCEEDED FLAG
+EICNTEXC LA    R1,EICCRECE         SHOW RECORDS EXCEEDED MESSAGE
+         NI    ECPRFLG3,ECNOSPI    MAKE SURE SPIE IS OFF FOR SAFETY   M
+         B     EIITIA              GO TO FINISH UP AND RETURN
+         SPACE 2
+*              XDUMP PSEUDO INSTRUCTION - DUMP STORAGE AND REGISTERS
+EIXDUMP  EQU   *                   ENTRY LABEL FOR STORAGE XDUMP
+         LR    R10,REC             MOVE ECONTROL POINTER FOR XXXXSNAP
+         XSNAP T=(NO,,1),LABEL='USER STORAGE',STORAGE=(*0(RAD1),*0(RWK1X
+               ,RAD1))
+         B     EIXRECHK            GO CHECK FOR RECORD OVERFLOW
+         SPACE 2
+EIXDUMPR EQU   *
+         LR    R10,REC             MOVE ECONTROL POINTER FOR XXXXSNAP
+         XSNAP T=(PR,,1),LABEL='USER REGISTERS'
+         B     EIXRECHK            GO CHECK FOR RECORD OVERFLOW
+         SPACE 2
+*              XLIMD PSEUDO INSTRUCTION -- LIMIT DUMP AREA
+EIXLIMD  EQU   *
+         LA    RAD2,0(RWK1,RAD1)   GET SECOND LIMIT REAL ADDRESS
+         BCT   RWK1,*+8            IF RWK1=1 (OMITTED) USE END OF PROG
+         L     RAD2,ECRADH         LENGTH=1 USE HIGHEST @ INSTEAD
+         ST    RAD1,ECRDLIML       ECRDLIML - ECRDLIMH - NEW LIMITS
+         ST    RAD2,ECRDLIML+4     STORE NEW LIMITS
+         B     EIFIN               RETURN FOR NEXT INSTRUCTION
+         EJECT
+*              THE FOLLOWING CODE INTERPRETS THE XOPC PSEUDO INSTRS
+         SPACE 5
+*              CHECK IF LEGAL CODE # IS SPECIFIED IN THE IMMED FIELD
+*              OF THE INSTR  --  IF OK, BRANCH TO INDIVIDUAL XOPC
+*              ROUTINES.
+EIXOPC   EQU   *
+         C     R7,=A(EC#XOPC)      IS CODE # LEGAL ?
+         BNH   EIXOPCOK            YES, BR AROUND ERROR CODE
+         TM    *+1,1               SET CC = 3 TO NOTE ERROR
+         BAL   RCC,EIFINRR         GET CC, FETCH NEXT INSTR
+EIXOPCOK EQU   *
+         LR    RWK1,R7             COPY CODE # FOR OFFSET INDEX
+         ALR   RWK1,RWK1           GET INDEX INTO OFFSET TABLE
+         LH    RWK1,EIOPCJMP(RWK1) GET BRANCH OFFSET TO ROUTINE
+         B     EIXOPC(RWK1)        BRANCH TO ROUTINE
+         SPACE 5
+*              THE FOLLOWING CODE PROCESSES THE INDIVIDUAL XOPC
+*              PSEUDO INSTRUCTIONS
+         SPACE 2
+*              XOPC 0  (SET UP PSEUDO SPIE)
+EIOPC0   EQU   *
+         L     RWK1,ECREG1         GET USER SPECIFIED EXIT @
+         LA    RWK0,1              ASSUME LENGTH-1 = 1
+         BAL   RLINK,EIXOPCHK      CHECK GIVEN ADDRESS FOR CORRECTNESS
+         ST    RWK1,ECPRSPIE       SET USER SPIE EXIT ADDR
+         MVC   ECPRSCDE(4),ECREG0  SET USER SPIE CODE MASK
+         OI    ECPRFLG3,B'10000000'  TURN ON FLAG NOTE SPIE IS SET
+         B     EIXOPCC0            BRANCH TO COMMON XOPC EXIT CODE
+         SPACE 2
+*              INSTRUCTION TRACE XOPC INSTRUCTIONS
+*
+*              CHECK AND SET LIMIT ADDRESSES FOR TRACE
+EIOPC1   EQU   *
+EIOPC3   EQU   EIOPC1
+         LM    RWK0,RWK1,ECREGS    GET LOW AND HIGH ADDRS FOR TRACE
+         CR    RWK0,RWK1           ARE ADDRESSES RELATIVELY CORRECT ?
+         BNL   EIXOPCC1            BRANCH IF NOT
+         BAL   RLINK,EIXOPCHA      CHECK ADDRESSES FOR LEGALITY
+         STM   RWK0,RWK1,ECPRTRAL  SET TRACE ADDRESS LIMITS IN PRCB
+         BCTR  R7,0                XOPC CODE# = CODE#-1
+         LTR   R7,R7               IS CODE = 1  (R7 = 0) ?
+         BZ    EIXOPCC0            YES, DOING XOPC 1 - FINISHED
+*        TURN ON INSTRUCTION TRACE FACILITY
+EIOPC2   EQU   *
+         OI    ECPRFLG1,ECPRTRCE   TURN ON TRACE FACILITY
+         B     EIXOPCC0            BRANCH TO COMMON XOPC EXIT CODE
+*              TURN OFF INSTRUCTION TRACE FACILITY
+EIOPC4   EQU   *
+         NI    ECPRFLG1,255-ECPRTRCE  TURN OFF TRACE FACILITY
+         B     EIXOPCC0            BRANCH TO COMMON XOPC EXIT CODE
+         SPACE 2
+*              STORAGE MODIFICATION CHECK XOPC INSTRUCTIONS
+*
+*              CHECK AND SET LIMIT ADDRESSES FOR MOD CHECK
+EIOPC5   EQU   *
+EIOPC7   EQU   EIOPC5
+         LM    RWK0,RWK1,ECREGS    GET LOW AND HIGH ADDRS FOR MOD CHK
+         CR    RWK0,RWK1           ARE ADDRS RELATIVELY CORRECT ?
+         BNL   EIXOPCC1            BRANCH IF NOT
+         BAL   RLINK,EIXOPCHA      CHECK IF ADDRESSES ARE LEGAL
+         STM   RWK0,RWK1,ECPRMODL  SET MOD CHECK ADDRESSES
+         LA    RWK1,5              LOAD CODE # COMPARATOR
+         CR    R7,RWK1             IS THIS AN XOPC 5 INSTR ?
+         BE    EIXOPCC0            YES - FINISHED
+*              TURN ON MODIFICATION CHECK FACILITY
+EIOPC6   EQU   *
+         OI    ECPRFLG1,ECPRMODC   TURN ON MOD CHECKING
+         B     EIXOPCC0            BRANCH TO COMMON XOPC EXIT CODE
+*              TURN OFF MODIFICATION CHECKING FACILITY
+EIOPC8   EQU   *
+         NI    ECPRFLG1,255-ECPRMODC  TURN OFF MOD CHECKING
+         B     EIXOPCC0            BRANCH TO COMMON XOPC EXIT CODE
+         SPACE 2
+*              TURN ON ALIGNMENT CHECKING  (360 STYLE)
+*              (OC-6 ALIGNMENT INTERRUPTS ALLOWED)
+EIOPC9   EQU   *
+         OI    ECPRFLG2,ECALNCHK   TURN ON CHECKING
+         B     EIXOPCC0            BRANCH TO COMMON XOPC EXIT CODE
+*              TURN OFF ALIGNMENT CHECKING   (370 STYLE)
+*              (OC-6 ALIGNMENT INTERRUPTS NOT ALLOWED)
+EIOPC10  EQU   *
+         NI    ECPRFLG2,255-ECALNCHK    TURN OFF CHECKING
+         B     EIXOPCC0            BRANCH TO COMMON XOPC EXIT CODE
+         SPACE 2
+*              XOPC 11  (FETCH INSTRUCTION COUNT)
+EIOPC11  EQU   *
+         MVC   ECREG0(4),ECILIMT   PUT COUNT IN USER REG 0
+         B     EIXOPCC0            BRANCH TO COMMON XOPC EXIT CODE
+         SPACE 2
+*              XOPC 12   -   EMULATE SYSTEM 360
+EIOPC12  EQU   *
+         NI    ECPRFLG2,B'11110011' SHUT OFF ALL EMULATION BITS
+         OI    ECPRFLG2,ECEM360    SHOW NOW EMULATING A 360
+         MVI   EITSTMSK+1,ECEM360  SET TM INSTR FOR NO 370 INSTRS
+         B     EIXOPCC0            BRANCH TO COMMON XOPC EXIT CODE
+         SPACE 2
+*              XOPC 13   -   EMULATE SYSTEM 370
+EIOPC13  EQU   *
+         NI    ECPRFLG2,B'11110011' SHUT OFF ALLL EMULATION BITS
+         OI    ECPRFLG2,ECEM370    SHOW NOW EMULATING A 370
+         MVI   EITSTMSK+1,ECEM370  SET TM INSTR FOR BOTH 370 AND 360
+         B     EIXOPCC0            BRANCH TO COMMON XOPC EXIT CODE
+         SPACE 2
+*              XOPC 14   -   SET INTERRUPT COUNT
+EIOPC14  EQU   *
+         MVC   ECPRCMPR(4),ECREG0  MOVE GIVEN VALUE TO PRCB
+         B     EIXOPCC0            BRANCH TO COMMON EXIT CODE
+         SPACE 2
+*              XOPC 15   -   SET COUNT EXIT ADDRESS
+EIOPC15  EQU   *
+         MVC   ECPRCLEA(4),ECREG0  MOVE GIVEN EXIT ADDRESS PRCB
+         OI    ECPRFLG4,ECLKADR    TURN ON FLAG TO NOTE CLOCK EXIT ADDR
+         B     EIXOPCC0            BRANCH TO COMMON EXIT CODE
+         SPACE 3
+*              INSTRUCTION EXECUTION COUNT FACILITY INSTRUCTIONS
+*
+*              XOPC 17 AND XOPC 18
+*              CHECK AND SET LIMIT ADDRESSES FOR COUNT FACILITY
+EIOPC17  EQU   *
+EIOPC18  EQU   *
+         LM    RWK0,RWK1,ECREGS    GET LOW AND HIGH ADDRS FOR COUNT
+         CR    RWK0,RWK1           ARE ADDRESSES RELATIVELY CORRECT ?
+         BNL   EIXOPCC1            BRANCH IF NOT SET CC = 1
+         BAL   RLINK,EIXOPCHA      CHECK ADDRESSES FOR LEGALITY
+         STM   RWK0,RWK1,ECPRICL   SET COUNT LIMIT ADDRESSES IN PRCB
+         CLI   R7,X'11'            IS XOPC CODE 17 OR 18?
+         BE    EIXOPCC0            IS 17, SO FINISHED
+         SPACE 3
+*              TURN ON THE INSTRUCTION EXECUTION COUNT FACILITY
+EIOPC16  EQU   *
+         TM    ECPRFLG1,ECPRNOSP   TEST PRCB FOR NO COUNTING SPACE AVAL
+         BO    EIXOPCC1            NO SPACE AVAILABLE, QUIT
+         TM    ECPRFLG1,ECPRCTON   HAS SPACE FOR COUNT ALREADY ALLOCED
+         BO    EINOALL             SPACE ALREADY ALLOCATED
+         L     RWK0,ECFADH         GET HIGH PROG ADDR IN REG 0
+         S     RWK0,ECFADL         SUBTRACT TO FIND CORE LENGTH NEEDED
+         LA    R9,ECPRICA          GET ADDR IECF AREAS IN ECONTROL
+         GETMAIN  EC,LV=(0),A=(R9),SP=1  TRY  GET LENGTH USER PROG
+         LTR   R15,R15             TEST TO SEE IF WE GOT WHAT WE NEEDED
+         BZ    EISPCOK             IF CC=0, WE GOT WHAT WE NEEDED
+         OI    ECPRFLG1,ECPRNOSP   IF NOT, NOT ENOUGH SPACE - SET FLAG.
+         B     EIXOPCC1            AND QUIT.
+EISPCOK  EQU   *
+         ST    RWK0,ECPRICAL       GOT AMOUNT NEEDED STORE LENGTH
+         OI    ECPRFLG1,ECPRCTON   NOTE ALLOCATION OF COUNTER SPACE
+EINOALL  EQU   *
+         OI    ECPRFLG1,ECPRIECF   NOTE THAT THE COUNT FACILITY IS ON
+         B     EIXOPCC0            BRANCH TO COMMON XOPC RETURN CODE
+         SPACE 3
+*              XOPC 19
+*              TURN OFF THE INSTRUCTION EXECUTION COUNT FACILITY
+EIOPC19  EQU   *
+         NI    ECPRFLG1,255-ECPRIECF  TURN OFF THE COUNT FACILITY FLAG
+         B     EIXOPCC0            BRANCH TO COMMON XOPC RETURN CODE
+         SPACE 3
+*              XOPC 20
+*              CLEAR INSTRUCTION EXECUTION COUNT FACILITY COUNT AREAS
+EIOPC20  EQU   *
+         TM    ECPRFLG1,ECPRCTON   TEST FOR COUNT SPACE ALLOCATION
+         BNO   EIXOPCC1            IF NOT ALLOCATED, CANNOT CLEAR IT
+         L     RWK1,ECPRICA        GET ADDRESS OF CORE TO BE CLEARED
+         L     R9,ECPRICAL         GET LENGTH OF CORE TO BE CLEARED
+         BCTR  R9,0                GET LENGTH IN WORKABLE FORM
+         C     R9,=XL4'000000FF'   IS LENGTH > 256 BYTES
+         BNH   EIREMAIN            IF NOT > 256 BYTES CLEAR USING EX
+         XR    R8,R8               ZERO OUT R8 FOR DIVIDE
+         D     R8,=XL4'00000100'   DIVIDE LEN BY 256 GIVING REMAINDER
+EIOPCLP  EQU   *
+         XC    0(256,RWK1),0(RWK1) ZERO OUT 256 BYTE AREA
+         LA    RWK1,256(RWK1)      MOVE ADDRESS POINTER OVER
+         BCT   R9,EIOPCLP          GO BACK AND GET NEXT 256 BYTE AREA
+         LTR   R9,R8               PUT REMNDR WHERE NEEDED BY EXECUTE
+         BZ    EIXOPCC0            IF REMAINDER IS 0 WE ARE DONE
+EIREMAIN EQU   *
+         EX    R9,EIXOPCXC         EXECUTE XC TO DO REMAINING BYTES
+         B     EIXOPCC0            BRANCH TO COMMON XOPC EXIT CODE
+EIXOPCXC XC    0(0,RWK1),0(RWK1)    ZERO OUT REMAINING BYTES IN COUNT
+         SPACE 3
+*              XOPC 21  (RETURN FROM INTERRUPT HANDLING STATE)
+EIOPC21  EQU   *
+         TM    ECPRFLG3,ECINHDST   TEST SEE IF IN INTERRUPT HANDLING
+         BO    EIOPC21A            IF WE ARE CONTINUE XOPC INSTR
+         TM    *,X'FF'             SET CC=1 TO DENOTE ERROR
+         BAL   RCC,EIFINRR         GET CC, FETCH NEXT INSTR
+EIOPC21A EQU   *
+         L     RIA,ECREG1          GET RESUMING ADDR FROM USER REG 1
+         MVC   ECREG0(8),ECPRIRGS  RELOAD USER REGISTERS 0 AND 1
+         NI    ECPRFLG3,B'10111111'  TURN OFF INTERRUPT HANDLING FLAG
+         SR    RWK1,RWK1           SET CC = 0 TO NOTE OKAY EXEC
+         BAL   RCC,EIFINB          GET NEXT INSTR TREAT XOPC 21 AS BR
+         SPACE 5
+*              XOPC 22 - DUMP INSTRUCTION EXECUTION COUNT STATISTICS
+         SPACE 2
+*              THIS SECTION PRINTS THE STATISTICAL REPORT FOR THE
+*              INSTRUCTION EXECUTION COUNT FACILITY.  DUE TO THE TABLE
+*              DESIGN OF IECF, MANY POINTERS ARE USED AND REGISTER
+*              USAGE DIFFERS A LITTLE FROM THAT IN THE REST OF THE
+*              EXTENDED INTERPRETER. REGISTER USAGE IN THIS SECTION IS
+*              AS FOLLOWS: RWK0  -  GENERAL WORK REGISTER
+*                          RWK1  -  OFFSET POINTER IN COUNT TABLE
+*                          R7    -  GENERAL WORK REGISTER
+*                          R8    -  THE CURRENT INSTRUCTION COUNT
+*                          R9    -  BASE ADDRESS OF COUNTING AREA
+*                          R10   -  BASE ADDRESS OF USER PROGRAM AREA
+*                          RWK14  -  CURRENT PROGRAM RELATIVE ADDRESS
+*                                BEING INSPECTED
+*              IT SHOULD BE NOTED THAT THIS SECTION IS VERY INSTRUCTION
+*              LENGTH DEPENDENT.  ANY NEW INSTRUCTION DIFFERING IN THE
+*              TRADITIONAL LENGTH CODES WILL DRASTICALLY EFFECT THIS
+*              SECTION.
+         SPACE 3
+EIOPC22  EQU   *
+         TM    ECPRFLG1,ECPRCTON   TEST COUNT SPACE ALLOCATION
+         BNO   EIXOPCC1            IF NEVER ALLOCATED CANNOT DUMP IT
+         L     RWK1,ECFADL         GET FAKE BEGIN INSTR ADDR
+         LA    R10,0(RMEM,RWK1)    GET PHYSICAL REAL STARTING INSTR ADR
+         L     RWK1,ECPRICL        GET BEGINNING COUNTABLE FAKE INSTR
+         ST    RWK1,EISAV22        SAVE FIST OFFSET AS BEG LOOP ADDR
+         LR    RWK14,RWK1          SAVE FIRST ADDR FOR LATER USE
+         S     RWK1,ECFADL         SET OFFSET POINTER AT BEG
+         SR    R8,R8               ZERO OUT COUNT SAVING REGISTER
+         L     R9,ECPRICA          GET STARTING ADDRESS OF COUNT SPACE
+         SPACE 2
+EILOP22  EQU   *
+         CH    R8,0(RWK1,R9)       IS THE NEW COUNT THE SAME AS OLD?
+         BE    EIMVPNTR            IF SAME, MOVE POINTER OVER
+         SPACE 2
+*              THIS SECTION ACTUALLY PRINTS THE STATISTICS LINE
+         LTR   R8,R8               WAS THE OLD COUNT ZERO?
+         BZ    EINEWCT             IF OLD WAS ZERO, JUST SAVE & RETURN
+         L     RWK0,EIEND22        GET ENDING ADDR OF THIS LOOP
+         XHEXO RWK0,EISTEND        CONVERT ENDING ADDR TO HEX
+         L     RWK0,EISAV22        SET BEGINNING ADDR OF THIS LOOP
+         XHEXO RWK0,EISTBEG        CONVERT BEGINNING ADDR TO HEX
+         XDECO R8,EISTCNT          CONVERT INSTR COUNT TO DECIMAL
+         MVC   EISTBEG(2),EISTBLK  BLANK OUT FIRST TWO BYTES OF ADDR
+         MVC   EISTEND(2),EISTBLK   BLANK OUT FIRST TWO BYTES OF ADDR
+         $PRNT EISTMSG,EISTMSGL,EICNTEXC    PRINT STATISTICAL LINE
+         SPACE 2
+EINEWCT  EQU   *
+         ST    RWK14,EISAV22       SAVE BEGINNING LOOP ADDRESS
+         LH    R8,0(RWK1,R9)       REPLACE OLD COUNT WITH NEW
+         SPACE 2
+EIMVPNTR EQU   *
+         ST    RWK14,EIEND22       SAVE ENDING LOOP ADDRESS
+         LTR   R8,R8               TEST FOR ZERO COUNT
+         BZ    EIRR22              ASSUME 2 BYTE LENGTH INSTRS ON H-WRD
+         LA    R7,0(RWK1,R10)      GET ADDRESS OPCODE OF PRES INSTR
+         TM    0(R7),X'C0'         TEST OPCODE FOR LENGTH
+         BM    EIRXSI22            BRANCH IF LENGTH EQUAL 4
+         BO    EISS22              BRANCH IF AN SS INSTR LENGTH = 6
+         SPACE 2
+EIRR22   EQU   *
+         LA    RWK1,2(RWK1)        LENGTH = 2 INCERMENT AND CHECK DONE
+         B     EICHK22             BRANCH CHECK IF DONE
+         SPACE 2
+EIRXSI22 EQU   *                   RX OR SI THEN LENGTH =4
+         LA    RWK1,4(RWK1)        LENGTH = 4 INCERMENT AND CHECK
+         B     EICHK22             CHECK FOR FINISHED
+         SPACE 2
+EISS22   EQU   *                   LENGTH = 6
+         LA    RWK1,6(RWK1)        INCERMENT OFFSET AND CHECK
+EICHK22  EQU   *
+         LR    RWK14,RWK1          MOVE OFFSET FOR ADDR CALCULATION
+         A     RWK14,ECFADL        ADD TO GET NEW USER PROGRAM ADDR
+         C     RWK14,ECPRICH       TEST TO SEE IF OUT OF COUNTING RANGE
+         BL    EILOP22             IF NOT OUT OF RANGE CONTINUE
+         LTR   R8,R8               IF FINISHED CHECK LAST COUNT
+         BZ    EIXOPCC0            IF ZERO, DONE, BRANCH COMMON CODE
+         L     RWK0,EIEND22        GET LAST ENDING ADDRESS
+         SPACE 2
+*              THIS SECTION PRINTS THE LAST STATISTICS LINE
+         XHEXO RWK0,EISTEND        CONVERT ENDING ADDRESS TO HEX
+         L     RWK0,EISAV22        SET BEGINNING ADDR OF THIS LOOP
+         XHEXO RWK0,EISTBEG        CONVERT BEGINNING ADDRESS TO HEX
+         XDECO R8,EISTCNT          CONVERT INSTR "OUNT TO DECIMAL
+         MVC   EISTBEG(2),EISTBLK  BLANK OUT FORST TWO BYTES OF ADDR
+         MVC   EISTEND(2),EISTBLK  BLANK OUT FIRST TWO BYTES OF ADDR
+         $PRNT EISTMSG,EISTMSGL,EICNTEXC    PRINT STATISTICAL LINE
+         B     EIXOPCC0            BRANCH TO COMMON XOPC EXIT CODE
+         SPACE 2
+EISTMSG  DC    C' STATS-->   BEGIN ADDR:'   STATISTICS MESSAGE
+EISTBEG  DC    8C' '               STATS MESSAGE
+         DC    C'   END ADDR:'     STATS MESSAGE
+EISTEND  DC    8C' '               STATS MESSAGE
+         DC    C'   INSTRUCTION COUNT:'      STATS MESSAGE
+EISTCNT  DC    12C' '              STATS MESSAGE
+EISTMSGL EQU   *-EISTMSG           LENGTH OF STATISTICAL MESSAGE
+EISTBLK  DC    2C' '               BLANK AREA
+EIEND22  DS    F                   ENDING LOOP ADDRESS
+EISAV22  DS    F                   BEGINNING LOOP ADDRESS
+         SPACE 2
+*              THIS IS THE XOPC COMMON EXIT CODE
+EIXOPCC0 EQU   *
+         SR    RWK1,RWK1           SET CC=0 NOTE OK EXECUTION
+         BAL   RCC,EIFINRR         BRANCH BACK AND FETCH NEXT INSTR
+         SPACE 2
+*              THIS IS THE XOPC EXIT CODE FOR CC = 1
+EIXOPCC1 EQU   *
+         O     RWK1,=XL4'11'       SET CC=1 TO NOTE USER ERROR
+         BAL   RCC,EIFINRR         GET CC AND BRANCH TO FETCH NXT INSTR
+         SPACE 3
+**--> INSUB: EIBASDSP      CALCULATE BASE/DISPLACEMENT  + + + + + + + +
+*+                                                                    +
+*+       ENTRY CONDS:                                                 +
+*+             RWK0 - MUST CONTAIN THE APPROPRIATE HALFWORD OF THE    +
+*+                    INSTRUCTION                                     +
+*+       EXIT CONDS:                                                  +
+*+             RWK0 - CONTAINS THE CALCULATED RELATIVE ADDRESS        +
+*+                    (NOT RELOCATED FOR ASSIST)                      +
+*+             RWK1 - CONTENTS ARE DESTROYED                          +
+*+                                                                    +
+*++ + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + +
+         SPACE 2
+EIBASDSP EQU   *
+         LR    RWK1,RWK0           COPY B/D OVER
+         N     RWK0,=XL4'FFF'      REMOVE BASE, LEAVING DISP
+         N     RWK1,=XL4'F000'     REMOVE DISP, LEAVING BASE
+         BCR   Z,RLINK             IF NO BASE, RETURN
+         SRL   RWK1,10             MULT BASE REG BY 4 FOR INDEX
+         AL    RWK0,ECREGS(RWK1)   ADD IN BASE REG'S VALUE
+         N     RWK0,EILONGMK       ZERO OUT HIGH ORDER BYTE
+         BR    RLINK               RETURN TO CALLER
+         SPACE 5
+**--> INSUB: EIMSFCHK       MODIFICATION & RANGE CHECKING ROUTINE + + +
+*+                                                                    +
+*+       THIS ROUTINE CHECKS THE ADDRESS IN RWK1 FOR BEING WITHIN     +
+*+       THE ALLOWABLE RANGE.  MODIFICATION CHECKING IS ALSO          +
+*+       PERFORMED IF THE INSTRUCTION MODIFIES STORAGE.               +
+*+                                                                    +
+*+       ENTRY CONDS:                                                 +
+*+             RWK1 - CONTAINS THE ADDRESS TO BE CHECKED              +
+*+             RWK0 - CONTAINS THE LENGTH OF STORAGE AFFECTED         +
+*+            RLINK - CONTAINS THE RETURN ADDRESS                     +
+*+           EIWORK - IS A STORAGE AREA THAT MUST CONTAIN THE CONTROL +
+*+                    BYTE EICTB3  (SHIFTED LEFT 2 BITS IF 2ND OPRND) +
+*+       EXIT CONDS:                                                  +
+*+             RWK0 - IS DESTROYED                                    +
+*+             RWK1 - IS DESTROYED                                    +
+*+                                                                    +
+*++ + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + +
+         SPACE 2
+EIMSFCHK EQU   *
+*              DETERMINE WHAT CHECKING TO PERFORM
+         BCTR  RWK0,0              RWK0 CONTAINS LENGTH-1
+         ALR   RWK0,RWK1           GET @ OF HIGHEST BYTE ACCESSED
+         TM    EIWORK,EI1STORE     WHAT CHECKING IS TO BE DONE ?
+         BCR   Z,RLINK             RETURN IF NO CHECKING
+         BO    EISTRCHK            BRANCH TO DO STORE CHECKING
+*              PERFORM FETCH CHECKING
+         TM    ECFLAG0,$ECPROT     IS ABSOLUTE PROTECT MODE ON ?
+         BCR   Z,RLINK             RETURN IF NOT
+EIFTHCHK EQU   *
+         C     RWK1,ECFADL         IS BEGINNING @ TOO LOW ?
+         BL    EIOC4               YES, SO ERROR
+         C     RWK0,ECFADH         IS ENDING @ TOO HIGH ?
+         BCR   L,RLINK             RETURN IF NOT (ADDR IS OK)
+         B     EIOC4               @ IS TOO HIGH, SO ERROR
+*              PERFORM STORE CHECKING
+EISTRCHK EQU   *
+         C     RWK1,ECFADL         IS BEGINNING @ TOO LOW ?
+         BL    EIOC4               YES, SO ERROR
+         C     RWK0,ECFADH         IS ENDING @ TOO HIGH ?
+         BH    EIOC4               YES, SO ERROR
+*              PERFORM MODIFICATION CHECKING
+         TM    ECPRFLG1,ECPRMODC   IS MOD CHECK OPTION ON ?
+         BCR   Z,RLINK             NO, SO RETURN TO CALLER
+         C     RWK1,ECPRMODH       IS BEGINNING @ HIGHER THAN CHK AREA?
+         BCR   H,RLINK             RETURN IF YES
+         C     RWK0,ECPRMODL       IS ENDING @ LOWER THAN CHECK AREA ?
+         BCR   L,RLINK             RETURN IF YES
+*              IF HERE, THE INSTRUCTION MODIFIES STORAGE WITHIN THE
+*              CHECKING AREA.  PERTINENT INFORMATION IS PRINTED FOR THE
+*              USER PROGRAMMER.
+         XHEXO RWK0,EICKHIGH       CONVERT HIGH @ TO HEX FOR PRINTING
+         MVC   EICKHIGH(2),EIBLANKS  BLANK OUT 1ST 2 DIGITS
+         XHEXO RWK1,EICKLOW        CONVERT LOW @ TO HEX FOR PRINTING
+         MVC   EICKLOW(2),EIBLANKS   BLANK OUT 1ST 2 DIGITS
+         L     RWK1,ECSTIADD       GET INSTRUCTION ADDR
+         XHEXO RWK1,EICKINAD       CONVERT INSTR ADDR TO HEX FOR PRNT
+         MVC   EICKINAD(2),EIBLANKS  BLANK OUT 1ST 2 DIGITS
+         MVC   EICKINST+4(10),EIBLANKS  BLANK OUT INSTR AREA
+         LM    RWK0,RWK1,ECSTCCPM  FETCH INSTR FROM INSTR STACK
+         SLDL R0,16                RR AND RX CODE IN REG 0
+         XHEXO RWK0,EIWORK         CONVERT 1ST 4 BYTES TO HEX
+         TM    ECSTINST,EISSINST   IS THISAN SS INSTR ?
+         BNO   EINOTSSI            BRANCH IF NOT
+         XHEXO RWK1,EIWORK+8       CONVERT LAST 2 BYTES TO HEX
+EINOTSSI EQU   *
+         LA    RWK1,EICKINST       GET @ OF THE HEX INSTR
+         BAL   R2,EIMOVINS         MOVE HEX INSTR TO PRINT FORMAT
+         $PRNT EICHKMSG,EICHKMSL,EICNTEXC  PRINT INSTR FOR MOD CHK,    X
+                                           BR OUT IF COUNT EXCEEDED
+         BR    RLINK               RETURN TO CALLER
+*              THE FOLLOWING STORAGE IS USED AS A PRINT FORMAT AREA BY
+*              THE MODIFICATION CHECK FACILITY
+EICHKMSG DC    C' CHECK-->   INSTR ADDR:'
+EICKINAD DC    8C' '
+         DC    C'   INSTR:  '
+EICKINST DC    14C' '
+         DC    C'     MODIFICATION LIMIT ADDRS-->   LOW:'
+EICKLOW  DC    8C' '
+         DC    C'   HIGH:'
+EICKHIGH DC    8C' '
+EICHKMSL EQU   *-EICHKMSG          LENGTH OF PRINT MESSAGE
+         SPACE 5
+**--> INSUB: EIMOVINS     MOVE HEX INSTR TO PRINT FORMAT  + + + + + + +
+*+                                                                    +
+*+       THIS INSUB MOVES A HEXIDECIMAL INSTRUCTION TO A              +
+*+       SPECIFIED AREA WITH BLANKS INSERTED TO RESEMBLE              +
+*+       SOURCE CODE LISTING FORMAT.                                  +
+*+                                                                    +
+*+       ENTRY CONDS:                                                 +
+*+             RWK1  -  CONTAINS THE TARGET ADDRESS FOR THE MOVE      +
+*+             R2    -  USED AS THE BAL LINK REG                      +
+*+             EIWORK-  ASSUMED TO BE THE FETCH AREA FOR THE MOVE     +
+*+       EXIT CONDS:                                                  +
+*+             R2    -  IS RE-CLEARED AS A BYTE REG                   +
+*+             RWK0  &                                                +
+*+             RWK1  -  CONTENTS DESTROYED                            +
+*+                                                                    +
+*++ + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + +
+         SPACE 2
+EIMOVINS DS  0H
+         ST    R2,EIMOVSAV         SAVE RETURN ADDR
+         SR    RWK0,RWK0           CLEAR LOOP COUNTER REG
+         IC    RWK0,EICTB2         GET INSTR LEN FOR LOOP COUNT
+         SRL   RWK0,1              DIVIDE LENGTH BY 2 FOR LOOP CTR
+         LA    R2,EIWORK           GET @ OF FETCH AREA
+EIMOVEIN EQU   *
+         MVC   0(4,RWK1),0(R2)     MOVE 4 HEX BYTES
+         LA    RWK1,5(RWK1)        INCREMENT TARGET ADDRESS
+         LA    R2,4(R2)            INCREMENT FETCH ADDRESS
+         BCT   RWK0,EIMOVEIN       IF CTR ›= 0, CONTINUE LOOP
+         L     RWK1,EIMOVSAV       GET RETURN ADDRESS
+         SR    R2,R2               CLEAR BYTE REG
+         BR    RWK1                RETURN TO CALLER
+EIMOVSAV DC    F'0'                RET ADDR SAVED HERE
+         SPACE 5
+**--> INSUB: EIXOPCHK       CHECK ADDRESSES FOR XOPC INSTRUCTIONS + + +
+*+                                                                    +
+*+       ENTRY CONDITIONS:                                            +
+*+             RWK1  - CONTAINS THE ADDRESS TO BE CHECKED (LOW @)     +
+*+             RWK0  - CONTAINS LENGTH-1 OF STORAGE AFFECTED          +
+*+             RLINK - INTERNAL LINK REGISTER                         +
+*+       EXIT CONDITIONS:                                             +
+*+             RWK0  - CONTENTS (LENGTH) DESTROYED, UNLESS            +
+*+                     EIXOPCHA IS CALLED WITH RWK0 CONTAINING        +
+*+                     THE HIGH ADDRESS --> (LOW @ + LENGTH - 1)      +
+*+                                                                    +
+*++ + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + + +
+         SPACE 2
+EIXOPCHK EQU   *
+         ALR   RWK0,RWK1           COMPUTE HIGH ADDRESS
+EIXOPCHA EQU   *
+         C     RWK1,ECFADL         IS LOW ADDRESS IN RANGE ?
+         BL    EIXOPCC1            NO, BRANCH TO NOTE ERROR
+         C     RWK0,ECFADH         IS HIGH ADDRESS IN RANGE ?
+         BCR   L,RLINK             YES, SO RETURN
+         B     EIXOPCC1            NO, BRANCH TO NOTE ERROR
+         LTORG
+         SPACE 2
+*        TABLE FOR THE XOPC INSTRUCTION DISPLACEMENTS
+EIOPCJMP $AL2  EIXOPC,(EIOPC0,EIOPC1,EIOPC2,EIOPC3,EIOPC4,EIOPC5,EIOPC6X
+               ,EIOPC7,EIOPC8,EIOPC9,EIOPC10,EIOPC11,EIOPC12,EIOPC13,EIX
+               OPC14,EIOPC15,EIOPC16,EIOPC17,EIOPC18,EIOPC19,EIOPC20,EIX
+               OPC21,EIOPC22)
+         SPACE 2
+*              TABLE FOR EXTENDED I/I INSTRUCTION DISPLACEME1T
+EIXIOJ   $AL2  EISPEJMP,(EIXREAD,EIXPRNT,EIXPNCH,EIXDUMP,EIXLIMD,EIXGETX
+               ,EIXPUT,EIOC1)
+.EINOXIO ANOP
+         SPACE 2
+*              OFF SETS TO COMPLETION CODE MESSAGES
+EICOFFS  $AL2  EICC0,(EICC1,EICC2,EICC3,EICC4,EICC5,EICC6,EICC7,EICC8,EX
+               ICC9,EICCA,EICCB),-2    STANDARD INTERRUPT POINTERS
+         AIF   (NOT &$FLOTE).EIFL6 SKI1IF NO FLOATING INTERRUPTS
+         $AL2  EICC0,(EICCC,EICCD,EICCE,EICCF)    FLOATING INTERS
+.EIFL6   ANOP
+         SPACE 2
+*              COMPLETION CODE MESSAGES
+EICC0    EQU   *
+EICC1    $ERCGN  0C1,'OPERATION'
+EICC2    $ERCGN  0C2,'PRIVILEGED OP)RATION'
+EICC3    $ERCGN  0C3,'EXECUTE'
+EICC4    $ERCGN  0C4,'PROTECTION'
+EICC5    $ERCGN  0C5,'ADDRESSING'
+EICC6    $ERCGN  0C6,'SPECIFICATION'
+EICC7    $ERCGN  0C7,'DATA'
+EICC8    $ERCGN  0C8,'FIXED-POINT OVERFLOW'
+EICC9    $ERCGN  0C9,'FIXED-POINT DIVIDE'
+EICCA    $ERCGN  0CA,'DECIMAL OVERFLOW'
+EICCB    $ERCGN  0CB,'DECIMAL DIVIDE'
+         AIF   (NOT &$FLOTE).EIFL8   SKIP MESSAGES FOR FLOATING PNT
+EICCC    $ERCGN  0CC,'EXPONENT OVERFLOW'
+EICCD    $ERCGN  0CD,'EXPONENT UNDERFLOW'
+EICCE    $ERCGN  0CE,'SIGNIFICANCE'
+EICCF    $ERCGN  0CF,'FLOATING-POINT DIVIDE'
+.EIFL8   ANOP
+         SPACE 1
+EICCREAD $ERCGN  220,'ATTEMPTED READ PAST END-FILE',TYPE=ASSIST
+EICCTIME $ERCGN  221,'INSTRUCTION LIMIT EXCEEDED',TYPE=ASSIST
+EICCRECE       $ERCGN  222,'RECORD LIMIT EXCEEDED',TYPE=ASSIST
+         AIF   (&$TIMER EQ 0).EINOTOC     SKIP IF NO TIMER AT ALL
+EICCTIMB $ERCGN  223,'TIME LIMIT EXCEEDED',TYPE=ASSIST
+.EINOTOC ANOP
+EICCBROU $ERCGN  224,'BRANCH OUT OF PROGRAM AREA',TYPE=ASSIST
+         SPACE 2
+*              THE FOLLOWING IS THE 256 SECONDARY CONTROL TABLE
+*              WHICH CONTAINS INDICES INTO THE MAIN CONTROL TABLE
+EIOPCDTB EQU   *
+         EIXTAB  2,XOPC,2,2,SPM,BALR,BCTR,BCR                         M
+         EIXTAB  PRIVH,PRIVH,PRIVH,2,2,2,MVCL,CLCL                    M
+         EIXTAB  NMRR,NMRR,NMRR,NMRR,NMRR,NMRR,NMRR,NMRR
+         EIXTAB  LR,NMRR,NMRR,NMRR,MRDR,MRDR,NMRR,NMRR
+         EIXTAB  FPRR,FPRR,FPRR,FPRR,FPRR,FPRR,FPRR,FPRR
+         EIXTAB  FPRR,FPRR,FPRR,FPRR,FPRR,FPRR,FPRR,FPRR
+         EIXTAB  FPRR,FPRR,FPRR,FPRR,FPRR,FPRR,FPRR,FPRR
+         EIXTAB  FPRR,FPRR,FPRR,FPRR,FPRR,FPRR,FPRR,FPRR
+         EIXTAB  STH,LA,STC,IC,EX,BAL,BCT,BC
+         EIXTAB  NMRXH,NMRXH,NMRXH,NMRXH,NMRXH,4,CVD,CVB
+         EIXTAB  ST,4,DECO,DECI,NMRXF,NMRXF,NMRXF,NMRXF
+         EIXTAB  NMRXF,NMRXF,NMRXF,NMRXF,MD,MD,NMRXF,NMRXF
+         EIXTAB  FPRS,HEXI,HEXO,4,4,4,4,XFPRF
+         EIXTAB  FPRF,FPRF,FPRF,FPRF,FPRF,FPRF,FPRF,FPRF
+         EIXTAB  FPRS,4,4,4,4,4,4,4
+         EIXTAB  FPRF,FPRF,FPRF,FPRF,FPRF,FPRF,FPRF,FPRF
+         EIXTAB  PRIVF,4,PRIVF,DIAG,PRIVF,PRIVF,BXH,BXLE              M
+         EIXTAB  SHFTS,SHFTS,SHFTS,SHFTS,SHFTD,SHFTD,SHFTD,SHFTD
+         EIXTAB STM,NMSIF,NMSIS,NMSIS,NMSIS,NMSIF,NMSIS,NMSIS
+         EIXTAB  LM,4,4,4,PRIVF,PRIVF,PRIVF,PRIVF                     M
+         EIXTAB  4,4,4,4,4,4,4,4
+         EIXTAB  4,4,4,4,PRIVF,PRIVF,4,PRIVF                          M
+         EIXTAB  4,PRIVF,PRIVF,4,4,4,PRIVF,PRIVF                      M
+         EIXTAB  4,4,4,4,4,CLM,STCM,ICM
+         EIXTAB  6,6,6,6,6,6,6,6
+         EIXTAB  6,6,6,6,6,6,6,6
+         EIXTAB 6,MOVES,MOVES,MOVES,LOGS,LOGFS,LOGS,LOGS
+         EIXTAB  6,6,6,6,TR,TRT,MOVES,EDMK
+         EIXTAB  XTND,DUMPR,6,6,6,6,6,6                               L
+         EIXTAB  6,6,6,6,6,6,6,6
+         EIXTAB  SRP,MVO,PACK,UNPK,6,6,6,6
+         EIXTAB  DECS,CP,DECS,DECS,DECS,DECS,6,6
+         TITLE '*** EXECUT - MAIN CONTROL TABLE'
+*              THE FOLLOWING IS THE MAIN CONTROL TABLE FOR THE
+*              EXTENDED INTERPRETER
+EICONTAB DS    0F                                                     L
+EIT2     DC    X'00020000',4X'00'                                     L
+EIT4     DC    X'00040000',4X'00'                                     L
+EIT6     DC    X'00060000',4X'00'                                     L
+         EITAB  NMRR,360,2,*,NO,NM,**,*,*,RR4,**,***,O,O,EINORMRR
+         EITAB    LR,360,2,*,NO,NM,**,*,*,RR4,**,***,O,O,EILR
+         EITAB  BALR,360,2,*,NO,NM,**,*,*,RR4,**,***,O,O,EIBALR
+         EITAB  BCTR,360,2,*,NO,NM,**,*,*,RR4,**,***,O,O,EIBCTR
+         EITAB   BCR,360,2,*,NO,NM,**,*,*,RR4,**,***,O,O,EIBCR
+         EITAB  FPRR,360,2,*,NO,NM,**,*,*,RR4,**,***,O,O,EIFPRR
+         EITAB  CLCL,370,2,*,NO,NM,NO,F,F,RR4,**,***,E,E,EILONG
+         EITAB  MVCL,370,2,*,NO,NM,NO,S,F,RR4,**,***,E,E,EILONG
+         EITAB   SPM,360,2,*,NO,NM,**,*,*,RR4,**,***,O,O,EISPM
+         EITAB  MRDR,360,2,*,NO,NM,**,*,*,RR4,**,***,E,O,EIMRDR
+         EITAB PRIVH,360,2,*,PR,NM,**,*,*,IOL,**,***,O,O,EILCTL       M
+         EITAB NMRXF,360,4,4,NO,NM,CK,F,*,RR4,IX,FUL,O,O,EINORMRX
+         EITAB    IC,360,4,1,NO,NM,CK,F,*,RR4,IX,NON,O,O,EINORMRX
+         EITAB NMRXH,360,4,2,NO,NM,CK,F,*,RR4,IX,HAF,O,O,EINORMRX
+         EITAB   CVB,360,4,8,NO,NM,CK,F,*,RR4,IX,DBL,O,O,EINORMRX
+         EITAB   BAL,360,4,*,NO,NM,NO,*,*,RR4,IX,NON,O,O,EIBAL
+         EITAB   BCT,360,4,*,NO,NM,NO,*,*,RR4,IX,NON,O,O,EIBCT
+         EITAB    BC,360,4,*,NO,NM,NO,*,*,RR4,IX,NON,O,O,EIBC
+         EITAB    LA,360,4,*,NO,NM,CK,*,*,RR4,IX,NON,O,O,EILA
+         EITAB    EX,360,4,*,NO,NM,CK,F,*,RR4,IX,HAF,O,O,EIEX
+         EITAB    MD,360,4,4,NO,NM,CK,F,*,RR4,IX,FUL,E,O,EIMD
+         EITAB   STH,360,4,2,NO,NM,CK,S,*,RR4,IX,HAF,O,O,EISTORS
+         EITAB   CVD,360,4,8,NO,NM,CK,S,*,RR4,IX,DBL,O,O,EISTORS
+         EITAB   STC,360,4,1,NO,NM,CK,S,*,RR4,IX,NON,O,O,EISTORS
+         EITAB    ST,360,4,4,NO,NM,CK,S,*,RR4,IX,FUL,O,O,EISTORS
+         EITAB  FPRF,360,4,4,NO,NM,CK,F,*,RR4,IX,FUL,E,O,EIFPRX
+         EITAB  FPRS,360,4,4,NO,NM,CK,S,*,RR4,IX,FUL,E,O,EIFPRXST CEH
+         EITAB XFPRF,360,4,8,NO,NM,CK,F,*,RR4,IX,DBL,E,O,EIFPRX
+         EITAB XFPRS,360,4,8,NO,NM,CK,S,*,RR4,IX,DBL,E,O,EIFPRXST CEH
+         EITAB NMSIS,360,4,1,NO,NM,CK,S,*,IOL,BD,NON,*,*,EINORMSI
+         EITAB NMSIF,360,4,1,NO,NM,CK,F,*,IOL,BD,NON,*,*,EINORMSI
+         EITAB  DIAG,360,4,1,NO,NM,NO,*,*,IOL,BD,NON,*,*,EIDIAG
+         EITAB   BXH,360,4,*,NO,NM,NO,N,*,RR4,BD,NON,O,O,EIRSBX
+         EITAB BXLE,360,4,*,NO,NM,NO,N,*,RR4,BD,NON,O,O,EIRSBX
+         EITAB    LM,360,4,*,NO,NM,NO,F,*,RR4,BD,FUL,O,O,EILMSTM
+         EITAB   STM,360,4,*,NO,NM,NO,S,*,RR4,BD,FUL,O,O,EILMSTM
+         EITAB SHFTS,360,4,*,NO,NM,NO,N,*,RR4,BD,NON,O,O,EISHIFT
+         EITAB SHFTD,360,4,*,NO,NM,NO,N,*,RR4,BD,NON,E,O,EISHIFT
+         EITAB   ICM,370,4,4,NO,NM,CK,F,*,RR4,BD,NON,O,O,EIICM
+         EITAB  STCM,370,4,4,NO,NM,CK,S,*,RR4,BD,NON,O,O,EISTCM
+         EITAB   CLM,370,4,4,NO,NM,CK,F,*,RR4,BD,NON,O,O,EICLM
+         EITAB PRIVF,360,4,*,PR,NM,**,*,*,IOL,**,***,O,O,EILCTL       M
+         EITAB MOVES,360,6,0,NO,NM,CK,S,F,IOL,BD,NON,*,*,EIMOVES
+         EITAB   MVO,360,6,0,NO,NM,CK,S,F,LL1,BD,NON,*,*,EIMOVES
+         EITAB  LOGS,360,6,0,NO,NM,CK,S,F,IOL,BD,NON,*,*,EILOGS
+         EITAB  LOGFS,360,6,0,NO,NM,CK,F,F,IOL,BD,NON,*,*,EILOGS
+         EITAB    TR,360,6,0,NO,NM,CK,S,F,IOL,BD,NON,*,*,EIMOVES
+         EITAB  PACK,360,6,0,NO,NM,CK,S,F,LL1,BD,NON,*,*,EIMOVES
+         EITAB  UNPK,360,6,0,NO,NM,CK,S,F,LL1,BD,NON,*,*,EIMOVES
+         EITAB  DECS,360,6,0,NO,NM,CK,S,F,LL1,BD,NON,*,*,EIDECS
+         EITAB    CP,360,6,0,NO,NM,CK,F,F,LL1,BD,NON,*,*,EIDECS
+         EITAB   TRT,360,6,0,NO,NM,CK,F,F,IOL,BD,NON,*,*,EITRT
+         EITAB  EDMK,360,6,0,NO,NM,CK,S,F,IOL,BD,NON,*,*,EIEDMK
+         EITAB   SRP,370,6,0,NO,NM,CK,S,N,LL1,BD,NON,*,*,EISRP
+         EITAB  XTND,*,*,*,*,EX,*,*,*,*,*,*,*,*,EI2EXTAB
+*        ONLY LENGTH AND OPCODE REQ FOR REGISTER XDUMP                L
+         EITAB DUMPR,360,6,*,NO,NM,**,*,*,*,*,*,*,*,EIXDUMPR          L
+         EITAB  HEXI,360,4,8,NO,NM,CK,F,*,RR4,IX,NON,O,O,EIXHEXI      M
+         EITAB  HEXO,360,4,8,NO,NM,CK,S,*,RR4,IX,NON,O,O,EIXHEXO      M
+         EITAB  DECI,360,4,8,NO,NM,CK,F,*,RR4,IX,NON,O,O,EIXDECI      M
+         EITAB  DECO,360,4,12,NO,NM,CK,S,*,RR4,IX,NON,O,O,EIXDECO     M
+         EITAB  XOPC,360,2,*,NO,NM,**,*,*,IOL,**,***,*,*,EIXOPC       M
+***********************************************************************
+*                                                                     *
+*        THE FOLLOWING BLOCK OF STMTS DESCRIBES A SINGLE ENTRY        *
+*        OF THE OPTIONAL INTERPRETER MAIN CONTROL TABLE               *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+*        NOTES ON THE DESIGN OF THE MAIN INTERPRETER TABLE            *
+*        -------------------------------------------------            *
+*                       (AND SUB-TABLES)                              *
+*                                                                     *
+*     => IMPORTANT:  THIS SHOULD BE REQUIRED READING FOR ANYONE       *
+*        NEEDING TO UNDERSTAND AND/OR MODIFY THIS TABLE SCHEME.       *
+*                                                                     *
+*             A 256 BYTE TABLE (1 BYTE PER POSSIBLE OPCODE) OF        *
+*        POINTERS ALLOW EASY ACCESS TO INSTRUCTION DECODING           *
+*        INFORMATION BY INDEXING INTO A LARGER MAIN TABLE             *
+*        DESCRIBED BELOW.                                             *
+*             THE OPTIONAL ASSIST INTERPRETER'S MAIN CONTROL TABLE    *
+*        (NAMED: EICONTAB) CONTAINS ONE ENTRY FOR EACH POSSIBLE       *
+*        TYPE OF INSTRUCTION DECODING.  EACH 8 BYTE ENTRY CONTAINS    *
+*        APPROPRIATE FLAGS AND OTHER INFORMATION (AS DESCRIBED        *
+*        BELOW) TO CONTROL EACH STEP OF THE SPECIFIC INSTRUCTION      *
+*        DECODING PROCESS.                                            *
+*             THE FIRST THREE COMPLETE ENTRIES OF EICONTAB WILL       *
+*        BE ALL ZEROS EXCEPT THE INSTRUCTION LENGTH BITS.  THE        *
+*        FIRST ENTRY'S INSTRUCTION LENGTH WILL BE EQUAL TO TWO,       *
+*        THE SECOND'S WILL EQUAL FOUR AND THE THIRD'S WILL EQUAL      *
+*        SIX.  ALL ILLEGAL OPCODES (IN EIOPCDTB, THE 256 BYTE         *
+*        TABLE DESCRIBED ABOVE) WILL POINT TO THE ENTRY WHOSE         *
+*        INSTRUCTION LENGTH CORRESPONDS TO THE HIGH ORDER TWO BITS    *
+*        OF THE OPCODE ITSELF.                                        *
+*             FOR EXTENDED OPCODES (S-TYPE & PSEUDO-INSTRUCTIONS)     *
+*        THE ENTRY IN EICONTAB WILL BE MARKED 'OPCODE-DOES-NOT-       *
+*        TELL-ALL' AND WILL CONTAIN INFORMATION CONCERNING ACCESS     *
+*        TO A SUB-TABLE GIVING ALL NECESSARY INFORMATION ABOUT        *
+*        INSTRUCTION DECODING.  SEE EQUATES BELOW.                    *
+*                                                                     *
+***********************************************************************
+*
+EICTNTRY DS    0D                  MOVE CONTROL TABLE ENTRY HERE
+*              FLAG BYTES -- CONTAIN INSTR DECODING INFORMATION AS
+*              DESCRIBED BY EQUATES BELOW
+EICTB1   DS    B                   FLAG BYTE 1
+EICTB2   DS    B                   FLAG BYTE 2
+EICTB3   DS    B                   FLAG BYTE 3
+EICTB4   DS    B                   FLAG BYTE 4
+EICTB5   DS    B                   FLAG BYTE 5
+EICTB6   DS    B                   FLAG BYTE 6
+EICTDISP DS    H                   DISPLACEMENT FOR BRANCHING TO       X
+                                   SPECIAL ROUTINE
+EICTE$L  EQU   *-EICTNTRY          LENGTH OF A SINGLE TABLE ENTRY
+*              MISCELLANEOUS EQUATES
+EIEXTTAB EQU   EICTB5              ADDRESS OF EXTENDED OP CODE TABLE
+EI360PLS EQU   B'00001100'         (EICTB1)==> 360 & 370 INSTR
+EI370ONL EQU   B'00001000'         (EICTB1)==> 370 INSTR ONLY
+EIRR     EQU   B'00100000'         (EICTB1)==> THIS IS AN RR INSTR
+EIPRIVOP EQU   B'01000000'         (EICTB1)==>  THIS IS A PRIVILEGED   X
+                                                INSTRUCTION
+EIEXOPCD EQU   B'10000000'         (EICTB1)==>  OPCODE DOES NOT TELL   X
+                                                ALL (EXTENDED OPCODE)
+EINOCNOW EQU   B'00010000'         (EICTB1)==>  DO PERFORM MOD/ST/FTCH X
+                                                CHECKING AT EINOCHK
+*              EQUATES FOR INSTRUCTION LENGTH CODE
+*              **** NOTE ****  NO OTHER FLAGS CAN BE ADDED TO EICTB2
+EILEN2   EQU   B'00000010'         (EICTB2)==>  LENGTH=2 BYTES
+EILEN4   EQU   B'00000100'         (EICTB2)==>  LENGTH=4 BYTES
+EILEN6   EQU   B'00000110'         (EICTB2)==>  LENGTH=6 BYTES
+*              EQUATES FOR MODIFICATION OR FETCH CHECKING
+*              --- FOR FIRST OPERAND
+EI1NOCHK EQU   B'00000000'         (EICTB3)==>  NO CHECKING
+EI1FETCH EQU   B'01000000'         (EICTB3)==>  FETCH CHECKING
+EI1STORE EQU   B'11000000'         (EICTB3)==>  STORE CHECKING
+*              --- FOR SECOND OPERAND
+EI2NOCHK EQU   B'00000000'         (EICTB3)==>  NO CHECKING
+EI2FETCH EQU   B'00010000'         (EICTB3)==>  FETCH CHECKING
+EI2STORE EQU   B'00110000'         (EICTB3)==>  STORE CHECKING
+*              EQUATES FOR INSTR DECODING (2ND BYTE OF INSTR)
+EIB2RRX4 EQU   B'00000000'         (EICTB3)==>  2 REGS (MULT BY 4)
+EIB2LLX1 EQU   B'00000001'         (EICTB3)==>  2 LENGTHS (NO MULT)
+EIB2IORL EQU   B'00000011'         (EICTB3)==>  1 LENGTH OR IMMED FLD
+*              EQUATES FOR INSTR DECODING (2ND HALFWORD OF INSTR)
+EIH2NODX EQU   B'00000100'         (EICTB3)==>  BASE+DISP ONLY (OTHER- X
+                                   WISE INDEX+(BASE+DISP))
+*              NOTE IF THIS IS A BRANCH INSTRUCTION
+EIBRINST EQU   B'00001000'         (EICTB3)==> THIS IS A NON-RR BR INST
+*              EQUATES FOR OPERAND ALIGNMENT
+*              ***** NO OTHER FLAGS ALLOWED IN EICTB4 *****
+EIALNONE EQU   B'00000000'         (EICTB4)==>  NO ALIGNMENT NEEDED
+EIALHALF EQU   B'00000001'         (EICTB4)==>  HALFWORD ALIGNMENT
+EIALFULL EQU   B'00000011'         (EICTB4)==>  FULLWORD ALIGNMENT
+EIALDOBL EQU   B'00000111'         (EICTB4)==>  DOUBLE-WORD ALIGNMENT
+*              EQUATES FOR EVEN/ODD REGISTER CHECKING
+*              (THIS BYTE CAN NOT CONTAIN ANY OTHER FLAGS)
+EINEREG1 EQU   B'00000000'         (EICTB5)==> REG1 CAN BE ODD
+EIEVREG1 EQU   B'00010000'         (EICTB5)==> REG1 MUST BE EVEN
+EINEREG2 EQU   B'00000000'         (EICTB5)==> REG2 CAN BE ODD
+EIEVREG2 EQU   B'00000001'         (EICTB5)==> REG 2 MUST BE EVEN
+*              EQUATES FOR INSTR MOD/FETCH LENGTH
+*
+*              NOTE *****  THE UPPER NIBBLE OF THIS BYTE SHOULD ONLY
+*              BE USED WHEN ABSOLUTELY NECESSARY.  IF IT IS USED,
+*              THEN THE FOLLOWING INSTR MUST BE PLACED BETWEEN THE
+*              IC AND LTR INSTRS FOLLOWING LABEL => EINOCHK:
+*                   N     R2,=XL4'0F'
+*
+EIMFLENG EQU   B'00001111'        (EICTB6)==> LOWER NIBBLE HAS LENGTH
+*
+***********************************************************************
+*                                                                     *
+*        THE FOLLOWING EQUATES ARE USED FOR EXTENDED OPCODE           *
+*        TABLE ENTRY FETCHING:                                        *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+******** IMPORTANT NOTES FOR EXTENDED OPCODE INSTRUCTIONS *************
+*                                                                     *
+*        THE MAIN TABLE (EICONTAB) ENTRY FOR AN EXTENDED OPCODE       *
+*        WILL CONTAIN THE ACTUAL 4 BYTE ADDRESS OF THE SECONDARY      *
+*        TABLE CONTAINING DECODING ENTRIES FOR THE EXTENDED OPCODE    *
+*        INSTRUCTION.                                                 *
+*                                                                     *
+*        THE FIRST 8 BYTE ENTRY OF THE SECONDARY TABLE WILL           *
+*        CONTAIN A BYTE HAVING THE # OF BITS TO SHIFT THE 2ND         *
+*        BYTE OF THE INSTRUCTION TO OBTAIN AN INDEX INTO THE          *
+*        BYTE TABLE FOLLOWING THE 1ST ENTRY.  ALSO IN THE 1ST ENTRY   *
+*        WILL BE A FULLWORD COMPARATOR GIVING THE MAXIMUM INDEX       *
+*        VALUE THAT IS LEGAL.                                         *
+*                                                                     *
+*        THE BYTE TABLE FOLLOWING THE 1ST ENTRY WILL CONTAIN AS       *
+*        MANY SINGLE BYTE ENTRIES AS NECESSARY.  EACH ENTRY WILL BE   *
+*        A DISPLACEMENT FROM THE BEGINNING OF THE TABLE TO THE        *
+*        CORRECT TABLE ENTRY FOR THE PARTICULAR INSTRUCTION.  IF      *
+*        THE BYTE IS ZERO THEN THE INSTRUCTION IS NOT IMPLEMENTED     *
+*        AND AN OC-1 INTERRUPT WILL BE FLAGGED.                       *
+*                                                                     *
+***********************************************************************
+*
+*                   SECONDARY EXTENDED OPCODE TABLE                   *
+*  THIS TABLE IS AN EXTENSION OF THE MAIN DECODING TABLE AND IS       *
+*  STRICTLY RESERVED FOR THE EXTENDED OPCODE INSTRUCTIONS -- THOSE    *
+*  WITH AN OPCODE OF 'EO'.  BY SHIFTING THE SECOND BYTE OF THE        *
+*  INSTRUCTIONS 5 BITS TO THE RIGHT, AN INBEX TO BYTE TABLE -- SECOND *
+*  8 BYTES OF THIS TABLE -- IS ESTABLISHED WHERE A DISPLACEMENT TO    *
+*  THE PROPER INSTRUCTION DECODING ENTRY IS LOCATED. THE FIRST 8 BYTES*
+*  OF THE SECONDARY DECODING TABLE IS EXPLAINED ABOVE.                *
+         SPACE 2
+EI2EXTAB DS    0F                  SECONDARY EXTENDED DECODING TABLE
+*              EXTENDED OPCODE TABLE EQUATES
+*              --> 1ST 8 BYTE ENTRY
+EIMAXIND EQU   4                   POSITION OF MAX INDEX VALUE ALLOWED X
+                                   (THIS IS A FULLWORD)
+EI#SHIFT EQU   3                   POS OF SHIFT BYTE IN 1ST TAB ENTRY
+         DC    XL3'0',X'5'         BYTE 3 = # BITS TO SHIFT MASK
+         DC    F'8'                MAXIMUM INDEX LIMIT
+         DC    X'1018202830384000' DISPLACEMENTS FROM EI2EXTAB
+         EITAB READ,360,6,0,NO,NM,CK,S,*,RR4,IX,NON,O,O,EIXIOS
+         EITAB PRNT,360,6,0,NO,NM,CK,F,*,RR4,IX,NON,O,O,EIXIOS
+         EITAB PNCH,360,6,0,NO,NM,CK,F,*,RR4,IX,NON,O,O,EIXIOS
+         EITAB DUMP,360,6,0,NO,NM,CK,F,*,RR4,IX,NON,O,O,EIXIOS
+         EITAB LIMD,360,6,0,NO,NM,CK,*,*,RR4,IX,NON,O,O,EIXIOS
+         EITAB  GET,360,6,0,NO,NM,CK,S,*,RR4,IX,NON,O,O,EIXIOS
+         EITAB  PUT,360,6,0,NO,NM,CK,F,*,RR4,IX,NON,O,O,EIXIOS
+.EINONE  ANOP

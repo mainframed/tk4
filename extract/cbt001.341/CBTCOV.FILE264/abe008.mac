@@ -1,0 +1,550 @@
+ /* COPYRIGHT 1983 BY THOMAS GLEN SMITH */
+ /* ABE008 - MOVE,MO,COPY,CO SUBCOMMANDS */
+ /* 1        2    3  4    5              */
+   %INCLUDE ABESUB;
+ ABESUB(ABE008) PARS(00000) PARSEVAL(NO) CHECK(YES);
+   %INCLUDE ABESUBA;
+   DCL 1 LRN_STRUCTURE BASED(LRNPTR),
+   %INCLUDE ABELRN;
+   %INCLUDE ABELRNA;
+   DCL 1 OUTPOS,
+   %INCLUDE ABELRN;
+
+   DCL KEYTABLE(3) CHAR(80) VAR STATIC INIT(
+     'OL','FROM','TO');
+   DCL INDX FIXED BIN(15,0);
+   DCL OPER CHAR(80) VAR;
+   DCL SETCAPS ENTRY;
+   DCL (PREFIX,SUFFIX) ENTRY(CHAR(*),CHAR(*))
+     RETURNS(FIXED BIN(15,0));
+   DCL CURBIN FIXED BIN(15,0),
+       CURBIT BIT(16) BASED(ADDR(CURBIN));
+   DCL LAST FIXED BIN(31,0) INIT(99999999);
+   DCL (ALTPTR,DELPTR,IPTR,OPTR,ORGPTR,SAVPTR,SEQPTR,WRKPTR) PTR;
+   DCL 1 NEWHD,
+     2 NEWLSTHDR PTR,
+     2 NEWNXTHDR PTR;
+   DCL 1 NEWSTR BASED(NEWPTR),
+     2 NEWLST PTR,
+     2 NEWNXT PTR,
+     2 NEWSEQ FIXED BIN(31,0),
+     2 NEWRPT PTR,
+     2 NEWLN FIXED BIN(15,0),
+     2 NEWBUF CHAR(L REFER(NEWLN)) VAR;
+   DCL (OFF,LEN,NSAVE) FIXED BIN(15,0);
+   DCL (FROMSW,TOSW,OLSW) FIXED BIN(15,0) INIT(0);
+   DCL ASW BIT(1) INIT('0'B);
+
+   IPTR=ADDR(LRN_STRUCTURE.POSITIONALS(1));
+   OPTR=ADDR(OUTPOS.POSITIONALS(1));
+   IF PARY(1)^=''
+     THEN IF SUBSTR(PARY(1),1,1)='('
+       THEN PARY(1)=SUBSTR(PARY(1),2,LENGTH(PARY(1))-2);
+
+   CALL #ABELSPP(RHHDRPT,RHPTR,ADDR(OUTPOS),PARY(1),NSAVE);
+   IF NSAVE<=LENGTH(PARY(1))
+     THEN DO;
+       MSGDATA='INVALID FIRST OPERAND=TO-SPECIFICATION';
+       RHRC=8;
+       RETURN;
+       END;
+   DUP=1; /* DEFAULT DUPLICATION FACTOR */
+   DO I=2 TO HBOUND(PARY,1) WHILE(PARY(I)^='');
+     CALL SETCAPS(PARY(I));
+     CALL #SPARS(PARY(I),KEYTABLE,OPER,INDX);
+     SELECT(INDX);
+       WHEN(1) OLSW=1;
+       WHEN(2) FROMSW=1;
+       WHEN(3) TOSW=1;
+       OTHERWISE DO;
+         IF I=2 & VERIFY(PARY(2),'0123456789')=0
+           THEN DUP=PARY(2); /* IT IS DUPLICATION FACTOR */
+           ELSE DO;
+             MSGDATA='INVALID OPERAND = '××PARY(I);
+             RHRC=8;
+             RETURN;
+             END;
+         END;
+       END; /* SELECT */
+     END;
+   IF (OLSW+FROMSW+TOSW)>1
+     THEN DO;
+       MSGDATA='ONLY ONE OF THE KEYWORDS FROM, TO, OR OL CAN BE USED';
+       RHRC=8;
+       RETURN;
+       END;
+   CALL SETASW;
+   IF ((OLSW+FROMSW+TOSW)=0)
+     THEN SELECT; /* SELECT DEFAULT TYPE OF PROCESSING */
+       WHEN(ASW) FROMSW=1;
+       WHEN(OUTPOS.LRN_RHP->NXTHDR=OUTPOS.LRN_RHP & OPTR->RH_L1=0 &
+         OPTR->RH_L2=99999999) FROMSW=1;
+       OTHERWISE TOSW=1;
+       END; /* SELECT */
+   IF ASW=1 & OLSW=0
+     THEN DO;
+       OPTR->RH_L2=OPTR->RH_L1;
+     /*OPTR->RH_OFF=IPTR->RH_OFF;
+       OPTR->RH_LEN=IPTR->RH_LEN;
+       OPTR->RH_NCOLS=IPTR->RH_NCOLS;
+     */END;
+   L=OUTPOS.LRN_RHP->BUFPTR->BUFLN; /* LENGTH FOR ALLOCATE */
+   NEWPTR=NULL;
+   NEWLSTHDR,NEWNXTHDR=ADDR(NEWHD);
+   ALTPTR=LRN_STRUCTURE.LRN_RHP;
+   IF LRN_STRUCTURE.LRN_RHP->HEXMODE
+     THEN OUTPOS.LRN_RHP->HEXMODE='1'B;
+   IF ASW × OUTPOS.LRN_RHP->NXTHDR=OUTPOS.LRN_RHP × OLSW
+     THEN CALL SIMPLE_PROC;
+     ELSE CALL COMPLEX_PROC;
+
+ COMPLEX_PROC: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * COMPLEX_PROC IS CALLED TO DO MOVE/COPY PROCESSING WHEN THE OUTPUT   *
+ * LINES CREATED MAY NOT BE CONTIGUOUS.  THAT IS, WHEN THE TO-LSU      *
+ * SPECIFIES A RANGE OF LINES IN WHICH THE COPIED/MOVED LINES WILL BE  *
+ * INTERLEAVED.                                                        *
+ *                                                                     *
+ **********************************************************************/
+   DCL I FIXED BIN;
+
+   IF (CMDINDX=1 × CMDINDX=2 × CMDINDX=3) /* IS IT MOVE? */
+     THEN IF OUTPOS.LRN_RHP=LRN_STRUCTURE.LRN_RHP /* SAME DATASET? */
+       THEN IF OVERLAP(OPTR->RH_L1,IPTR->RH_L1,IPTR->RH_L2) ×
+         OVERLAP(OPTR->RH_L2,IPTR->RH_L1,IPTR->RH_L2)
+         THEN DO;
+           CALL SIMPLE_PROC; /* RANGES CAN'T OVERLAP ON A COMPLEX */
+           RETURN;
+           END;
+   IF FROMSW=1
+     THEN CALL TO_PROC_FROM_COMPLEX;
+     ELSE CALL TO_PROC_TO_COMPLEX;
+   I=0;
+   IF NEWLSTHDR^=ADDR(NEWHD)
+     THEN IF NEWNXTHDR->NEWRPT^=OUTPOS.LRN_RHP
+       THEN I=NEWNXTHDR->NEWRPT->RECSEQ;
+   IF (CMDINDX=1 × CMDINDX=2 × CMDINDX=3) /* IS IT MOVE? */
+     THEN CALL MOVE_DELETE; /* GO DELETE FROM RECORDS */
+   IF NEWLSTHDR^=ADDR(NEWHD)
+     THEN IF I>=NEWLSTHDR->NEWSEQ
+       THEN CALL SIMPLE_PROC_INSERT; /* INSERT AT FRONT */
+       ELSE DO;
+         NEWPTR=NEWNXTHDR;
+         DO WHILE(NEWPTR^=ADDR(NEWHD));
+           CALL #ADD(OUTPOS.LRN_RHP,RHHDRPT,NEWRPT,NEWRPT,
+             NEWRPT->RECSEQ+1,NEWBUF,0);
+           DELPTR=NEWPTR;
+           NEWPTR=NEWNXT;
+           FREE DELPTR->NEWSTR;
+           END;
+         END;
+   END COMPLEX_PROC;
+
+ MOVE_DELETE: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN IT IS TIME TO DELETE THE FROM COLUMNS DURING MOVE       *
+ * PROCESSING.                                                         *
+ *                                                                     *
+ **********************************************************************/
+
+   /* FIRST RESET TO START OF FROM LSU */
+   DO WHILE(LRN_STRUCTURE.LRN_BUFP^=NULL);
+     CALL #ABELSP(RHHDRPT,LRNPTR);
+     END;
+   /* NOW DELETE FROM COLUMNS */
+   DO FOREVER=1 REPEAT FOREVER;
+     CALL #ABELSP(RHHDRPT,LRNPTR); /* GET NEXT FROM-SEGMENT */
+     IF LRN_STRUCTURE.LRN_BUFP=NULL
+       THEN LEAVE; /* ALL DONE */
+     SUBSTR(RECFLGS,5,1)='1'B; /* TELL #ABELSP TO DELETE RECORD */
+     END;
+   END MOVE_DELETE;
+
+ OVERLAP: PROC(A,B,C) RETURNS(BIT(1));
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO DETERMINE IF A IS IN THE CLOSED INTERNAL B TO C.          *
+ *                                                                     *
+ **********************************************************************/
+   DCL (A,B,C) FIXED BIN;
+
+   IF A>=B & A<=C
+     THEN RETURN('1'B);
+     ELSE RETURN('0'B);
+   END OVERLAP;
+
+ SETASW: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO DETERMINE WHETHER THE TO-LSU SPECIFIES AT MOST A SINGLE   *
+ * LINE NUMBER.  IT WILL SET GLOBAL VARIABLE ASW.                      *
+ *                                                                     *
+ **********************************************************************/
+   DCL I FIXED BIN;
+   DCL STR CHAR(256) VAR;
+
+   ASW='1'B;
+   IF PARY(1)=''
+     THEN RETURN;
+   /* ELIMINATE NAME, IF ANY,  AT START OF LSU */
+   I=INDEX(PARY(1),':');
+   IF I>0
+     THEN IF I=LENGTH(PARY(1))
+       THEN RETURN;
+       ELSE STR=SUBSTR(PARY(1),I+1);
+     ELSE DO;
+       I=INDEX(PARY(1),' ');
+       IF I=0
+         THEN I=LENGTH(PARY(1))+1;
+       IF OUTPOS.LRN_RHP->RHNAME=SUBSTR(PARY(1),1,I-1)
+         THEN IF I>LENGTH(PARY(1))
+           THEN RETURN;
+           ELSE STR=SUBSTR(PARY(1),I);
+         ELSE STR=PARY(1);
+       END;
+   IF STR=''
+     THEN RETURN; /* NO LSU */
+   STR=SUBSTR(STR,PREFIX(STR,' ')); /* GET RID OF LEADING BLANKS */
+   STR=SUBSTR(STR,1,SUFFIX(STR,' ')); /* GET RID OF TRAILING BLANKS */
+   /* STR SHOULD NOW CONTAIN JUST THE LSU */
+   I=INDEX(STR,'.');
+   IF I>0
+     THEN ALUP: DO I=I-1 REPEAT I-1;
+       IF I=0
+         THEN RETURN;
+       IF SUBSTR(STR,I,1)=' '
+         THEN DO;
+           STR=SUBSTR(STR,1,I-1);
+           STR=SUBSTR(STR,1,SUFFIX(STR,' '));
+           LEAVE ALUP;
+           END;
+       END ALUP;
+   IF STR=''
+     THEN RETURN;
+   DO WHILE(SUBSTR(STR,LENGTH(STR))=',');
+     STR=SUBSTR(STR,1,LENGTH(STR)-1);
+     IF STR=''
+       THEN RETURN;
+     END;
+   IF INDEX(STR,' ')+INDEX(STR,',')+INDEX(STR,'.')=0
+     THEN IF VERIFY(STR,'0123456789')=0
+       THEN RETURN;
+   SELECT(STR);
+     WHEN('T','B','*','N','P') RETURN;
+     OTHERWISE;
+     END; /* SELECT */
+   IF VERIFY(SUBSTR(STR,1,1),'0123456789')=0
+     & INDEX(STR,'M')=2 & LENGTH(STR)=2
+     THEN RETURN; /* IT IS SINGLE MARK ARRAY REFERENCE */
+   ASW='0'B;
+   END SETASW;
+
+ SIMPLE_PROC: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * SIMPLE_PROC IS CALLED TO DO MOVE/COPY PROCESSING WHEN THE OUTPUT    *
+ * LINES CREATED WILL ALL BE CONTIGUOUS.  THAT IS, EITHER WHEN THE     *
+ * TO-LSU SPECIFIES A SINGLE LINE BEHIND WHICH THE NEW LINES ARE TO    *
+ * BE INSERTED, OR IT SPECIFIES AN EMPTY DATASET INTO WHICH THE NEW    *
+ * LINES ARE TO BE INSERTED, OR OVERLAY PROCESSING IS TO BE DONE.      *
+ *                                                                     *
+ **********************************************************************/
+
+   IF OPTR->RH_L1>OPTR->RH_L2
+     THEN DO;  /* PROCESS FRONT-TO-BACK ONLY IN TO-DATA SET */
+       I=OPTR->RH_L1;
+       OPTR->RH_L1=OPTR->RH_L2;
+       OPTR->RH_L2=I;
+       END;
+   SELECT;
+     WHEN(FROMSW=1)
+       DO I=1 TO DUP;
+         CALL TO_PROC_FROM;
+         END;
+     WHEN(TOSW=1)
+       DO I=1 TO DUP;
+         CALL TO_PROC_TO;
+         END;
+     OTHERWISE
+       CALL TO_PROC_OL;
+     END; /* SELECT */
+
+   /* CLEANUP */
+   IF (CMDINDX=1×CMDINDX=2×CMDINDX=3) /* IS IT MOVE? */ & (OLSW=0)
+     THEN CALL MOVE_DELETE; /* GO DELETE MOVED COLUMNS */
+   IF NEWLSTHDR^=ADDR(NEWHD)
+     THEN CALL SIMPLE_PROC_INSERT; /* LINES TO INSERT */
+   END SIMPLE_PROC;
+
+ SIMPLE_PROC_INSERT: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN IT IS TIME TO INSERT RECORDS CREATED AS A RESULT OF A   *
+ * MOVE/COPY OPERATION.                                                *
+ *                                                                     *
+ **********************************************************************/
+   ORGPTR,SEQPTR=OUTPOS.LRN_RHP->RECPTR;
+   CALL #MD(OUTPOS.LRN_RHP,RHHDRPT,OPTR->RH_L1);
+   IF OUTPOS.LRN_RHP->CURSEQ>OPTR->RH_L1
+     THEN DO; /* TO BE INSERTED AT FRONT */
+       OUTPOS.LRN_RHP->RECPTR=OUTPOS.LRN_RHP;
+       OUTPOS.LRN_RHP->CURSEQ=0;
+       SEQPTR=OUTPOS.LRN_RHP;
+       END;
+   WRKPTR=OUTPOS.LRN_RHP->RECPTR;
+   NEWPTR=NEWNXTHDR;
+   DO WHILE(NEWPTR^=ADDR(NEWHD));
+     IF OUTPOS.LRN_RHP->RECPTR=OUTPOS.LRN_RHP
+       THEN DO;
+         PRIORSEQ=0;
+         IF OUTPOS.LRN_RHP->NXTHDR=OUTPOS.LRN_RHP
+           THEN NEXTSEQ=99999999;
+           ELSE NEXTSEQ=OUTPOS.LRN_RHP->NXTHDR->RECSEQ;
+         END;
+       ELSE DO;
+         PRIORSEQ=OUTPOS.LRN_RHP->RECPTR->RECSEQ;
+         IF OUTPOS.LRN_RHP->RECPTR->NXTPTR=OUTPOS.LRN_RHP
+           THEN NEXTSEQ=99999999;
+           ELSE NEXTSEQ=OUTPOS.LRN_RHP->NXTPTR->RECSEQ;
+         END;
+     SEQ=0;
+     IF OPTR->RH_L1>PRIORSEQ & OPTR->RH_L1<NEXTSEQ
+       THEN SEQ=OPTR->RH_L1;
+     IF NEWSEQ>PRIORSEQ & NEWSEQ<NEXTSEQ
+       THEN SEQ=NEWSEQ;
+     IF ^(SEQ>PRIORSEQ & SEQ<NEXTSEQ)
+       THEN SEQ=PRIORSEQ+1;
+     CALL #ADD(OUTPOS.LRN_RHP,RHHDRPT,
+       OUTPOS.LRN_RHP->RECPTR,OUTPOS.LRN_RHP->RECPTR,SEQ,NEWBUF,0);
+     DELPTR=NEWPTR;
+     NEWPTR=NEWNXT;
+     FREE DELPTR->NEWSTR;
+     END;
+   IF WRKPTR->NXTPTR^=OUTPOS.LRN_RHP
+     THEN DO;
+       SUBSTR(WRKPTR->NXTPTR->RECFLGS,3,1)='1'B;
+         /* SET CURSOR TO 1ST COPIED RECORD */
+       CURBIN=PREFIX(WRKPTR->NXTPTR->RECSTR,' ')-1;
+       WRKPTR->NXTPTR->RECRES=SUBSTR(CURBIT,9,8);
+       END;
+   CALL #RESEQ(OUTPOS.LRN_RHP,RHHDRPT,SEQPTR,'NOSAVE','NORENUM',
+     LAST);
+   IF ORGPTR=OUTPOS.LRN_RHP
+     THEN CALL #NC(OUTPOS.LRN_RHP,OUTPOS.LRN_RHP->NXTHDR);
+     ELSE CALL #NC(OUTPOS.LRN_RHP,ORGPTR);
+   END SIMPLE_PROC_INSERT;
+
+ TO_PROC_FROM: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * ALTERNATIVE PROCESSING, IN WHICH THE COPY/MOVE OPERATION IS TO BE   *
+ * DRIVEN BY THE FROM-SPECIFICATION.                                   *
+ *                                                                     *
+ **********************************************************************/
+   DCL SEQ FIXED BIN(31,0);
+
+   OUTPOS.LRN_CURCOL=OPTR->RH_NCOLS;
+   DO FOREVER=1 REPEAT FOREVER;
+     CALL #ABELSP(RHHDRPT,LRNPTR); /* GET NEXT FROM-SEGMENT */
+     IF LRN_STRUCTURE.LRN_BUFP=NULL
+       THEN LEAVE;
+     OUTPOS.LRN_CURCOL=OUTPOS.LRN_CURCOL+1;
+     IF OUTPOS.LRN_CURCOL>OPTR->RH_NCOLS
+       THEN DO;
+         OUTPOS.LRN_CURCOL=1;
+         SEQ=LRN_STRUCTURE.LRN_RHP->RECPTR->RECSEQ;
+         CALL TO_PROC_NEXT(SEQ,NULL); /* GET NEW OUTPUT RECORD */
+         END;
+     OFF=OPTR->RH_OFF+(OUTPOS.LRN_CURCOL-1)*OPTR->RH_LEN;
+     LEN=OPTR->RH_LEN;
+     CALL #ABEINS(LSPBUF,ADDR(NEWLN),OFF,LEN);
+     END;
+   END TO_PROC_FROM;
+
+ TO_PROC_FROM_COMPLEX: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * ALTERNATIVE PROCESSING, IN WHICH THE COPY/MOVE OPERATION IS TO BE   *
+ * DRIVEN BY THE FROM-SPECIFICATION, AND THE PROCESSING IS COMPLEX.    *
+ *                                                                     *
+ **********************************************************************/
+   DCL (CURCOL,J,LEN,NCOLS,OFF,TOFF,TOSEQ) FIXED BIN;
+   DCL RPT PTR;
+
+   OFF=OPTR->RH_OFF;
+   LEN=OPTR->RH_LEN;
+   CURCOL,NCOLS=OPTR->RH_NCOLS;
+   OPTR->RH_NCOLS,OPTR->RH_OFF,OPTR->RH_LEN=1;
+   TOSEQ=OPTR->RH_L1;
+   DO FOREVER=1 REPEAT FOREVER;
+     CALL #ABELSP(RHHDRPT,LRNPTR); /* GET NEXT FROM-SEGMENT */
+     IF LRN_STRUCTURE.LRN_BUFP=NULL
+       THEN LEAVE;
+     CURCOL=CURCOL+1;
+     IF CURCOL>NCOLS
+       THEN DO;
+         CURCOL,J=1;
+         DO UNTIL(OUTPOS.LRN_BUFP^=NULL);
+           CALL #ABELSP(RHHDRPT,ADDR(OUTPOS)); /* NEXT TO-RECORD */
+           IF OUTPOS.LRN_BUFP=NULL & J=1
+             THEN LEAVE; /* AVOID INFINITE LOOP */
+           J=0;
+           END;
+         RPT=OUTPOS.LRN_RHP->RECPTR;
+         IF J=0
+           THEN SEQ=RPT->RECSEQ+1;
+           ELSE IF TOSEQ>OPTR->RH_L2
+             THEN LEAVE;
+             ELSE DO;
+               SEQ=TOSEQ;
+               TOSEQ=TOSEQ+1;
+               END;
+         CALL TO_PROC_NEXT(SEQ,RPT);
+           /* GET NEW OUTPUT RECORD */
+         END;
+     TOFF=OFF+(CURCOL-1)*LEN;
+     CALL #ABEINS(LSPBUF,ADDR(NEWLN),TOFF,LEN);
+     END;
+   OPTR->RH_OFF=OFF;
+   OPTR->RH_LEN=LEN;
+   OPTR->RH_NCOLS=NCOLS;
+   END TO_PROC_FROM_COMPLEX;
+
+ TO_PROC_NEXT: PROC(SEQ,RPT);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN THE NEXT OUTPUT RECORD IS TO BE OBTAINED.               *
+ *                                                                     *
+ **********************************************************************/
+   DCL (SEQ,OLDSEQ) FIXED BIN(31,0);
+   DCL RPT PTR;
+
+   IF NEWLSTHDR=ADDR(NEWHD)
+     THEN OLDSEQ=0;
+     ELSE OLDSEQ=NEWLSTHDR->NEWSEQ;
+   ALLOCATE NEWSTR; /* ALLOCATE NEW BUFFER */
+   NEWBUF='';
+   NEWLST=NEWLSTHDR;
+   NEWNXT=ADDR(NEWHD);
+   NEWLST->NEWNXT=NEWPTR;
+   NEWNXT->NEWLST=NEWPTR;
+   IF SEQ<=OLDSEQ
+     THEN NEWSEQ=OLDSEQ+1;
+     ELSE NEWSEQ=SEQ;
+   NEWRPT=RPT;
+   OUTPOS.LRN_CURCOL=1;
+   END TO_PROC_NEXT;
+
+ TO_PROC_OL: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PROCESS WHEN THE OL KEYWORD WAS SPECIFIED.                *
+ *                                                                     *
+ **********************************************************************/
+
+   DO FOREVER=1 REPEAT FOREVER;
+     CALL #ABELSP(RHHDRPT,ADDR(OUTPOS)); /* NEXT TO-SEGMENT */
+     IF OUTPOS.LRN_BUFP=NULL
+       THEN LEAVE;
+     SAVPTR=RECPTR;
+     RECPTR=ALTPTR;
+     CALL #ABELSP(RHHDRPT,LRNPTR); /* NEXT FROM-SEGMENT */
+     IF LRN_STRUCTURE.LRN_BUFP=NULL
+       THEN CALL #ABELSP(RHHDRPT,LRNPTR); /* START OVER */
+     ALTPTR=RECPTR;
+     RECPTR=SAVPTR;
+     OUTPOS.LRN_BUFP->LSPBUF=LRN_STRUCTURE.LRN_BUFP->LSPBUF;
+     IF CMDINDX=1 × CMDINDX=2 × CMDINDX=3 /* MOVE? */
+       THEN LRN_STRUCTURE.LRN_BUFP->LSPBUF='';
+     END;
+
+   /* NOW BE SURE TO RE-POSITION THE FROM DATA SET */
+   SAVPTR=RECPTR;
+   RECPTR=ALTPTR;
+   DO WHILE(LRN_STRUCTURE.LRN_BUFP^=NULL);
+     IF CMDINDX=1 × CMDINDX=2 × CMDINDX=3 /* MOVE? */
+       THEN LRN_STRUCTURE.LRN_BUFP->LSPBUF='';
+     CALL #ABELSP(RHHDRPT,LRNPTR);
+     END;
+   ALTPTR=RECPTR;
+   RECPTR=SAVPTR;
+   END TO_PROC_OL;
+
+ TO_PROC_TO: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * ALTERNATIVE PROCESSING, IN WHICH THE COPY/MOVE OPERATION IS TO BE   *
+ * DRIVEN BY THE TO-SPECIFICATION.                                     *
+ *                                                                     *
+ **********************************************************************/
+   DO TOL=OPTR->RH_L1 REPEAT TOL+OPTR->RH_INCR WHILE(TOL<=OPTR->RH_L2);
+     CALL TO_PROC_NEXT(TOL,NULL); /* GET NEXT RECORD */
+     DO OUTPOS.LRN_CURCOL=1 TO OPTR->RH_NCOLS;
+       CALL #ABELSP(RHHDRPT,LRNPTR); /* GET NEXT FROM-SEGMENT */
+       IF LRN_STRUCTURE.LRN_BUFP=NULL
+         THEN CALL #ABELSP(RHHDRPT,LRNPTR); /* START OVER */
+       OFF=OPTR->RH_OFF+(OUTPOS.LRN_CURCOL-1)*OPTR->RH_LEN;
+       LEN=OPTR->RH_LEN;
+       IF LRN_STRUCTURE.LRN_BUFP=NULL
+         THEN CALL #ABEINS('',    ADDR(NEWLN),OFF,LEN);
+         ELSE CALL #ABEINS(LSPBUF,ADDR(NEWLN),OFF,LEN);
+       END;
+     END;
+
+   /* NOW BE SURE TO RE-POSITION THE FROM DATA SET */
+   DO WHILE(LRN_STRUCTURE.LRN_BUFP^=NULL);
+     CALL #ABELSP(RHHDRPT,LRNPTR);
+     END;
+   END TO_PROC_TO;
+
+ TO_PROC_TO_COMPLEX: PROC;
+ /**********************************************************************
+ *                                                                     *
+ * ALTERNATIVE PROCESSING, IN WHICH THE COPY/MOVE OPERATION IS TO BE   *
+ * DRIVEN BY THE TO-SPECIFICATION, AND THE PROCESSING IS COMPLEX.      *
+ *                                                                     *
+ **********************************************************************/
+   DCL (CURCOL,J,LEN,NCOLS,OFF,TOFF,TOSEQ) FIXED BIN;
+   DCL RPT PTR;
+
+   OFF=OPTR->RH_OFF;
+   LEN=OPTR->RH_LEN;
+   CURCOL,NCOLS=OPTR->RH_NCOLS;
+   OPTR->RH_NCOLS,OPTR->RH_OFF,OPTR->RH_LEN=1;
+   TOSEQ=OPTR->RH_L1;
+   J=1;
+   DO FOREVER=1 REPEAT FOREVER;
+     CALL #ABELSP(RHHDRPT,ADDR(OUTPOS)); /* GET NEXT TO-RECORD */
+     IF OUTPOS.LRN_BUFP=NULL
+       THEN IF J=0
+         THEN LEAVE;
+         ELSE;
+       ELSE J=0;
+     RPT=OUTPOS.LRN_RHP->RECPTR;
+     IF J=0
+       THEN SEQ=RPT->RECSEQ+1;
+       ELSE IF TOSEQ>OPTR->RH_L2
+         THEN LEAVE;
+         ELSE DO;
+           SEQ=TOSEQ;
+           TOSEQ=TOSEQ+1;
+           END;
+     CALL TO_PROC_NEXT(SEQ,RPT);/* NEW OUTPUT REC */
+     DO CURCOL=1 TO NCOLS;
+       CALL #ABELSP(RHHDRPT,LRNPTR); /* NEXT FROM-SEGMENT */
+       IF LRN_STRUCTURE.LRN_BUFP=NULL
+         THEN CALL #ABELSP(RHHDRPT,LRNPTR); /* CYCLE */
+       TOFF=OFF+(CURCOL-1)*LEN;
+       IF LRN_STRUCTURE.LRN_BUFP=NULL
+         THEN CALL #ABEINS(''    ,ADDR(NEWLN),TOFF,LEN);
+         ELSE CALL #ABEINS(LSPBUF,ADDR(NEWLN),TOFF,LEN);
+       END;
+     END;
+   OPTR->RH_OFF=OFF;
+   OPTR->RH_LEN=LEN;
+   OPTR->RH_NCOLS=NCOLS;
+   END TO_PROC_TO_COMPLEX;
+
+   END ABE008;

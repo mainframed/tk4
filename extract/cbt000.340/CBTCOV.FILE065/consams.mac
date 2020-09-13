@@ -1,0 +1,430 @@
+         PRINT NOGEN
+CONSAMS  TITLE 'INVOKE ACCESS METHOD SERVICES FROM CONSOLE'
+***********************************************************************
+*
+*        CONSAMS PROVIDES AN OPERATOR CONSOLE INTERFACE TO
+*        ACCESS METHOD SERVICES (IDCAMS).
+*
+*        CONSAMS MUST BE AUTHORIZED IN ORDER TO EXECUTE CERTAIN
+*        IDCAMS COMMANDS. THE MAJORITY OF COMMANDS DO NOT REQUIRE
+*        AUTHORIZATION.
+*
+*        CONSAMS IS INVOKED VIA AN OPERATOR START COMMAND TO A JCL
+*        PROCEDURE IN SYS1.PROCLIB. THE FOLLOWING JCL IS SUGGESTED:
+*              //AMS     PROC
+*              //IEFPROC EXEC PGM=CONSAMS,PARM='MARGINS(1,120)'
+*              //AMSDUMP  DD  SYSOUT=A    IDCAMS SNAP DUMP
+*              //SYSOUT   DD  SYSOUT=A    OUTFILE OUTPUT
+*              //SYSPRINT DD  SYSOUT=A    CONSOLE LOG
+*              //SYSUDUMP DD  SYSOUT=A
+*        THE PARM FIELD ON THE EXEC STATEMENT IS PASSED TO IDCAMS,
+*        WHICH EXECUTES IT AS THE FIRST COMMAND.
+*        ALL DD STATEMENTS ARE OPTIONAL.
+*        AMSDUMP MAY BE USEFUL FOR DEBUGGING IDCAMS.
+*        SYSPRINT IS WRITTEN BY CONSAMS, AND CONTAINS A HARD COPY
+*        OF THE OUTPUT WRITTEN TO THE CONSOLE.
+*        SYSOUT MAY BE USED VIA THE OUTFILE PARAMETER OF SOME IDCAMS
+*        COMMANDS FOR HARD COPY OUTPUT TOO VOLUMINOUS FOR A CONSOLE.
+*
+*        TO USE THE ABOVE PROCEDURE, ENTER THE OPERATOR COMMAND:
+*              START AMS
+*        CONSAMS WILL RESPOND WITH THE MESSAGE: AMS READY.
+*        TO ENTER AN IDCAMS COMMAND, USE THE OPERATOR MODIFY COMMAND:
+*              MODIFY AMS,IDCAMS-COMMAND
+*        CONSAMS WILL PASS THE IDCAMS-COMMAND TEXT TO IDCAMS AS A SYSIN
+*        RECORD.
+*        IDCAMS WILL THEN RESPOND WITH SYSPRINT RECORDS WHICH CONSAMS
+*        WILL WRITE VIA WTO TO THE CONSOLE WHICH ENTERED THE MODIFY
+*        COMMAND. A ONE SECOND DELAY IS IMPOSED ON CONSECUTIVE WTO'S TO
+*        PREVENT EXCESSIVE QUEUED CONSOLE OUTPUT.
+*        TO STOP CONSAMS WHEN IT IS WAITING FOR A MODIFY COMAND,
+*        ENTER THE COMMAND:
+*              STOP AMS
+*        TO CANCEL CONSAMS AT ANY TIME, ENTER THE COMMAND:
+*              CANCEL AMS
+*
+***********************************************************************
+         EJECT ,
+CONSAMS  CSECT ,
+         EJECT ,
+         DCBD  ,
+IEZCIB   DSECT ,
+         IEZCIB ,
+         EJECT ,
+IEZCOM   DSECT ,
+         IEZCOM ,
+         EJECT ,
+         IEZWPL ,
+         EJECT ,
+         REGEQU ,
+         EJECT ,
+***********************************************************************
+*              WORK AREA
+*              COMMUNICATION BETWEEN CONSAMS TASK, IDCAMS SUBTASK,
+*              AND SYSIN/SYSPRINT EXIT ROUTINES.
+***********************************************************************
+WORKAREA DSECT ,
+SAVE     DS    18F                 MOTHER TASK SAVE AREA
+RTNSAVE  DS    18F                 DAUGHTER TASK USER EXIT SAVE AREA
+FIELDS   DS    0F
+COMM     DS    A                   COMM ECB/CIB ADDRESS
+ARGLIST  DS    0XL16               IDCAMS ARGUMENT LIST
+ARGOPT   DS    A                       OPTIONS
+ARGDDNAM DS    A                       DDNAMES
+ARGPAGE  DS    A                       PAGE NUMBER
+ARGIOLST DS    A                       IOLIST
+IOLIST   DS    0X                  IDCAMS INPUT/OUTPUT LIST
+ION      DS    F                       N - NUMBER OF GROUPS OF FIELDS
+IODDIN   DS    A                       DDNAME - SYSIN
+IORTNIN  DS    A                       IOROUTINE - SYSIN
+IOUDIN   DS    A                       USER DATA - SYSIN
+IODDPRT  DS    A                       DDNAME - SYSPRINT
+IORTNPRT DS    A                       IOROUTINE - SYSPRINT
+IOUDPRT  DS    A                       USER DATA - SYSPRINT
+IOGROUPS EQU   ((*-ION)/4-1)/3         N - CONTENTS OF ION
+ATTACH   ATTACH EP=IDCAMS,         ATTACH ACCESS METHOD SERVICES       *
+               ECB=ATTECB,                                             *
+               SZERO=YES,                                              *
+               SF=L
+ATTECB   DS    F                   IDCAMS SUBTASK TERMINATION ECB
+         USING STIMEREX,R15
+STIMEREX SAVE  (14,12)             ACTUAL STIMER EXIT
+         POST  TIMECB              POST SYSPRINT EXIT ROUTINE
+         RETURN (14,12)
+         DROP  R15
+STIMERSI DS    0XL(*-STIMEREX)     SIZE OF STIMER EXIT
+TIMECB   DS    F                   SYSPRINT STIMER EXIT ECB
+TCB      DS    A                   IDCAMS SUBTASK TCB ADDRESS
+EXTRACT  EXTRACT FIELDS,           GET COMM ECB/CIB POINTERS           *
+               FIELDS=COMM,                                            *
+               MF=L
+WTO      DS    XL(L'WPLLGH+L'WPLMCSF),CL(L'WPLTXT)
+SYSPRINT DCB   BFALN=F,                                                *
+               BLKSIZE=129,                                            *
+               BUFNO=2,                                                *
+               DDNAME=SYSPRINT,                                        *
+               DSORG=PS,                                               *
+               LRECL=125,                                              *
+               MACRF=PL,                                               *
+               RECFM=VA
+PRTSIZE  DS    0XL(*-SYSPRINT)     SIZE OF SYSPRINT DCB
+DMLIST   OPEN  (SYSPRINT,OUTPUT),  OPEN/CLOSE PARM LIST                *
+               MF=L
+CONTROL  DS    B                   USER EXIT FLAGS
+SUPPRESS EQU   B'10000000'              SUPPRESS WTO
+WORKSIZE DS    0XL(*-WORKAREA)     SIZE OF WORK AREA
+         EJECT ,
+RTNARG   DSECT ,                   USER I/O ROUTINE ARGUMENT LIST
+USERDATA DS    A                   USER DATA ADDRESS
+IOFLAGS  DS    A                   IOFLAGS ADDRESS
+IOINFO   DS    A                   IOINFO ADDRESS
+         SPACE 2
+FLAGS    DSECT ,                   IOFLAGS -> FLAGS
+         DS    BL4
+         SPACE 2
+GETPUT   DSECT ,                   IOINFO -> GET/PUT INFO
+RECORD   DS    A                   RECORD ADDRESS
+RECORDLN DS    F                   RECORD LENGTH
+         EJECT ,
+***********************************************************************
+*              CONSAMS TASK
+*              INITIALIZE, ATTACH IDCAMS, TERMINATE
+***********************************************************************
+CONSAMS  CSECT ,
+         USING CONSAMS,R15
+         SAVE  (14,12)
+         MODID ,
+         LR    R12,R15
+         USING CONSAMS,R12
+         DROP  R15
+         LR    R2,R1               SAVE PARM POINTER
+         GETMAIN RU,               GET WORK AREA                       *
+               LV=L'WORKSIZE,                                          *
+               BNDRY=PAGE
+         LR    R4,R1               CLEAR WORK AREA
+         LA    R5,L'WORKSIZE
+         SR    R6,R6
+         SR    R7,R7
+         MVCL  R4,R6
+         ST    R13,4(R1)           CHAIN SAVE AREAS
+         ST    R1,8(R13)
+         LR    R13,R1
+         USING WORKAREA,R13
+         EXTRACT FIELDS,           GET COMM ECB/CIB POINTERS           *
+               FIELDS=COMM,                                            *
+               MF=(E,EXTRACT)
+         L     R3,COMM             GET ECB/CIB POINTERS
+         USING COMLIST,R3
+         ICM   R4,15,COMCIBPT      POINT TO START CIB
+         BZ    NORMAL              BRANCH IF NO CIB
+         DROP  R3
+         MVC   ARGOPT+1(3),1(R2)   COPY PARM POINTER
+         LA    R2,IOLIST           SET INPUT/OUTPUT LIST POINTER
+         ST    R2,ARGIOLST
+         MVI   ARGIOLST,X'80'      TERMINATE ARGUMENT LIST
+         LA    R2,IOGROUPS         SET NUMBER OF I/O LIST GROUPS
+         ST    R2,ION
+         LA    R2,DDIN             SET SYSIN DD POINTER
+         ST    R2,IODDIN
+         LA    R2,RTNIN            SET SYSIN I/O ROUTINE POINTER
+         ST    R2,IORTNIN
+         LA    R2,RTNSAVE          SET USER DATA POINTER
+         ST    R2,IOUDIN
+         LA    R2,DDPRT            SET SYSPRINT DD POINTER
+         ST    R2,IODDPRT
+         LA    R2,RTNPRT           SET SYSPRINT I/O ROUTINE POINTER
+         ST    R2,IORTNPRT
+         LA    R2,RTNSAVE          SET USER DATA POINTER
+         ST    R2,IOUDPRT
+         MVC   SYSPRINT(L'PRTSIZE),DCBPRT  COPY DCB TO WORK AREA
+         OI    DMLIST,X'80'        TERMINATE OPEN LIST
+         MVC   STIMEREX(L'STIMERSI),STIMER  COPY STIMER EXIT
+         MVI   TIMECB,X'40'        SET STIMER ECB INITIALLY POSTED
+         MVI   WPLMCSF1-WPL+WTO,WPLMCSFB+WPLMCSFC  SET MCS FLAGS
+         OI    CONTROL,SUPPRESS    SUPPRESS WTO OUTPUT INITIALLY
+*----------------------------------------------------------------------
+         ATTACH EP=IDCAMS,         ATTACH ACCESS METHOD SERVICES       *
+               ECB=ATTECB,                                             *
+               SZERO=YES,                                              *
+               MF=(E,ARGLIST),                                         *
+               SF=(E,ATTACH)
+         ST    R1,TCB              SAVE IDCAMS TCB POINTER
+         WAIT  ECB=ATTECB,         WAIT FOR IDCAMS TERMINATION         *
+               LONG=YES            ALLOW SWAP OUT
+         DETACH TCB                DETACH IDCAMS TCB
+*----------------------------------------------------------------------
+NORMAL   DS    0H
+         L     R2,ATTECB           SAVE IDCAMS RETURN CODE
+         LR    R1,R13              RESTORE SAVE AREA POINTER
+         L     R13,4(R1)
+         FREEMAIN RU,              FREE WORK AREA STORAGE              *
+               LV=L'WORKSIZE,                                          *
+               A=(1)
+         LA    R15,0(R2)           SET RETURN CODE
+         RETURN (14,12),           RETURN TO SYSTEM                    *
+               RC=(15)
+         DROP  R12,R13
+         EJECT ,
+***********************************************************************
+*              SYSIN EXIT ROUTINE
+*              ISSUE AMS READY MESSAGE
+*              PASS MODIFY COMMAND INPUT TO IDCAMS AS SYSIN
+*              PASS STOP COMMAND TO IDCAMS AS EOD
+***********************************************************************
+RTNIN    SAVE  (14,12)
+         LR    R12,R15
+         USING RTNIN,R12
+         LR    R2,R1               SAVE ARGUMENT LIST POINTER
+         USING RTNARG,R2
+         L     R1,USERDATA         GET WORK AREA ADDRESSABILITY
+         ST    R13,4(R1)           CHAIN SAVE AREAS
+         ST    R1,8(R13)
+         LR    R13,R1
+         USING RTNSAVE,R13
+         L     R3,COMM             GET ECB/CIB POINTERS
+         USING COMLIST,R3
+         L     R4,COMCIBPT         POINT TO CIB
+         USING CIBNEXT,R4
+         L     R5,IOFLAGS          POINT TO IDCAMS FLAGS
+         USING FLAGS,R5
+         CLI   FLAGS,0             IS THIS OPEN REQUEST?
+         BE    RTNINOPN            BRANCH - YES
+         CLI   FLAGS,4             IS THIS CLOSE REQUEST?
+         BE    RTNINCLS            BRANCH - YES
+         CLI   FLAGS,8             IS THIS GET REQUEST?
+         BE    RTNINGET            BRANCH - YES
+         B     RTNINNO             BRANCH - ERROR
+         DROP  R5
+*----------------------------------------------------------------------
+RTNINOPN DS    0H                  OPEN SYSIN
+         QEDIT ORIGIN=COMCIBPT,    ALLOW MODIFY COMMAND                *
+               CIBCTR=1
+         SR    R0,R0
+         IC    R0,CIBCONID         GET START CONSOLE ID
+         WTO   MF=(E,WTOREADY)     READY FOR INPUT
+         B     RTNINNRM            BRANCH
+*----------------------------------------------------------------------
+RTNINCLS DS    0H                  CLOSE SYSIN
+         QEDIT ORIGIN=COMCIBPT,    DISALLOW MODIFY COMMANDS            *
+               CIBCTR=0
+         QEDIT ORIGIN=COMCIBPT,    FREE STOP CIB                       *
+               BLOCK=CIBNEXT
+         B     RTNINNRM            BRANCH
+*----------------------------------------------------------------------
+RTNINGET DS    0H                  GET SYSIN
+         QEDIT ORIGIN=COMCIBPT,    FREE START/MODIFY CIB               *
+               BLOCK=CIBNEXT
+         DROP  R4
+         NI    CONTROL,X'FF'-SUPPRESS  ALLOW WTO OUTPUT
+         L     R1,COMECBPT         POINT TO COMM ECB
+*
+         WAIT  ECB=(1),            WAIT FOR MODIFY/STOP COMMAND        *
+               LONG=YES            ALLOW SWAP OUT
+*
+         L     R4,COMCIBPT         POINT TO CIB
+         USING CIBNEXT,R4
+         CLI   CIBVERB,CIBSTOP     IS THIS STOP COMMAND?
+         BE    RTNINEOD            BRANCH - YES
+         CLI   CIBVERB,CIBMODFY    IS THIS MODIFY COMMAND?
+         BNE   RTNINNO             BRANCH - NO
+         L     R5,IOINFO           POINT TO IDCAMS RECORD INFO
+         USING GETPUT,R5
+         LH    R6,CIBDATLN         GET CIB DATA LENGTH
+         ST    R6,RECORDLN         STORE LENGTH FOR IDCAMS
+         LA    R7,CIBDATA          GET ADDRESS OF RECORD
+         ST    R7,RECORD           STORE ADDRESS FOR IDCAMS
+         B     RTNINNRM            BRANCH
+RTNINEOD DS    0H
+         LA    R15,4               SET END OF DATA RETURN CODE
+         B     RTNINRET            BRANCH
+*----------------------------------------------------------------------
+RTNINNO  DS    0H                  ERROR
+         LA    R15,12              SET DO NOT CALL RETURN CODE
+         B     RTNINRET            BRANCH
+*----------------------------------------------------------------------
+RTNINNRM DS    0H                  PASS SYSIN RECORD
+         SR    R15,R15             SET NORMAL RETURN CODE
+RTNINRET DS    0H
+         L     R13,4(R13)          RESTORE SAVE AREA POINTER
+         RETURN (14,12),           RETURN TO IDCAMS                    *
+               RC=(15)
+         DROP  R12,R2,R13,R3,R4,R5
+         EJECT ,
+***********************************************************************
+*              SYSPRINT EXIT ROUTINE
+*              OPEN SYSPRINT
+*              WRITE IDCAMS OUTPUT TO CONSOLE AND SYSPRINT
+*              CLOSE SYSPRINT
+***********************************************************************
+RTNPRT   SAVE  (14,12)
+         LR    R12,R15
+         USING RTNPRT,R12
+         LR    R2,R1               SAVE ARGUMENT LIST POINTER
+         USING RTNARG,R2
+         L     R1,USERDATA         GET WORK AREA ADDRESSABILITY
+         ST    R13,4(R1)           CHAIN SAVE AREAS
+         ST    R1,8(R13)
+         LR    R13,R1
+         USING RTNSAVE,R13
+         L     R3,COMM             GET ECB/CIB POINTERS
+         USING COMLIST,R3
+         L     R4,COMCIBPT         POINT TO CIB
+         USING CIBNEXT,R4
+         L     R5,IOFLAGS          POINT TO IDCAMS FLAGS
+         USING FLAGS,R5
+         CLI   FLAGS,0             IS THIS OPEN REQUEST?
+         BE    RTNPRTOP            BRANCH - YES
+         CLI   FLAGS,4             IS THIS CLOSE REQUEST?
+         BE    RTNPRTCL            BRANCH - YES
+         CLI   FLAGS,12            IS THIS PUT REQUEST?
+         BE    RTNPRTPU            BRANCH - YES
+         B     RTNPRTNO            BRANCH - ERROR
+         DROP  R5
+*----------------------------------------------------------------------
+RTNPRTOP DS    0H                  OPEN SYSPRINT
+         OPEN  (SYSPRINT,OUTPUT),  OPEN DCB                            *
+               MF=(E,DMLIST)
+         B     RTNPRTNR            BRANCH
+*----------------------------------------------------------------------
+RTNPRTCL DS    0H                  CLOSE SYSPRINT
+         TM    SYSPRINT+DCBOFLGS-IHADCB,DCBOFOPN  DCB OPEN?
+         BZ    RTNPRTNR            NO, BRANCH
+         CLOSE MF=(E,DMLIST)       CLOSE DCB
+         FREEPOOL SYSPRINT         FREE BUFFER POOL
+         B     RTNPRTNR            BRANCH
+*----------------------------------------------------------------------
+RTNPRTPU DS    0H                  PUT SYSPRINT
+         L     R5,IOINFO           POINT TO IDCAMS RECORD INFO
+         USING GETPUT,R5
+         L     R6,RECORDLN         GET IDCAMS RECORD LENGTH
+         L     R7,RECORD           POINT TO IDCAMS OUTPUT RECORD
+         DROP  R5
+         LA    R8,WTO              POINT TO WTO PARAMETER LIST
+         USING WPL,R8
+         BCTR  R6,0                DECREMENT LENGTH FOR MVC
+         TM    SYSPRINT+DCBOFLGS-IHADCB,DCBOFOPN  DCB OPEN?
+         BZ    RTNPRTNP            NO, BRANCH
+         PUT   SYSPRINT            LOCATE SYSPRINT BUFFER
+         EX    R6,RTNPRTMP         MOVE DATA TO BUFFER
+RTNPRTNP DS    0H
+         BCTR  R6,0                DECREMENT LENGTH FOR MVC
+         EX    R6,RTNPRTMW         MOVE DATA TO WTO TEXT
+         LA    R0,5(R6)            GET LENGTH FOR WTO
+         STH   R0,WPLLGH           STORE LENGTH FOR WTO
+         LA    R0,6(R6)            GET LENGTH FOR RECFM=VA
+         SLL   R0,16               SHIFT FOR RDW
+         ST    R0,0(R1)            STORE LENGTH FOR PUT
+         CLI   0(R7),C'1'          IS THIS PAGE EJECT?
+         BE    RTNPRTNR            BRANCH - YES
+         EX    R6,RTNPRTCW         IS LINE BLANK?
+         BE    RTNPRTNR            BRANCH - YES
+         CLC   ENTRIES,WPLTXT      ENTRIES PROCESSED LINE?
+         BE    RTNPRTEN            BRANCH - YES
+         CLC   PROTECT,WPLTXT      PROTECTED ENTRIES SUPPRESSED LINE?
+         BE    RTNPRTPR            BRANCH - YES
+         TM    CONTROL,SUPPRESS    SUPPRESSING WTO OUTPUT?
+         BO    RTNPRTNR            BRANCH - YES
+         WAIT  ECB=TIMECB,         SLOW DOWN CONSOLE OUTPUT            *
+               LONG=NO             PREVENT SWAP OUT
+         SR    R0,R0               CLEAR R0
+         IC    R0,CIBCONID         INSERT CALLING CONSOLE ID
+         WTO   MF=(E,WPL)          RESPOND WITH IDCAMS OUTPUT
+         XC    TIMECB,TIMECB       CLEAR STIMER ECB
+         STIMER REAL,              SET WAIT INTERVAL                   *
+               STIMEREX,                                               *
+               BINTVL=BINTVL
+         B     RTNPRTNR            BRANCH
+RTNPRTEN DS    0H
+         OI    CONTROL,SUPPRESS    SET SUPPRESS WTO OUTPUT FLAG
+         B     RTNPRTNR
+RTNPRTPR DS    0H
+         NI    CONTROL,X'FF'-SUPPRESS  ALLOW WTO OUTPUT
+         B     RTNPRTNR
+*----------------------------------------------------------------------
+RTNPRTNO DS    0H                  ERROR
+         LA    R15,12              SET DO NOT CALL RETURN CODE
+         B     RTNPRTRT            BRANCH
+*----------------------------------------------------------------------
+RTNPRTNR DS    0H                  SYSPRINT RECORD PROCESSED
+         SR    R15,R15             SET NORMAL RETURN CODE
+RTNPRTRT DS    0H
+         L     R13,4(R13)          RESTORE SAVE AREA POINTER
+         RETURN (14,12),           RETURN TO IDCAMS                    *
+               RC=(15)
+*----------------------------------------------------------------------
+RTNPRTMP MVC   4(0,R1),0(R7)       EXECUTED - MOVE SYSPRINT FOR PUT
+RTNPRTMW MVC   WPLTXT(0),1(R7)     EXECUTED - MOVE SYSPRINT FOR WTO
+RTNPRTCW CLC   WPLTXT(0),BLANKS    EXECUTED - COMPARE FOR ALL BLANKS
+         DROP  R12,R2,R13,R4,R8
+         EJECT ,
+***********************************************************************
+*              DUMMY CODE/CONTROL BLOCKS
+*              THESE ARE COPIED TO WORK AREA FOR REENTRANCY
+***********************************************************************
+         USING STIMEREX,R15
+STIMER   SAVE  (14,12)             DUMMY STIMER EXIT
+         POST  TIMECB              POST SYSPRINT EXIT ROUTINE
+         RETURN (14,12)
+         DROP  R15
+DCBPRT   DCB   BFALN=F,            DUMMY SYSPRINT DCB                  *
+               BLKSIZE=129,                                            *
+               BUFNO=2,                                                *
+               DDNAME=SYSPRINT,                                        *
+               DSORG=PS,                                               *
+               LRECL=125,                                              *
+               MACRF=PL,                                               *
+               RECFM=VA
+         EJECT ,
+***********************************************************************
+*              CONSTANTS
+***********************************************************************
+BINTVL   DC    F'100'              1.00 SECOND STIMER VALUE
+DDIN     DC    CL10'DDSYSIN'       DDNAME - SYSIN
+DDPRT    DC    CL10'DDSYSPRINT'    DDNAME - SYSPRINT
+BLANKS   DC    CL(L'WPLTXT)' '     BLANK LINE
+ENTRIES  DC    C'         THE NUMBER OF ENTRIES PROCESSED WAS'
+PROTECT  DC  C'         THE NUMBER OF PROTECTED ENTRIES SUPPRESSED WAS'
+WTOREADY WTO   'AMS READY',                                            *
+               MCSFLAG=(REG0,RESP),                                    *
+               MF=L
+         END   ,

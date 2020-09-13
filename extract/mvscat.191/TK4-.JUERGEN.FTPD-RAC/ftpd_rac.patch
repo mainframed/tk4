@@ -1,0 +1,473 @@
+--- std/ftpd.c	2015-02-09 20:48:00.000000000 +0100
++++ rac/ftpd.c	2015-03-15 12:25:00.000000000 +0100
+@@ -8,6 +8,13 @@
+  */
+ 
+ /*
++ * RAC based authentication & authorization added by Juergen Winkelmann, 2015.
++ *
++ * winkelmann@id.ethz.ch
++ *
++ */
++
++/*
+  # Dumb As Fudge written in Perl:
+  #
+  # by  James Ensor (ensor@xcf.berkeley.edu)
+@@ -50,11 +57,35 @@
+ #define FAKE_USER  "user"
+ #define FAKE_GROUP "group"
+ 
+-#define WELCOME_MESSAGE "*** MVS38j FTP Daemon on TK4- ***"
+-#define LOGIN_MESSAGE   "You are now logged in."
+-
+-    short SERVER_PORT;
+-    char  SERVER_IP[16];
++#define WELCOME_MESSAGE  "*** MVS38j FTP Daemon on TK4- ***"
++#define LOGIN_MESSAGE    "You are now logged in."
++#define LOGIN_MESSAGE_C  "FTP001I %s - logged in - TIME=%.2d.%.2d.%.2d DATE=%d/%.2d/%.2d"
++#define REJECT_MESSAGE   "FTP002I %d.%d.%d.%d - rejected - %.2d.%.2d.%.2d %d/%.2d/%.2d"
++#define LOGOUT_MESSAGE_C "FTP003I %s - logged out - TIME=%.2d.%.2d.%.2d DATE=%d/%.2d/%.2d"
++#define LOGIN_FAILED_MESSAGE "Authentication failed, login rejected."
++#define AUTH_USER "HERC01"
++
++short  SERVER_PORT;
++char   SERVER_IP [16];
++
++struct tm * td;
++time_t lt;
++char   wtomsg [126];
++
++extern unsigned int rac_user_login (char * user, char * pass);
++extern unsigned int rac_user_logout (unsigned int acee);
++extern unsigned int rac_switch_user (unsigned int acee);
++extern void rac_ftp_auth (unsigned int state);
++
++void user_logout (unsigned int acee, char * user) {
++    rac_user_logout (acee);
++    Sleep (1000);
++    time (&lt);
++    td = localtime (&lt);
++    sprintf (wtomsg, LOGOUT_MESSAGE_C, user, (* td).tm_hour, (* td).tm_min, (* td).tm_sec, (* td).tm_year + 1900, (* td).tm_mon + 1, (* td).tm_mday);
++    _write2op (wtomsg);
++    return;
++}
+ 
+ /**** The following is a back-up mechanism for OSs like Windows that don't return information in getsockname. */
+     char  PASVADDR[16]; /* PASV style string for hosts that don't return their IP Address. */
+@@ -88,10 +119,11 @@
+     long   READ_BUF_LENGTH;
+     char * WRITE_BUF;         /* outgoing responses buffer */
+     long   WRITE_BUF_LENGTH;
+-    long   AUTHED;     /* Has logged in with a valid password (not checked, just set to 1 regardless.) */
++    unsigned int ACEE; /* access control environment element address */
+     char   TYPE;       /* A-Ascii, I-Binary */
+     char   STRU;       /* F-No structure */
+     char   MODE;       /* S-Stream */
++    char   USER[9];    /* user from last USER command entered */
+     struct sockaddr * DATA_CONNECT_ADDR; /* malloc'd area for building connect to client-socket information */
+     SOCKET DATA_SOCK;  /* All file related data transfers uses this SOCKET. */
+     SOCKET DATA_LISTEN_SOCK; /* PASV mode transfers allow connecting to this SOCKET. */
+@@ -157,6 +189,7 @@
+                     if (d->DATA_CONNECT_ADDR) free (d->DATA_CONNECT_ADDR);
+                     if (d->DATA_SOCK_BUF) free (d->DATA_SOCK_BUF);
+                     if (d->CWD) free (d->CWD);
++                    if (d->ACEE > 1) user_logout (d->ACEE, d->USER);
+ 
+                     free (d);
+                 };
+@@ -198,6 +231,7 @@
+                     if (d->DATA_CONNECT_ADDR) free (d->DATA_CONNECT_ADDR);
+                     if (d->DATA_SOCK_BUF) free (d->DATA_SOCK_BUF);
+                     if (d->CWD) free (d->CWD);
++                    if (d->ACEE > 1) user_logout (d->ACEE, d->USER);
+ 
+                     free (d);
+                 };
+@@ -1132,7 +1166,7 @@
+     free (s);
+     data->WRITE_BUF_LENGTH = strlen (data->WRITE_BUF);
+ 
+-    data->AUTHED = 0;
++    data->ACEE = 0;
+     data->TYPE = 'A'; /* either "I" (binary) or "A" (ascii) */
+     /* STRU is always "F" (no record structure) */
+     data->STRU = 'F';
+@@ -1771,7 +1805,7 @@
+ -rw-r--r--    1 Administ None        27158 May 14 18:37 xstore.o
+ -rwxrwxrwx    1 Administ Users        3509 Aug  5  2002 znew
+ */
+-static char * ls_dash_l (char * target) {
++static char * ls_dash_l (char * target, unsigned int acee) {
+     long i;
+     long j; /* current length of result */
+     long clen;
+@@ -1816,7 +1850,7 @@
+             }
+         }
+ 
+-        refresh (); // Comment-out for faster directory refreshes (using the cache)
++        // refresh (); Comment-out for faster directory refreshes (using the cache)
+         // Then, to update the listing (if required) use the "REFR" command or ftpcmd.c
+ 
+         r = root; // Start point
+@@ -1852,7 +1886,7 @@
+         strupr (line);
+ 
+         sprintf (name, "//DSN:%s", line);
+-        readdir (name); /* Go get 'em */
++        readdir (name, acee); /* Go get 'em */
+ 
+         r = root; // Start point, search for the right date to transmit
+         while (r) {
+@@ -1901,7 +1935,7 @@
+ */
+ static char * ftp_ls (data_tag_ptr data) {
+ 
+-    return ls_dash_l (data->CWD);
++    return ls_dash_l (data->CWD, data->ACEE);
+ };
+ 
+ static long get_cmd_args (char * line, char * cmd, char * args) {
+@@ -1950,6 +1984,7 @@
+     SOCKET tsock;
+     char   fmode [19];
+     int    org;
++    unsigned int acee_old;
+ 
+     /* get whatever data is ready */
+     status = read_into_buf (sock, &(data->READ_BUF [data->READ_BUF_LENGTH]));
+@@ -2023,16 +2058,32 @@
+                 free (line);
+                 return;
+             } else if (strcmp (cmd, "USER") == 0) {
+-                data->AUTHED = 0;
++                if (data->ACEE > 1) user_logout (data->ACEE, data->USER);
++                data->ACEE = 0;
++                args [8] = 0;
++                _strupr (args);
++                strcpy (data->USER, args);
+                 ctl_write_line (data, "331 Okay, waiting for password.");
+             } else if (strcmp (cmd, "PASS") == 0) {
+-                data->AUTHED = 1;
+-                ctl_write_msg (data, 230, LOGIN_MESSAGE);
++                args [8] = 0;
++                data->ACEE = rac_user_login (data->USER, args);
++                if (data->ACEE > 1) {
++                    ctl_write_msg (data, 230, LOGIN_MESSAGE);
++                    time (&lt);
++                    td = localtime (&lt);
++                    sprintf (wtomsg, LOGIN_MESSAGE_C, data->USER, (* td).tm_hour, (* td).tm_min, (* td).tm_sec, (* td).tm_year + 1900, (* td).tm_mon + 1, (* td).tm_mday);
++                    _write2op (wtomsg);
++                }
++                if (data->ACEE == 1) ctl_write_msg (data, 230, LOGIN_MESSAGE);
++                if (data->ACEE == 0) {
++                    ctl_write_msg (data, 530, LOGIN_FAILED_MESSAGE);
++                    Sleep (1000);
++                }
+             } else if (strcmp (cmd, "NOOP") == 0) {
+                 ctl_write_line (data, "200 NOOP command successful");
+-            /*} else if (!data->AUTHED) {
++            } else if (!data->ACEE) {
+                 // don't allow other commands until logged in
+-                ctl_write_line (data, "530 Log in with USER and PASS first."); */
++                ctl_write_line (data, "530 Log in with USER and PASS first.");
+             } else if (strcmp (cmd, "SYST") == 0) {
+                 ctl_write_line (data, "215 MVS Type: L8");
+             } else if (strcmp (cmd, "MODE") == 0) {
+@@ -2073,8 +2124,8 @@
+                     free (comma_list);
+                 };
+ 
+-            } else if (strcmp (cmd, "PORT") == 0) {
+-                if (!comma_list_to_sockaddr (&addr, args)) {
++            } else if (strcmp (cmd, "PORT") == 0) {ctl_write_line (data, "500 PORT command rejected, please use passive mode");
++            /*  if (!comma_list_to_sockaddr (&addr, args)) {
+                     ctl_write_line (data, "500 That's not how to use the PORT command.");
+                 } else {
+                     reset_data_connection (data);
+@@ -2090,7 +2141,7 @@
+                         set_callbacks (data->DATA_SOCK, data, NULL, &data_connect_sock_wcb);
+                         ctl_write_line (data, "200 PORT command successful");
+                     };
+-                };
++                }; */
+             } else if (strcmp (cmd, "LIST") == 0) {
+                 if (prepare_for_xfer (data)) {
+                     tdata = ftp_ls (data);
+@@ -2182,20 +2233,36 @@
+                         sprintf (tstr, "553 %s: Access denied.", args);
+                         ctl_write_line (data, tstr);
+ 
+-                    } else if ((fh = fopen (real_path, fmode)) == NULL) {
++                    } else {
++                        if (data->ACEE > 1) {
+ 
+-                        sprintf (tstr, "550 %s: %d", args, errno);
+-                        ctl_write_line (data, tstr);
++                            rac_ftp_auth (1);
++                            acee_old = rac_switch_user (data->ACEE);
++                        }
+ 
+-                    } else {
+-                        if (prepare_for_xfer (data)) {
+-                            data->FILE = fh;
++                        fh = fopen (real_path, fmode);
++
++                        if (data->ACEE > 1) {
++
++                            rac_switch_user (acee_old);
++                            rac_ftp_auth (0);
++                        }
++
++                        if (fh == NULL) {
++
++                            sprintf (tstr, "550 %s: %d", args, errno);
++                            ctl_write_line (data, tstr);
++
++                        } else {
++                            if (prepare_for_xfer (data)) {
++                                data->FILE = fh;
+ #ifdef debug_output
+-                            printf ("Opened file: %d read\n", (int)data->FILE);
++                                printf ("Opened file: %d read\n", (int)data->FILE);
+ #endif
+-                            set_callbacks_f (fh, data, file_rcb, NULL);
+-                            data->XFER = 'R'; /* the client is reading the file */
+-                            set_xfer_callback (data);
++                                set_callbacks_f (fh, data, file_rcb, NULL);
++                                data->XFER = 'R'; /* the client is reading the file */
++                                set_xfer_callback (data);
++                            };
+                         };
+                     };
+                 } else {
+@@ -2256,20 +2323,36 @@
+                         sprintf (tstr, "553 %s: Access denied.", args);
+                         ctl_write_line (data, tstr);
+ 
+-                    } else if ((fh = fopen (real_path, fmode)) == NULL) {
++                    } else {
++                        if (data->ACEE > 1) {
+ 
+-                        sprintf (tstr, "550 %s: Not opened %d", args, errno);
+-                        ctl_write_line (data, tstr);
++                            rac_ftp_auth (1);
++                            acee_old = rac_switch_user (data->ACEE);
++                        }
+ 
+-                    } else {
+-                        if (prepare_for_xfer (data)) {
+-                            data->FILE = fh;
++                        fh = fopen (real_path, fmode);
++
++                        if (data->ACEE > 1) {
++
++                            rac_switch_user (acee_old);
++                            rac_ftp_auth (0);
++                        }
++
++                        if (fh == NULL) {
++
++                            sprintf (tstr, "550 %s: Not opened %d", args, errno);
++                            ctl_write_line (data, tstr);
++
++                        } else {
++                            if (prepare_for_xfer (data)) {
++                                data->FILE = fh;
+ #ifdef debug_output
+-                            printf ("Opened file: %d write\n", (int)data->FILE);
++                                printf ("Opened file: %d write\n", (int)data->FILE);
+ #endif
+-                            set_callbacks_f (fh, data, NULL, file_wcb);
+-                            data->XFER = 'W'; /* the client is writing the file */
+-                            set_xfer_callback (data);
++                                set_callbacks_f (fh, data, NULL, file_wcb);
++                                data->XFER = 'W'; /* the client is writing the file */
++                                set_xfer_callback (data);
++                            };
+                         };
+                     };
+                 } else {
+@@ -2277,9 +2360,9 @@
+                     ctl_write_line (data, tstr);
+                 };
+ 
+-            } else if (strcmp (cmd, "TERMINATE") == 0) {
++            } else if ((strcmp (cmd, "TERMINATE") == 0) && (strcmp (data->USER, AUTH_USER) == 0)) {
+                 running = 0;
+-            } else if (strcmp (cmd, "TERM") == 0) {
++            } else if ((strcmp (cmd, "TERM") == 0) && (strcmp (data->USER, AUTH_USER) == 0)) {
+                 running = 0;
+             } else if (strcmp (cmd, "REFR") == 0) {
+                 refresh ();
+@@ -2356,8 +2439,13 @@
+ */
+ static void ftp_serv_sock_rcb (SOCKET serv_sock, data_tag_ptr data) {
+     SOCKET acc;
++    struct sockaddr client_addr;
++    long addr_size = sizeof (client_addr);
++    struct sockaddr_in * client_addr_in;
++    unsigned long client_ip_addr;
++    unsigned char * clip;
+ 
+-    acc = accept_sock (serv_sock);
++    acc = accept (serv_sock, &client_addr, &addr_size);
+ 
+     if (acc == -1) {
+         printf ("error accepting connection: %d\n", HercGetLastError ());
+@@ -2365,6 +2453,23 @@
+         return;
+     };
+ 
++    client_addr_in = (void *)&client_addr;
++    client_ip_addr = client_addr_in->sin_addr.s_addr;
++
++    if (sock_ip (acc) != client_ip_addr) {
++        closesocket (acc);
++        clip = (unsigned char *) &client_ip_addr;
++        time (&lt);
++        td = localtime (&lt);
++        sprintf (wtomsg, REJECT_MESSAGE, clip [0], clip [1], clip [2], clip [3],
++                 (* td).tm_hour, (* td).tm_min, (* td).tm_sec, (* td).tm_year + 1900, (* td).tm_mon + 1, (* td).tm_mday);
++        _write2op (wtomsg);
++        Sleep (1000);
++        return;
++    };
++
++    if (optimise < acc) optimise = acc;
++
+     set_callbacks (acc, new_ftp_data (acc), &ftp_sock_rcb, &ftp_sock_wcb);
+ };
+ 
+--- std/mvsdirs.h	2009-03-30 11:58:00.000000000 +0200
++++ rac/mvsdirs.h	2015-03-15 12:25:00.000000000 +0100
+@@ -7,13 +7,13 @@
+ static char devices [maxdevs][7];
+ static char units   [maxdevs][7];
+ 
+-/* This is a non UCB access version of obtaining DASD system info:
++/* This is a non UCB access version of obtaining DASD system info: */
+ static long dirsupport () {
+     long   i;
+     FILE * fh;
+     char   line [81];
+ 
+-    fh = fopen ("//DSN:SYS1.PARMLIB(VATLST00)", "rb");
++    fh = fopen ("//DSN:SYS1.PARMLIB(VATLSTFF)", "rb");
+     if (fh == NULL) {
+         return (1);
+     }
+@@ -46,7 +46,7 @@
+     fclose (fh);
+ 
+     return (0);
+-}*/
++}
+ 
+ static char * disktype [] = {
+     "UNKN",   // 0
+@@ -114,71 +114,6 @@
+     return (LOWLEVIO (UCBSCAN, (long)scan, 2, savearea));
+ }
+ 
+-static long dirsupport () {
+-    char * cvt = *((char **)16);
+-    unsigned char * c;
+-    // For new style...
+-    t_ucbscan scan;
+-    // For old style...
+-    char * ucb;
+-    unsigned short b;
+-    char   serial [7];
+-
+-    serial [6] = 0;
+-    if (__libc_oarch == 0) { // Is this an old O/S?
+-        // Old OS style of reading UCB
+-        ucb = *((char **)&(cvt [40]));
+-        b = *((short *)ucb);
+-        while (b != 0xFFFF) { // End of list?
+-            c = (unsigned char *)b;
+-            if ((c) && // Check if null?
+-                ((c [18] & 0x20) != 0) && // Is a Disk?
+-                ((c [3] & 0x80) != 0) && // Is Online?
+-                ((c [6] & 0x40) == 0)) { // Is Ready?
+-                memcpy (serial, &(c [28]),6);
+-                if ((c [19] != 0x04) || (c [17] == 0x00))
+-                    adddev (serial, disktype [c [19] & 0x0F]);
+-                else
+-                    adddev (serial, "9345");
+-            }
+-            ucb += 2; // Continue to the next in the list.
+-            b = *((short *)ucb);
+-        }
+-    } else {
+-        // New OS style of reading UCB
+-        // This version only does static devices <16MB
+-        /*c = *((unsigned char **)&(cvt [1252]));
+-        while (c) { // End of list?
+-            if (((c [18] & 0x20) != 0) && // Is a Disk?
+-                ((c [3] & 0x80) != 0) &&  // Is Online?
+-                ((c [6] & 0x40) == 0)) {  // Is Ready?
+-                memcpy (serial, &(c [28]),6);
+-                if ((c [19] != 0x04) || (c [17] == 0x00))
+-                    adddev (serial, disktype [c [19] & 0x0F]);
+-                else
+-                    adddev (serial, "9345");
+-            }
+-            c = *((unsigned char **)&(c [8]));
+-        }*/
+-
+-        // This version does all DASD devices (Use JCC lib of 11/JAN/09)
+-        ucbinit (&scan); // Start at the first UCB
+-        c = scan.ucbc; // Get ready..
+-        while (ucbscan (&scan) == 0) {
+-            if (((c [18] & 0x20) != 0) && // Is a Disk? (Not needed!)
+-                ((c [3] & 0x80) != 0) &&  // Is Online?
+-                ((c [6] & 0x40) == 0)) {  // Is Ready?
+-                memcpy (serial, &(c [28]),6);
+-                if ((c [19] != 0x04) || (c [17] == 0x00))
+-                    adddev (serial, disktype [c [19] & 0x0F]);
+-                else
+-                    adddev (serial, "9345");
+-            }
+-        }
+-    }
+-    return (0);
+-}
+-
+ typedef struct dirs_tag * dirs_tag_ptr;
+ typedef struct dirs_tag {
+     char name [45];
+@@ -315,7 +250,7 @@
+ #define SKIP_MASK ((int) 0x1F)
+ #define ALIAS_MASK ((int) 0x80)
+ 
+-long readdir (char * pds) {
++long readdir (char * pds, unsigned int acee) {
+     long   i;
+     long   j;
+     FILE * fh;
+@@ -329,11 +264,22 @@
+     long   quit;
+     int    info_byte;
+     short  l;
++    unsigned int acee_old;
+ 
+     pdsecount = 0;
+ 
++    if (acee > 1) {
++        rac_ftp_auth (1);
++        acee_old = rac_switch_user (acee);
++    }
++
+     fh = fopen (pds, "rb,klen=0,lrecl=256,blksize=256,recfm=u,force");
+ 
++    if (acee > 1) {
++        rac_switch_user (acee_old);
++        rac_ftp_auth (0);
++    }
++
+     if (fh == NULL) {
+         printf ("Error opening directory in %s\n", pds);
+         return (1);

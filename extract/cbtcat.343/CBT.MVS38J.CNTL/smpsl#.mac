@@ -1,0 +1,41 @@
+//HERC01  JOB  (SMP),
+//             'Select PTFs',
+//             CLASS=A,
+//             MSGCLASS=X,
+//             MSGLEVEL=(1,1),
+//             NOTIFY=HERC01
+//********************************************************************
+//*
+//* NAME: SYS1.SETU.CNTL(SMPSEL02)
+//*
+//* DESC: Select SYSMODs via Filter Criteria
+//*
+//********************************************************************
+//LIST    EXEC PGM=HMASMP,REGION=1024K,PARM='DATE=U'
+//SMPCDS   DD  DSN=SYS1.SMPCDS,DISP=SHR
+//SMPACDS  DD  DSN=SYS1.SMPACDS,DISP=SHR
+//SMPPTS   DD  DSN=SYS1.SMPPTS,DISP=SHR
+//SMPLIST  DD  UNIT=VIO,SPACE=(CYL,(10,4),RLSE),DISP=(,PASS)
+//SMPRPT   DD  SYSOUT=*
+//SMPOUT   DD  SYSOUT=*
+//SYSPRINT DD  SYSOUT=*
+//SMPLOG   DD  DUMMY
+//SMPCNTL  DD  *
+           LIST PTS SYSMOD .
+           LIST CDS SYSMOD NOACCEPT .
+//*
+//SELECT  EXEC PGM=SMPTFSEL
+//INPUT    DD  DSN=*.LIST.SMPLIST,DISP=(OLD,PASS)
+//OUTPUT   DD  SYSOUT=*
+//*UTPUT   DD  DSN=HERC01.SMPTFSEL.CNTL,DISP=(MOD,CATLG,DELETE),
+//*            UNIT=SYSDA,SPACE=(TRK,(4,1),RLSE)
+//SYSPRINT DD  SYSOUT=*
+//SYSIN    DD  *
+ FMID(EJE1103)
+ APP(72000-74365)
+ REQ(UZ7-UZ9)
+ PRE(JVT1102)
+ LMOD(IEANUC01)
+ RMID(ZUM0001-ZUM0002) UMID(ZUM0004)
+ SZAP(IEFJESNM)
+ .

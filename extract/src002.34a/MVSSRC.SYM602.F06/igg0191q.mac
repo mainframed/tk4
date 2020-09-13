@@ -1,0 +1,674 @@
+    TITLE ' IGG0191Q - OPEN EXECUTOR FOR CHAINED SCHEDULING (TAPE-UR)'
+IGG0191Q CSECT
+*MODULE NAME - IGG0191Q                                          Y02072
+*
+*DESCRIPTIVE NAME - BUILD IOBS                                   Y02072
+*
+*COPYRIGHT - NONE                                                Y02072
+*
+*CHANGE ACTIVITY - AS FOLLOWS:                                   Y02072
+*
+*        VS 2 RELEASE 2 DELETIONS                                Y02072
+*000204,000600,011400,050300,050420-050480,065400,073600,117400  Y02072
+*120350,120500,125400-125600,126200,130000                       Y02072
+*                                                                YM4697
+*                                                                YM6583
+*
+*        VS2 RELEASE 3 DELETIONS
+*                                                              @Z30TSCF
+*        VS2 RELEASE 4 DELETIONS
+*                                                              @Z40MSMI
+*        RELEASE 20 DELETIONS
+*0485130700,131400,131800                                        M6128
+*0485002800,005000-005200,120400,130800                          M5071
+*0485130700                                                      M5898
+*0485120250                                                      M6413
+*        RELEASE 21 DELETIONS
+*1300                                                            A45221
+*1300107000-107600                                               A36955
+*                                                               SA67354
+*
+*STATUS CHANGE LEVEL 007
+*
+*FUNCTION/OPERATION-- THIS ROUTINE GETS THE AMOUNT OF SPACE REQUIRED
+*                     FOR THE MAIN IOB AND ICBS WITH THEIR CHANNEL
+*                     PROGRAMS.TAPE AND UR ARE SUPPORTED BY THIS
+*                     ROUTINE.THE ROUTINE ALSO GENERATES THE CHANNEL
+*                     PROGRAMS REQUIRED,STORES THE ID'S OF THE EOB
+*                     RTS NEEDED IN DCB(TEMPORARILY),AND INITIALIZES
+*                     FIELDS IN THE DCB.
+*                     IT SETS AN AUDIT TRAIL BIT IN THE OPEN     Y02072
+*                     WORKAREA INDICATING TO FORCE CLOSE THAT    Y02072
+*                     THE CORE GETMAINED FOR THE IOB'S CAN BE    Y02072
+*                     FREEMAINED.                                Y02072
+*
+*
+*ENTRY POINT:  IGG0191Q FROM IGG0191T, IGG0191U, IGG0191V, IGG0193I,
+*              IGG0196B OR IGG0196Q
+*
+*INPUT      --  SEE DESCRIPTION OF REGISTERS,USER DCB,WHERE TO GO TABLE
+*               CURRENT ENTRY IN WHERE TO GO TABLE,USER PARAMETER LIST,
+*               CURRENT ENTRY IN PARAMETER LIST,AND OPEN'S 536 BYTE
+*               WORK AREA (SEE FORECORE DSECT) ASSOCIATED WITH EACH DCB
+*
+*OUTPUT     --  ICBS AND CHANNEL PROGRAMS ,MAIN IOB ,DCB INITIALIZATION
+*
+*EXTERNAL RTS.  IFG019RA.
+*
+*EXITS      --  NORMAL - IGG01913, IGG01916
+*               ABNORMAL - IGG0191G WHEN CHAINED SCHEDULING
+*                          NOT SUPPORTABLE
+*
+*MACROS : ACTION -- MODESET, GETMAIN, IECRES
+*
+*MACROS : MAPPING -- IHACCW, DCBD, IECDSECS, IEZIOB, IEZDEB,
+*                    IKJTCB, IGGPARML
+*
+*TABLES     --  SEE FORECORE DSECT ,DCB DSECT ; WHERE TO GO DSECT
+*
+*ATTRIBUTES --  RE-ENTRANT, RE-USABLE, ENABLED, RUNS IN DATA     Y02072
+*               MANAGEMENT KEY UNLESS OTHERWISE SPECIFIED        Y02072
+*               RUNS IN SUPERVISOR STATE                         Y02072
+*
+*NOTES      --  THIS EXECUTOR WILL GO TO IGG0191G IF CHAINED SCHEDULING
+*               CANNOT BE SUPPORTED BUT THE USER IS CAPABLE OF RUNNING.
+*
+*               3800 PRINTER SUPPORT (@Z40MSMI) - OPTCD=J (DYNAMIC
+*               SELECTION OF TRANSLATE TABLES) REQUIRES AN ADDITIONAL
+*               CCW IN THE CHANNEL PROGRAM. WHEN IT IS REQUIRED THIS
+*               MODULE WILL INCREASE THE ICB/CP SIZE TO BE GETMAINED
+*               BY 8 BYTES PER ICB. THE NEW CHANNEL PROGRAM WILL BE:
+*                  NOP/ASA
+*                  NOP/SELECT TRANSLATE TABLE
+*                  WRITE
+*                  NOP
+*                  NOP/TIC
+*
+***********************************************************************
+*
+*  REGISTER CONVENTIONS USED THROUGH OUT ALL OPEN PASSES
+*
+***********************************************************************
+*
+RDCB     EQU   2         DCB REGISTER
+RBASE    EQU   3         BASE REGISTER
+RCORE    EQU   4         WORK AREA ADDRESS
+RPAR     EQU   5         TOP OF PARAMETER LIST
+RWTG     EQU   6         TOP OF WTG TABLE
+RPARC    EQU   7         CURRENT PARAMETER
+RWTGC    EQU   8         CURRENT TRANS LOAD
+RTIOT    EQU   9         USED HERE AS WRK REG AND  COMM VECTOR ADDR.
+RUCB     EQU   10        USED HERE AS A COUNTER IN IOB GENERATION
+RDEB     EQU   11        DEB ADDRESS, WORKREG AND FOR MODESET
+RB       EQU   12        WORK REG1  **
+RC       EQU   13        WORK REG2  **  USED IN IOB GENERATION
+RD       EQU   14        WORK REG3  **
+RRET     EQU   RD                       RETURN ADDRESS REGISTER  Y02072
+RJ       EQU   15        WORK REG4
+RWK4     EQU   RJ                       WORK REGISTER            Y02072
+RE       EQU   0         WORK REG5
+RF       EQU   1         WORK REG6
+RWK5     EQU   RF                       WORK REGISTER            Y02072
+*
+*
+***********************************************************************
+*
+*
+*
+* MASKS FOR DEVICES TO BE SUPPORTED
+*
+*
+*
+TAPEB    EQU   X'80'
+URBITS   EQU   X'40'
+PRINTER  EQU   X'48'
+*
+*
+*********************************************************************
+*
+*          CCW COMMAND CODES
+*
+WRITE    EQU   X'01'                    WRITE COMMAND
+PRTSPC1  EQU   X'09'                    PRINT AND SINGLE SPACE 1
+READ     EQU   X'02'                    READ COMMAND
+READBACK EQU   X'0C'                    READ BACKWARDS COMMAND
+TIC      EQU   X'08'                    TIC COMMAND
+NOP      EQU   X'03'                    NOP COMMAND
+EJCT     EQU   X'80'                    EJECT MODE FOR 1442
+COLBIN   EQU   X'20'                    COLUMN BINARY MODE
+STCK2    EQU   X'40'                    STACKER TWO MODE
+*
+*********************************************************************
+*
+*          MISCELLANEOUS EQUATES
+*
+TIMES8   EQU   3                        SHIFT VALUE TO MULTIPLY BY 8
+ECBNORM  EQU   X'7F'                    CODE TO SET NORMAL COMPLETION
+ICBLRD   EQU   7                        ICB LEN. FOR READ IN DBL WRDS
+ICBLWT   EQU   8                        ICB LEN. FOR WRITE IN DBL WRDS
+ICBLWA   EQU   9                        ICB LEN FOR 3800 IN DBL WRDS
+WCPO     EQU   32                       CHANNEL PROG OFFSETS FOR DCB
+NOPR     EQU   48                       NOP OFFSET FOR READ
+NOPW     EQU   56                       NOP OFFSET FOR WRITE
+NOPA     EQU   64                       NOP OFFSET FOR 3800
+*********************************************************************
+         EJECT
+         BALR  RBASE,0
+         USING SOPC,RBASE
+         USING PARML,RPARC
+         USING WTGENTRY,RWTGC
+         USING WTG,RWTG
+*
+*
+SOPC     EQU   *
+*
+         B     BEGIN                    BR AROUND CONSTANTS      Y02072
+         DC    C'IGG0191Q'              MODULE NAME              Y02072
+         DC    C'@Z40MSMI'              LAST SHIP CODE         @Z40MSMI
+         DC    C'01/31/75'              LAST DATE MODIFIED     @Z40MSMI
+BEGIN    DS    0H                                                YM4697
+         SR    RE,RE                    INITIALIZE
+         L     RDCB,PARDCBAD            GET DCB ADDRESS
+         USING IHADCB,RDCB
+         LA    RDCB,IHADCB              CLEAR HI BYTE
+         L     RCORE,WTGCORE-1          GET WRK AREA ADDRESS
+         USING FORCORE,RCORE
+*
+***********************************************************************
+*
+         MVC   WTGIDTTR,SOP5            NXT RTN IF CH SCH NOT PERMITTED
+*
+*
+         TM    PAROPT,PAROUTPT-PARRDBCK DCB OPENED FOR OUT/IN OR IN/OUT
+         BM    RELOOP                   YES BRANCH - NO CH SCHED
+*
+         BO    SOPC005                  BRANCH IF OPENED FOR OUTPUT
+*
+         TM    DCBMACF1,DCBMRCRL        IS CNTRL MACRO USED
+         BO    RELOOP                   YES BRANCH  NO CH SCHEDULE
+*
+         LA    RF,ICBLRD                ICB SIZE IN DBL WRDS      19768
+         B     SOPC007
+*
+SOPC005  EQU   *
+*
+         TM    DCBMACF2,DCBMRCTL        IS CNTRL MACRO USED
+         BO    RELOOP                   YES BRANCH  NO CH SCHEDULE
+*
+         LA    RF,ICBLWT                ICB SIZE IN DBL WRDS      19768
+*
+*   FOR 3800 WITH OPTCODE = J SPACE MUST BE GOTTEN FOR AN EXTRA CCW
+*
+         CLI   DCBDEVT,DCBDVPR5         IS THIS A 3800         @Z40MSMI
+         BNE   SOPC007                  NO - CONTINUE          @Z40MSMI
+         TM    DCBOPTCD,DCBOPTJ         OPTCD=J SPECIFIED      @Z40MSMI
+         BZ    SOPC007                  NO - CONTINUE          @Z40MSMI
+         LA    RF,ICBLWA                ICB SIZE IN DBL WORDS  @Z40MSMI
+*
+SOPC007  EQU   *
+*
+         STC   RF,DCBIOBL               STORE ICB&CP LEN IN DBL.WRDS.
+         SLL   RF,TIMES8                GET LENGTH IN BYTES
+*
+         SR    RE,RE
+         IC    RE,DCBBUFNO              GET BUFFER NUMBER--QSAM PARA.
+         TM    DCBCIND2,DCBCNQSM        IS QSAM BEING USED
+         BO    SOPC013                  YES BRANCH
+*
+         TM    DCBMACF1,DCBMRPT1        IS NOTE/POINT TO BE USED
+         BO    SOPC009                  YES BRANCH
+         TM    DCBMACF2,DCBMRPT2        IS NOTE/POINT TO BE USED
+         BZ    SOPC011                  NO BRANCH
+*
+SOPC009  EQU   *
+*
+         MVI   DCBRTN2,RTN6             STORE PCI NOTE/POINT ID INDEX
+         TM    DCBDEVT,TAPEB            IS DCB USING TAPE
+         BO    SOPC011                  YES BRANCH
+*
+         MVI   DCBRTN2,RTN10            STORE DUMMY RT ID INDEX VALUE
+*
+SOPC011  EQU   *
+*
+         IC    RE,DCBNCP                GET NUMBER OF ICBS TO GEN.
+*
+SOPC013  EQU   *
+*
+         LR    RTIOT,RE                 SAVE NO. OF ICBS TO BUILD
+*
+         CH    RE,CONONE                IS NCP EQUAL TO 1 OR ZERO
+         BNH   RELOOP                   YES BRANCH
+*
+         MR    RE,RE                    COMPUTE AMT SPACE REQ FOR ICBS
+         LA    RF,IOBEXTEN-IOBQSAMC(RF) SPACE REQ FOR MAIN IOB
+         LR    RB,RF                    SAVE AMT TO CLEAR
+         OI    DCBCIND2,DCBCNCHS        SET TRUE PCI INDICATOR   YM4697
+*
+*  THE FOLLOWING SAVES THE AMOUNT OF CORE GETMAINED FOR THE      YM4697
+*  IOB AND ICBS IN THE FORCE CLOSE AUDIT TRAIL FOR THE FORCE     YM4697
+*  EXECUTOR.                                                     YM4697
+*
+         ST    RF,DXATEXC2              SAVE LENGTH              YM4697
+*
+         MODESET  KEYADDR=DXUKEY,WORKREG=11 GET INTO USER KEY    Y02072
+         GETMAIN R,LV=(RF),SP=0                                  Y02072
+*
+         MODESET  EXTKEY=DATAMGT        BACK TO DATA MANAG KEY   Y02072
+*
+***********************************************************************
+*
+*
+         ST    RF,DCBIOBAD              SAVE MAIN IOB ADDRESS
+         OI    FCAOPEN,FCAOIOB          INDIC IOB'S CAN BE FREED Y02072
+         MODESET  KEYADDR=DXUKEY,WORKREG=11 GET INTO USER KEY    Y02072
+***********************************************************************
+*
+*        CLEAR THE AREA GETMAINED
+*
+         SR    RJ,RJ                    INDICATE CLEAR TO X'00'
+         LR    RE,RF                    LOCATION TO CLEAR
+         LR    RF,RB                    LENGTH TO CLEAR
+         MVCL  RE,RD                    CLEAR THE AREA
+*
+*
+***********************************************************************
+         L     RB,DCBIOBAD              GET MAIN IOB ADDRESS
+         USING IOBQSAMC,RB
+*
+*     THIS SECTION OF CODE WILL BUILD THE MAIN IOB
+*
+*
+         LA    RUCB,IOBEXTEN            POINT TO FIRST ICB
+         ST    RUCB,IOBCICB             STORE IN MAIN IOB
+         LA    RD,IOBCECB               POINT TO ECB IN MAIN IOB
+*
+         MVI   IOBCECB,ECBNORM          POST MAIN IOB COMPLETE
+*
+*
+         LA    RF,IOBEXTEN+ICBEXTEN-ICB POINT TO FIRST ICB CHANNEL PRG
+*
+         ST    RD,IOBECBPT              ECB ADDRESS TO IOB       Y02072
+         ST    RF,IOBSTART              CHAN PGM ADDR TO IOB     Y02072
+         L     RWK4,DXUDCBAD            GET USERS DCB ADDRESS    Y02072
+         ST    RWK4,IOBDCBPT            DCB ADDRESS TO IOB       Y02072
+         MODESET  EXTKEY=DATAMGT        BACK TO DATA MANAG KEY   Y02072
+*
+*
+         MVI   DCBWCPO,WCPO             MOVE IN FIRST OFFSET  AND
+         MVC   DCBWCPL(3),DCBWCPO       PROPAGATE THE BYTE ACROSS
+         MODESET  KEYADDR=DXUKEY,WORKREG=11 GET INTO USER KEY    Y02072
+IOBOFF   MVI   IOBCINOP,NOPR            NOP OFFSET IN IOB         19768
+         MVI   IOBCONOP,NOPR            NOP OFFSET IN IOB         19768
+*
+         OI    IOBFLAG1,IOBCMDCH        INDICATE COMMAND CHAINING
+*
+*   ASSUME TAPE OR CARD READER CHANNEL PROGRAM FOR OFFSETS STORED
+*
+         LA    RB,IOBEXTEN              POINT TO FIRST ICB
+         DROP  RB
+         MODESET  EXTKEY=DATAMGT        BACK TO DATA MANAG KEY   Y02072
+         ST    RB,DCBIOBA               SAVE ADDRESS FOR SUBROUTINES
+         MODESET  KEYADDR=DXUKEY,WORKREG=11 GET INTO USER KEY    Y02072
+         LR    RC,RB                    COPY ICB ADDRESS
+*
+*                                       DURING THE FOLLOWING LOOP, RB
+*                                       MUST REMAIN INTACT FOR IT IS
+*                                       NEEDED TO PUT LINK ADDRESS IN
+*                                       1ST ICB.
+*
+*
+*
+*   ICB CONSTRUCTION BEGINS AT THIS POINT
+*
+*
+ICBLOOP  EQU   *
+*
+         USING ICB,RB
+         ST    RC,ICBNICBA              LINK LAST ICB TO CURRENT ICB
+         LR    RB,RC                    UPDATE LAST ICB POINTER
+         LA    RC,ICBNECB               POINT TO ICBS ECB
+         ST    RC,ICBECBPT              SAVE IN ECB SLOT
+         MVI   ICBNECB,ECBNORM          POST ICB COMPLETE
+         LA    RC,ICBEXTEN              POINT TO CP START ADDR
+         USING CCW,RC
+         ST    RC,ICBSTART              SAVE IN ICB CP STARTAD
+*
+*    NORMAL ICB HAS BEEN GENERATED
+*
+         TM    DCBDEVT,TAPEB            DCB USING TAPE
+         BO    SOPC043                  YES BRANCH
+*
+         TM    PAROPT,PAROUTPT          DCB FOR OUTPUT
+         BZ    SOPC029                  NO BRANCH
+*
+*      SUPPLY AUTOMATIC UNBLOCKING FUNCTION FOR QSAM U.R. OUTPUT
+*
+         TM    DCBCIND2,DCBCNQSM        QSAM BEING USED FOR OUTPUT
+         BZ    SOPC023                  NO BRANCH
+         TM    DCBRECFM,DCBRECBR        BLOCKED RECORDS         SA67354
+         BZ    SOPC023                  NO, BYPASS UNBLOCKING   SA67354
+         TM    DCBCIND2,DCBCNBFP        DID OPEN BUILD BUFFERS  SA67354
+         BO    SOPC023                  YES, FUNCTION ALREADY   SA67354
+*                                         PROVIDED              SA67354
+         TM    DCBRECFM,DCBRECU         U RECORDS BEING USED
+         BNM   SOPC023                  YES BRANCH              SA67354
+         SPACE
+         MODESET  EXTKEY=DATAMGT        BACK TO DATA MANAG KEY   Y02072
+         SPACE
+         TM    DCBRECFM,DCBRECF         F RECORDS USED
+         BZ    SOPC021                  NO BRANCH
+         MVC   DCBBLKSI,DCBLRECL        FORCE UNBLOCKED RECORDS TO BE
+*                                       OUTPUT TO UNIT RECORD EQUIPMENT
+SOPC021  EQU   *
+         NI    DCBRECFM,X'FF'-DCBRECBR  TURN BLOCKED BIT OFF
+         OI    DCBCIND1,DCBCNBRM        SET BIT FOR CLOSE. MUST  A45221
+*                                         KNOW BIT TURNED OFF.   A45221
+         MODESET  KEYADDR=DXUKEY,WORKREG=11 GET INTO USER KEY    Y02072
+SOPC023  EQU   *                        BUILD WRITE CHANNEL PROGRAM
+         MVI   CCWCOMCD,NOP             STORE NOP CMD BYTE
+         MVI   CCWFLGS,CCWCC            SET CMD CHAIN FLAG
+         MVI   CCWBYTE+1,1              SAVE COUNT OF ONE
+*
+*   NOP CCW HAS BEEN GENERATED FOR OUTPUT CHANNEL PROGRAM
+*
+         MODESET  EXTKEY=DATAMGT        BACK TO DATA MANAG KEY   Y02072
+         TM    DCBRECFM,DCBRECCA        ASA CHARACTERS USED
+         BZ    SOPC025                  NO BRANCH
+*
+         MVI   DCBRTN4,RTN4             SAVE DDB'S ID INDEX VALUE
+         B     SOPC027
+*
+SOPC025  EQU   *
+*
+         MVI   DCBRTN4,RTN3             SAVE DDA'S ID INDEX VALUE
+*
+SOPC027  EQU   *
+         MODESET  KEYADDR=DXUKEY,WORKREG=11 GET INTO USER KEY    Y02072
+*
+         L     RD,DCBIOBAD              GET MAIN IOB ADDRESS
+         USING IOBQSAMC,RD
+         MVI   IOBCINOP,NOPW            NOP OFFSET IN IOB
+         MVI   IOBCONOP,NOPW            NOP OFFSET IN IOB
+*
+*        FOR 3800 WITH OPTCD=J AN ADDITIONAL NOP MUST BE BUILT
+*
+         CLI   DCBDEVT,DCBDVPR5         IS THIS A 3800         @Z40MSMI
+         BNE   SOPC024                  NO - CONTINUE          @Z40MSMI
+         TM    DCBOPTCD,DCBOPTJ         OPTCD=J SPECIFIED      @Z40MSMI
+         BZ    SOPC024                  NO - CONTINUE          @Z40MSMI
+         LA    RC,CCW+L'CCW             INCREMENT TO NEXT CCW  @Z40MSMI
+         MVI   CCWCOMCD,NOP             SET NOP                @Z40MSMI
+         MVI   CCWFLGS,CCWCC            SET CHAIN COMMAND      @Z40MSMI
+         MVI   CCWBYTE+1,1              SET COUNT              @Z40MSMI
+         MODESET EXTKEY=DATAMGT         GET IN DM KEY          @Z40MSMI
+         NI    DCBPRBYT,X'FF'-DCBTRCID  SET ACT TRANS TBL ID   @Z40MSMI
+         MODESET KEYADDR=DXUKEY,WORKREG=11 GET IN CALLER KEY   @Z40MSMI
+         MVI   IOBCINOP,NOPA            SET NOP OFFSET         @Z40MSMI
+         MVI   IOBCONOP,NOPA            SET NOP OFFSET         @Z40MSMI
+         DROP  RD
+SOPC024  EQU   *
+         LA    RC,CCW+L'CCW             UPDATE CCW POINTER
+         MVI   CCWCOMCD,WRITE           STORE WRITE CMD BYTE
+         OI    CCWFLGS,CCWCC+CCWSLI+CCWPCI SET FLAGS
+         BAL   RRET,SOPC070             GO RESET PCI BIT IF      Y02072
+*                                         NECESSARY              Y02072
+         TM    DCBDEVT,PRINTER          DCB USING PRINTER
+         BO    SOPC037                  YES BRANCH
+*
+         CLI   DCBDEVT,DCBDVCRP         1442 BEING USED FOR OUTPUT
+         BNE   SOPC031                  NO BRANCH
+*
+         OI    CCWCOMCD,EJCT            TURN ON EJECT MOD.
+         B     SOPC031
+*
+*
+SOPC029  EQU   *                        BUILD READ CHANNEL PROGRAM
+*
+         OI    CCWFLGS,CCWCC+CCWSLI+CCWPCI SET PCI,SILI, CC FLAGS
+         BAL   RRET,SOPC070             GO RESET PCI BIT IF      Y02072
+*                                         NECESSARY              Y02072
+         MODESET  EXTKEY=DATAMGT        BACK TO DATA MANAG KEY   Y02072
+         MVI   DCBRTN4,RTN2             STORE EPG2 INDEX  VALUE
+         MODESET  KEYADDR=DXUKEY,WORKREG=11 GET INTO USER KEY    Y02072
+         OI    CCWCOMCD,READ            TURN ON READ CMD IN CCW
+SOPC031  EQU   *
+*
+         TM    DCBMODE,DCBMODEC         PROCESSING COLUMN BINARY
+         BZ    SOPC033                  NO BRANCH
+*
+         OI    CCWCOMCD,COLBIN          SET COL BIN MOD ON IN CCW
+SOPC033  EQU   *
+*
+         TM    DCBSTACK,DCBSTCK2        STACKER TWO SPECIFIED
+         BZ    SOPC061                  NO BRANCH
+*
+         OI    CCWCOMCD,STCK2           TURN STACKER TWO MOD ON
+         B     SOPC061
+*
+SOPC037  EQU   *
+*
+         MVC   CCWCOMCD,DCBPRTSP        STORE PRINTER CMD IF SPECIFIED
+         TM    DCBRECFM,DCBRECCA        ASA CHARACTERS USED
+         BZ    SOPC039                  NO BRANCH
+*
+         MVI   CCWCOMCD,WRITE           STORE PRINT SUPPRESS CMD BYTE
+SOPC039  EQU   *
+         CLI   CCWCOMCD,0               WAS PRINTER CMD GENERATED
+         BNE   SOPC041                  YES BRANCH
+*
+         MVI   CCWCOMCD,PRTSPC1         SAVE PRINT CMD SPACE ONE LINE
+*
+SOPC041  EQU   *
+*
+         B     SOPC061                  BUILD TAPE CHANNEL PROGRAMS
+*
+SOPC043  EQU   *
+         MODESET  EXTKEY=DATAMGT        BACK TO DATA MANAG KEY   Y02072
+         MVI   DCBRTN4,RTN2             STORE EGP2'S ID VALUE
+         MODESET  KEYADDR=DXUKEY,WORKREG=11 GET INTO USER KEY    Y02072
+         MVI   ICBINCAM+1,1             SAVE INCREMENT VALUE
+         OI    CCWFLGS,CCWCC+CCWSLI+CCWPCI SET FLAGS
+         BAL   RRET,SOPC070             GO RESET PC I BIT IF     Y02072
+*                                         NECESSARY              Y02072
+         MVI   CCWCOMCD,WRITE           SET FOR WRITE
+         TM    PAROPT,PAROUTPT          DCB FOR OUTPUT
+         BO    SOPC061                  YES BRANCH
+*
+         MVI   CCWCOMCD,READ            STORE READ CMD BYTE
+         TM    PAROPT,PARRDBCK          READ BACKWARDS BIT ON
+         BZ    SOPC045                  NO - NOT READ BACKWARDS
+         TM    PAROPT,PAROUTPT-PARRDBCK ANY OTHER BITS ON
+         BNZ   SOPC045                  YES - NOT READ BACKWARDS
+*
+*        READ BACKWARDS CHANGE COMMAND CODE AND INCREMENT AMOUNT
+*
+         MVI   CCWCOMCD,READBACK        SAVE RD BACK CMD BYTE
+         MVC   ICBINCAM,NEGONE          SAVE INCREMENT VALUE NEGATIVE
+*
+*
+SOPC045  EQU   *
+*
+*    APAR 36955 RESULTED FROM A BAD APAR FIX (17073).  THE       A36955
+*    PROBLEM SYMPTOM WAS THAT THE SILI BIT WAS BEING LEFT ON FOR A36955
+*    FIXED UNBLOCKED RECORDS.                                    A36955
+         TM    DCBRECFM,DCBRECF         TEST FOR FIXED OR        A36955
+*                                       UNDEFINED                A36955
+         BNO   SOPC061                  NO, MUST BE VARIABLE     A36955
+*    AT THIS POINT RECORDS COULD BE EITHER UNDEFINED OR          A36955
+*    FIXED.  MUST TEST FURTHER.                                  A36955
+         TM    DCBRECFM,DCBRECU         RECORDS FORMAT U         A36955
+         BO    SOPC061                                           A36955
+*
+*
+*
+         NI    CCWFLGS,X'FF'-CCWSLI     TURN SILI FLAG OFF
+*
+SOPC061  EQU   *                        ALL DEVICES
+*
+*
+*             THIS NOP MUST BE INSERTED TO INSURE A SIMULTANEOUS
+*             CHANNEL END DEVICE END INTERUPT IN THE EVENT THIS
+*             ICB'S CHANNEL PROGRAM IS RESTARTED BY THE ERPS
+*
+         LA    RC,CCW+L'CCW             GET NEXT CCW              19768
+         MVI   CCWCOMCD,NOP             NOP COMMAND CODE          19768
+         MVI   CCWBYTE+1,1              COUNT OF 1 IN CCW         19768
+         MVI   CCWFLGS,CCWCC            SET CMD CHAIN FLAG        19768
+*
+         LA    RC,CCW+L'CCW             POINT TO NOP/TIC          19768
+*
+         LA    RD,ICBEXTEN-ICB+L'CCW(RC) POINT TO NEXT POSSIBLE ICB CP.
+         ST    RD,CCWADDRA              SAVE IN NOP/TIC CCW
+         MVI   CCWCOMCD,NOP             SAVE CMD BYTE
+         OI    CCWFLGS,CCWSLI           SET SILI ON IN CCW
+         MVI   CCWBYTE+1,1              COUNT OF ONE IN CCW
+         LA    RC,CCW+L'CCW             POINT TO NEXT POSSIBLE ICB
+         BCT   RTIOT,ICBLOOP            DECREMENT ICB COUNTER
+*
+*
+**********************************************************************
+*
+*
+SOPCEND  EQU   *
+*
+*
+*
+         L     RD,DCBIOBA               GET FIRST ICB ADDRESS
+         ST    RD,ICBNICBA              LINK FIRST ICB TO LAST ICB.
+         DROP  RB
+         USING ICB,RD
+         LA    RE,ICBEXTEN              POINT TO ICB'S CP START AD.
+         LA    RF,L'CCW                 CONSTANT OF EIGHT
+         SR    RC,RF                    POINT BACK TO LAST ICB'S NOP
+         ST    RE,CCWADDRA              STORE FIRST ICB'S CP AD IN NOP
+         MVI   CCWCOMCD,NOP             RESTORE NOP CMD BYTE
+         DROP  RC,RD
+*
+*
+*
+*
+         L     RDEB,DCBIOBAD            PICK UP MAIN IOB ADDRESS
+         USING IOBQSAMC,RDEB
+*
+         IC    RF,IOBCINOP              PICK UP NOP OFFSET
+         AR    RD,RF                    GET NOP ADDRESS AND
+         ST    RD,IOBCNOPA               STORE AS 'LAST NOP' IN MAINIOB
+         MVI   IOBCNOPA,IOBCEXCP         SET EXCP NEEDED FLAG    YM6583
+*
+*
+*
+*    GENERATION OF ICB'S AND CHANNEL PROGRAMS ARE COMPLETE
+*
+*
+         MODESET  EXTKEY=DATAMGT        BACK TO DATA MANAG KEY   Y02072
+         TM    DCBRECFM,DCBRECV+DCBRECSB  VARIABLE SPANNED     M6413
+         BO    LOAD1916                YES, XCTL TO 1916         M5071
+         MVC   WTGIDTTR,SOPSLDFT        NO, XCTL TO 1913       @Z30TSCF
+         B     RELOOP                                            M5071
+LOAD1916 EQU   *                                                 M5071
+         MVC   WTGIDTTR,SOPS1916        XCTL TO 1916           @Z30TSCF
+         EJECT
+RELOOP   LA    RWTGC,WTGEND             INCREMENT CURR WTG ENTRY
+         LA    RPARC,L'PARDCBAD(0,RPARC) INCR CURRENT DCB ENTRY PRTR
+         CLC   WTGID,AMIDCNST           THIS RT NEEDED AGAIN
+         BER   RBASE
+*
+         CLC   WTGID,OPIDCNST           END OF TABLE
+         BNE   RELOOP                   NO,CHECK NEXT ENTRY
+*
+         LR    RPARC,RPAR               REINITIALIZE PARM LIST PTR
+         DROP  RWTGC
+         LA    RWTGC,WTGENTRY           REINITIALIZE WTG LIST PTR
+         USING WTGENTRY,RWTGC
+ZCHEK    CLI   WTGENTRY,0               IS THIS ENTRY COMPLETE
+         BNE   TCTLRTN                  IF NOT TRANSFER CONTROL
+*
+         LA    RWTGC,WTGEND             GET NEXT ENTRY
+         LA    RPARC,L'PARDCBAD(0,RPARC)
+         B     ZCHEK
+*
+TCTLRTN  EQU   *
+         IECRES LOAD,PREFIX=WTGPREFX,BRANCH=DIRECT,            @Z30TSCF*
+               MODID=WTGENTRY                                  @Z30TSCF
+*
+* THE FOLLOWING ROUTINE TESTS TO SEE IF THIS JOB IS RUNNING IN   Y02072
+* A VIRTUAL ENVIRONMENT.  IF YES, PCI BIT SHOULD NOT BE TURNED   Y02072
+* ON.  IF NO, PCI BIT CAN BE LEFT ON.                            Y02072
+* ON INPUT RC MUST POINT TO THE CCW
+*
+SOPC070  L     RDEB,DCBDEBAD            GET DEB ADDRESS          Y02072
+         USING DEBBASIC,RDEB                                     Y02072
+         L     RWK5,DEBTCBAD            TCB ADDR FOR V=R TEST    Y02072
+         DROP  RDEB                                              Y02072
+         USING TCB,RWK5                                          Y02072
+         TM    TCBFLGS6,TCBRV           JOB RUNNING VIRT=REAL    Y02072
+         BOR   RRET                     NO, RETURN               Y02072
+         USING CCW,RC                                            Y02072
+         NI    CCWFLGS,X'FF'-CCWPCI     YES, TURN OFF PCI FLAG   Y02072
+         DROP  RC                                                Y02072
+         BR    RRET                     RETURN MAINLINE          Y02072
+*
+**
+*
+*********************************************************************
+*
+OPIDCNST DC    C'0S'
+AMIDCNST DC    C'1Q    '
+SOPS1916 DC    C'16',VL3(IGG01916)      VAR, SPANNED RECS      @Z30TSCF
+SOPSLDFT DC    C'13',VL3(IGG01913)      OTHER THAN IGG01916    @Z30TSCF
+SOP5     DC    C'1G',VL3(IGG0191G)   CHAINED SCHEDULING UNSUP  @Z30TSCF
+NEGONE   DC    X'FFFF'
+CONONE   DC    H'1'
+*
+*
+***********************************************************************
+*
+DS       DS    0H
+*
+PATCH    DC    0H'0',50X'00'            PATCH AREA               Y02072
+END      EQU   *                        END OF MODULE            Y02072
+         EJECT
+         IHACCW  DSECT=YES
+         EJECT
+CVT      DSECT
+         CVT
+         EJECT
+         DCBD    DSORG=PS
+*
+*        THE FOLLOWING EQUATES REPRESENT A TABLE IN THE STAGE 3
+*        EXECUTORS AND IS USED TO DECIDE WHICH ROUTINES TO LOAD.
+*
+         ORG   DCBCNTRL
+DCBRTN1  DS    X                        ROUTINE 1
+DCBRTN2  DS    X                        ROUTINE 2
+DCBRTN3  DS    X                        ROUTINE 3
+DCBRTN4  DS    X                        ROUTINE 4
+RTN1     EQU   1                        ROUTINE 1 ID
+RTN2     EQU   2                        ROUTINE 2 ID
+RTN3     EQU   3                        ROUTINE 3 ID
+RTN4     EQU   4                        ROUTINE 4 ID
+RTN5     EQU   5                        ROUTINE 5 ID
+RTN6     EQU   6                        ROUTINE 6 ID
+RTN7     EQU   7                        ROUTINE 7 ID
+RTN8     EQU   8                        ROUTINE 8 ID
+RTN9     EQU   9                        ROUTINE 9 ID
+RTN10    EQU   10                       ROUTINE 10 ID
+         EJECT
+         IEZDEB  LIST=YES
+         EJECT
+         IECDSECS  (MAIN,(IOB,NO)),IOB,WTG,PREFX,EXPAND=YES
+         ORG   WTGIDTTR
+WTGID    DS    CL2                      NEXT MODS ID
+IOBCEXCP EQU   X'80'                    FLAG TO SAY EXCP NEEDED  YM6583
+         EJECT
+         IHAICB
+         EJECT
+FORCORE  DSECT
+         IHAFCAUD  ORG=YES
+         EJECT
+         IGGPARML
+         EJECT
+         IKJTCB
+UCB      DSECT
+         IEFUCBOB  LIST=YES
+         END

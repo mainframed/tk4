@@ -1,0 +1,733 @@
+ /* COPYRIGHT 1983 BY THOMAS GLEN SMITH */
+ /* ABE028 - LSP,LSS */
+   %INCLUDE ABESUB;
+ ABESUB(ABE028) PARS(0000000000000000) CHECK(YES);
+   %INCLUDE ABESUBA;
+
+ /* *******************************************************************
+    FOLLOWING IS A SAMPLE TREE STRUCTURE TO ILLUSTRATE THE
+    RELATIONSHIP OF THE VARIOUS CONTROL BLOCKS:
+
+    *******   ********   *******
+    * NCB *-->* LCB  *-->* CCB *-->NULL
+    *******   ********   *******<----------------×
+                            ×                    ×
+                            V                    ×
+                         ********   ********   *******
+                         * LCB  *-->* LCB  *-->* CCB *-->NULL
+                         ********   ********   *******
+                                                 T ×
+                                                 × V
+                                               *******   ********
+                                               * CCB *-->* LCB  *-->NULL
+                                               *******   ********
+                                                  ×
+                                                  V
+                                               ********
+                                               * LCB  *-->NULL
+                                               ********
+
+ *************************************************************** */
+   DCL 1 NCB UNALIGNED BASED(NCBPT),
+       /* THERE ARE 10 NCBS, ASSOCIATED WITH SYMBOLIC
+          VARIABLES 0 TO 9. */
+     2 CBPT PTR,
+       /* POINTER TO 1ST CCB OR LCB ON 1ST LEVEL */
+     2 CURCCB PTR,
+       /* DURING TREE
+          USE, POINTS TO MOST RECENTLY ENCOUNTERED CCB */
+     2 CURLCB PTR,
+       /* POINTER TO LCB CURRENTLY IN USE */
+     2 CURLINE PTR;
+       /* POINTER TO LINE CURRENTLY IN USE */
+   DCL 1 CB UNALIGNED BASED(CBPTR),
+       /* CHARACTER/LINE CONTROL BLOCK */
+     2 CBNXT PTR,
+       /* NEXT CCB OR LCB ON THIS LEVEL */
+     2 CBUP PTR,
+       /* IF CCB, POINTER TO CCB ON NEXT HIGHER LEVEL.
+          IF LCB, POINTER TO 1ST LINE IN RANGE. */
+     2 CBDOWN PTR,
+       /* IF CCB, POINTER TO CCB OR LCB ON NEXT LOWER LEVEL.
+          IF LCB, POINTER TO LAST LINE IN RANGE. */
+     2 CCBFLAGS,
+      3 CCB BIT(1),
+       /* ON IF CCB, OFF IF LCB */
+      3 CCBNOT BIT(1),
+       /* ON IF "NOT" (^) SPECIFIED */
+      3 CCBBRK BIT(1),
+       /* ON IF CONTROL BREAK CHECK */
+      3 CCBPAD BIT(13),
+     2 CBINCR FIXED BIN(15,0),
+       /* INCREMENT BY WHICH LINES ARE TO BE SELECTED */
+     2 CBCOL FIXED BIN(15,0),
+       /* STARTING COLUMN WHERE SCAN FOR CCBSTR
+          IS TO BEGIN IN EACH RECORD */
+     2 CBLEN FIXED BIN(15,0),
+       /* LENGTH OF AREA IN EACH RECORD WHERE
+          SCAN FOR CCBSTR IS TO BEGIN */
+     2 CCBLEN FIXED BIN(15,0),
+       /* LENGTH OF CCBSTR, WHICH FOLLOWS */
+     2 CCBSTR CHAR(L REFER (CCBLEN));
+   DCL NCBARY(0:9) PTR;
+       /* NCBARY POINTS TO CHAIN OF NCBS ASSOCIATED
+          WITH REPLACEMENT VARIABLES &0 THRU &9. */
+   DCL NCBDONE(0:9) BIT(1);
+       /* NCBDONE(N) IS TURNED ON WHEN THE ENTIRE RANGE
+          OF LINES HAS BEEN PROCESSED FOR VARIABLE N
+          AT LEAST ONCE */
+   DCL NCBLOOP(0:9) BIT(1);
+       /* NCBLOOP(N) IS TURNED ON WHEN THE ENTIRE RANGE
+          OF LINES HAS BEEN PROCESSED FOR VARIABLE N, AND THE
+          CURRENT LINE HAS BEEN SET TO THE FIRST LINE IN RANGE */
+   DCL 1 LBARY(0:9),
+     2 LBSTRT FIXED BIN(31,0) INIT((10)0),
+       /* STARTING REPLACEMENT VALUE FOR VARIABLE */
+     2 LBINCR FIXED BIN(31,0) INIT((10)1),
+       /* INCREMENT VALUE */
+     2 LBLEN FIXED BIN(31,0) INIT((10)0);
+       /* LENGTH OF REPLACEMENT CHARACTER STRING */
+   DCL AM CHAR(80) VAR STATIC INIT(
+ '.(&$,%?''=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567
+ 89'
+   );
+   DCL (CMDHDR,DELPTR,ORGBL,ORGPTR) PTR;
+   DCL TDSW BIT(1) INIT('0'B);
+   DCL OBLPTR PTR;
+   DCL PREFIX ENTRY(CHAR(*),CHAR(*))
+     RETURNS(FIXED BIN(15,0));
+   DCL SETCAPS ENTRY;
+   DCL EOT BIT(1);
+   DCL 1 REPBUF,
+     2 BUFLEN FIXED BIN(15,0),
+     2 OFFSET FIXED BIN(15,0),
+     2 BF CHAR(250);
+   DCL (TPTR,CPTR) PTR;
+   DCL 1 BLSTR BASED(BLPTR),
+     2 NBLPTR PTR,
+     2 BLCMDLEN FIXED BIN(15,0),
+     2 BLCMD CHAR(L REFER(BLCMDLEN)) VAR;
+   DCL (LSSPTR,SAVPTR) PTR;
+   DCL LSSCMD CHAR(256) VAR;
+   DCL LAST FIXED BIN(31,0) INIT(99999999);
+   IF CMDINDX=3 /* IS IT LSS? */
+     THEN DO;
+       SAVPTR = RHPTR;
+       I=#CMD('SSE',RHPTR,RHHDRPT); /* DEFINE VIRT. DATA SET */
+       LSSPTR = RHPTR;
+       RHPTR = SAVPTR;
+       END;
+   ORGPTR=RECPTR;
+   NCBARY(*) = NULL;
+   NCBDONE(*) = '0'B;
+   NCBLOOP(*) = '0'B;
+   ON CONDITION(RNGERR) GO TO BADEXIT;
+   CMDHDR=NULL;
+   IF VERIFY(SUBSTR(PARY(1),1,1),AM)=0
+     THEN CALL BLSET(PARY(1));
+     ELSE DO; /* IT IS STRING OF COMMANDS */
+       I=1;
+       DO WHILE(I<LENGTH(PARY(1)));
+         J = INDEX(SUBSTR(PARY(1),I+1),SUBSTR(PARY(1),1,1))+I;
+         IF J=I
+           THEN J = LENGTH(PARY(1))+1;
+         CALL BLSET(SUBSTR(PARY(1),I+1,J-I-1));
+         I=J;
+         END;
+       END;
+   DO I = 2 TO HBOUND(PARY,1) WHILE(PARY(I)^='');
+     CALL DOOPER(PARY(I));
+       /* DOOPER WILL PROCESS ALL OPERANDS */
+     END;
+   BLPTR,ORGBL=NULL;
+   DO EOT=SETN REPEAT SETN WHILE(^EOT);
+     /* SETN SETS &N VARIABLES WITH NEXT LINE IN RANGE */
+     DO TPTR = CMDHDR REPEAT TPTR->NBLPTR WHILE(TPTR^=NULL);
+       BUFLEN = MIN(254,LENGTH(TPTR->BLCMD)+4);
+       OFFSET = 0;
+       BF = TPTR->BLCMD;
+       CALL REPLB; /* GO RESOLVE #N VARIABLES */
+       CALL #REP(RHHDRPT,RH_SYMTREE,REPBUF); /* CALL REP@ */
+       IF CMDINDX=3 /* IS IT LSS? */
+         THEN DO;
+           LSSCMD = SUBSTR(BF,1,BUFLEN-4);
+           SEQ=-1;
+           IF TDSW
+             THEN CPTR=LSSPTR->LSTHDR;
+             ELSE CPTR=LSSPTR->HDPTR;
+           CALL #ADD(RHPTR,RHHDRPT,CPTR,SAVPTR,SEQ,LSSCMD,0);
+           END;
+         ELSE IF TDSW
+           THEN CALL #PUSHLILO(RHPTR,RH_STACK,RH_QUEUE,
+             SUBSTR(BF,1,BUFLEN-4));
+           ELSE CALL #PUSHLIFO(RHPTR,RH_STACK,RH_QUEUE,
+             SUBSTR(BF,1,BUFLEN-4));
+       END;
+     END;
+   CALL #NC(RHPTR,ORGPTR); /* CALL NEWCUR */
+   IF CMDINDX=3 /* IS IT LSS? */
+     THEN DO;
+       CALL #RESEQ(LSSPTR,RHHDRPT,LSSPTR->HDPTR,'NOSAVE',
+         'RENUM',LAST);
+       LSSPTR->RECPTR=LSSPTR->NXTHDR;
+       IF LSSPTR->RECPTR^=LSSPTR->HDPTR
+         THEN LSSPTR->CURSEQ=LSSPTR->RECPTR->RECSEQ;
+       END;
+   DO BLPTR=CMDHDR REPEAT DELPTR WHILE(BLPTR^=NULL);
+     DELPTR=NBLPTR;
+     FREE BLSTR;
+     END;
+   RHRC = 0;
+   RETURN;
+   /* END MAINLINE */
+
+ BLSET:  PROC(TEMPLATE);
+   DCL TEMPLATE CHAR(256) VAR;
+
+   L=LENGTH(TEMPLATE);
+   ALLOCATE BLSTR;
+   NBLPTR = CMDHDR;
+   CMDHDR = BLPTR;
+   BLCMD = TEMPLATE;
+   END BLSET;
+
+ DOOPER:  PROC(PARM);
+ /**********************************************************************
+ *                                                                     *
+ *  DOOPER IS PASSED THE SECOND AND EACH SUBSEQUENT OPERAND            *
+ *  FROM THE LSP SUBCOMMAND IN SUCCESSION.  DOOPER WILL DETERMINE      *
+ *  WHETHER THE OPERAND IS OF THE FORM N(LR), WHERE N IS 0 TO 9.       *
+ *  IF IT IS, THE OPERAND IS PASSED TO PROCEDURE DOLR.  OTHERWISE,     *
+ *  THE OPERAND IS ASSUMED TO BE OF THE FORM "KEY(VALUE)".  IT         *
+ *  WILL BE PARSED, AND SETR CALLED TO SET THE REPLACEMENT             *
+ *  VALUE FOR THE APPROPRIATE REPLACEMENT VARIABLE.                    *
+ *                                                                     *
+ **********************************************************************/
+   DCL PARM CHAR(80) VAR;
+   DCL (I,N) FIXED BIN;
+   DCL KEY CHAR(80) VAR;
+   DCL VAL CHAR(256) VAR;
+   DCL TDLIT CHAR(7) STATIC INIT('TOPDOWN');
+
+   I=INDEX(PARM,'(');
+   IF I < 2 × I > 8
+     THEN DO;
+       CALL SETCAPS(PARM);
+       IF PARM=SUBSTR(TDLIT,1,MIN(7,LENGTH(PARM)))
+         THEN DO;
+           TDSW='1'B;
+           RETURN;
+           END;
+       SIGNAL CONDITION(RNGERR);/*GET OUT-BAD OPERAND*/
+       END;
+   KEY = SUBSTR(PARM,1,I-1);
+   VAL = SUBSTR(PARM,I+1,LENGTH(PARM)-I-1);
+   IF I=3 & SUBSTR(KEY,1,1)='#'
+     THEN IF VERIFY(SUBSTR(KEY,2,1),'0124356789')=0
+       THEN CALL SETLB(KEY,VAL);
+   IF I=2 & VERIFY(KEY,'0123456789')=0
+     THEN DO;
+       N = KEY;
+       ALLOCATE NCB;
+       NCBARY(N)=NCBPT;
+       CBPT,CURCCB,CURLCB,CURLINE=NULL;
+       CALL DOLR(CBPT,CURCCB,VAL);
+       END;
+     ELSE CALL SETR(KEY,VAL);
+   END DOOPER;
+
+ SETR:  PROC(KEY,VAL);
+ /**********************************************************************
+ *                                                                     *
+ *  SETR ESTABLISHES THE REPLACEMENT VALUE FOR REPLACEMENT VARIABLES   *
+ *                                                                     *
+ **********************************************************************/
+   DCL KEY CHAR(80) VAR;
+   DCL VAL CHAR(256) VAR;
+   DCL GBLSW BIT(1) STATIC INIT('0'B);
+   DCL SYMBOLPM CHAR(8);
+
+   SYMBOLPM=KEY;
+   CALL #SETC(RHHDRPT,RH_SYMTREE,SYMBOLPM,VAL); /* CALL SET@ */
+   END SETR;
+
+ DOLR:  PROC(NEWPT,OLDCCB,VAL) RECURSIVE;
+ /**********************************************************************
+ *                                                                     *
+ *  DOLR IS CALLED WHEN IT IS DETERMINED THAT KEY IS A SINGLE          *
+ *  DIGIT FROM 0 TO 9.  VAL IS THEN ASSUMED TO BE A LINE RANGE         *
+ *  SPECIFICATION.  SINCE A LINE RANGE SPECIFICATION MAY CONTAIN       *
+ *  A LINE RANGE SPECIFICATION, DOLR MAY BE RECURSIVELY INVOKED.       *
+ * -NEWPT IS A POINTER TO BE SET BY DOLR WITH THE ADDRESS OF THE       *
+ *  NEW CCB OR LCB.                                                    *
+ * -OLDCCB IS A POINTER CONTAINING NULL OR THE ADDRESS OF THE          *
+ *  CCB ON THE NEXT HIGHER LEVEL CONTROLLING THIS LINE RANGE.          *
+ *  IF DOLR CREATES A NEW CCB, IT WILL STORE THIS ADDRESS IN           *
+ *  THE CBUP FIELD OF THE NEW CCB.                                     *
+ * -VAL CONTAINS THE UNPARSED LINE RANGE SPECIFICATION.                *
+ *                                                                     *
+ **********************************************************************/
+   DCL BRKSW BIT(1) INIT('0'B);
+   DCL MYCOL FIXED BIN(15,0) INIT(1);
+   DCL MYLEN FIXED BIN(15,0) INIT(9999);
+   DCL (NEWPT,OLDCCB,MYCB,NEWCB) UNALIGNED PTR;
+   DCL VAL CHAR(256) VAR;
+   DCL (I,J,K,M,P,S) FIXED BIN(15,0);
+   DCL NOTSTR CHAR(1) VAR;
+   DCL (MYSTR,QUOTSTR) CHAR(80) VAR;
+   DCL PARY(16) CHAR(256) VAR;
+   DCL PARQCK(16) BIT(1);
+   DCL NUMCK BIT(16) STATIC INIT('0'B);
+   DCL QSTR ENTRY(CHAR(*) VAR, FIXED BIN(15,0),
+     CHAR(*) VAR, FIXED BIN(15,0));
+
+   I=#ABEPRS(VAL,PARY,PARQCK,NUMCK); /* PARS LINE RANGE SPEC */
+   IF I^=0
+     THEN SIGNAL CONDITION(RNGERR);
+   DO I = 1 TO HBOUND(PARY,1) WHILE(PARY(I)^='');
+     /* PARY(I) WILL BE IN ONE OF THE FOLLOWING FORMS:
+               FORM #1:  N
+               FORM #2:  N:N
+               FORM #3:  N:N:N
+               FORM #4:  (STRING B)
+               FORM #5:  (^STRING B)
+               FORM #6:  (#:COL:LEN B)
+               FORM #7:  (^#:COL:LEN B) */
+     IF SUBSTR(PARY(I),1,1)='('
+       THEN DO; /* IT IS STRING SPEC */
+         MYSTR=SUBSTR(PARY(I),2,LENGTH(PARY(I))-2);
+           /* GET RID OF CONTAINING PARENTHESES */
+         IF SUBSTR(MYSTR,1,1)='^'
+           THEN NOTSTR='^';
+           ELSE NOTSTR='';
+         IF SUBSTR(MYSTR,1+LENGTH(NOTSTR),1)=''''
+           THEN CALL QSTR(MYSTR,1+LENGTH(NOTSTR),QUOTSTR,J);
+           ELSE DO;
+             J = INDEX(MYSTR,' ');
+             K = INDEX(MYSTR,':');
+             IF K^=0
+               THEN J = K;
+             QUOTSTR = SUBSTR(MYSTR,1+LENGTH(NOTSTR),J-1-
+               LENGTH(NOTSTR));
+             IF QUOTSTR='#'
+               THEN BRKSW = '1'B;
+             END;
+         IF J<=LENGTH(MYSTR)
+           THEN IF SUBSTR(MYSTR,J,1)=':'
+             THEN DO;
+               M=INDEX(SUBSTR(MYSTR,J+1),' ')+J;
+               IF M=J
+                 THEN SIGNAL CONDITION(RNGERR);
+               K=INDEX(SUBSTR(MYSTR,J+1),':')+J;
+               IF K=J × K>M
+                 THEN K=M;
+               MYCOL=SUBSTR(MYSTR,J+1,K-J-1);
+               IF K^=M
+                 THEN IF SUBSTR(MYSTR,K+1,1)='+'
+                   THEN MYLEN=SUBSTR(MYSTR,K+2,M-K-2);
+                   ELSE DO;
+                     P=SUBSTR(MYSTR,K+1,M-K-1);
+                     IF P<MYCOL
+                       THEN SIGNAL CONDITION(RNGERR);
+                     MYLEN=P+1-MYCOL;
+                     END;
+                 ELSE MYLEN=LENGTH(QUOTSTR);
+               J=M;
+               END;
+         IF BRKSW
+           THEN DO;
+             QUOTSTR='';
+             S = MIN(MYLEN,256);
+             END;
+           ELSE S = LENGTH(QUOTSTR);
+         CALL ALC;
+         NEWCB->CCB='1'B;
+         NEWCB->CCBNOT=(1=LENGTH(NOTSTR));
+         NEWCB->CCBSTR=QUOTSTR;
+         MYSTR=SUBSTR(MYSTR,J);
+         IF MYSTR=''
+           THEN SIGNAL CONDITION(RNGERR);
+         CALL DOLR(NEWCB->CBDOWN,NEWCB,MYSTR);
+         END;
+       ELSE DO; /* IT IS N OR N:N FORM */
+         S = 0;
+         QUOTSTR,NOTSTR = '';
+         CALL ALC;
+         NEWCB->CCB='0'B;
+         CALL SETCAPS(PARY(I));
+         IF PARY(I)='A'
+           THEN PARY(I)='T:B';
+         J = INDEX(PARY(I),':');
+         IF J=0
+           THEN J,K=LENGTH(PARY(I))+1;
+           ELSE DO;
+             K = INDEX(SUBSTR(PARY(I),J+1),':')+J;
+             IF K=J
+               THEN K = LENGTH(PARY(I))+1;
+             END;
+         NEWCB->CBUP=GETL(SUBSTR(PARY(I),1,J-1));
+         IF J > LENGTH(PARY(I))
+           THEN NEWCB->CBDOWN=NEWCB->CBUP;
+           ELSE DO;
+             NEWCB->CBDOWN=GETL(SUBSTR(PARY(I),J+1,K-J-1));
+             IF K<LENGTH(PARY(I))
+               THEN NEWCB->CBINCR=SUBSTR(PARY(I),K+1);
+             END;
+         END;
+     END;
+
+ ALC:  PROC;
+ /**********************************************************************
+ *                                                                     *
+ *  ALC IS NESTED IN PROCEDURE DOLR.                                   *
+ *                                                                     *
+ **********************************************************************/
+   L = S;
+   ALLOCATE CB SET(NEWCB);
+   IF NEWPT = NULL
+     THEN NEWPT = NEWCB;
+     ELSE MYCB->CBNXT=NEWCB;
+   MYCB = NEWCB;
+   NEWCB->CBNXT=NULL;
+   NEWCB->CBUP=OLDCCB;
+   NEWCB->CBDOWN=NULL;
+   NEWCB->CCB='0'B;
+   NEWCB->CCBNOT=(1=LENGTH(NOTSTR));
+   NEWCB->CCBBRK=BRKSW;
+   NEWCB->CCBPAD='0'B;
+   NEWCB->CCBSTR=QUOTSTR;
+   NEWCB->CBINCR=1;
+   NEWCB->CBCOL=MYCOL;
+   NEWCB->CBLEN=MYLEN;
+   END ALC;
+
+ GETL:  PROC(NSTR) RETURNS(PTR);
+ /**********************************************************************
+ *                                                                     *
+ *  GETL IS NESTED IN PROCEDURE DOLR.                                  *
+ *  GETL IS CALLED TO PARS A LINE SPECIFICATION, AND TO OBTAIN         *
+ *  THE POINTER TO THAT LINE.  NSTR CONTAINS THE LINE SPECIFICATION.   *
+ *                                                                     *
+ **********************************************************************/
+   DCL (NSTR,TSTR) CHAR(80) VAR;
+   DCL (I,J,K) FIXED BIN(31,0);
+   DCL RETPTR PTR;
+
+   I = MAX(INDEX(NSTR,'+'),INDEX(NSTR,'-'));
+   IF I=0
+     THEN I = LENGTH(NSTR)+1;
+   TSTR = SUBSTR(NSTR,1,I-1);
+   SELECT(TSTR);
+     WHEN('T') RETPTR=NXTHDR;
+     WHEN('B') RETPTR=LSTHDR;
+     WHEN('*') RETPTR=RECPTR;
+     OTHERWISE DO;
+       IF VERIFY(TSTR,'0123456789')^=0
+         THEN SIGNAL CONDITION(RNGERR);
+       J = TSTR; /* J=BASE LINE # */
+       CALL #MD(RHPTR,RHHDRPT,J); /* CALL MDPROC */
+       IF RECSEQ^=J
+         THEN SIGNAL CONDITION(RNGERR);
+           /* GET OUT IF LINE NOT FOUND */
+       RETPTR=RECPTR;
+       END;
+     END;
+   IF RETPTR=HDPTR
+     THEN SIGNAL CONDITION(RNGERR);
+   IF I <= LENGTH(NSTR)
+     THEN DO;
+       TSTR=SUBSTR(NSTR,I+1);
+       IF LENGTH(TSTR)=0
+         THEN SIGNAL CONDITION(RNGERR);
+       IF VERIFY(TSTR,'0123456789')^=0
+         THEN SIGNAL CONDITION(RNGERR);
+           /* GET OUT IF OFFSET BAD */
+       K = TSTR;
+       DO K = 1 TO K;
+         IF SUBSTR(NSTR,I,1)='-'
+           THEN RETPTR=RETPTR->LSTPTR;
+           ELSE RETPTR=RETPTR->NXTPTR;
+         IF RETPTR=HDPTR
+           THEN SIGNAL CONDITION(RNGERR);
+         END;
+       END;
+   RETURN(RETPTR);
+   END GETL;
+   END DOLR;
+
+ SETN: PROC RETURNS(BIT(1));
+ /**********************************************************************
+ *                                                                     *
+ *  SETN SETS VARIABLES &0 TO &9 WITH THE NEXT LINE NUMBER IN          *
+ *  THE RANGE.  RETURNS '1'B WHEN ALL RANGES PROCESSED AT LEAST ONCE.  *
+ *                                                                     *
+ **********************************************************************/
+   DCL (KEY,NKEY,LKEY) CHAR(80) VAR;
+   DCL (VAL,NVAL,LVAL,CVAL) CHAR(256) VAR;
+   DCL HITSW BIT(1);
+   DCL CTLKEY CHAR(80) VAR STATIC INIT('CTL');
+   DCL BRK BIT(1);
+   DCL (I,N) FIXED BIN;
+   DCL PIC PIC'ZZZZZZZ9';
+   DCL (CPT,TPT) PTR;
+   DCL RETBIT BIT(1);
+
+   VAL = '';
+   DO N = 0 TO 9;
+     PIC = N;
+     KEY = SUBSTR(PIC,8,1);
+     NKEY = 'N'××KEY;
+     LKEY = 'L'××KEY;
+     VAL,NVAL,LVAL = '';
+     IF NCBARY(N)^=NULL
+       THEN DO;
+         DO UNTIL(TPT=NULL);
+           CALL GETN(N);
+           TPT = NCBARY(N)->CURCCB;
+           NLUP: DO WHILE(TPT^=NULL);
+             IF TPT->CCBBRK
+               THEN DO; /* IT IS CONTROL BREAK CCB */
+                 IF NCBLOOP(N)
+                   THEN BRK='1'B;
+                   ELSE IF LENGTH(NCBARY(N)->CURLINE->RECSTR)<
+                     TPT->CBCOL
+                     THEN IF TPT->CCBSTR^=''
+                       THEN BRK='1'B;
+                       ELSE BRK='0'B;
+                     ELSE IF TPT->CCBSTR^=SUBSTR(NCBARY(N)->
+                       CURLINE->RECSTR,TPT->CBCOL,MIN(LENGTH(
+                       NCBARY(N)->CURLINE->RECSTR)+1-TPT->CBCOL,
+                       TPT->CBLEN))
+                       THEN BRK='1'B;
+                       ELSE BRK='0'B;
+                 IF BRK
+                   THEN DO;
+                     IF LENGTH(NCBARY(N)->CURLINE->RECSTR)<
+                       TPT->CBCOL
+                       THEN TPT->CCBSTR='';
+                       ELSE TPT->CCBSTR=SUBSTR(NCBARY(N)->
+                         CURLINE->RECSTR,
+                         TPT->CBCOL,MIN(LENGTH(NCBARY(N)->
+                         CURLINE->RECSTR)+1-TPT->CBCOL,
+                         TPT->CBLEN));
+                     CVAL=TPT->CCBSTR;
+                     CALL SETR(CTLKEY,CVAL);
+                     END;
+                 IF (^BRK&^TPT->CCBNOT) × (BRK&TPT->CCBNOT)
+                   THEN LEAVE NLUP; /* NOT ELIGIBLE IF NOT
+                     CONTROL BREAK & '^' WAS NOT SPECIFIED, OR
+                     IF CONTROL BREAK AND '^' SPECIFIED */
+                 END;
+               ELSE DO;
+                 IF LENGTH(NCBARY(N)->CURLINE->RECSTR)<TPT->CBCOL
+                   THEN IF TPT->CCBSTR=''
+                     THEN HITSW='1'B;
+                     ELSE HITSW='0'B;
+                   ELSE IF INDEX(SUBSTR(NCBARY(N)->CURLINE->
+                     RECSTR,TPT->CBCOL,MIN(LENGTH(NCBARY(N)->
+                     CURLINE->RECSTR)+1-TPT->CBCOL,TPT->CBLEN)),
+                     TPT->CCBSTR)=0
+                     THEN HITSW='0'B;
+                     ELSE HITSW='1'B;
+                 IF (^HITSW&^TPT->CCBNOT) × (HITSW&TPT->CCBNOT)
+                   THEN LEAVE NLUP;
+                 END;
+             TPT=TPT->CBUP;
+             END NLUP;
+           IF NCBLOOP(N)
+             THEN LEAVE;
+           END;
+         IF TPT=NULL
+           THEN DO;
+             PIC=NCBARY(N)->CURLINE->RECSEQ;
+             VAL=SUBSTR(PIC,PREFIX(PIC,' '));
+             IF NCBARY(N)->CURLINE->LSTPTR=HDPTR
+               THEN PIC=0;
+               ELSE PIC=NCBARY(N)->CURLINE->LSTPTR->RECSEQ;
+             LVAL=SUBSTR(PIC,PREFIX(PIC,' '));
+             IF NCBARY(N)->CURLINE->NXTPTR=HDPTR
+               THEN PIC=0;
+               ELSE PIC=NCBARY(N)->CURLINE->NXTPTR->RECSEQ;
+             NVAL=SUBSTR(PIC,PREFIX(PIC,' '));
+             END;
+         END;
+     CALL SETR(KEY,VAL);
+     CALL SETR(NKEY,NVAL);
+     CALL SETR(LKEY,LVAL);
+     END;
+   RETBIT='1'B;
+   DO N = 0 TO 9;
+     IF NCBARY(N) ^= NULL
+       THEN RETBIT=RETBIT & NCBDONE(N);
+     END;
+   RETURN(RETBIT);
+   END SETN;
+
+ GETN:  PROC(N);
+ /**********************************************************************
+ *                                                                     *
+ *  GETN SETS CURLINE TO THE NEXT LINE.  IF THE ENTIRE RANGE HAS BEEN  *
+ *  PROCESSED, GETN WILL TURN ON NCBDONE(N), AND WILL GET              *
+ *  THE FIRST LINE OF THE RANGE.                                       *
+ *                                                                     *
+ **********************************************************************/
+   DCL (I,N) FIXED BIN;
+   DCL CPT PTR;
+
+   IF NCBLOOP(N)
+     THEN NCBLOOP(N)='0'B;
+   IF NCBARY(N)->CURLINE^=NULL
+     THEN DO; /* WE ARE NOT AT START OF RANGE */
+       IF NCBARY(N)->CURLINE^=NCBARY(N)->CURLCB->CBDOWN
+         THEN DO; /* WE ARE NOT AT END OF THIS SUB-RANGE */
+           DO I=1 TO NCBARY(N)->CURLCB->CBINCR
+             WHILE(NCBARY(N)->CURLINE^=NCBARY(N)->CURLCB->CBDOWN);
+             NCBARY(N)->CURLINE = NCBARY(N)->CURLINE->NXTPTR;
+             IF NCBARY(N)->CURLINE = HDPTR
+               THEN NCBARY(N)->CURLINE = NXTHDR;
+             END;
+           IF I<=NCBARY(N)->CURLCB->CBINCR
+             THEN CALL GETNS(N); /* IT IS END OF SUBRANGE */
+           END;
+         ELSE CALL GETNS(N); /*WE ARE AT END OF THIS SUB-RANGE*/
+       END;
+   IF NCBARY(N)->CURLINE = NULL
+     THEN DO; /* IT IS START OF RANGE */
+       DO CPT = NCBARY(N)->CBPT REPEAT CPT->CBDOWN
+         WHILE(CPT->CCB);
+         NCBARY(N)->CURCCB = CPT;
+         END;
+       NCBARY(N)->CURLCB = CPT;
+       NCBARY(N)->CURLINE = CPT->CBUP;
+       END;
+
+ GETNS:  PROC(N);
+ /**********************************************************************
+ *                                                                     *
+ *  GETNS IS NESTED IN PROCEDURE GETN.                                 *
+ *  GETNS IS CALLED AT END OF SUB-RANGE.  IT WILL GET NEXT SUB-RANGE,  *
+ *  OR IF NO MORE SUBRANGES, WILL SET CURLINE TO NULL, AND WILL SET    *
+ *  NCBDONE(N)='1'B                                                    *
+ *                                                                     *
+ **********************************************************************/
+   DCL N FIXED BIN;
+
+   NCBARY(N)->CURLINE=NULL;
+   DO UNTIL(NCBARY(N)->CURCCB=NULL × NCBARY(N)->CURLINE^=NULL);
+     DO CPT = NCBARY(N)->CURLCB->CBNXT
+       REPEAT CPT->CBDOWN WHILE(CPT ^= NULL);
+       IF ^CPT->CCB
+         THEN LEAVE; /* GET OUT WITH FIRST LCB */
+       NCBARY(N)->CURCCB = CPT;
+       END;
+     IF CPT = NULL
+       THEN DO; /* IT IS END OF SUBRANGE - NO LCB YET */
+         DO WHILE(NCBARY(N)->CURCCB ^= NULL) UNTIL(CPT ^= NULL);
+           /* THERE IS A HIGHER LEVEL */
+           CPT = NCBARY(N)->CURCCB->CBNXT;
+           NCBARY(N)->CURCCB = NCBARY(N)->CURCCB->CBUP;
+             /* CURCCB = PREVIOUS LEVEL, OR NULL */
+           IF CPT^=NULL
+             THEN DO CPT = CPT REPEAT CPT->CBDOWN WHILE(CPT->CCB);
+               NCBARY(N)->CURCCB = CPT;
+               END;
+           END;
+         END;
+     IF CPT ^= NULL
+       THEN DO; /* WE HAVE NEXT LCB */
+         NCBARY(N)->CURLCB=CPT;
+         NCBARY(N)->CURLINE=CPT->CBUP;
+         END;
+       ELSE NCBDONE(N),NCBLOOP(N)='1'B; /*  RANGE PROCESSED */
+     END;
+   END GETNS;
+   END GETN;
+
+ SETLB:  PROC(KEY,VAL);
+ /**********************************************************************
+ *                                                                     *
+ *  SETLB RECEIVES CONTROL TO PROCESS A #N OPERAND                     *
+ *  A TYPICAL OPERAND OF THIS KIND WOULD BE #1(10:-1:3), WHERE #1 IS   *
+ *  THE NAME OF THE INCREMENTAL SYMBOLIC VARIABLE, 10 IS THE INITIAL   *
+ *  VALUE TO WHICH #1 IS TO BE SET,  -1 IS THE INCREMENT TO BE         *
+ *  ADDED TO #1 EACH TIME IT IS REFERENCED, AND 3 IS THE LENGTH OF     *
+ *  THE REPLACEMENT VALUE.  IF #1(10:-1) HAD BEEN SPECIFIED, THE       *
+ *  LENGTH OF THE REPLACEMENT VALUE WOULD BE EQUAL TO THE NUMBER OF    *
+ *  SIGNIFICANT DIGITS IN THE REPLACEMENT VALUE.                       *
+ *                                                                     *
+ **********************************************************************/
+   DCL KEY CHAR(80) VAR;
+   DCL VAL CHAR(256) VAR;
+   DCL IX FIXED BIN(15,0);
+   DCL (I,J,K,L) FIXED BIN(31,0);
+
+   IX = SUBSTR(KEY,2);
+   IF IX < 0 × IX > 9
+     THEN SIGNAL ERROR;
+   I = INDEX(VAL,':');
+   IF I=0
+     THEN LBSTRT(IX)=VAL;
+     ELSE DO;
+       LBSTRT(IX)=SUBSTR(VAL,1,I-1);
+       VAL=SUBSTR(VAL,I+1);
+       I=INDEX(VAL,':');
+       IF I=0
+         THEN LBINCR(IX)=VAL;
+         ELSE DO;
+           LBINCR(IX)=SUBSTR(VAL,1,I-1);
+           LBLEN(IX)=SUBSTR(VAL,I+1);
+           END;
+       END;
+   IF LBLEN(IX)>8
+     THEN DO;
+       MSGDATA='LENGTH SPEC. FOR #N VARIABLE MUST BE <=8';
+       SIGNAL CONDITION(RNGERR);
+       END;
+   END SETLB;
+
+ REPLB:  PROC;
+   DCL (IX,IL,I,LB,L,J) FIXED BIN(15,0);
+   DCL TXT CHAR(8) VAR;
+   DCL PIC PIC'99999999';
+   IL = LENGTH(BF);
+   IX = 0;
+   DO UNTIL(IX >= BUFLEN-4);
+     I=INDEX(SUBSTR(BF,IX+1,BUFLEN-4-IX),'&');
+     IF I=0
+       THEN RETURN;
+     IX=IX+I;
+     IF SUBSTR(BF,IX+1,1)='&'
+       THEN IX=IX+1;
+       ELSE IF SUBSTR(BF,IX+1,1)='#'
+         THEN IF VERIFY(SUBSTR(BF,IX+2,1),'0123456789')=0
+           THEN DO;
+             LB=SUBSTR(BF,IX+2,1);
+             PIC=LBSTRT(LB);
+             LBSTRT(LB)=LBSTRT(LB)+LBINCR(LB);
+             IF LBLEN(LB)^=0
+               THEN TXT=SUBSTR(PIC,8-LBLEN(LB)+1);
+               ELSE DO;
+                 J=VERIFY(PIC,'0');
+                 IF J=0
+                   THEN J=8;
+                 TXT=SUBSTR(PIC,J);
+                 END;
+             L=LENGTH(TXT);
+             BUFLEN=BUFLEN-3+L;
+             IF BUFLEN > IL
+               THEN BUFLEN = IL;
+             J=IX+3;
+             IF IL > J
+               THEN SUBSTR(BF,IX,IL-IX)=TXT××
+                 SUBSTR(BF,J,IL-J);
+               ELSE SUBSTR(BF,IX,IL-IX)=TXT;
+             IX=IX-1;
+             END;
+     END;
+   END REPLB;
+
+ BADEXIT:
+   IF MSGDATA=''
+     THEN MSGDATA='INVALID LINE RANGE';
+   RHRC = 8;
+   END ABE028;

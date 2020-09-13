@@ -1,0 +1,242 @@
+*          DATA SET SRCHVOL    AT LEVEL 001 AS OF 07/17/78
+SRCHVOL  CSECT
+*
+* SUBROUTINE SRCHVOL - TO FIND USER/JOBS ENQUEUED ON A VOLUME .
+*
+*
+*
+* CALLING SEQUENCE :
+*
+*       WHOGOTIT = ''; /* REQUIRED TO INITIALIZE STRUCTURE */
+*       CALL SRCHVOL(VOLSER,WHOGOTIT,#ENTRIES,RETURN_CODE);
+*
+* WHERE:
+*
+*      DCL  1  WHOGOTIT(#ENTRIES),
+*             2 USER    CHAR(8),
+*             2 FLAGS,
+*               3 FOUND BIT(1),
+*               3 JOB   BIT(1),
+*               3 OLD   BIT(1),
+*           #ENTRIES    FIXED BIN(15,0)  INIT( --DESIRED NUMBER--),
+*           RETURN_CODE FIXED BIN(15,0),
+*           VOLSER      CHAR(44),
+*
+*           SRCHVOL     ENTRY   OPTIONS(ASSEMBLER);
+*
+*  ON RETURN:
+*
+*     WHOGOTIT STRUCTURE WILL CONTAIN THE USERID/JOBNAMES OF USERS
+*       ENQUEUED ON VOLSER ALONG WITH THEIR STATUS (OLD/SHR).
+*     RETURN_CODE = 0 .. NO ERRORS
+*                   4 .. NO ERRORS..VOL NOT ALLOCATED
+*                   8 .. ERROR IN VOLSER..UNABLE TO PROCESS
+*                  12 .. RAN OUT OF ROOM TO RECORD ADDIT USERS.
+*                  16 .. NO ROOM IN WHOGOTIT TO RECORD USAGE AT ALL!
+*
+*
+*
+         SAVE  (14,11),,SRCHVOL           SAVE PLI REGS IN SAVE AREA
+         LR    R4,R12                 SAVE R12 BECAUSE PLI GETS UNHAPPY
+         BALR  R12,0
+         USING *,R12
+         ST    R4,REG12                AND 0C1'S AND 0C6'S...
+         LA    R4,PLISAVE             CHAIN MY SAVE AREA
+         ST    R13,PLISAVE+4          SAVE PLI ADDR
+         LA    R13,PLISAVE              AND LINKIT..
+         EJECT
+         LM    R2,R5,0(R1)            PICK UP ADDRESSES OF ARGS
+         STM   R2,R5,ARGS              AND SAVE
+*
+         L     R11,WHOGOT@            LOAD ADDR OF START OF STRUCT.
+         USING WHOGOT,R11               ESTAB. ADDRESSABILITY
+*
+         L     R4,#ENTR@
+         SR    R5,R5
+         LH    R5,0(R4)               (R5)= MAX # ENTRIES
+         LTR   R5,R5
+         BNP   NOTENUF                 SPLIT IF <= 0
+         MVC   USER,BLANKS            INIT FIRST ENTRY
+         MVI   FLAGS,X'00'              TO NOBODY HOME..
+*
+         L     R3,VOL@                (R3)=ADDR START OF VOLSER
+         LA    R5,6                   MAX # CHARS = 6
+         LR    R4,R3                  POINT TO START.
+*
+VOL1     CLI   0(R4),X'40'            FIND LAST CHAR
+         BE    VOL2                     OF VOLSER
+         LA    R4,1(R4)                    BUMP CNT AND
+         BCT   R5,VOL1                        LOOP
+         SPACE 2
+VOL2     SR    R4,R3                    (R4) = LENGTH OF VOLSER
+         LTR   R4,R4                    MUST BE >= 1 CHAR
+         BNP   ERRVOL                   SPLIT IF NOT...
+*
+         LR    R8,R4                    LOAD LENGTH OF VOLSER
+         LA    R5,6                      AND THE MAX ALLOWED
+         CR    R8,R5                    IF LENGTH >6
+         BH    ERRVOL                    THEN SPLIT...
+         MVI   VOLSER,C' '              CLEAR VOLSER WITH BLANKS
+         MVC   VOLSER+1(L'VOLSER-1),VOLSER
+*
+         BCTR  R4,0                     ADJ LENGTH FOR MVC
+         EX    R4,MOVEFQ                MOVE VOLSER INTO OUR AREA
+*
+         LR    R7,R8                    CONVERT VOLSER TO UPPERCASE
+         LA    R2,VOLSER                 BY SNEAKLY ORING IN
+CONV     OI    0(R2),X'40'               A BLANK...HEE HEE
+         LA    R2,1(R2)
+         BCT   R7,CONV
+         EJECT
+* NOW BEGIN SEARCH. FIRST LOOK AT MAJOR QCB CHAIN FOR MAJNAME=SYSVOL
+* THEN SEARCH ASSOCIATED MINOR QCB CHAIN FOR OUR VOLUME NAME.
+* THEN USE THE MINOR QCB TO POINT TO THE QELS FOR THIS ENQUEUE.
+* FROM THE QELS GET THE ASID OF THE USER ENQUEUED ON THE VOLUME.
+* USING ASID..LOCATE ASCB FOR THIS USER, AND GET TSOUID OR JOBNAME
+*  FROM ASCB......WHEW....
+*
+         L     R2,16                   ADDRESS OF CVT
+         L     R2,640(R2)              ADDRESS OF FIRST MAJOR QCB
+QCBNEXT  LTR   R2,R2
+         BZ    NOFIND
+         CLC   16(8,R2),SYSVOL
+         BE    FINDVOL
+         L     R2,0(R2)                ADDRESS OF NEXT MAJOR QCB
+         B     QCBNEXT
+         SPACE 2
+FINDVOL  L     R3,8(R2)                ADDRESS OF FIRST MINOR QCB
+         SR    R4,R4
+NEXTMIN  LTR   R3,R3
+         BZ    NOFIND
+         IC    R4,16(R3)               LENGTH OF QCB NAME
+         CR    R4,R8
+         BNE   INCR
+         BCTR  R4,R0
+         EX    R4,COMPVOL
+         BE    GETQEL
+INCR     L     R3,0(R3)                ADDRESS OF NEXT MINOR QCB
+         B     NEXTMIN
+         EJECT
+GETQEL   L     R4,#ENTR@
+         SR    R5,R5
+         LH    R5,0(R4)               (R5)= MAX # ENTRIES
+         LA    R4,0                   (R4) = CNT OF ENTRIES USED
+         L     R3,8(R3)               (R3) = ADDR OF FIRST QEL..
+         B     CHKQEL                 GO PROCESS IT..
+*
+NEXTQEL  L     R3,0(R3)               (R3) = ADDR OF NEXT QEL
+CHKQEL   LTR   R3,R3                  ANYBODY HOME IN THERE?
+         BZ    OKFIN                  NOPE-SPLIT..
+*
+         CR    R4,R5                  ANY ROOM IN TABLE FOR ENTRY?
+         BNL   NOROOM                 NO-SPLIT
+         LA    R4,1(R4)               YES-> BUMP CNT OF ENTRIES
+         MVC   USER,BLANKS            INITIALIZE ENTRY
+         MVI   FLAGS,X'00'
+         BAL   R6,FINDJN              GO FIND THE USERS STUFF..
+*
+         B     NEXTQEL                GO GET ANOTHER ONE..
+         EJECT
+NOTENUF  LA    R15,16
+         B     GOBACK
+*
+NOROOM   LA    R15,12
+         B     GOBACK
+*
+ERRVOL   LA    R15,8
+         B     GOBACK
+*
+NOFIND   LA    R15,4
+         B     GOBACK
+*
+OKFIN    LA    R15,0
+*
+GOBACK   L     R2,RETCD@       GET ADDR OF RETURN CODE
+         STH   R15,0(R2)       AND GIVE IT BACK TO CALLER
+*
+         L     R13,4(R13)          RESTORE PLI REGS...
+         LM    R14,R11,12(R13)       AND RETURN
+         L     R12,REG12
+         BR    R14                 TO PLI...
+         EJECT
+*        FINDJN    -    FINDS THE JOB/USER NAME, AND MOVES IT
+*                       AND THE FLAGS TO THE USERS STRUCTURE
+*
+*                       REG. 3  -  ADDRESS OF QEL
+*                       REG. 6  -  RETURN REG.
+*                       REG. 7  -  WORK REG.
+*                       REG. 8  -  WORK REG.
+*                       REG. 9  -  WORK REG.
+*                       REG. 10 -  WORK REG.
+*                       REG. 11 -  PTR TO CURRENT ENTRY IN STRUCTURE
+         SPACE 4
+FINDJN   OI    FLAGS,FOUND    SAY WE FOUND AN ENTRY
+         TM    12(R3),X'80'   IS IT OLD OR SHR
+         BO    SHR            ITS SHARE..
+         OI    FLAGS,OLD      ITS OLD..SAY SO
+*
+SHR      SR    R10,R10
+         LH    R10,14(R3)     LOAD ASID FROM QEL
+         L     R8,16          (R8)=ADDR( CVT )
+         L     R8,556(R8)     (R8)=ADDR( ASVT )
+         LA    R8,524(R8)     (R8)=ADDR( STRT OF ASCB PTRS )
+*                             (NOTE: ASID#1 PTR IS 4 BYTES UP FROM HERE
+*                              SO THIS IS ACTUALLY 4 BYTES BELOW THE
+*                              START OF THE ASVTENTY LOCATIONS.)
+         SLL   R10,2          GEN WRD OFFSET FOR ASCB PTR
+         AR    R8,R10         (R10)=ADDR( ASCB PTR FOR THIS ASID)
+         L     R8,0(R8)       (R8)=ADDR( ASCB )
+*
+         L     R7,172(R8)     (R7)=ADDR( JOBNAME FOR INIT TASKS )
+         LTR   R7,R7          IF NOT THERE, MUST BE TSO
+         BZ    DOTSO          ->ITS A TSO JOB..(I HOPE)
+*
+         OI    FLAGS,JOB      SAY ITS A BATCH JOB
+         B     MOVEIT         GO MOVE THE NAME
+*
+DOTSO    L     R7,176(R8)     (R7)=ADDR(TSO/STRT/MOUNT JOBNAME)
+*
+MOVEIT   MVC   USER,0(R7)      MOVE JOB NAME/USERID INTO STRUCT
+*
+         LA    R11,WHOGOTL(R11)  BUMP STRUCTURE POINTER
+         BR    R6
+         EJECT
+MOVEFQ   MVC   VOLSER(0),0(R3)      EXECUTED INSTRUCTION
+COMPVOL  CLC   20(0,R3),VOLSER      EXECUTED INSTRUCTION
+VOLSER   DC    CL6' '
+SYSVOL   DC    CL8'SYSZVOLS'
+ARGS     DS    0F                   PLACE TO STORE CALLING ARGS
+VOL@     DS    A
+WHOGOT@  DS    A
+#ENTR@   DS    A
+RETCD@   DS    A
+BLANKS   DC    CL8' '
+PLISAVE  DC     20F'0'
+REG12    DS    F
+         EJECT
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         SPACE 4
+WHOGOT   DSECT     ,      MAPPING FOR STRUCTURE
+USER     DS    CL8
+FLAGS    DS    XL1
+WHOGOTL  EQU   *-WHOGOT
+*
+FOUND    EQU   B'10000000'
+JOB      EQU   B'01000000'
+OLD      EQU   B'00100000'
+         END

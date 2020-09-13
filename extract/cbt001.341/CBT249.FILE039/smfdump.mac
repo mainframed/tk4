@@ -1,0 +1,364 @@
+SMFDUMP  TITLE 'SMF DUMP ROUTINE TO DUMP MANX AND/OR MANY (MVS W/SU-S)'
+         PRINT NOGEN
+***********************************************************************
+*                                                                     *
+*       ----- THIS ROUTINE WAS LIFTED FROM THE MVS IPO SYSTEM         *
+*       ----- AND MODIFIED AS DESCRIBED BELOW.                        *
+*                                                                     *
+*             MODULE NAME = SMFDUMP                                   *
+*                                                                     *
+*             DESCRIPTIVE NAME = SMF DATASET DUMP ROUTINE             *
+*                                                                     *
+*             COPYRIGHT = NONE                                        *
+*                                                                     *
+*             FUNCTION =                                              *
+*                DUMP SYS1.MANX AND/OR SYS1.MANY DEPENDING WHICH IS   *
+*                ACTIVE AND HAS DATA TO DUMP.                         *
+*                                                                     *
+*                OPERATION =                                          *
+*                   CHECK THAT DUMPOUT DD IS PRESENT.                 *
+*                   CHECK THAT DUMPOUT DEVICE TYPE IS DISK OR TAPE    *
+*                   IF SMF RECORDING NOT ACTIVE EXIT                  *
+*                   DUMP INACTIVE DATASET (X OR Y) VIA LINK TO        *
+*                     IFASMFDP ROUTINE.                               *
+*                   IF BOTH DATASETS ARE FULL FIRST DUMP ALTERNATE    *
+*                     AND RE-START THE SMF DUMP TASK VIA SVC 34.      *
+*                                                                     *
+*              NOTES =                                                *
+*                                                                     *
+*                 DEPENDENCIES = CHARACTER SET IS EBCDIC.  REASSEMBLE *
+*                    IF A DIFFERENT CHARACTER SET IS NEEDED.          *
+*                                                                     *
+*                 RESTRICTIONS =                                      *
+*                    BOTH SYS1.MANX AND SYS1.MANY MUST BE CATALOGED   *
+*                    DATASETS ON DIRECT ACCESS DEVICES.               *
+*                    DUMPOUT DEVICE MUST BE DISK OR TAPE.             *
+*                                                                     *
+*                 REGISTER CONVENTIONS = STANDARD CONVENTIONS.        *
+*                    REGISTERS 0 TO 3  = WORK REGISTERS               *
+*                    REGISTERS 4 TO 6  = UNUSED                       *
+*                    REGISTER   7      = LINKAGE TO INTERNAL ROUTINES *
+*                    REGISTERS 8 TO 10 = UNUSED                       *
+*                    REGISTER  11      = ADDRESSABILITY TO SMCA DSECT *
+*                    REGISTER  12      = ADDRESSABILITY TO SMFDUMP    *
+*                                        CSECT                        *
+*                    REGISTER  13      = SAVE AREA REGISTER           *
+*                    REGISTERS 14,15   = WORK REGISTERS               *
+*                                                                     *
+*                PATCH LABEL = PATCH (UNUSED AND INTIALIZED TO        *
+*                   BINARY ZEROES)                                    *
+*                                                                     *
+*             MODULE TYPE = PROCEDURE                                 *
+*                                                                     *
+*                PROCESSOR = ASM                                      *
+*                                                                     *
+*                MODULE SIZE = 1200 BYTES                             *
+*                                                                     *
+*                ATTRIBUTES = KEY 8, NON-REENTRANT,                   *
+*                   PROBLEM PROGRAM STATE,AUTHORIZED                  *
+*                                                                     *
+*             ENTRY POINTS = SMFDUMP (ONLY ENTRY POINT)               *
+*                                                                     *
+*                LINKAGE = STANDARD (SAVE/RETURN MACROS)              *
+*                                                                     *
+*             INPUT = NONE                                            *
+*                                                                     *
+*             OUTPUT = NONE                                           *
+*                                                                     *
+*             EXIT - NORMAL = AT PROGRAM END VIA BRANCH REGISTER 14   *
+*                                                                     *
+*                OUTPUT = NONE                                        *
+*                                                                     *
+*                RETURN CODES =                                       *
+*                   00 = NORMAL RETURN (DAILY RUN)                    *
+*                   04 = NORMAL RETURN (MONTHLY RUN)                  *
+*                   08 = IFASMFDP RETURNED NON-ZERO RETURN CODE       *
+*                   12 = UNUSED                                       *
+*                   16 = DUMPOUT DD MISSING                           *
+*                   20 = NO SMF DATA SET AVAILABLE TO DUMP            *
+*                                                                     *
+*             EXIT - ERROR = NONE - PROGRAM WILL RETURN WITH          *
+*                CODE IN REGISTER 15                                  *
+*                                                                     *
+*                OUTPUT = NONE                                        *
+*                                                                     *
+*                RETURN CODE = ZERO                                   *
+*                                                                     *
+*             EXTERNAL REFERENCES =                                   *
+*                                                                     *
+*                ROUTINES = IFASMFDP, IKJEFF18                        *
+*                                                                     *
+*                DATA AREAS = NONE                                    *
+*                                                                     *
+*                CONTROL BLOCKS = SMCA, CVT.                          *
+*                                                                     *
+*             TABLES = NONE                                           *
+*                                                                     *
+*             MACROS = SAVE, DEVTYPE, WTO, MODESET, RETURN, DYNALLOC, *
+*                      LINK, IEESMCA.                                 *
+*                                                                     *
+*             CHANGE ACTIVITY = NONE                                  *
+*                                                                     *
+*             MESSAGES =                                              *
+*                DAIRFAIL SERVICE ROUTINE IS USED TO ISSUE MESSAGES.  *
+*                THOSE ISSUED BY THE COMMAND ARE FOUND FOLLOWING THE  *
+*                LABEL ERRMSGS.                                       *
+*                                                                     *
+*             ABEND CODES = NONE                                      *
+*                                                                     *
+***********************************************************************
+         EJECT
+SMFDUMP  CSECT ,                       CSECT NAME DECLARED
+*
+*  CONSTANT EQUATES
+*
+CMDSVC   EQU   34                      SVC TO ISSUE COMMAND
+CVTPTR   EQU   X'10'                   OFFSET OF CVT ADDRESS
+CVTSMCA  EQU   196                     OFFSET OF SMCA PTR IN CVT
+DASD     EQU   X'20'                   UCB DEVICE TYPE FOR DASD DEVICES
+TAPE     EQU   X'80'                   UCB DEVICE TYPE FOR TAPE DEVICES
+ONEMIN   EQU   60                      60 SECONDS PER MINUTE (LOOP CNT)
+*
+K0       EQU   0                       CONSTANT 0
+K1       EQU   1                       CONSTANT 1
+K2       EQU   2                       CONSTANT 2
+K4       EQU   4                       CONSTANT 4
+K8       EQU   8                       CONSTANT 8
+K12      EQU   12                      CONSTANT 12
+K16      EQU   16                      CONSTANT 16
+*
+* REGISTER EQUATES
+*
+R00      EQU   00
+R01      EQU   01
+R02      EQU   02
+R03      EQU   03
+R04      EQU   04
+R05      EQU   05
+R06      EQU   06
+R07      EQU   07
+R08      EQU   08
+R09      EQU   09
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         EJECT
+         SAVE  (14,12),,SMFDUMP_&SYSDATE SAVE REGISTERS
+         USING SMFDUMP,R12             SET UP BASE ADDRESSABILITY
+         LR    R12,R15                 LOAD BASE REG WITH ENTRY POINT
+         LA    R14,SAVE                GET ADDRESS OF REGISTER SAVE
+         ST    R13,K4(R14)             SAVE CALLER'S SAVE AREA ADDR
+         ST    R14,K8(R13)             SAVE MY SAVE AREA ADDRESS
+         LR    R13,R14                 LOAD SAVE AREA ADDRESS
+*
+* CHECK FOR USER SPECIFIED PARM OVERRIDE
+*
+         L     R01,0(R01)     GET PARM POINTER
+         LH    R02,0(R01)     GET PARM SIZE IF ANY
+         LTR   R02,R02        ANY PARM?
+         BZ    DEFAULT        NO, USE SMCA
+         CH    R02,=H'1'      OVERRIDE PROVIDED, CHECK SIZE
+         BNE   PARMERR        INVALID SIZE, INFORM USER
+         CLI   2(R01),C'X'    VALID OPTION?
+         BE    SETXY          YES, SET UP DYNALLOC DSNAME
+         CLI   2(R01),C'Y'    VALID OPTION?
+         BNE   PARMERR        NO, INFORM USER
+SETXY    MVC   MANXY,2(R01)   MOVE IN USER REQUEST
+         OI    OPTION,PRESET  INDICATE USER OVERRIDE
+*
+* CHECK FOR DUMPOUT DD PRESENT
+*
+DEFAULT  DEVTYPE DDOUT,DEVAREA         GET DEVICE TYPE OF DUMPOUT DD
+         LTR   R15,R15                 IS DUMPOUT DD PRESENT?
+         BNZ   NODDOUT                 DD MISSING BR TO ERROR RTN
+*
+* CHECK DEVICE TYPE OF DUMPOUT DEVICE(TAPE OR DASD)
+*
+         CLI   DEVAREA+K2,DASD         IS DUMPOUT A DASD DEVICE
+         BE    OKTODUMP                YES, BR TO CONTINUE PROCESSING
+         CLI   DEVAREA+K2,TAPE         IS DUMPOUT A TAPE DEVICE
+         BNE   NOCANDMP                NO, INVLAID DEVICE TYPE BR
+*
+* CHECK SMF TASK AND DATASET STATUS
+*
+OKTODUMP TM    OPTION,PRESET           DID USER OVERRIDE?
+         BO    COMMON                  YES, GO TO COMMON CODE
+         L     R11,CVTPTR(K0,K0)       LOAD ADDRESS OF CVT
+         L     R11,CVTSMCA(,R11)       GET ADDRESS OF SMCA
+         USING SMCABASE,R11            GET SMCA BASE ADDRESS
+         TM    SMCAMISC,SMCAUSER+SMCAMAN  IS SMF RECORDING?
+         BZ    SMFERROR                NO, NOTHING TO DUMP
+         TM    SMCASTA,SMCAPNAV+SMCAPTAP+SMCAPMTY  IS INACTIVE DATSET
+*                                      EMPTY OR NOT AVAILABLE?
+         BNZ   SMFERROR                YES, - THEN CANNOT DUMP IT
+         MVC   MANXY,SMCAYORX          MOVE IN SUFFIX(X/Y) IN DSNAME
+         TM    SMCASWA,SMCADSTR        ARE BOTH DATASETS FULL?
+         BZ    COMMON                  NO, CONTINUE
+         OI    OPTION,BOTHFULL         YES, SET INDICATOR
+COMMON   BAL   R07,DALOC               CALL DUMP SUBROUTINE
+         TM    OPTION,BOTHFULL         WERE BOTH DATASETS FULL?
+         BZ    EXIT                    NO, - THEN DONE PROCESSING
+*
+* ISSUE 'START SMFDUMP' COMMAND AND RETURN TO THE SYSTEM
+*
+SMFSTART MODESET MF=(E,SUPRMOD)        GET IN SUPR STATE FOR SVC 34
+         SLR   R00,R00                 CLEAR REG 0
+         LA    R01,CMDSTART            GET ADDRESS OF COMMAND BUF
+         SVC   CMDSVC                  ISSUE COMMAND VIA SVC 34
+         MODESET MF=(E,PROBMOD)        GET BACK IN PROB STATE
+*
+* RETURN BACK TO CALLER
+*
+EXIT     SLR   R15,R15                 SET NORMAL RETURN CODE
+EXITR    L     R13,K4(R13)             LOAD CALLERS SAVE AREA ADDRESS
+         RETURN (14,12),RC=(15)        RETURN TO CALLER
+         EJECT
+*
+NODDOUT  WTO   MF=(E,MSG001)           ELSE ISSUE ERROR MESSAGE
+         LA    R15,K16                 LOAD RETURN CODE
+         B     EXITR                   BR TO EXIT WITH RET. CODE
+*
+PARMERR  WTO   MF=(E,MSG002)           ISSUE ERROR MESSAGE
+         LA    R15,K16                 LOAD RETURN CODE
+         B     EXITR                   BR TO EXIT WITH RET. CODE
+*
+SMFERROR WTO   MF=(E,MSG003)           ISSUE NO DATASET TO DUMP MESSAGE
+         LA    R15,20                  LOAD RETURN CODE
+         B     EXITR                   BR TO EXIT WITH RETURN CODE
+*
+NOCANDMP WTO   MF=(E,MSG008)           ELSE ISSUE ERROR MESSAGE
+         LA    R15,K16                 LOAD RETURN CODE
+         B     EXITR                   BR TO EXIT WITH RET. CODE
+*
+*  ROUTINE TO ALLOCATE MANX OR MANY DATASET AS DDNAME DUMPIN
+*
+DALOC    DS    0H                      ALLOC SUBROUTINE
+         XC    FREEER(K4),FREEER       CLEAR DYNALLOC ERROR AREAS
+         LA    R01,FREE                LOAD DYNALLOC PARM LIST
+         DYNALLOC                      FREE DDNAME DUMPIN
+         XC    ALOCER(K4),ALOCER       CLEAR DYNALLOC ERROR AREAS
+         LA    R01,ALOC                LOAD PARM LIST ADDRESS
+         DYNALLOC                      ALLOC MANX/Y DATASET DD=DUMPIN
+         LTR   R15,R15                 TEST RETURN CODE
+         BNZ   DYNERR                  IF ZERO THEN ALLOC OK
+         LINK  SF=(E,LINKDUMP)         LINK TO SMF UTILITY
+         LTR   R15,R15                 TEST RETURN CODE
+         BNZ   DUMPERR                 IF ZERO THEN BR TO EXIT ROUTINE
+         MVC   MSG007XY,MANXY          MOVE DSN SUFFIX TO MESSAGE
+         WTO   MF=(E,MSG007)           ISSUE MESSAGE OF DATASET DUMPED
+         BR    R07                     RETURN TO CALLER
+*
+DUMPERR  WTO   MF=(E,MSG006)           ISSUE DUMP FAILED MESSAGE
+         LA    R15,K8                  SET RETURN CODE
+         B     EXITR                   BR TO EXIT FROM SMFDUMP
+*
+DYNERR   ST    R15,DRFLR15             SAVE RETCODE FOR DAIRFAIL
+         LA    R01,DRFLPARM            LOAD DAIRFAIL PARM LIST ADDRESS
+         LINK  SF=(E,LINKDRFL)         LINK TO DAIRFAIL SERVICE ROUTINE
+         LTR   R15,R15                 TEST RETURN CODE
+         BNZ   DRFLERR                 IF NOT ZERO THEN GOTO DRFL ERR
+         WTO   MF=(E,MSG005)           ELSE ISSUE DYNALLOC FAILED MSG
+         LA    R15,K12                 SET RETURN CODE
+         B     EXITR                   BR TO EXIT FROM SMFDUMP
+*
+DRFLERR  WTO   MF=(E,MSG004)           ELSE ISSUE DAIRFAIL ERROR MSG
+         LA    R15,K16                 SET RETURN CODE
+         B     EXITR                   BR TO EXIT FROM SMFDUMP
+         EJECT
+*
+*  DATA AREA
+*
+SAVE     DC    18F'0'                  REGISTER SAVE AREA
+CMDSTART DC    AL2(16),AL2(00),CL012'S SMFDUMP ' SVC 34 CMD BUFFER
+*
+*  CONTROL FOR SVC 99 TO FREE DDNAME DUMPIN
+*
+FREE     DC    0F'0',X'80',AL3(FREERB)  RB POINTER
+FREERB   DS    0F                      REQUEST BLOCK FO DYNALLOC
+         DC    AL1(20),AL1(02),AL2(0)  LENGTH,UNALLOC_VERB,FLAGS
+FREEER   DC    AL2(0)                  ERROR CODE
+FREEIN   DC    AL2(0)                  INFO CODE
+         DC    A(FREETP)               TXT UNIT LIST POINTER
+         DC    A(0)                    RESEVRD
+         DC    A(0)                    FLAGS
+FREETP   CALL  ,(FREEDDN),VL,MF=L      TEXT UNIT POINTERS
+FREEDDN  DC    XL2'1',XL2'1',XL2'8',CL8'DUMPIN'  FREE DDNAME=DUMPIN
+*
+*  CONTROL FOR SVC 99 TO ALLOCATE DDNAME DUMPIN TO MANX OR MANY
+*
+ALOC     DC    0F'0',X'80',AL3(ALOCRB)  RB POINTER
+ALOCRB   DS    0F
+         DC    AL1(20),AL1(01),AL2(0)  LENGTH,ALLOC_VERB,FLAGS
+ALOCER   DC    AL2(0)                  ERROR CODE
+ALOCIN   DC    AL2(0)                  INFO CODE
+         DC    A(ALOCTP)               TEXT UNIT LIST POINTER
+         DC    A(0)                    RESERVED
+         DC    A(0)                    FLAGS
+ALOCTP   CALL  ,(ALOCDDN,ALOCDSN,ALOCDSP,ALOCVBS),VL,MF=L TU POINTERS
+ALOCDDN  DC    XL2'1',XL2'1',XL2'8',CL8'DUMPIN'  DDNAME=DUMPIN
+ALOCDSN  DC    XL2'2',XL2'1',XL2'9',CL10'SYS1.MAN'  DSN=SYS1.MAN_
+MANXY    EQU   ALOCDSN+14              SUFFIX FOR SYS1.MAN_ IN TEXT U.
+ALOCDSP  DC    XL2'4',XL2'1',XL2'1',XL1'08'      DISP=SHR
+ALOCVBS  DC    XL2'49',XL2'1',XL2'1',XL1'58'     RECFM=VBS
+*
+* PROGRAM CONSTANTS
+*
+         DS    0F                      FULLWORD ALIGNMENT
+DDOUT    DC    CL8'DUMPOUT'            OUTPUT DDNAME FOR TIOT SCAN
+DEVAREA  DC    2F'0'                   OUTPUT FOR DEVTYPE MACRO
+DRFLR15  DC    A(0)
+DRFLPARM DC    A(ALOCRB)
+         DC    A(DRFLR15)
+         DC    X'80',X'32',XL2'00'
+         DC    A(0)
+         DC    A(0)
+OPTION   DC    X'00'                   PROGRAM OPTION FLAGS
+BOTHFULL EQU   X'80'                   BOTH DATASETS FULL FLAG
+PRESET   EQU   X'40'                   USER SPECIFIED REQUEST FLAG
+*
+* MODESETS ISSUED
+*
+SUPRMOD  MODESET KEY=ZERO,MODE=SUP,MF=L GET IN SUPR STATE FOR SVC 34
+PROBMOD  MODESET KEY=NZERO,MODE=PROB,MF=L GET BACK IN PROB STATE
+*
+* LINKS ISSUED
+*
+LINKDRFL LINK  EP=IKJEFF18,SF=L        LINK TO DAIRFAIL SERVICE ROUTINE
+LINKDUMP LINK  EP=IFASMFDP,SF=L        LINK TO IFASMFDP SMF DUMP RTN
+*
+* MESSAGES ISSUED
+*
+ERRMSGS  DS    0F
+MSG001   WTO   'SMFDUMP DUMPOUT DD MISSING',                           X
+               ROUTCDE=(1,2,11),MF=L
+MSG002   WTO   'SMFDUMP INVALID PARM SPECIFIED       ',                X
+               ROUTCDE=(1,2,11),MF=L
+MSG003   WTO   'SMFDUMP NO SMF DATASETS ELIGIBLE FOR DUMP',            X
+               ROUTCDE=(1,2,11),MF=L
+MSG004   WTO   'SMFDUMP DYNAMIC ALLOCATION FAILED, AND DAIRFAIL',      X
+               ROUTCDE=(1,2,11),MF=L
+MSG005   WTO   'SMFDUMP DYNAMIC ALLOCATION FAILED',                    X
+               ROUTCDE=(1,2,11),MF=L
+MSG006   WTO   'SMFDUMP IFASMFDP PROGRAM FAILED TO DUMP SMF',          X
+               ROUTCDE=(1,2,11),MF=L
+MSG007   WTO   'SMFDUMP COMPLETED FOR DATASET SYS1.MAN_',              X
+               ROUTCDE=(1,2,11),MF=L
+MSG007XY EQU   MSG007+42              SUFFIX FOR MANX/MANY DSN IN MSG
+MSG008   WTO   'SMFDUMP DUMPOUT DD INVALID DEVICE TYPE ',              X
+               ROUTCDE=(1,2,11),MF=L
+*
+* PATCH AREA
+*
+         DS    0D
+MODLEN   EQU   *-SMFDUMP           EQUATE FOR MODULE LENGTH(- PATCH)
+PTCHLEN  EQU   ((MODLEN+7)/8+7)/8*8 PATCH AREA LENGTH EQUATE
+PTCHLNTH DC    Y(PTCHLEN)          LENGTH OF PATCH AREA
+PTCHBASE DC    S(PATCH)            BASE DISPLACED ADDRESS OF PATCH
+PATCH    DC    XL(PTCHLEN)'00'     PATCH AREA
+         EJECT
+         PRINT ON,GEN
+         IEESMCA ,                 SMCA DSECT IN SYS1.AMODGEN
+         END

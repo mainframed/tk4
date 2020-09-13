@@ -1,0 +1,209 @@
+TSSOESTA CSECT
+&WTOR    SETC  'YES'
+         EQUATES
+**********************************************************************
+* THIS MODULE IS THE ESTAE ROUTINE FOR TSSO. ITS PURPOSE IS TO GAIN
+* CONTROL OF TSSO AFTER A FAILURE, AND PERFORM THE FOLLOWING FUNCTIONS
+*
+* 1) DISCONNECT THE SUBSYSTEM FROM MVS.
+* 2) FREEMAIN THE TSSO COMMAND RING
+* 3) FREEMAIN THE TSSO SSVT
+* 4) DELETE THE TSSO AUTOMATED OPERATOR PROCEDURE TABLE
+* 5) DELETE THE TSSO SUBSYSTEM SUPPORT MODULE.
+* 6) DECREMENT THE COUNT OF SUBSYSTEMS REQUESTING WTO BROADCASTS
+* 7) RETURN THE JOB ID TO JES.
+*
+*
+**********************************************************************
+* FIRST, WE DETERMINE IF AN SDWA IS PRESENT
+         USING TSSOESTA,R15
+         CH    R0,=H'12'               SDWA PRESENT ?
+         BNE   YESSDWA
+NOSDWA   DS    0H
+* NO SDWA PRESENT, WE MUST GET THE PARMS FROM THE REGISTERS.
+* R2 POINTS TO THE TSSO CVT AS THIS WAS PASSED FROM THE ESTAE MACRO
+         USING TSSOCVT,R2
+         LR    R7,R14                  SAVE RETURN ADDRESS
+         LR    R10,R2                  TRANSFER ADDRESS OF TSSO CVT
+         DROP  R2
+         USING TSSOCVT,R10
+         WTO   'TSSE991E ESTAE IS IN CONTROL WITHOUT SDWA'
+         MVI   ESTASDWA,C'N'           INDICATE NO SDWA
+         B     ESTAEX
+YESSDWA  DS    0H
+* HERE, WE HAVE AN SDWA, SO WE CAN SAVE THE REGISTERS IN THE SAVE AREA
+* PROVIDED BY MVS
+         LR    R7,R14                  SAVE RETURN ADDRESS
+         LR    R8,R1                   SAVE SDWA
+         L     R10,0(R1)               ADDRESS PARM (TSSO CVT)
+* REG 10 NOW HAS THE TSSO CVT ADDRESS NO MATTER HOW ESTAE WAS ENTERED
+         LR    R12,R15
+         USING TSSOESTA,R12
+         DROP  R15
+         MVI   ESTASDWA,C'Y'           INDICATE SDWA
+ESTAEX   DS    0H
+**********************************************************************
+* AT THIS POINT, THE ESTAE ROUTINE IS READY TO GO...
+* STEP 1 IS TO DISCONNECT THE SUBSYSTEM
+**********************************************************************
+         OI    $SVSTUS,$SVSTUST        SET TERMINATION FLAG
+         L     R2,$SSCT                LOAD ADDRESS OF SSCT
+         LTR   R2,R2                   MAKE SURE IT EXISTS
+         BZ    NOSSCT
+         XR    R3,R3                   WIPE OUT R3
+         USING SSCT,R2
+         CLC   SSCTSNAM(4),=CL4'TSSO'  MAKE SURE ITS TSSO
+         BNE   NOSSCT
+         ST    R3,SSCTSSVT             ** DISC SUBSYSTEM **
+         MVI   SSCTFLG1,X'00'         MOVE ZEROES IN
+         DROP  R2
+*
+         B     FREEIT
+NOSSCT   DS    0H
+         WTO   'TSSE990E UNABLE TO DISCONNECT SUBSYSTEM- SSCT POINTER IX
+               VALID',DESC=(6)
+         B     FREEIT
+FREEIT   DS    0H
+**********************************************************************
+* STEP 2 AFTER DISCONNECTING THE SUBSYSTEM IS TO FREEMAIN THE TSSO
+* COMMAND RING. THIS IS A RELATIVELY STRAIGHTFOWARD PROCEDURE
+**********************************************************************
+         L     R2,NUMCMDS             GET MAX COMMAND ENTRY FOR TSSO
+         SLL   R2,8
+         L     R1,CMDRING             GET ADDRESS OF COMMAND RING
+         FREEMAIN R,LV=(R2),A=(R1),SP=241      COMMAND RING
+FREESSVT DS    0H
+**********************************************************************
+* STEP 3 AFTER FREEING THE COMMAND RING, IS TO FREEMAIN THE TSSO SSVT
+*
+**********************************************************************
+         L     R2,$SSVT               GET ADDRESS OF SSVT
+         LTR   R2,R2
+         BZ    NOSSVT
+         SL    R2,=F'4'        ACTUAL SSVT IS FOUR BYTES LESS THEN
+*                              SSVT PRESENTED TO MVS FOR SSVT HEADER
+         CLC   0(4,R2),=CL4'SSVT'     MAKE SURE
+         BNE   NOSSVT                 IT ISNT FAKED
+         FREEMAIN R,LV=1024+256+4+4,SP=241,A=(R2)   FREEMAIN IT
+         B     FREEMORE
+NOSSVT   DS    0H
+         WTO   'TSSE989E UNABLE TO FREEMAIN SSVT- SSVT POINTER INVALID'X
+               ,DESC=(6)
+FREEMORE DS    0H
+**********************************************************************
+* STEP 4 AFTER FREEING THE SSVT IS TO PERFORM A MODULE DELETE ON THE
+* TSSO AUTOMATED OPERATOR FACILITY REPLY TABLE.
+**********************************************************************
+         L     R2,TSSOTABL         GET ADDRESS OF TSSO AOF TABLE.
+         LTR   R2,R2               DOES IT EXIST ?
+         BZ    NOREPLY
+         LA    R2,16(R2)           POINT TO TABLE NAME
+         DELETE EPLOC=(R2)         ALL GONE...
+*
+NOREPLY  DS    0H
+**********************************************************************
+* STEP 5 AFTER DELETE THE AOF TABLE, IS TO DELETE THE SSSM MODULE, THIS
+* IS POINTER TO BY THE SSSMNAME VARIABLE IN THE TSSO CVT
+**********************************************************************
+FREESSSM DS    0H
+         LA    R2,SSSMNAME
+         DELETE EPLOC=(R2)            ALL GONE...
+**********************************************************************
+* STEP 6 AFTER DELETING THE SSSM MODULE IS TO DECREMENT THE COUNT OF
+* SUBSYSTEMS RECEIVEING WTO REQUESTS. THIS IS REQUIRED IF ASSURE
+* SUCCESS OF FUTURE STARTUPS OF TSSO.
+**********************************************************************
+         L     R2,16
+         USING CVT,R2
+         L     R2,CVTCUCB           GET UCM PREFIX
+         USING UCM,R2
+         AIF   ('&WTOR' NE 'YES').NOBRD2
+         LH    R3,UCMBRDST
+         BALR  R3,0
+         STH   R3,UCMBRDST
+.NOBRD2  ANOP
+         DROP  R2
+**********************************************************************
+* STEP 7 CONCERNS RETURNING THE JOB ID TO JES. THIS IS A SUBSYSTEM
+* FUNCTION. THIS ALLOWS JES TO NUKE CONTROL BLOCKS, CLOSE SUBSYSTEM
+* DATASETS AND THE LIKE. IT IS NOT REQUIRED IF TSSO NEVER OBTAINED A
+* JES ID.
+* THE FIRST STEP IN THIS FUNCTION IS TO MODIFY THE JSCBSSIB FIELD
+* TO REFLECT WHAT IT WAS ORIGNINALLY.
+**********************************************************************
+         TM    $SVSTUS,$SVSTUSJ      DID TSSO EVER MODIFY THE JSCBSSIB
+         BZ    JSCBOK
+* WE MUST MODIFY THE JSCB
+         L     R15,540               CURRENT TCB POINTER
+         L     R15,180(R15)          TCBJSCB FIELD
+         USING IEZJSCB,R15
+         L     R15,JSCBACT
+         L     R5,TSSOSSIB           GET ORIGNAL SSIB
+         ST    R5,JSCBSSIB           AND STORE IT IN...
+         DROP  R15
+JSCBOK   DS    0H
+         TM    $SVSTUS,$SVSTUSI      DID TSSO EVER GET A JOBID ?
+         BZ    NORETJOB              NOPE, DONT SWEAT IT.
+*
+         LA    R5,$SVSSOB            THIS FIELD WAS PREVIOUSLY
+*                                    INITIALIZED IN THE REQUEST
+*                                    JOBID FUNCTION OF TSSO
+         USING SSOB,R5               ADDRESS IT
+         LA    R15,SSOBRTRN          GET JES FUNCTION CODE
+         STH   R15,SSOBFUNC          AND PUT IN SSOB
+*
+         MODESET MODE=SUP            SUBSYSTEM REQUESTS NEED
+*                                    SUPERVISOR MODE
+         LA    R1,$SVSSOBA           THIS FIELD WAS INITIALIZED TO
+*                                    THE START OF THE SSOB IN THE
+*                                    REQUEST JOBID FUNCTION.
+         IEFSSREQ
+         LR      R5,R15
+*
+         MODESET MODE=PROB           ALL DONE
+         LTR     R5,R5
+         BNZ     ERRRETJB
+         B       NORETJOB
+ERRRETJB DS      0H
+         WTO     'TSSE988E TSSO UNABLE TO RETURN JOB ID TO JES'
+*
+NORETJOB DS    0H
+**********************************************************************
+* HERE, WE ARE READY TO RETURN TO MVS. NO RETRY WILL BE ATTEMPTED.
+*
+**********************************************************************
+         CLI   ESTASDWA,C'Y'         DID WE GET AN SDWA
+         BE    TERMSDWA              YES, TERMINATE WITH SDWA
+* TERMINATE WITHOUT SDWA
+*
+         XR    R15,R15
+         BR    R7                    GO AWAY
+*
+TERMSDWA DS    0H
+         SETRP WKAREA=(R8),DUMP=NO,RC=0
+         MODESET KEY=NZERO
+**********************************************************************
+* LASTLY, WE ARE FINALLY READY TO FREEMAIN THE TSSO CVT.
+**********************************************************************
+         FREEMAIN R,LV=1024,A=(R10),SP=228
+         MODESET KEY=ZERO
+         WTO   'TSSE987E T S S O IS UNFORTUNATELY TERMINATING DO TO AN'
+         WTO   '         UNEXPECTED ABEND. NOTIFY THE TSSO SYSTEM     '
+         WTO   '         PROGRAMMER OF THE ABEND CODE AND RESTART TSSO'
+         WTO   '         WITH THE  "S TSSO" COMMAND'
+         BR    R7                     GO AWAY...
+         IHASDWA
+         TSSOCVT
+UCM      DSECT
+         IEECUCM
+         IEFJESCT
+         IEFJSCVT
+         IEFJSSOB (CM,RR),CONTIG=YES
+         IEZJSCB
+         CVT  DSECT=YES
+         END  TSSOESTA
+ PUNCH ' SETCODE  AC(1)'
+ PUNCH ' IDENTIFY TSSOESTA(''TSSO V 4.0.0 &SYSDATE &SYSTIME'') '
+ PUNCH ' ENTRY    TSSOESTA'
+ PUNCH ' NAME     TSSOESTA(R)'
+         END

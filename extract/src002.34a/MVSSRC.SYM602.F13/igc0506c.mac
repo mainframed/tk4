@@ -1,0 +1,688 @@
+         GBLC  &LIB
+&LIB     SETC  'LIB1'                   SET VARIABLE TO LIB1
+         TITLE 'IGC0506C  QUIESCE I/O PHASE                            *
+                        CHECK I/O  CHECKPOINT-SVC 63  OS/360'
+IGC0506C CSECT
+*STATUS CHANGE LEVEL 000
+***********************************************************************
+*                                                                     *
+*FUNCTION/OPERATION- THE CHECK I/O ROUTINE WILL ACCESS ALL OPEN DATA  *
+*     SETS ASSOCIATED WITH THE TASK AND QUIESE I/O ACTIVITY BY        *
+*     ISSUING AN SVC PURGE WITH THE QUIESE OPTION.  PURGING OF I/O IS *
+*     BYPASSED FOR THE FOLLOWING TYPES OF DATA SETS:                  *
+*                             TCAM                                    *
+*                             DUMMY                                   *
+*                             VSAM                                    *
+*                             SUBSYSTEM                               *
+*                             ISAM/VSAM(CI)                           *
+*                                                                     *
+*     IT WILL DETERMINE IF ANY PERMANENT I/O ERRORS OCCURRED DURING   *
+*     THE QUIESING OF I/O ON DATA SETS BEING PROCESSED WITH THE       *
+*     'QUEUED ACCESS METHODS'.                                        *
+*                                                                     *
+*         IF THERE WERE PERMANENT ERRORS THE CHECKPOINT FUNCTION WILL *
+*         NOT WRITE AN ENTRY.  THEREFORE, THE CHECK I/O ROUTINE WILL  *
+*         RETURN AN ERROR CODE IN CHECKPOINT WORKAREA AND PASS CONTROL*
+*         TO THE RESUME I/O PHASE.                                    *
+*         THE ONE EXCEPTION TO THE ABOVE IS A QSAM DATA SET WITH AN   *
+*         ERROR OPTION OF ACCEPT IN WHICH CASE THE CHECK I/O ROUTINE  *
+*         WILL CONTINUE PROCESSING AS THOUGH NO ERROR HAD OCCURRED.   *
+*                                                                     *
+*        THE CHECK I/O ROUTINE ALSO QUIESCES THE USER'S ADDRESS SPACE *
+*        BY DISPATCHING ALL SERVICE REQUEST BLOCKS, FOR THE USER'S    *
+*        ADDRESS SPACE, THAT ARE ATTACHED TO THE SERVICE PRIORITY     *
+*        LISTS.                                                       *
+*                                                                     *
+*        PRIOR TO EXITING, THIS MODULE VALIDITY CHECKS THE USER'S     *
+*        CHECKPOINT DATA SET'S DCB AND CHECKID ADDRESSES.             *
+*                                                                     *
+*ENTRY POINTS- IGC0506C                                               *
+*                                                                     *
+*INPUT- WORK AREA ADDRESS IN REGISTER 1                               *
+*     TASK CONTROL BLOCK ADDRESS IN WORKAREA FIELD 'CKTCBAD'          *
+*                                                                     *
+*OUTPUT- WORK AREA ADDRESS IN REGISTER 1                              *
+*     TASK CONTROL BLOCK ADDRESS IN WORKAREA FIELD 'CKTCBAD'          *
+*     RETURN CODE IN WORKAREA FIELD 'CKRETCOD'  AND MESSAGE CODE IN   *
+*     'CKMSGCOD'.                                                     *
+*         RETURN CODE IS X'0C', MESSAGE CODE IS 30 - IF A DATA SET    *
+*         THAT IS BEING PROCESSED WITH  THE 'QUEUED  ACCESS           *
+*         METHOD' HAD A PERMANENT I/O ERROR AND WAS                   *
+*         NOT A QSAM DATA SET WITH ERROR OPTION OF ACCEPT             *
+*                                                                     *
+*         RETURN CODE IS X'0C', MESSAGE CODE IS 200 - IF PURGE        *
+*         DETECTED AN I/O ERROR.                                      *
+*                                                                     *
+*         RETURN CODE IS X'08', MESSAGE CODE IS 01 - IF VALIDITY      *
+*         TESTS FAILED                                                *
+*                                                                     *
+*         RETURN CODE IS X'00' IN ALL OTHER CASES                     *
+*                                                                     *
+*EXTERNAL ROUTINES- NONE                                              *
+*                                                                     *
+*EXITS-NORMAL- TO THE PRESERVE ROUTINE OF CHECKPOINT                  *
+*                                                                     *
+*     -ERRORS- TO THE RESUME I/O ROUTINE OF CHECKPOINT                *
+*                                                                     *
+*TABLES/WORKAREAS-                                                    *
+*      CVT,PSA,ASCB,SPL,SRB,DSAB,DEB,DCB,CHECKPOINT WORK AREA,        *
+*      TIOT,TCB,PURGE PARAMETER LIST(PPL),CHKPT PARAMETER LIST        *
+*                                                                     *
+*ATTRIBUTES- READ ONLY, REENTERABLE AND PRIVILEGED                    *
+*                                                                     *
+*                                                                     *
+*                                                                     *
+***********************************************************************
+         EJECT
+***********************************************************************
+*                                                                     *
+*  REGISTERS USED                                                     *
+*                                                                     *
+RPM0     EQU   0                        PARAMETER REGISTER            *
+RTCB     EQU   1                        ADDRESS OF TCB/WORK REGISTER  *
+RBASE    EQU   2                        BASE REGISTER                 *
+RDEB     EQU   3                        ADDRESS OF DEB                *
+RDCB     EQU   4                        ADDRESS OF USERS DCB          *
+RIOB     EQU   5                        ADDRESS OF IOB                *
+RWRK     EQU   6                        ADDRESS OF WORKAREA           *
+RWKW     EQU   7                        ADDRESS OF CHECKIO'S WORKAREA *
+RSVI     EQU   8                        SAVE FIRST IOB ADDRESS        *
+RWK9     EQU   9                        WORK REGISTER                 *
+RWKA     EQU   10                       WORK REGISTER                 *
+RWKB     EQU   11                       WORK REGISTER                 *
+RWKC     EQU   12                       WORK REGISTER                 *
+REG13    EQU   13                       SAVE AREA POINTER             *
+RET14    EQU   14                       RETURN REGISTER               *
+RPM15    EQU   15                       PARAMETER REGISTER            *
+*                                                                     *
+*  MASKS TO TEST MACRF FOR ACCESS METHOD USED                         *
+*                                                                     *
+GET      EQU   X'40'                                                  *
+PUT      EQU   X'40'                                                  *
+READ     EQU   X'20'                                                  *
+EXCP     EQU   X'80'                                             A27230
+*                                        2723                    A27230
+*                                                                     *
+*  OTHER MASKS AND CONSTANTS                                          *
+*                                                                     *
+TCAMID1  EQU   X'C0'                    UNIQUE TCAM DEB CODE     M3408
+TCAMID2  EQU   X'CF'                    UNIQUE TCAM DEB CODE     M3408
+ACC      EQU   X'80'                    TEST DCBEROPT FOR ACCEPT ERROR*
+INDSEQ   EQU   X'80'                    TEST DCBDSORG FOR ACCESS METH *
+NTPRGD   EQU   X'FF'                    TEST DEBUSRPG FOR NOT PURGED  *
+OUTP     EQU   X'0F'                    TEST DEBOPATB FOR OUTPUT      *
+PERMERR  EQU   X'C0'                    TEST DCBIFLGS FOR ERROR       *
+QISAMERR EQU   X'0C'                    TEST DCBEXCD1 FOR QISAM ERROR *
+UNITEX   EQU   X'01'                    TEST IOBSTAT0 FOR UNIT EXCEPT *
+INP      EQU   X'01'                    CODE TO SIGNIFY INPUT         *
+IOERR    EQU   X'10'                    I/O ERROR RETURN CODE         *
+CKERIOA  EQU   X'1E'                    I/O ERROR RETURN CODE         *
+OFF      EQU   X'FE'                    SWITCH OFF                    *
+ON       EQU   X'01'                    SWITCH ON                     *
+OPTION   EQU   B'11000000'              OPTION BYTE FOR PURGE         *
+*     BIT        0      1      2      3      4      5      6      7   *
+*     SETTING    1      1      0      0      0      0      0      0   *
+*     MEANING  SPEC-   POST QUIESCE  ALL   SPARE SPECIAL PURGE   ALL  *
+*              IFIED        OUT-     I/O         ROLLOUT BY DEB  DEB  *
+*              DEB          STANDNG              OPTION               *
+*              ONLY         I/O                  OFF                  *
+*                                                                     *
+***********************************************************************
+         EJECT
+         BALR  RBASE,0                  ESTABLISH BASE
+         USING CHECKIO,RBASE
+         USING DEBBASIC,RDEB
+         USING IHADCB,RDCB
+         USING DXECB-4,RIOB
+         USING CHKWA,RWRK
+         USING CHKIOWA,RWKW
+*
+CHECKIO  EQU   *
+         B     BEGIN               BRANCH AROUND EYE CATCHER     Y01909
+         CNOP  0,8                 ALIGN TO A DBL WORD BOUNDARY  Y01909
+         DC    C'IGC0506C'         CSECT NAME                    Y01909
+BEGIN    EQU   *                                                 Y01909
+         LR    RWRK,RTCB                SAVE ADDRESS OF WORK AREA
+         LR    RWKW,RTCB                GET MY WORK AREA
+         A     RWKW,CKWAOFST            ADD OFFSET TO CHECKIO WORKAREA
+         NI    CKFLAG2,OFF              TURN OFF RESUME I/O SWITCH
+***********************************************************************
+*     GET SPACE FOR PURGE PARAMETER LIST                         Y02076
+***********************************************************************
+         ICM   R0,ADDRBYTS,PURGPLN      PURG PARM LST LNGTH IN R0Y02076
+         ICM   R0,HIORDER,SP253         SUBPOOL NO. IN R0        Y02076
+         GETMAIN R,LV=(R0)              GET 16 BYTES FOR PURGEPL Y02076
+         ST    R1,PARMLSTA              SAVE ADDR OF PARM LIST   Y02076
+         L     RPM15,CVTADDR(K0,K0)     GET PTR TO CVT           Y02076
+         USING CVTMAP,RPM15                                      Y02076
+         MVC   VL00AD,CVT0VL00          SAVE ADDR OF VAL.RTN00   Y02076
+         MVC   VL01AD,CVT0VL01          SAVE ADDR OF VAL.RTN01   Y02076
+         DROP  RPM15                                             Y02076
+         USING TCB,RTCB                                          Y02076
+*                                                                     *
+*                                                                     *
+*  OBTAIN CHAIN OF DEB'S FROM TCB                                     *
+*                                                                     *
+         L     RTCB,CKTCBAD             GET ADDR OF TCB FROM WORK AREA
+         L     RDEB,TCBDEB              GET ADDR OF FIRST DEB FROM TCB
+CHKDC010 LTR   RDEB,RDEB                TEST FOR END OF DEB CHAIN
+         BZ    CHKDC135                 IF AT END QUIESCE AD SP  Y02076
+         CLI   DEBNMSUB,TCAMID1         Q - TCAM DEB (TYPE 1)    M3408
+         BE    CHKDC070                 IF YES, SKIP THIS DEB    M3408
+         CLI   DEBNMSUB,TCAMID2         Q - TCAM DEB (TYPE 2)    M3408
+         BE    CHKDC070                 IF YES, SKIP THIS DEB    M3408
+*                                                                     *
+         L     RDCB,DEBDCBAD            GET ADDRESS OF DCB FROM DEB
+         LA    RDCB,0(0,RDCB)           CLEAR HIGH ORDER BITS
+*
+*  IGNORE DEB'S FOR DD DUMMY DATA SETS WHEN PURGING
+*
+         L     RTCB,CKTCBAD             GET ADDR OF TCB AGAIN,    25118
+*                                       IT WAS LOST IN LOOP
+         L     RWKA,TCBTIO              GET ADDR OF TIOT          25118
+         AH    RWKA,DCBTIOT             ADD OFFSET TO DD DEVICE   25118
+         L     RWKA,TIOEFSRT-1-TIOELNGH(0,RWKA)  GET UCB ADDR     25118
+         LA    RWKA,0(0,RWKA)           CLEAR HIGH ORDER BYTE     25118
+         LTR   RWKA,RWKA                TEST IF DD DUMMY DATA SET 25118
+         BZ    CHKDC070                 BR IF DUMMY               25118
+**********************************************************************
+*   BYPASS PURGING I/O FOR VSAM, SUBSYSTEM, AND ISAM/VSAM(CI) DS Y02076
+**********************************************************************
+         LR    RWKB,RDEB                GET ADDR OF DEB          Y02076
+         LA    RWKA,DEBPRFLN            GET LENGTH OF PREFIX     Y02076
+         SR    RWKB,RWKA                CALC ADDR OF DEB PREFIX  Y02076
+         USING DEBPREFX,RWKB                                     Y02076
+         CLI   DEBAMTYP,VSAMIDCD        TEST FOR VSAM DATA SET   Y02076
+         BE    CHKDC070                 IF YES - BYPASS PURGE    Y02076
+         L     RWKC,DEBXTNP             GET DEB EXT ADDR         Y02049
+         DROP  RWKB                                              Y02076
+         USING DEBXTN,RWKC                                       Y02049
+         L     RWKA,DEBXDSAB            GET ADDR OF DSAB         Y02076
+         USING DSAB,RWKA                                         Y02076
+         L     RWKA,DSABTIOT            GET ADDR OF DDNTRY       Y02076
+         USING TIOENTRY,RWKA                                     Y02076
+         TM    TIOELINK,TIOESSDS        TEST IF SS DATA SET      Y02076
+         BO    CHKDC070                 IF YES-BYPASS PURGE      Y02076
+         DROP  RWKA                                              Y02076
+         CLI   DEBEXSCL,DUMMYDEB        IS IT A DUMMY DEB        Y02076
+         BNE   CHKDC015                 BRANCH IF NO             Y02076
+         TM    DEBFLGS1,DEBCINDI        TEST FOR CI BIT          Y02076
+         BO    CHKDC070                 IF ON-BYPASS PURGE       Y02076
+CHKDC015 EQU   *                        TEST DATA SET TYPES      Y02076
+*
+         SR    RWKB,RWKB                CLEAR REGISTER FOR NOTING INPUT
+*                                                                     *
+*                                                                     *
+*  IF CHKDCB IS NOT IMPLEMENTED FOR THIS ACCESS METHOD DO NOTHING BUT *
+*    ISSUE PURGE                                                      *
+*                                                                     *
+         TM    DEBXDSO1,IMPL            IF CHECKIO NOT IMPLEMENTED FOR
+*                                         THIS ACCESS METHOD
+         BZ    CHKDC030                 GO TO PURGE ONLY
+*                                                                27230*
+*                                                                27230*
+*  DETERMINE IF HAVE AN EXCP DCB                                 27230*
+*                                                                27230*
+         TM    DEBXMCF1,DCBMRECP           TEST DCB FOR EXCP     Y02049
+         BO    CHKDC030                 IF SO, GO TO PURGE ONLY  A27230
+*                                                                     *
+*                                                                     *
+*  DETERMINE IF INPUT OR OUTPUT BEFORE TESTING MACRF                  *
+*                                                                     *
+         TM    DEBOPATB,OUTP            TEST HOW DCB WAS OPENED       *
+         BO    CHKDC020                 BRANCH IF OPENED FOR OUTPUT   *
+*                                                                     *
+         TM    DEBXMCF1,DCBMRGET        TEST DEB FOR 'GET' MACRO Y02049
+         BO    CHKDC050                 IF SO GO TO POST AS INPUT
+*                                                                     *
+         TM    DEBXMCF1,DCBMRRD        TEST DEB FOR 'READ' MACRO Y02049
+         BO    CHKDC030                 IF SO ACCESS METHOD IS BASIC
+*                                                                     *
+CHKDC020 EQU   *                                                 Y02049
+         TM    DEBXMCF2,DCBMRPUT   TEST DEB FOR 'PUT' MACRO      Y02049
+         BO    CHKDC060                 IF SO ACCESS METHOD IS QUEUED
+*                                                                     *
+*                                                                     *
+*  ASSUME BASIC ACCESS AT THIS POINT                                  *
+*                                                                     *
+CHKDC030 BAL   RET14,CHKDC040           ISSUE PURGE
+*                                                                     *
+*                                                                     *
+         B     CHKDC070                 GO TO GET NEXT DEB
+*                                                                     *
+***                                                                 ***
+*                                                                     *
+***********************************************************************
+*
+*  SET UP FOR PURGE ON THE CURRENT DEB
+*
+CHKDC040 EQU   *                        PURGE ROUTINE
+         USING PPL,R1                                            Y02076
+         L     R1,PARMLSTA              GET ADDR OF PURGE P.L.   Y02076
+         XC    K0(PLLENGTH,R1),K0(R1)   CLEAR PARM LIST          Y02076
+         ST    RDEB,PPLOPT1             ST ADDR OF DEB IN P.L.   Y02076
+         MVI   PPLOPT1,POPTION1         SET OPTION BYTE 1        Y02076
+         LA    R0,DEBUSRPG              GET DEBUSRPG ADR         Y02076
+         ST    R0,PPLPIRL-K1            STORE IN PURGE P.L.      Y02076
+         MVI   PPLOPT2,PPLOTCB          MVE OPTION BYTE 2        Y02076
+         L     RWK9,DEBUCBRG            SAVE UCB ADDR FOR ISAM   Y02076
+         TM    DEBXDSO1,DCBDSGIS        IS IT ISAM DATA SET      Y02049
+         BZ    CHKDCB4A                 BRANCH IF NO             Y02076
+         MVC   DEBUCBRG(K4),DEBUCBIS    CORRECT ISAM DEB FOR PRG Y02076
+***********************************************************************
+*    UCB ADDRESS IN AN ISAM DEB IS IN WRONG LOCATION FOR PURGE   Y02076
+*        THEREFORE IT IS SAVED AND RESTORED BEFORE/AFTER PURGE   Y02076
+***********************************************************************
+CHKDCB4A PURGE (R1)                     PURGE I/O FOR CURR DEB   Y02076
+         L     R1,PARMLSTA              RESTORE PURGE LST PTR    Y02076
+         LTR   RF,RF                    WAS PURGE SUCCESSFUL     Y02076
+         BNZ   CHKDC041                 BRANCH TO ERROR IF NOT   Y02076
+         ST    RWK9,DEBUCBRG            RESTORE ISAM DEB UCB ADR Y02076
+         CLI   PPLCC,PRGSUCS            SUCCESSFUL PURGE         Y02076
+         BE    CHKDC042                 BRANCH IF YES            Y02076
+CHKDC041 MVC   CKMSGCOD,PURGERR         SET ERR CODE 200         Y02076
+         MVI   CKRETCOD+K1,CKIOERR      SET ERR RETURN CODE      Y02076
+         MVC   LIST(K8),ERRADDR         ADR OF RESUME I/O MOD.   Y02076
+         B     CHKDC130                 BRANCH TO EXIT           Y02076
+CHKDC042 CLC   DEBUSRPB,PURGTOOK        DID PURGE TAKE PLACE     Y02076
+         BE    CHKDC048                 BRANCH IF NO             Y02076
+         OI    CKFLAG2,ON               IF PURGED, ALERT RESUME I/O
+CHKDC048 EQU   *
+         BR    RET14                    RETURN TO MAIN LINE
+*                                                                     *
+***                                                                 ***
+*                                                                     *
+***********************************************************************
+*                                                                     *
+*                                                                     *
+*  THE FOLLOWING CODE WILL PROCESS ALL QUEUED ACCESS METHOD ENTRIES
+*                                                                     *
+CHKDC050 EQU   *
+         LA    RWKB,INP            NOTE THAT THIS IS INPUT
+CHKDC060 EQU   *                                                 Y02049
+         TM    DEBXDSO1,DCBDSGIS   TEST ORGANIZAITION            Y02049
+         BO    CHKDC080                 BRANCH IF INDEXED SEQ ORG
+         DROP  RWKC                                              Y02049
+*                                                                     *
+         TM    DCBIFLGS,PERMERR         TEST SUPERVISOR MESSAGE
+         BO    CHKDC090                 BRANCH IF ERROR POSTED IN DCB
+*                                                                     *
+         BAL   RET14,CHKDC040           ISSUE PURGE
+*                                                                     *
+*                                                                     *
+         TM    DCBIFLGS,PERMERR         TEST SUPERVISOR MESSAGE
+         BO    CHKDC090                 BRANCH IF ERROR POSTED IN DCB
+*                                                                     *
+*                                                                     *
+*  GET NEXT DEB FROM CHAIN                                            *
+*                                                                     *
+CHKDC070 L     RDEB,DEBDEBAD            GET ADDRESS OF PREVIOUS DEB
+         LA    RDEB,0(0,RDEB)           CLEAR HIGH ORDER BITS
+         B     CHKDC010                 GO BACK TO BEGINNING OF DEB
+*                                         CHAIN LOOP
+***                                                                 ***
+*                                                                     *
+*                                                                     *
+* PROCESS QUEUED INDEXED SEQUENTIAL ENTRIES                           *
+*                                                                     *
+CHKDC080 BAL   RET14,CHKDC040           ISSUE PURGE
+*                                                                     *
+*                                                                     *
+         TM    DCBEXCD1,QISAMERR        TEST EXCEPTIONAL CONDITIONS
+         BZ    CHKDC070                 BRANCH IF NO INPUT OR OUTPUT
+*                                         ERRORS
+*                                                                     *
+         B     CHKDC110                 OTHERWISE GO TO ERROR ROUTINE
+*                                                                     *
+***                                                                 ***
+*                                                                     *
+CHKDC090 TM    DCBEROPT,ACC             TEST ERROR OPTION
+         BO    CHKDC070                 BRANCH IF ACCEPTABLE
+*                                                                     *
+         LTR   RWKB,RWKB                TEST FOR INPUT OR OUTPUT
+         BZ    CHKDC110                 IF OUTPUT GO TO ERROR ROUTINE
+*                                                                     *
+         L     RIOB,DCBIOBA             GET ADDRESS OF IOB FROM DCB
+         LA    RIOB,0(0,RIOB)           CLEAR HIGH ORDER BITS
+         LR    RSVI,RIOB                SAVE FIRST IOB ADDR FOR EXIT
+CHKDC100 L     RIOB,DXECB-4             LINK TO NEXT IOB
+         LA    RIOB,0(0,RIOB)           CLEAR HIGH ORDER BITS
+         TM    IOBSTAT0,UNITEX          TEST FOR UNIT EXCEPTION
+         BNZ   CHKDC070                 IF SO, GO GET NEXT ENTRY
+*
+*                                                                     *
+*  IF THERE IS A UNIT EXCEPTION THIS IS AN END OF FILE AND NOT A TRUE *
+*    ERROR - THEREFORE CONTINUE PROCESSING                            *
+*                                                                     *
+*                                                                     *
+         CLR   RIOB,RSVI                TEST FOR LAST IOB FOR THIS ENT
+         BNE   CHKDC100                 BRANCH IF MORE IOB'S
+*                                                                     *
+*                                                                     *
+*  THE FOLLOWING ERROR ROUTINE WILL PLACE AN ERROR CODE IN THE CKRETCOD
+*  FIELD OF THE WORK AREA AND SET THE FLAG TO ACTIVATE RESUME I/O     *
+*                                                                     *
+CHKDC110 OI    CKFLAG2,ON               RESUME I/O WILL RESTORE I/O REQ
+         MVC   LIST(8),ERRADDR          PUT ADDRESS OF RESUME I/O IN  *
+*                                         WORK AREA                   *
+         MVI   CKRETCOD+1,CKIOERR       PUT ERROR RETURN CODE X'0C' IN
+         MVI   CKMSGCOD+1,CKERIOA           CHKWA
+         B     CHKDC130                 GO TO RETURN
+*                                                                     *
+***                                                                 ***
+*                                                                     *
+*  SET UP FOR RETURN
+*                                                                     *
+CHKDC120 MVC   LIST(K8),XADDR           PUT ADDRESS OF NEXT MODULE IN
+***********************************************************************
+*  PERFORM VALIDITY CHECK ON BEGINNING AND ENDING ADDRESS OF          *
+*      USER'S CHECKPOINT DATA SET'S DCB AND USER'S AREA FOR      Y02076
+*      STORING SYSTEM GENERATED CHECKID                          Y02076
+***********************************************************************
+*                                                                     *
+*                                                                     *
+         LA    R0,DCBLNGTH              GET DCB LENGTH           Y02076
+         STH   R0,LNGTHDCB              STORE IN WORK AREA       Y02076
+         STM   RWKB,RET14,CKREGSAV      SAVE REGS 11-14          Y02076
+         SETLOCK OBTAIN,TYPE=LOCAL,MODE=UNCOND,                  Y02076X
+               RELATED=(LOCREL,(IGC0506C,CHKDC130))
+         LTR   RD,RD                    TEST RETURN CODE         Y02076
+         BZ    CHKDC125                 BR IF NO ERROR           Y02076
+         MVI   CKMSGCOD+K1,SETLKERR     SET SETLOCK ERROR        Y02076
+         MVI   CKRETCOD+K1,CKIOERR      SET RET CODE 0C          Y02076
+         MVC   LIST(K8),ERRADDR         SET UP EXIT LIST         Y02076
+         B     CHKDC131                 GO TO EXIT PROCESSING    Y02076
+CHKDC125 LM    RWKB,RET14,CKREGSAV      RESTORE REGS 11-14       Y02076
+         USING PARMSECT,RWKA                                     Y02076
+         L     RWKA,CKPARMAD            GET PARM LIST ADDR       Y02076
+         L     R1,PARMFLG               GET PARMDCB FOR DCB ADDR Y02076
+         LA    R1,K0(R1)                CLEAR HI ORDER BYTE      Y02076
+         LR    RDEB,RBASE               SAVE BASE REG            Y02076
+         LR    R2,R1                    GET BEGIN ADDR OF DCB    Y02076
+         AH    R2,LNGTHDCB              END ADDR OF DCB IN R2    Y02076
+         L     RPM15,VL01AD             GET ADDR OF VALID.RTN01  Y02076
+         BALR  RET14,RF                 PERFORM VALIDITY CHECK   Y02076
+         LR    RBASE,RDEB               RESTORE BASE REG         Y02076
+         BNZ   CHKDC180                 CC NON ZERO INDICATE ERR Y02076
+         CLI   LNCHKID,X'FF'            DOES USER WANT CHECKID   Y02076
+         BNE   CHKDC130                 BRANCH IF NO             Y02076
+         L     R1,IDADDR                GET CHECKID ADDR         Y02076
+         LA    R1,K0(R1)                CLEAR HI ORDER BYTE      Y02076
+         LR    RDEB,RBASE               SAVE BASE REG            Y02076
+         LR    R2,R1                    BEGIN ADDR OF CHECKID    Y02076
+         LA    R2,IDLONG(R2)            END ADDR OF CHECKID      Y02076
+         L     RPM15,VL00AD             GET ADDR OF VALID.RTN00  Y02076
+         BALR  RET14,RF                 PERFORM VALIDITY CHECK   Y02076
+         LR    RBASE,RDEB               RESTORE BASE REG         Y02076
+         BNZ   CHKDC180                 CC NON 0 INDICATES ERROR Y02076
+*                                         WORK AREA
+CHKDC130 EQU   *
+         STM   RWKB,RET14,CKREGSAV      SAVE REGS 11-14          Y02076
+         SETLOCK RELEASE,TYPE=LOCAL,                             Y02076X
+               RELATED=(LOCSET,(IGC0506C,CHKDC120))
+         LM    RWKB,RET14,CKREGSAV      RESTORE REGS 11-14       Y02076
+CHKDC131 LR    RTCB,RWRK                RELOAD ADDR OF PASSED WORK AREA
+         LA    R0,LIST                  GET ADR OF NEXT MODULE   Y02076
+         ST    R0,LIST+8                STORE IN XCTL PARM LST   Y02076
+         LA    RPM15,LIST+8             TELL XCTL WHERE TO GO
+*                                                                     *
+         XCTL  EPLOC=(RWKW),SF=(E,(15)) TO CHECKPOINT ROUTINE
+***********************************************************************
+*        QUIESCE THE USER'S ADDRESS SPACE                        Y02076
+***********************************************************************
+CHKDC135 EQU   *                        INITIALIZE FOR QUIESCING Y02076
+         L     RPM15,CVTADDR(K0,K0)     GET CVT ADDR FROM LOC 16 Y02076
+         USING  CVTMAP,RPM15                                     Y02076
+         L     RWKB,CVTTCBP             GET PTR TO NEXT TCB      Y02076
+         LA    RWKB,CURASOFS(RWKB)      GET ADR OF CURR ASCB ADR Y02076
+         L     RWKB,K0(RWKB)            GET ADR OF CURR ASCB     Y02076
+         ST    RWKB,USERASCB            SAVE ADDR OF USER'S ASCB Y02076
+         LA    RWKC,GSPLSIZE            GET GLOBAL SPL SIZE      Y02076
+         SRL   RWKC,DIV8                DIVIDE BY 8              Y02076
+         STC   RWKC,SPLOOPCG            STORE GLOBAL SPL NTRY CT Y02076
+         LA    RSVI,LSPLSIZE            GET LOCAL SPL SIZE       Y02076
+         SRL   RSVI,DIV8                DIVIDE BY 8              Y02076
+         STC   RSVI,SPLOOPCL            ST LOCAL SPL ENTRY CNT   Y02076
+***********************************************************************
+*     ESTABLISH ESTAE ENVIRONMENT IN THE EVENT AN ABEND OCCURS   YM5785
+*     WHEN STATUS STOP,SRB IS IN EFFECT AND GLOBAL LOCK HAS      YM5785
+*     NOT BEEN RELEASED.                                         YM5785
+***********************************************************************
+         LA    RWK9,CHKESTAE            GET ESTAE ENTRY POINT    YM5785
+         LR    R1,RWRK                  GET WORK AREA ADDR       YM5785
+         A     R1,CKBFOFST              POINT TO PARM BUFFER     YM5785
+         LA    R1,CHRL(,R1)             POSITION PAST CHR BUFFER YM7049
+         MVC   K0(CKESTALN,R1),CKESTAE  MOVE PARM LIST TO BUFF   YM5785
+         MVI   CKERAS06,X'00'           CLEAR ESTAE SW'S         YM7008
+         ESTAE (RWK9),PARAM=(RWRK),MF=(E,(R1))    SET ENVIRON.   YM5785
+CHKDC140 EQU   *                        LOOP THRU SPLS           Y02076
+         SR    RWK9,RWK9                CLR LOCAL SPL NTRY PTR   Y02076
+         SR    RSVI,RSVI                CLEAR LOCAL LOOP CNT REG Y02076
+         IC    RSVI,SPLOOPCL            GET LOCAL SPL ENTRY CNT  Y02076
+         STATUS STOP,SRB                STOP SRB DISPATCHING     Y02076
+         OI    CKERAS06,STOPSW          SET STATUS-STOP SW       YM7008
+         STM   RWKB,RET14,CKREGSAV      SAVE REGISTER 11 THRU 14 Y02076
+CHKDC142 SETLOCK OBTAIN,TYPE=DISP,MODE=UNCOND, GLOBAL DISP LOCK  Y02076X
+               RELATED=(GLDSPREL,(IGC0506C,CHKDC162))
+         LTR   RD,RD                    TEST FOR SETLOCK ERROR   Y02076
+         BZ    CHKDC143                 BR IF NO ERROR           Y02076
+         MVI   CKMSGCOD+K1,SETLKERR     SET SETLOCK ERROR        Y02076
+         MVI   CKRETCOD+K1,CKIOERR      SET RET CODE 0C          Y02076
+         MVC   LIST(K8),ERRADDR         SET UP XCTL LIST         Y02076
+         B     CHKDC194                 GO TO EXIT PROCESSING    YM7008
+CHKDC143 LM    RWKB,RET14,CKREGSAV      RESTORE REGS 11 THRU 14  Y02076
+         SR    RWKC,RWKC                CLEAR GLOBL LOOP CNT REG Y02076
+         IC    RWKC,SPLOOPCG            GET SPL ENTRY COUNTR     Y02076
+         L     RPM15,CVTADDR(K0,K0)     RESTORE PTR TO CVT       Y02076
+         L     RWKA,CVTGSPL             GET ADDR OF GLOBAL SPL   Y02076
+CHKDC145 L     RWKB,K0(,RWKA)           GET PTR TO 1ST SRB       Y02076
+         LTR   RWKB,RWKB                ANY SRBS ON 1ST SPL NTRY Y02076
+         BZ    CHKDC155                 BRANCH IF NO             Y02076
+***********************************************************************
+*   CHECK GLOBAL SRBS TO DETERMINE IF ANY ARE FOR USER'S MEMORY  Y02076
+***********************************************************************
+CHKDC150 EQU   *                        SEARCH GLOBAL SPL        Y02076
+         USING SRBSECT,RWKB                                      Y02076
+CHKDC152 CLC   SRBASCB,USERASCB         IS THIS SRB OF USER SPAC Y02076
+         BE    CHKDC160                 Y-BRANCH TO DISPATCH SRB Y02076
+         CL    RWKB,LASTSRB(,RWKA)      LAST SRB ON QUEUE        Y02076
+         BE    CHKDC155                 Y-GO GET NEXT SPL ENTRY  Y02076
+         L     RWKB,SRBFLNK             GET NEXT SRB             Y02076
+         B     CHKDC152                 LOOK FOR MORE USER SRBS  Y02076
+CHKDC155 EQU   *                        ANY MORE SPL ENTRIES     Y02076
+         BCTR  RWKC,K0                  DECREASE LOOP COUNT      Y02076
+         LTR   RWKC,RWKC                SET CONDITION CODE       Y02076
+         BZ    CHKDC170                 BR - DONE W LAST SPLNTRY Y02076
+         LA    RWKA,NXTSPLET(,RWKA)     GET ADDR NXT SPL ENTRY   Y02076
+         B     CHKDC145                 BR TO CHECK NXT SPL NTRY Y02076
+CHKDC160 EQU   *                        DISPATCH SRBS            Y02076
+         STM   RWKB,RET14,CKREGSAV      SAV REGS 11 THRU 14      Y02076
+CHKDC162 SETLOCK RELEASE,TYPE=DISP,     RELEASE GLOBAL DISP LOCK Y02076X
+               RELATED=(GLDSPSET,(IGC0506C,CHKDC142))            Y02076
+         LM    RWKB,RET14,CKREGSAV      RESTORE REGS 11 THRU 14  Y02076
+CHKDC163 EQU   *                        ISSUE STATUS START       Y02076
+         STATUS START,SRB               DISPATCH SRBS            Y02076
+         LA    RPM15,K8                 SET PARM REG TO 8        Y02076
+         SVC   116                      IMED SRB START           VS4684
+         NI    CKERAS06,X'FF'-STOPSW    CLEAR STATUS-STOP SW     YM7008
+         B     CHKDC140                 CONTINUE QUIESING ADR SP Y02076
+CHKDC170 EQU   *                        CHECK LOCAL SPL          Y02076
+         USING ASCB,RWKC                                         Y02076
+         L     RWKC,USERASCB            GET ADDR OF USERS ASCB   Y02076
+         L     RWKC,ASCBSPL-ASCB(,RWKC) GET ADDR OF LOCAL SPL    Y02076
+CHKDC175 L     RWKC,K0(RWK9,RWKC)       GET PTR TO 1ST SRB       Y02076
+         LTR   RWKC,RWKC                ANY SRBS TO DISPATCH     Y02076
+         BNZ   CHKDC160                 Y-CONTINUE QUIESING      YM2851
+         BCTR  RSVI,K0                  DONE WITH LOCAL SPL      Y02076
+         LTR   RSVI,RSVI                SET CONDITION CODE       Y02076
+         BZ    CHKDC190                 Y-BRANCH TO RETURN       Y02076
+         LA    RWK9,NXTSPLET(,RWK9)     PT RWK9 TO NXT SPL ENTRY Y02076
+         B     CHKDC170                 LOOK AT NEXT SPL ENTRY   YM5732
+CHKDC180 OI    CKFLAG2,ON               SET FLG IN WA TO RESUME  Y02076
+         MVC   LIST(K8),ERRADDR         SET XCTL PARM FOR NO6C   Y02076
+         MVI   CKRETCOD+K1,CKPGMERR     SET RETURN CODE = X'08'  Y02076
+         MVI   CKMSGCOD+K1,VALIDERR     SET VALIDITY ERROR CODE  Y02076
+         B     CHKDC130                 BRANCH TO ERROR EXIT     Y02076
+CHKDC190 EQU   *                        START SRBS AGAIN         Y02076
+         STM   RWKB,RET14,CKREGSAV      SAVE REGS11-14           YM2851
+CHKDC192 SETLOCK RELEASE,TYPE=DISP,     RELEASE GLOBAL LOCK      YM2851X
+               RELATED=(GLDSPSET,(IGC0506C,CHKDC142))            YM2851
+         LM    RWKB,RET14,CKREGSAV      RESTORE REGS11-14        YM2851
+CHKDC194 EQU   *                        ERROR EXIT ENTRY         YM7008
+         STATUS START,SRB               BEGIN DISPATCHING SRBS   Y02076
+         NI    CKERAS06,X'FF'-STOPSW    CLEAR STATUS-STOP SW     YM7008
+         ESTAE 0                        CANCEL ESTAE ENVIRONMET  YM7008
+         CLI   CKRETCOD+K1,X'00'        WAS THIS A ERROR ENTRY   YM7008
+         BE    CHKDC120                 TO EXIT PROCESSING       Y02076
+         CLI   CKRETCOD+K1,X'10'        IS IT ENQS OUTSTANDING   YM7332
+         BE    CHKDC120                 TO EXIT PROCESSING       YM7332
+         B     CHKDC131                 ERROR-TERMINATE          YM7332
+**********************************************************************
+*                          ESTAE ROUTINE                         YM5785
+***********************************************************************
+CHKESTAE CH    RPM0,RETCOD12-CHKESTAE(RF) DID RTM GET A WA       YM7082
+         BNE   CHKESTA2-CHKESTAE(RF)    IF YES, BRANCH           YM7082
+         LR    RWRK,R2                  GET CHKPT WA ADDR        YM7082
+         LR    R2,RF                    ESTABLISH CODE BASE AS   YM7082
+         S     R2,BASEDIFF-CHKESTAE(RF)   ORIGINALLY ASSEMBLED   YM7082
+         ST    RET14,CKREGSAV           SAVE RTM RET. ADR        YM5785
+         BAL   RET14,CHKESTA4           GO TEST STATUS/STOP SW. ZA00627
+         SR    RPM0,RPM0                ZERO RETRY ADR.          YM5785
+         SR    RPM15,RPM15              TELL RTM TO TERMINATE    YM5785
+         L     RET14,CKREGSAV           RESTORE RTM RET. ADR.    YM5785
+         BR    RET14                    GETURN TO RTM            YM5785
+CHKESTA2 STM   RE,RC,12(RD)             SAVE RTM'S REGS          YM7082
+         LR    R2,RF                    ESTABLISH CODE BASE AS   YM7082
+         S     R2,BASEDIFF-CHKESTAE(RF)   ORIGINALLY ASSEMBLED   YM7082
+         L     RWRK,K0(,R1)             GET PARM (CKWA) FR RTCA  YM5785
+         ST    RET14,CKREGSAV           SAVE RTM RET REG         YM5785
+         BAL   RET14,CHKESTA4           GO TEST STATUS/STOP SW. ZA00627
+         L     RET14,CKREGSAV           RESTORE RTM RET. REG.    YM5785
+         SETRP RC=0,REGS=(14,12)        CONTINUE W/ TERMINATION  YM5785
+CHKESTA4 TM    CKERAS06,STOPSW          IS STATUS-STOP IN EFFECT YM7008
+         BZR   RET14                    BR BACK IF NO            YM5785
+         STATUS START,SRB               START DISPATCHING SRBS   YM5785
+         BR    RET14                    RETURN                   YM5785
+*                                                                     *
+***                                                                 ***
+*                                                                     *
+XADDR    DC    CL8'IGC0A06C'            PRESERVE ROUTINE
+ERRADDR  DC    CL8'IGC0N06C'            RESUME I/O ROUTINE
+RETCOD12 DC    H'12'                    RTM NO-RTCA-ENTRY CODE   YM5785
+BASEDIFF DC    A(CHKESTAE-CHECKIO)      ESTAE BASE REG CONSTANT  YM7082
+PURGPLN  DC    AL3(16)                  PURGE P.L. LENGTH        Y02076
+SP253    DC    AL1(253)                 SUBPOOL 253
+PURGERR  DC    AL2(200)                 PURGE ERROR CODE         Y02076
+PURGTOOK DC    XL3'FFFFFF'              PURGE DID NOT TAKE PLACE Y02076
+CKESTAE  ESTAE CKESTAE,CT,PARAM=CKESTAE,TERM=YES,                YM5785X
+               RECORD=YES,MF=L                                   YM5785
+CKESTALN EQU   *-CKESTAE                                         YM5785
+*                                                                     *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+*        MAINTENANCE SPACE                                       Y01909
+*                                                                     *
+PATCH    DC    XL((*-IGC0506C)/20)'00'   FIVE PERCENT SPACE      Y01909
+*                                                                     *
+***********************************************************************
+CVTADDR  EQU   16                       CVT ADDR AT LOC 16       Y02076
+K0       EQU   0                        CONSTANT 0               Y02076
+K1       EQU   1                        CONSTANT 1               Y02076
+K3       EQU   3                        CONSTANT 3               YM7332
+K4       EQU   4                        CONSTANT 4               Y02076
+K8       EQU   8                        CONSTANT 8               Y02076
+CURASOFS EQU   12                       OFFSET TO CURRENT ASCB   Y02076
+VSAMIDCD EQU   X'01'                    ID OF VSAM DATA SET      Y02076
+DUMMYDEB EQU   X'00'                    ID OF DUMMY DEB          Y02076
+DEBPRFLN EQU   16                       DEB PREFIX LENGTH        Y02076
+LASTSRB  EQU   4                        LAST SRB OFSET IN SPL    Y02076
+NXTSPLET EQU   8                        INDEX TO NST SPL ENTRY   Y02076
+VALIDERR EQU   1                        ERR CODE FOR P.L.ERRS    Y02076
+IDLONG   EQU   7                        LENGTH OF CHECKID -1     YM5785
+DIV8     EQU   3                        SHFT CNT TO DIVIDE BY 8  Y02076
+ADDRBYTS EQU   7                        ADDR MASK                Y02076
+HIORDER  EQU   8                        HI ORDER BIT MASK        Y02076
+PLLENGTH EQU   16                       PARM LIST LENGTH         Y02076
+POPTION1 EQU   X'81'                    OPTION 1                 Y02076
+PPLOTCB  EQU   X'08'                    OPTION 2                 Y02076
+PRGSUCS  EQU   X'7F'                    SUCCESSFUL PURGE         Y02076
+STOPSW   EQU   X'80'                    STATUS-STOP SW FOR ESTAE YM7008
+LOCKSW   EQU   X'40'                    DISP-LOCK SW FOR ESTAE   YM7008
+CHRL     EQU   400                      CHR LENGTH               YM7049
+PPL      DSECT                          DSECT OF PURGE PARM LIST Y02076
+PPLOPT1  DS    CL1                      OPTION BYTE 1            Y02076
+PPLDSID  DS    AL3                      ADDR OF DEB              Y02076
+PPLCC    DS    CL1                      COMPLETION CODE          Y02076
+PPLTCB   DS    AL3                      TCB ADDR                 Y02076
+         DS    CL1                      RESERVED                 Y02076
+PPLPIRL  DS    AL3                      SP FOR DEBUSRPB FIELD    Y02076
+PPLOPT2  DS    CL1                      OPTION BYTE 2            Y02076
+         DS    CL1                      RESERVED                 Y02076
+PPLASID  DS    H                        MEMORY PURGE BYTES       Y02076
+PARMSECT DSECT                          PARM LIST DSECT          Y02076
+PARMFLG  DS    1C                       FLAG BYTE                Y02076
+PARMDCB  DS    3C                       ADDR OF CHKPT DCB        Y02076
+IDADDR   DS    0F                       ID ADDRESS WORD          Y02076
+LNCHKID  DS    CL1                      FF IF USER WANTS CHEKID  Y02076
+         DS    CL3                      CHECKID ADDR             Y02076
+         EJECT
+         CVT                                                     Y02076
+         IHASDWA                                                 YM5785
+         IHAPSA                                                  Y02076
+         IHAASCB                                                 Y02076
+         IHASPL                                                  Y02076
+         IHASRB                                                  Y02076
+         IHADSAB                                                 Y02076
+         IEZDEB                                                  Y02076
+         DCBD  DSORG=(PS,IS)
+         EJECT
+         EJECT
+         IEEVCHWA VER=3                 USE AOS2 VERSION OF WA
+         EJECT                                                  , 25118
+TIOTSECT DSECT                          DEFINE TIOT LABELS        25118
+         IEFTIOT1                                               , 25118
+         EJECT
+TCB      DSECT      TASK CONTROL BLOCK
+*
+TCBRBP   DS    A                       POINTER TO EXECUTING RB
+TCBPIE   DS    A                       POINTER TO PROG. INTERRUPT EL.
+TCBDEB   DS    A                       POINTER TO DEB QUEUE
+TCBTIO   DS    A                       POINTER TO TIOT
+TCBCMP   DS    F                       TASK COMPLETION CODE
+TCBTRN   DS    A                       TESTRAN FIELD
+TCBMSS   DS    A                       DATA BLOCK QUEUE ELEMENT POINTER
+TCBPRTK  DS    BL1                     PROTECTION TAG
+TCBFLGS  DS    BL5                     FLAG BYTES
+TCBLMP   DS    BL1                     LIMIT PRIORITY
+TCBDSP   DS    BL1                     DISPATCHING PRIORITY
+TCBLLS   DS    A                       POINTER TO LOAD LIST
+TCBJLB   DS    A                       POINTER TO JOBLIB DCB
+TCBJSE   DS    A                       LIST OF INACTIVE PROGRAMS ADDR.
+TCBGRS   DS    16F                     GENERAL REGISTER SAVE AREA
+TCBIDF   DS    0BL1                    TCB IDENTIFIER FIELD
+TCBFSA   DS    A                       POINTER TO 1ST PROB.PROG.SAVEAR
+TCBTCB   DS    A                       NEXT TCB ON READY QUEUE POINTER
+TCBTME   DS    A                       POINTER TO TIMER ELEMENT
+*
+*             *********************************************************
+*             *                                                       *
+CHKIOWA  DSECT      CHECKIO'S WORK AREA
+*
+LIST     DS    3F   AREA WHERE PURGE LIST IS BUILT AND ENTRY PT STORED
+*
+***********************************************************************
+USERASCB EQU   CKERAS00                 STORAGE FOR USRS ASCBAD  Y02076
+PARMLSTA EQU   CKERAS01                 SPACE FOR PURGE PL ADDR  Y02076
+DEBUCBIS EQU   DEBFIEAD+16              LOC OF ISAM UCB ADDR     Y02076
+DEBUCBRG EQU   DEBFIEAD                 LOC OF NORM UCB ADDR     Y02076
+SPLOOPCG EQU   CKERAS02                 LOOP CNT-GLOBAL SRBS     Y02076
+SPLOOPCL EQU   CKERAS02+K1              LOOP CNT-LOCAL SRBS      Y02076
+VL00AD   EQU   CKERAS03                 VALID. CHECK RTN 00      Y02076
+VL01AD   EQU   CKERAS04                 VALID. CHECK RTN 01      Y02076
+LNGTHDCB EQU   CKERAS05                 AREA FOR DCB LENGTH      Y02076
+SETLKERR EQU   202                      UNSUCCESSFUL SETLOCK ERR Y02076
+DCBLNGTH EQU   DCBPOINT+K3-IHADCB       LNGTH OF DCB             YM7332
+IMPL     EQU   DCBDSGIS+DCBDSGPS+DCBDSGDA+DCBDSGPO               Y02049
+*                                  IMPLEMENTED ACCESS METHODS    Y02049
+         END   IGC0506C

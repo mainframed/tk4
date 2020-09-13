@@ -1,0 +1,595 @@
+         TITLE 'TMPFRONT - TMP FRONT END'
+**********************************************************************
+* NAME       -   TMPFRONT                                            *
+*                                                                    *
+* AUTHOR     -   C. LYONS                                            *
+*                                                                    *
+* FUNCTION   -   PROVIDE GENERALIZED TMP FRONT-END; CURRENTLY        *
+*                THIS FACILITY IS USED TO:                           *
+*                                                                    *
+*                     1. BUILD TSDASCB TO SUPPORT DUSER COMMAND      *
+*                     2. CLEAR TERMINAL SCREEN AT NORMAL LOGOFF      *
+*                        OPERATOR CANCEL, OR FORCED LOGOFF           *
+*                     3. SUPPORT DYNAMIC STEPLIB COMMAND             *
+*                                                                    *
+* INPUT      -   PARMS ON EXEC STATEMENT IN LOGON PROCEDURE          *
+*                                                                    *
+* OUTPUT     -   TSDASCB CONSTRUCTED                                 *
+*                SCREEN CLEARED                                      *
+*                                                                    *
+* ERRORS     -   NONE                                                *
+*                                                                    *
+* SYSTEM     -   MVS 3.8 (TCAM 10 OR ACF/VTAM VERSION 2) WITH SPF    *
+*                MVS/SE2                                             *
+*                                                                    *
+* EXITS      -   ESTAE EXIT FOR OPERATOR CANCEL AND FORCED LOGOFF    *
+*                                                                    *
+* DATE       -   ORIGINAL - 7/11/80                                  *
+*                REVISED FOR STEPLIB COMMAND  - 10/01/80             *
+*                                                                    *
+* SMP FMID   -   EBB1102 (BASE CONTROL PROGRAM)                      *
+*                                                                    *
+* MACROS     -   FULLSAVE,REGS,SAVE,GETMAIN,SETAUTH,ATTACH,          *
+*                MODESET,TPUT,FULLRTRN,RETURN,ENQ,DEQ,ESTAE,SETRP,   *
+*                WAIT,IDENTIFY,OPEN,CLOSE,DETACH,FREEMAIN,IKJRLSA,   *
+*                IKJIDENT,IKJENDP,CALLTSSR,POST                      *
+*                                                                    *
+* DSECTS     -   WORK,IHAPSA,IHAASCB,IKJTSB,TSDCVT,TSDASCB,JCT,ACT,  *
+*                IKJPSCB,IHASDWA,IHADCB,IKJTCB,IEZJSCB,IKJCPPL,      *
+*                IKJECT,IKJPPL,STEPWORK,PDL                          *
+*                                                                    *
+* REGISTERS  -   R12 =BASE; R3->WORK AREA; R4->EXEC PARMS            *
+*                R6 -> TSDASCB                                       *
+*                                                                    *
+* LANGUAGE   -   OS/VS LEVEL ASSEMBLER                               *
+*                                                                    *
+* PRIVILEGES -   AUTHORIZED, PROTECT KEY 0                           *
+*                                                                    *
+* ATTRIBUTES -   RENT,REFR                                           *
+*                                                                    *
+* LOGIC      -   1. INITIALIZATION (IDENTIFY STEPLIB CMD ENTRY)      *
+*                2. BUILD TSDASCB                                    *
+*                3. ATTACH IKJEFT01                                  *
+*                4. WAIT FOR LOGOFF OR STEPLIB COMMAND               *
+*                5. IF LOGOFF:                                       *
+*                   DETACH TMP                                       *
+*                   CLEAR SCREEN VIA STLINENO OR TPUT                *
+*                   FREEMAIN TSDASCB & WORK AREA                     *
+*                   EXIT TO INITIATOR                                *
+*                6. IF STEPLIB COMMAND:                              *
+*                   CLOSE OLD STEPLIB                                *
+*                   OPEN NEW STEPLIB                                 *
+*                   SAVE DCB PTR IN TMP TCBJBL FIELD                 *
+*                   POST STEPLIB CP ECB                              *
+*                   GO TO 4                                          *
+* STEPLIB CP LOGIC                                                   *
+*                                                                    *
+*                1. PARSE OPERAND                                    *
+*                2. SAVE STEPLIB DDNAME IN TSDASCB                   *
+*                3. POST TMPFRONT TO OPEN STEPLIB                    *
+*                4. WAIT UNTIL TMPFRONT FINISHED                     *
+*                5. RETURN                                           *
+*                                                                    *
+* NOTES      -   THE TCAM MCP IS MODIFIED TO RECOGNIZE A SPECIAL     *
+*                SIGNAL STRING FOR SPF. TO OBTAIN THE CORRECT        *
+*                STRING, SPF WAS RUN IN TRACE MODE. SEE SPF LOGIC    *
+*                MANUAL FOR DISCUSSION OF SPF/TCAM INTERFACE.        *
+*                                                                    *
+*                                                                    *
+* INSTALL    -   CHANGE SVC # FOR SETAUTH MACRO                      *
+*                ASSEMBLE AND LINK AUTHSVC INTO PLPA                 *
+*                CHANGE &MAXASID CONSTANT - MUST ALSO BE CHANGED     *
+*                                           IN DUSER AND MUST BE     *
+*                                           CONSISTENT WITH IEFU84   *
+*                CHANGE CODE REGARDING ACCOUNT NUMBER (SEE SOURCE)   *
+*                ASSEMBLE TMPFRONT                                   *
+*                LINK TMPFRONT RENT REUS REFR                        *
+*                PLACE TMPFRONT IN LINKLIST LIBRARY OR PLPA          *
+*                CHANGE LOGON PROCEDURE EXEC STATEMENT TO            *
+*                       REFER TO TMPFRONT                            *
+*                                                                    *
+*       TMPFRONT IDENTIFIES THE ENTRY NAME 'STEPLIB' AT EXECUTION    *
+*                                                                    *
+**********************************************************************
+         TITLE 'TMPFRONT - MACROS'
+         MACRO
+&LABEL   SETAUTH &DIR
+         AIF   ('&DIR' EQ 'ON').ON
+&LABEL   SR    R0,R0 .                 INDICATE AUTH OFF
+         AGO   .SVC
+.ON      ANOP
+&LABEL   LA    R0,1                    INDICATE AUTH ON
+.SVC     SVC   248                     SPECIAL SVC
+         MEND
+         TITLE 'TMPFRONT - INITIALIZATION'
+TMPFRONT CSECT
+         LCLA  &MAXASID                MAXIMUM ADDRESS SPACES
+&MAXASID SETA  100
+ACCTLEN  EQU   16                      LENGTH OF FRBNY ACCT #
+********************************************************************
+*                                                                  *
+*              INITIALIZATION SECTION                              *
+*                                                                  *
+********************************************************************
+         REGS  R                       REGISTER EQUATES
+         FULLSAVE RENT=YES             ENTRANCE CONVENTIONS
+         LR    R4,R1                   SAVE PARM POINTER
+         GETMAIN R,LV=WORKLEN          GET WORK SPACE
+         LR    R3,R1                   SAVE WORK SPACE ADDRESS
+         USING WORK,R3
+         IDENTIFY EP=STEPLIB,ENTRY=STEPCMD  ENTRY FOR STEPLIB CP
+         MVI   ASCBFLG,X'00'           CLEAR TSDASCB FLAG
+         XC    TMPECB,TMPECB           CLEAR ATTACH ECB
+         XC    NEWSTEP,NEWSTEP         CLEAR DYN STEPLIB DCB PTR
+         USING PSA,R0
+         L     R1,PSATOLD              TCB
+         USING TCB,R1
+         L     R1,TCBJLB               STEPLIB/JOBLIB DCB PTR
+         ST    R1,OLDSTEP              SAVE IT
+         DROP  R0,R1
+         LA    R1,TMPECB               TMP ECB
+         ST    R1,WAITLIST             SAVE IN ECB LIST
+         MVI   WAITLIST,X'80'          INDICATE END OF LIST
+         MVC   OPARMS(OLEN),OPENLST    SETUP OPEN PARMS
+         MVC   CPARMS(CLEN),CLOSLST    SETUP CLOSE PARMS
+         MVC   SUPVPARM(ATTACHL),SPARM SETUP ATTACH PARMS
+         MVC   ELIST(ELEN),EPARM       SETUP ESTAE PARMS
+         ST    R3,WORKPTR              SAVE WORK AREA ADDR FOR ESTAE
+         ESTAE MF=(E,ELIST),PARAM=(3)  SETUP ESTAE ENVIRONMENT
+         TITLE 'TMPFRONT - BUILD TSDASCB'
+********************************************************************
+*                                                                  *
+*             BUILD TSDASCB CONTROL BLOCK                          *
+*                                                                  *
+********************************************************************
+         L     R1,CVTPTR               CVT
+         USING CVT,R1
+         L     R1,CVTUSER              IF TSDCVT NOT PRESENT,
+         DROP  R1                         CAN'T BUILD TSDASCB
+         LTR   R1,R1
+         BZ    NOBUILD
+         USING PSA,R0
+         L     R1,PSAAOLD              ASCB
+         USING ASCB,R1
+         LH    R5,ASCBASID             ASID
+         DROP  R0,R1
+         CH    R5,MAXUSER              IF ASID > MAXUSER,
+         BH    NOBUILD                    THEN CAN'T BUILD TSDASCB
+         MVI   ASCBFLG,X'FF'           INDICATE TSDASCB BUILT
+         STH   R5,TSDASID              SAVE ASID
+         SETAUTH ON
+         GETMAIN R,LV=ASCBLEN,SP=241   GETMAIN TSDASCB IN CSA
+         ST    R1,TSDASCBA             SAVE ADDRESS
+         LR    R6,R1
+         SETAUTH OFF
+         USING TSDASCB,R6              ADDRESS THE TSDASCB
+         MVC   ASCBNAME,CBNAME         MOVE ACRONYM
+         MVC   STEPDD,BLANKS           CLEAR DYN STEPLIB DDNAME
+         XC    TMPFECB,TMPFECB         CLEAR TMP FRONT ECB
+         XC    STEPECB,STEPECB         CLEAR STEPLIB CP ECB
+         LA    R1,TMPFECB
+         ST    R1,WAITLIST+4           COMPLETE WAIT LIST
+         MVI   WAITLIST,X'00'
+         MVI   WAITLIST+4,X'80'        SET END OF LIST INDICATOR
+         TIME  DEC                     GET LOGON TIME
+         ST    R0,LOGTIME              SAVE IN TSDASCB
+         USING PSA,R0
+         L     R1,PSAAOLD              ASCB
+         USING ASCB,R1
+         MVC   TSOUCB,ASCBRV50         A(TSOMON USER CONTROL BLOCK)
+         SR    R0,R0
+         MVC   USERID,BLANKS           INITIALIZE USERID & PROCNAME
+         MVC   PROCNAME,BLANKS
+         L     R1,ASCBJBNS
+         DROP  R0,R1
+         CR    R1,R0                   IF NO USERID, LEAVE BLANKS
+         BE    GETAUTH
+         MVC   USERID,0(R1)            SAVE USERID & PROCNAME
+         MVC   PROCNAME,8(R1)               FROM CSCB
+         USING PSA,R0
+GETAUTH  L     R1,PSATOLD              TCB
+         USING TCB,R1
+         L     R1,TCBJSCB              JSCB
+         USING IEZJSCB,R1
+         L     R1,JSCBPSCB             PSCB
+         USING PSCB,R1
+         MVC   USERAUTH,PSCBATR1       SAVE USER AUTHORITY
+         DROP  R0,R1
+         USING PSA,R0
+         L     R1,PSATOLD              TCB
+         USING TCB,R1
+         L     R1,TCBJSCB              JSCB
+         USING IEZJSCB,R1
+         L     R1,JSCBJCT              JCT
+         USING JCT,R1
+         ICM   R1,7,JCTACTAD           ACT
+         USING ACT,R1
+*
+*        THIS CODE IMPLEMENTS AN INSTALLATION RESTRICTION
+*        CONCERNING ACCOUNT NUMBERS.
+*
+         MVC   ACCOUNT,BLANKS          INITIALIZE TSDASCB ACCOUNT
+         CLI   ACTJNFLD,X'00'          ANY ACCOUNTING FIELDS?
+         BE    SETTERM                 NO, LEAVE ACCT BLANK
+         CLI   ACTFLDL,ACCTLEN         ACCOUNT = 16 DIGITS?
+         BNE   SETTERM                 NO, LEAVE ACCT BLANK
+         MVC   ACCOUNT,ACTFIELD        SAVE ACCOUNT # IN TSDASCB
+         DROP  R0,R1
+         USING PSA,R0
+SETTERM  L     R1,PSAAOLD              ASCB
+         USING ASCB,R1
+         L     R5,ASCBTSB              TSB
+         DROP  R1
+         USING TSB,R5
+         SETAUTH ON
+         MODESET KEY=ZERO,MODE=PROB
+         MVC   TERMNAME,TSBTRMID       SAVE TERMINAL NAME
+         MVC   LINEADDR,TSBLINE        SAVE LINE ADDRESS
+         MODESET KEY=NZERO,MODE=PROB
+         SETAUTH OFF
+         DROP  R5
+         SETAUTH ON                    GET AUTHORIZATION
+         MODESET KEY=ZERO,MODE=PROB    GET PK 0
+         LH    R5,TSDASID              GET ASID
+         BCTR  R5,0                    RELATIVIZE ASID
+         SLL   R5,2                    GET DISPLACEMENT IN TSDASVT
+         L     R1,CVTPTR               CVT
+         USING CVT,R1
+         L     R1,CVTUSER              TSDCVT  (SP 245 KEY 0)
+         USING TSDCVT,R1
+         ST    R6,TSDASVT(R5)          SAVE -> TSDASCB IN TSDASVT
+         DROP  R1
+         MODESET KEY=NZERO,MODE=PROB   USER KEY
+         SETAUTH OFF                   RELEASE AUTHORIZATION
+         TITLE 'TMPFRONT - TMP ATTACH'
+********************************************************************
+*                                                                  *
+*                     ATTACH TMP                                   *
+*                                                                  *
+********************************************************************
+NOBUILD  SETAUTH ON                    GET AUTHORIZATION
+         ATTACH EP=IKJEFT01,MF=(E,(R4)),   ATTACH TMP                  $
+               SF=(E,SUPVPARM),ECB=TMPECB
+         ST    R1,TMPTCBAD             SAVE TMP TCB ADDRESS
+         TITLE 'WAIT FOR LOGOFF OR STEPLIB COMMAND'
+********************************************************************
+*                                                                  *
+*           WAIT FOR LOGOFF OR STEPLIB COMMAND                     *
+*                                                                  *
+********************************************************************
+MWAIT    WAIT  1,ECBLIST=WAITLIST      WAIT FOR LOGOFF OR STEPLIB
+         L     R1,WAITLIST             CHECK FOR LOGOFF
+         TM    0(R1),X'40'
+         BO    LOGOFF                  IF NOT LOGOFF, MUST BE STEPLIB
+         TITLE 'PROCESS STEPLIB COMMAND'
+********************************************************************
+*                                                                  *
+*             PROCESS STEPLIB COMMAND                              *
+*                                                                  *
+********************************************************************
+         MVI   TMPFECB,X'00'           CLEAR POST FLAG
+         L     R2,NEWSTEP
+         LTR   R2,R2                   CHECK FOR OUTSTANDING STEPLIB
+         BZ    NOCLOSE
+         CLOSE ((2)),MF=(E,CPARMS)     CLOSE OUTSTANDING STEPLIB
+NOCLOSE  CLI   TMPFECB+3,X'01'         CANCEL REQUEST?
+         BE    CANSTEP                 YES, PROCESS IT
+         LA    R2,LIBDCB
+         USING IHADCB,R2
+         MVC   LIBDCB(DCBLEN),STEPLIB  MOVE STEPLIB DCB PROTOTYPE
+         MVC   DCBDDNAM,STEPDD         SAVE USER DDNAME
+         OPEN  ((2)),MF=(E,OPARMS)     OPEN NEW STEPLIB
+         TM    DCBOFLGS,DCBOFOPN       SUCCESSFUL?
+         BZ    CANSTEP                 NO, REVERT TO ORIGINAL
+         L     R9,TMPTCBAD             GET TMP TCB ADDRESS
+         USING TCB,R9
+         SETAUTH ON                    GET APF AUTHORIZATION
+         MODESET KEY=ZERO              GET KEY 0
+         ST    R2,TCBJLB               SAVE NEW STEPLIB DCB PTR
+         MODESET KEY=NZERO
+         SETAUTH OFF
+         DROP  R9                           IN TMP TCBJLB &
+         ST    R2,NEWSTEP                   TMPFRONT WORK AREA
+         POST  STEPECB,0               WAKEUP STEPLIB CP
+         B     MWAIT                   WAIT FOR AN EVENT
+CANSTEP  XC    NEWSTEP,NEWSTEP         CLEAR STEPLIB DCB PTR
+         MVC   STEPDD,BLANKS           CLEAR STEPLIB DD NAME
+         CLI   TMPFECB+3,X'01'         CANCEL REQUEST?
+         BE    MOVEOLD
+         TPUT  OPENERR,40              IF NOT CANCEL, MUST BE
+MOVEOLD  L     R9,TMPTCBAD                HERE FROM OPEN ERROR
+         USING TCB,R9
+         SETAUTH ON
+         MODESET KEY=ZERO
+         MVC   TCBJLB,OLDSTEP          REVERT TO ORIGINAL STEPLIB
+         MODESET KEY=NZERO
+         SETAUTH OFF
+         POST  STEPECB,0               WAKEUP STEPLIB CP
+         B     MWAIT                   WAIT FOR AN EVENT
+OPENERR  DC    CL40'STEPLIB COMMAND - OPEN FAILED'
+         DS    0H
+         DROP  R2,R6,R9
+         TITLE 'HANDLE LOGOFF CONDITION'
+********************************************************************
+*                                                                  *
+*                HANDLE LOGOFF CONDITION                           *
+*                                                                  *
+********************************************************************
+LOGOFF   DETACH TMPTCBAD               DETACH TMP
+         BAL    R14,CLRSCR             CLEAR TERMINA SCREEN
+         BAL   R14,CLEANUP             FREE TSDASCB
+         FULLRTRN RENT=YES,RC=0        EXIT CONVENTIONS
+         TITLE 'TMPFRONT - ESTAE EXIT'
+********************************************************************
+*                                                                  *
+*        ESTAE EXIT FOR OPERATOR CANCEL AND OPEN ABEND             *
+*                                                                  *
+********************************************************************
+         USING *,R15
+ABEND    C     R0,TWELVE               IF AN SDWA WAS PROVIDED,
+         BNE   FULLEXIT                   PERFORM COMPLETE EXIT;
+         SR    R15,R15                 ELSE RETURN.
+         BR    R14
+TWELVE   DC    F'12'
+         DROP  R15
+FULLEXIT STM   R14,R12,12(R13)         SAVE REGS
+         BALR  R11,0                   SETUP ADDRESSABILITY
+         USING *,R11
+         LR    R10,R1                  SAVE PTR TO SDWA
+         USING SDWA,R1
+         L     R3,SDWAPARM             GET ADDRESS OF WORK AREA
+         LTR   R3,R3
+         BZ    EOUT
+         CLC   SDWAABCC,OPEN913        ACF2 ACCESS VIOLATION?
+         BNE   NOTOPEN
+         L     R2,RECOVER              YES, GET RETRY ADDRESS
+         SETRP WKAREA=(10),REGS=(14,12),DUMP=NO,RC=4,RETADDR=(2),      $
+               RETREGS=YES,FRESDWA=YES
+NOTOPEN  L     R12,ENTRY               SETUP ADDRESSABILITY TO
+*                                      CLRSCR AND CLEANUP SUBROUTINES
+         L     R15,CLR
+         BALR  R14,R15                 CLEAR TERMINAL SCREEN
+         L     R15,CLEAN
+         BALR  R14,R15                 FREE TSDASCB
+EOUT     SETRP WKAREA=(10),REGS=(14,12),DUMP=NO,RC=0   TERMINATE
+         DROP  R1,R11
+ENTRY    DC    A(TMPFRONT)             R12 BASE ADDRESS
+CLR      DC    A(CLRSCR)               CLRSCR SUBROUTINE
+CLEAN    DC    A(CLEANUP)              CLEANUP SUBROUTINE
+OPEN913  DC    X'00913000'             913 ABEND CODE
+RECOVER  DC    A(CANSTEP)              RETRY ADDRESS
+         DS    0H
+         TITLE 'TMPFRONT - CLEAR TERMINAL SCREEN SUBROUTINE'
+*******************************************************************
+*                                                                 *
+*          CLEAR TERMINAL SCREEN SUBROUTINE                       *
+*                                                                 *
+*******************************************************************
+         USING PSA,R0
+CLRSCR   L     R1,PSAAOLD              ASCB
+         USING ASCB,R1
+         L     R5,ASCBTSB              TSB
+         DROP  R1
+         SETAUTH ON                    GET AUTHORIZATION
+         MODESET KEY=ZERO,MODE=PROB    GET PK0
+         USING TSB,R5
+         TM    TSBSTAT,TSB3270         3270?
+         BZ    EXIT                    NO, CAN'T CLEAR SCREEN
+         TM    TSBFLG5,TSBVTAM         VTAM TERMINAL?
+         BZ    TCAMCLR                 NO, CLEAR SCREEN WITH TPUT
+         DROP  R5
+         STLINENO LINE=1               YES, LET VTAM CLEAR SCREEN
+         B     EXIT
+TCAMCLR  TPUT  CLEAR,17,FULLSCR        TCAM SCREEN CLEAR
+EXIT     MODESET KEY=NZERO,MODE=PROB   GET PK FROM TCB
+         SETAUTH OFF                   RELEASE AUTHORIZATION
+         BR    R14
+         TITLE 'TMPFRONT - CLEANUP SUBROUTINE'
+*******************************************************************
+*                                                                 *
+*        FREE TSDASCB AND CLEANUP TSDCVT SUBROUTINE               *
+*                                                                 *
+*******************************************************************
+CLEANUP  CLI   ASCBFLG,X'FF'           WAS TSDASCB BUILT?
+         BNE   FREEWK                  NO, OMIT FREEMAIN
+         ENQ   MF=(E,ENQPARM)          SERIALIZE TSDASVT
+         L     R2,TSDASCBA             TSDASCB
+         SETAUTH ON
+         FREEMAIN R,LV=ASCBLEN,A=(R2),SP=241  FREE TSDASCB
+         MODESET KEY=ZERO,MODE=PROB
+         LH    R5,TSDASID              GET ASID
+         BCTR  R5,0                    RELATIVIZE ASID
+         SLL   R5,2                    GET DISPLACEMENT
+         SR    R0,R0
+         L     R1,CVTPTR               CVT
+         USING CVT,R1
+         L     R1,CVTUSER              TSDCVT
+         USING TSDCVT,R1
+         ST    R0,TSDASVT(R5)          CLEAR TSDASVT SLOT
+         DROP  R1
+         MODESET KEY=NZERO,MODE=PROB
+         SETAUTH OFF
+         DEQ   MF=(E,DEQPARM)          RELEASE TSDASVT
+FREEWK   FREEMAIN R,LV=WORKLEN,A=(R3)  FREE WORK AREA
+         BR    R14
+         TITLE 'STEPLIB COMMAND PROCESSOR'
+********************************************************************
+*                                                                  *
+*            STEPLIB COMMAND PROCESSOR                             *
+*                                                                  *
+********************************************************************
+STEPCMD  FULLSAVE RENT=YES
+         LR    R3,R1                   SAVE CPPL ADDRESS
+         USING CPPL,R3
+         GETMAIN R,LV=WLEN
+         LR    R4,R1                   SAVE WORK AREA ADDRESS
+         USING STEPWORK,R4
+         XC    STEPWORK(WLEN),STEPWORK CLEAR WORK AREA
+         L     R1,CPPLECT              ECT
+         USING ECT,R1
+         TM    ECTSWS,ECTNOPD          ANY OPERANDS?
+         DROP  R1
+         BO    NOPARSE                 NO, THEN PARSE UNNECESSARY
+         LA    R5,PARSPARM
+         USING PPL,R5                  SETUP PARSE PARAMETERS
+         MVC   PPLUPT,CPPLUPT          UPT
+         MVC   PPLECT,CPPLECT          ECT
+         MVC   PPLCBUF,CPPLCBUF        CIB
+         LA    R1,PARSECB              ECB
+         ST    R1,PPLECB
+         L     R1,=A(PCL)              PCL
+         ST    R1,PPLPCL
+         LA    R1,ANSWER               PDL
+         ST    R1,PPLANS
+         CALLTSSR EP=IKJPARS,MF=(E,(R5))  PARSE OPERANDS
+         DROP  R5
+         L     R6,ANSWER               GET PDL ADDR
+         LTR   R6,R6                   CHECK IF PARSE OK
+         BP    NOPARSE
+         TPUT  PARSERR,40              IF NOT, ISSUE MESSAGE
+         B     STEPEXIT                        AND EXIT
+         USING PDL,R6
+         USING PSA,R0
+NOPARSE  L     R1,PSAAOLD              FIND TSDASCB
+         USING ASCB,R1
+         LH    R2,ASCBASID                  GET ASID
+         L     R1,CVTPTR
+         USING CVT,R1
+         L     R1,CVTUSER                   GET TSDCVT
+         USING TSDCVT,R1
+         LTR   R1,R1
+         BP    GETASCB                 IF TSDCVT NOT CREATED,
+         TPUT  CVTERR,40                    SEND MSG AND EXIT
+         B     STEPEXIT
+GETASCB  BCTR  R2,0                         GET DISPL IN TSDCVT
+         SLL   R2,2
+         L     R5,TSDASVT(R2)               GET TSDASCB ADDR
+         USING TSDASCB,R5
+         LTR   R5,R5                   MAKE CERTAIN TSDASCB EXISTS
+         BP    MOVEDD
+         TPUT  ASCBERR,40              IF TSDASCB NOT CREATED,
+         B     STEPEXIT                   ISSUE MESSAGE AND EXIT
+MOVEDD   L     R1,CPPLECT
+         LA    R2,1                    ASSUME CANCEL REQUEST
+         USING ECT,R1
+         TM    ECTSWS,ECTNOPD          ANY OPERANDS?
+         DROP  R1
+         BO    NOSETUP                 NO, BYPASS SETUP
+         MVC   STEPDD,BLANKS           CLEAR STEPLIB DDNAME
+         L     R2,DDPTR                GET DDNAME ADDR
+         LH    R1,DDLEN                GET DDNAME LENGTH
+         BCTR  R1,0
+         EX    R1,*+4
+         MVC   STEPDD(*-*),0(R2)       SAVE THE STEPLIB DDNAME
+         DROP  R0
+         SR    R2,R2
+NOSETUP  XC    STEPECB,STEPECB         CLEAR COMMUNICATIONS ECB
+         POST  TMPFECB,(2)             POST TMPFRONT
+         WAIT  ECB=STEPECB             WAIT FOR STEPLIB PROCESSING
+         DROP  R3,R5,R6
+STEPEXIT IKJRLSA ANSWER                FREE PARSE WORK AREA
+         FREEMAIN R,LV=WLEN,A=(R4)     FREE STEPLIB CP WORK AREA
+         FULLRTRN RENT=YES             RETURN
+PARSERR  DC    CL40'STEPLIB COMMAND - PARSE ERROR'
+CVTERR   DC    CL40'STEPLIB COMMAND - TSDCVT NOT FOUND'
+ASCBERR  DC    CL40'STEPLIB COMMAND - TSDASCB NOT FOUND'
+         TITLE 'STEPLIB COMMAND PROCESSOR PCL'
+********************************************************************
+*                                                                  *
+*              PARSE PARAMETER CONTROL LIST                        *
+*                                                                  *
+********************************************************************
+PCL      IKJPARM DSECT=PDL
+DDNAME   IKJIDENT 'DDNAME',MAXLNTH=8,FIRST=ALPHA,OTHER=ALPHANUM
+         IKJENDP
+         TITLE 'TMPFRONT - CONSTANTS'
+********************************************************************
+*                                                                  *
+*           CONSTANTS, LIST FORMS, STEPLIB DCB                     *
+*                                                                  *
+********************************************************************
+MAXUSER  DC    H'&MAXASID'             MAXIMUM ADDRESS SPACES
+CLEAR    DC    X'27F540115D7E1140403C40400011404013'   3270 ORDERS
+BLANKS   DC    CL16' '                 BLANKS CONSTANT
+CBNAME   DC    CL8'TSDASCB'            TSDASCB ACRONYM
+QNAME    DC    CL8'TSDASVT'
+RNAME    DC    CL7'TSDASCB'
+SPARM    ATTACH SF=L                   ATTACH PARMS
+ATTACHL  EQU   *-SPARM                 L'PARMS
+ENQPARM  ENQ   (QNAME,RNAME,E,7,SYSTEM),MF=L    ENQ PARMS
+DEQPARM  DEQ   (QNAME,RNAME,7,SYSTEM),MF=L      DEQ PARMS
+EPARM    ESTAE ABEND,CT,TERM=YES,MF=L  ESTAE PARMS
+ELEN     EQU   *-EPARM                 L'ESTAE PARMS
+OPENLST  OPEN  STEPLIB,MF=L            OPEN PARMS
+OLEN     EQU   *-OPENLST               L'OPEN PARMS
+CLOSLST  CLOSE (STEPLIB),MF=L          CLOSE PARMS
+CLEN     EQU   *-CLOSLST               L'CLOSE PARMS
+STEPLIB  DCB   DDNAME=X,DSORG=PO,MACRF=R        STEPLIB DCB PROTOTYPE
+DCBLEN   EQU   *-STEPLIB                        DCB LENGTH
+         TITLE 'TMPFRONT - MVS DSECTS'
+********************************************************************
+*                                                                  *
+*                MVS CONTROL BLOCK DSECTS                          *
+*                                                                  *
+********************************************************************
+         PRINT NOGEN
+         CVT DSECT=YES,PREFIX=NO       CVT
+         IHAPSA                        PSA
+         IKJTSB                        TSB
+         IKJPPL                        PPL
+         IKJCPPL                       CPPL
+         IKJECT                        ECT
+         IHAASCB                       ASCB
+         IHADCB DSORG=PO,DEVD=DA       DCB
+         IKJPSCB                       PSCB
+         IKJTCB                        TCB
+         IEZJSCB                       JSCB
+         IHASDWA                       SDWA
+         PRINT GEN
+         TITLE 'TMPFRONT - TSD DSECTS'
+*******************************************************************
+*                                                                 *
+*           TSD CONTROL BLOCK DESCRIPTIONS                        *
+*                                                                 *
+*******************************************************************
+         JCT                           JCT
+         SPACE 2
+         ACT                           ACT
+         SPACE 2
+         TSDCVT                        TSDCVT
+         SPACE 2
+         TSDASCB                       TSDASCB
+         SPACE 2
+WORK     DSECT                         TMPFRONT WORK AREA
+WORKPTR  DS    A                       ADDRESS OF WORKAREA
+TMPECB   DS    F                       ATTACH ECB
+TSDASCBA DS    A                       TSDASCB ADDRESS
+TMPTCBAD DS    A                       TMP TCB ADDRESS
+NEWSTEP  DS    A                       DYN STEPLIB DCB ADDR
+OLDSTEP  DS    A                       STEPLIB/JOBLIB DCB ADDR
+WAITLIST DS    2A                      ECB WAIT LIST
+         DS    0F
+OPARMS   DS    CL(OLEN)                OPEN PARMS
+         DS    0F
+CPARMS   DS    CL(CLEN)                CLOSE PARMS
+         DS    0F
+SUPVPARM DS    CL(ATTACHL)             ATTACH PARMS
+         DS    0F
+ELIST    DS    CL(ELEN)                ESTAE PARMS
+         DS    0F
+LIBDCB   DS    CL(DCBLEN)              STEPLIB DCB
+TSDASID  DS    H                       ASID
+ASCBFLG  DS    X                       TSDASCB FLAG
+WORKLEN  EQU   *-WORK                  LENGTH OF WORK AREA
+         SPACE 2
+STEPWORK DSECT                         STEPLIB CP WORK AREA
+PARSPARM DS   7A                       PPL
+PARSECB  DS   F                        PARSE ECB
+ANSWER   DS   A                        PDL POINTER
+WLEN     EQU  *-STEPWORK
+         SPACE 2
+PDL      DSECT                         PDL EXTENSION
+         ORG  DDNAME                   DDNAME PDE
+DDPTR    DS   F                        ADDRESS OF DDNAME
+DDLEN    DS   H                        LENGTH OF DDNAME
+         END   TMPFRONT

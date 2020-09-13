@@ -1,0 +1,745 @@
+         TITLE 'SCANTEXT: DYNAMIC ALLOCATION PROCESSOR'
+***********************************************************************
+*                                                                     *
+*  SCANTEXT.  A MODULE TO SCAN AN INPUT JCL DD STATEMENT AND          *
+*        PRODUCE AN INTERNAL TEXT STRING AS OUTPUT.                   *
+*                                                                     *
+*  ATTRIBUTES. REENTRANT.ISSUES INSTALLATION MACRO  IEFKEYS AND       *
+*        USES THE CONCEPT14 MACRO SET.                                *
+*                                                                     *
+*  JCL REQUIRED. NONE.                                                *
+*                                                                     *
+*  PARAMETERS. UP TO 5 FIELDS ARE PASSED BY STANDARD LINKAGE          *
+*              1.  THE JCL DD STATEMENT. PRECEDED BY A HALFWORD       *
+*                      WHICH CONTAINS THE MAX LENGTH OF THE IMAGE.    *
+*              2.  A 1 BYTE FUNCTION CODE -  'A' = ALLOCATE THE D/S   *
+*                                            'D' = DEALLOCATE THE D/S *
+*                                            'C' = CONVERT JCL ONLY   *
+*                                            'F' = FREE TEXT STRINGS  *
+*              3.  A 1 BYTE RETURN CODE - '0' = OPERATION SUCCESSFUL  *
+*                                         '>0' = NOT SUCCESSFUL       *
+*              4.  ADDRESS OF A FULLWORD TO CONTAIN THE ADDRESS OF    *
+*                  THE ALLOCATE TEXT STRING. (OPTIONAL, ONLY NEEDED   *
+*                  IF 'CONVERT' RQUESTED.                             *
+*              5.  ADDRESS OF A FULLWORD TO CONTAIN THE ADDRES OF     *
+*                  THE DE-ALLOCATE TEXT STRING. (OPTIONAL).           *
+*                                                                     *
+*                                                                     *
+*                                                                     *
+*                                                                     *
+*  REGISTER USAGE.                                                    *
+*        REG0  WORK REGISTER.                                         *
+*        REG1  WORK REGISTER                                          *
+*        REG2  USED BY SCAN MACRO (TRT INSTR) & WORK REGISTER.        *
+*        REG3  ADDRESS OF PROGRAM'S GETMAINED WORK AREA.              *
+*        REG4  ADDRESS OF GETMAINED AREA WHERE INTERNAL TEXT WILL     *
+*                  BE CONSTRUCTED.                                    *
+*        REG5  ADDRESS OF USER FULLWORD PARAMETER.                    *
+*        REG6  ADDRESS OF INPUT SOURCE JCL STATEMENT.                 *
+*        REG7  LENGTH OF INPUT JCL STATEMENT                          *
+*        REG8  ADDRESS OF SCAN MACRO OUTPUT CHAIN                     *
+*        REG9  ADDRESS OF OPERAND BEING PROCESSED.                    *
+*        REG10 LENGTH OF OPERAND BEING PROCESSED.                     *
+*        REG11 LINK REGISTER BETWEEN ROUTINES.                        *
+*        REG12 BASE ADDRESS REGISTER.                                 *
+*        REG13 ADDRESS OF PROGRAM SAVE AREA                           *
+*        REG14 PROGRAM LINK REGISTER & WORK REGISTER.                 *
+*        REG15 PROGRAM LINK REGISTER, RETURN CODE & WORK REGISTER     *
+*                                                                     *
+*                                                                     *
+*                                                                     *
+*                                                                     *
+***********************************************************************
+         EJECT
+***********************************************************************
+*        EQUATES                                                      *
+***********************************************************************
+         SPACE 2
+VERBCODE EQU   X'01'               DEFAULT VERB CODE STORED IN REQ.
+VERBCOD2 EQU   X'02'               DEFAULT VERB CODE FOR UNALLOCATION
+*
+*        THE FOLLOWING EQUATES RELATE TO THE FLAGS IN EACH IEFENTRY
+*
+KEYCNVRT EQU   X'01'               OPERAND NEEDS CONVERSION TO 1 BYTE
+ZEROLEN  EQU   X'02'               TEXT UNIT NEEDS NO OPERAND SPEC
+NUMCNVRT EQU   X'04'               OPERAND NEEDS CONVERSION TO BINARY
+MANYOPS  EQU   X'08'               MORE THAN 1 OPERAND MAY BE CODED
+*
+*        THE FOLLOWING EQUATES ARE THE RETURN CODES PLACED IN PARAMTER
+*
+JCLERROR EQU   X'80'               ALLOCATION FAILED. JCL ERROR
+INVREQST EQU   X'40'               REQUEST INVALID.
+NOALLOC  EQU   X'20'               ALLOCATION WAS UNSUCCESSFUL
+ALLOK    EQU   X'00'               OPERATION REQUESTED WAS COMPLETED OK
+         EJECT
+***********************************************************************
+*        DSECTS                                                       *
+***********************************************************************
+         SPACE 1
+WKAREA   DSECT
+GETMNLEN DS    A                   LENGTH OF GETMAIN ISSUED.
+GETMNADD DS    A                   ADDRESS OF CORE RETURNED.
+CHAIN    DS    56F                 SCAN DESCR BLKS. ALLOWS 28 OPERANDS
+ALLOCLST DS    A                   ADDRESS OF ALLOCATION TEXT STRING
+UNLOCLST DS    A                   ADDRESS OF UNALLOCATION LIST
+NXTTUNAD DS    A                   ADDRESS NEXT FREE TXT UNIT
+WORKF    DS    F                   WORK AREA
+VOLR11   DS    A                   SAVE AREA FOR LINK REGISTER
+SPACER11 DS    A                   SAVE AREA FOR LINK REGISTE
+BASICR11 DS    A                   SAVE AREA FOR LINK REGISTER
+SAVER111 DS    A                   SAVE AREA FOR LINK REGISTER
+SAVER112 DS    A                   SAVE AREA FOR LINK REGISTER
+SAVER113 DS    A                   SAVE AREA FOR LINK REGISTER
+SAVER114 DS    A                   SAVE AREA FOR LINK REGISTER
+FKEYAREA DS    CL8                 KEYWORD LEFT JUSTIFIED & PADDED
+DBLWORD  DS    D                   USED FOR CONVERSION TO BINARY
+RETCODE  DS    H                   RETURN CODE TO CALLER
+WKAREAND EQU   *                   END OF DSECT
+WKAREALN EQU   WKAREAND-WKAREA     LENGTH OF DSECT
+         SPACE 2
+TXTAREA  DSECT
+S99RB    EQU   *                   DYNAMIC ALLOCATION REQUEST BLOCK.
+S99RBLN  DC    X'14'               LENGTH OF THIS REQUEST BLOCK.
+S99VERB  DC    X'01'               INDICATES ALLOCATION BY DSNAME.
+S99FLAG1 DC    X'0000'             FUNCTION FLAGS.
+S99ERROR DC    X'0000'             ERROR FLAGS.
+S99INFO  DC    X'0000'             RETURN INFORMATION FROM SYSTEM.
+S99TXTPP DC    A(0)                ADDRESS OF TXT UNIT POINTERS.
+S99      DS    A                   RESERVED
+S99FLAG2 DC    A(0)                AUTHORISED FLAGS.
+S99RBLEN EQU   *-S99RB             LENGTH OF THIS BLOCK
+S99TUPL  DS    56A                 TXT UNIT POINTER LIST.
+S99WAREA DC    A(WKAREA)           USED TO RESTORE ADDRESSABILITY
+TXTAREND EQU   *                   END OF DSECT
+TXTARELN EQU   TXTAREND-TXTAREA    LENGTH OF DSECT
+         SPACE 2
+S99TUNIT DSECT ,                   MAPPING FOR TEXT STRING
+S99FRDET DS    F                   SAVE AREA FOR FREEMAIN DETAILS
+S99TUKEY DS    H                   CODE FOR KEYWORD.
+S99TUNUM DS    H                   NUMBER OF OPERANDS.
+S99TUENT DS    0H                  TEXT UNIT ENTRY
+S99TULNG DS    H                   LENGTH OF EBCDIC STRING
+S99TUBSE EQU   *-S99TUNIT          LENGTH OF TEXT UNIT
+S99TUPAR DS    C                   CHARACTER STRING PARAMETER.
+         SPACE 2
+TABENTRY DSECT ,                   MAPPING FOR KEYWORD TABLE ENTRY
+TABPRCSR BAL   REG1,0              BRANCH INST TO PROCESSOR OF KEYWORD
+TABKEYWD DS    CL8                 PADDED KEYWORD VALUE
+TABCODE  DS    XL2                 TEXT CODE FOR THIS KEYWORD
+TABFLAGS DS    0XL2                FLAGS FOR THIS KEYWORD
+TABFLAG1 DS    X                   FUNCTION FLAG
+TABFLAG2 DS    X                   LENGTH OF CONVERTED NUMERIC DATA
+TABENEND EQU   *
+TABENLEN EQU   TABENEND-TABENTRY   LENGTH OF TABLE ENTRY
+         EJECT
+***********************************************************************
+*        PROGRAM ENTRY HOUSEKEEPING                                   *
+***********************************************************************
+SCANTEXT CSECT
+UT501    EQU   *
+         ENTRY UT501
+SCANTEXT ZCSECT GETMAIN=1
+         EJECT
+***********************************************************************
+*        VERIFY THAT THIS IS MVS AND THAT LINKAGE IS DYNAMIC          *
+***********************************************************************
+         SPACE 2
+         LOAD  EP=UT501            LOAD A COPY OF MYSELF
+         L     REG15,4(REG13)      LOAD ADDRESS OF PREVIOUS SAVE AREA
+         L     REG15,16(REG15)     LOAD ENTRY POINT SUPPLIED BY CALLER
+         LA    REG15,0(REG15)      STRIP OF TOP BYTE
+         CR    REG15,REG0          COMPARE THE TWO ENTRY POINTS
+*        BNE   ABEND               NOT SAME. I AM A DIFFERENT COPY.
+         DELETE EP=UT501           RELEASE THE COPY OF ME.
+         TESTOS MVS                TEST LEVEL OF OPERATING SYSTEM
+         LTR   REG15,REG15         TEST RETURN CODE
+         BNZ   ABEND               MFT. DYNAMIC ALLOCATION IMPOSSIBLE
+         EJECT
+***********************************************************************
+*        INITIALISATION CODE                                          *
+***********************************************************************
+         USING WKAREA,REG3         ADDRESSABILITY
+         USING TXTAREA,REG4        ADDRESSABILITY
+         USING S99TUNIT,REG1       ADDRESSABILITY
+         L     REG1,4(REG13)       LOAD ADDRESS OF PREVIOUS SAVE AREA
+         L     REG1,24(REG1)       LOAD ADDRESS OF PASSED PARM LIST
+         L     REG6,4(REG1)        LOAD ADDRESS OF FUNCTION BYTE
+         CLI   0(REG6),C'F'        FREEMAIN OF CORE REQUESTED
+         BE    SETADDR             YES. GO INITIALISE REGISTERS ETC.
+         L     REG6,0(REG1)        LOAD ADDRESS OF JCL CARD PASSED
+         LA    REG0,WKAREALN+TXTARELN+S99RBLEN+4 LENGTH OF CORE NEEDED.
+         GETMAIN R,LV=(0)          ISSUE GETMAIN
+         LR    REG3,REG1           ADDRESS OF WORK AREA
+         ST    REG0,GETMNLEN       SAVE LENGTH FOR FREEMAIN
+         ST    REG1,GETMNADD       SAVE FOR FREEMAIN MACRO
+         LA    REG4,WKAREALN(REG3) ADDRESS OF INTERNAL TEXT STRING
+         LA    REG4,7(REG4)        ADD 7 TO THIS ADDRESS AND..
+         N     REG4,ANDMASK1       ROUND DOWN TO DOUBLE WORD.
+         ST    REG4,UNLOCLST       SAVE ADDRESS UNALLOCATION TEXT RB
+         LA    REG4,S99RBLEN+4(REG4) LOAD ADDRESS OF ALLOCATION RB
+         ST    REG4,ALLOCLST       SAVE ADDRESS OF ALLOCATION TEXT
+         ST    REG3,S99WAREA       SAVE ADDRESS OF WORK AREA
+         XC    RETCODE,RETCODE     ZEROISE THE RETURN CODE.
+         BAL   REG11,INITTEXT      INITIALISE WORK AREAS.
+         B     SCANDD              EXIT TO NEXT ROUTINE.
+ANDMASK1 DC    F'-8'               MASK TO STRIP OFF LOW ORDER 3 BITS
+         EJECT
+***********************************************************************
+*        SET UP WORK AREA AND TEXT STRING REQUEST BLOCK               *
+***********************************************************************
+         SPACE 2
+INITTEXT LA    REG15,S99TUPL       FIRST FREE ADDRESS FOR TEXT UNITS
+         ST    REG15,NXTTUNAD      SAVE IN WORK AREA.
+         XC    S99RB(S99RBLEN),S99RB ZEROISE THE REQUEST BLOCK.
+         LA    REG15,S99RBLEN      LENGTH OF REQUEST BLOCK.
+         STC   REG15,S99RBLN       STORE INTO REQUEST BLOCK
+         LA    REG15,VERBCODE      LOAD DEFAULT VERB CODE.
+         STC   REG15,S99VERB       STORE IN REQUEST BLOCK.
+         LA    REG15,S99TUPL       LOAD ADDRESS OF TEXT UNIT POINTERS
+         ST    REG15,S99TXTPP      STORE INTO REQUEST BLOCK.
+         SPACE 2
+*        BUILD THE DEALLOCATION REQUEST BLOCK
+         L     REG4,UNLOCLST       RELOAD ADDRESS UNALLOCATION LIST
+         XC    S99RB(S99RBLEN),S99RB ZEROISE THE REQUEST BLOCK
+         LA    REG15,S99RBLEN      LOAD LENGTH OF REQUEST BLOCK
+         STC   REG15,S99RBLN       STORE INTO THE BLOCK
+         LA    REG15,VERBCOD2      LOAD DEFAULT VERB CODE
+         STC   REG15,S99VERB       STORE INTO REQUEST BLOCK
+         LA    REG15,S99TUPL       LOAD ADDRESS TXT UNIT PTR
+         ST    REG15,S99TXTPP      STORE INTO REQUEST BLOCK
+         L     REG4,ALLOCLST       RELOAD ADDRESS ALLOCATION LIST
+         BR    REG11               RETURN TO MAINLINE
+         EJECT
+***********************************************************************
+*        ANALYSE INPUT DD STATEMENT BY KEYWORD PHASE 1 FIND PARTS     *
+***********************************************************************
+         SPACE 1
+SCANDD   DS    0H
+         LH    REG7,0(REG6)        LOAD LENGTH OF THE JCL 'CARD'
+         LA    REG6,2(REG6)        STEP OVER THE LENGTH FIELD
+         LA    REG6,2(REG6)        STEP OVER THE '//' OF JCL
+         BCTR  REG7,0              REDUCE LENGTH OF FIELD BY
+         BCTR  REG7,0              LENGTH OF '//'. (AVOID 0C4'S)
+         CLI   0(REG6),C' '        BLANK DDNAME ?
+         BE    INVLDJCL            CAN'T HAVE THAT!
+         PRINT NOGEN
+         SCAN  DATA=(REG6),LENGTH=(REG7),RETAREA=CHAIN,                X
+               DELIM=(' ')
+         PRINT GEN
+         L     REG8,CHAIN          ADDRESS OF SCAN DESCR BLOCKS
+         BAL   REG11,TESTDDNM      TEST FOR A GOOD DDNAME
+         BAL   REG11,TESTDD        TEST FOR DD KEYWORD
+         BAL   REG11,SCANKEYS      PROCESS OPERANDS
+         MVC   RETCODE,GOODEXIT    SIGNAL NORMAL RETURN
+         B     PGMEXIT             EXIT FROM THE PROGRAM
+GOODEXIT DC    H'0'                NO ERRORS ENCOUNTERED
+         EJECT
+***********************************************************************
+*        JCL CARD IS NOT VALID. SET RETURN CODE                       *
+***********************************************************************
+         SPACE 2
+INVLDJCL DS    0H
+         MVC   RETCODE,INVALID     SIGNAL REASON FOR FAILURE
+         B     PGMEXIT             EXIT FROM THE PROGRAM
+INVALID  DC    H'4'                RETURN CODE FOR INVALID JCL
+         EJECT
+***********************************************************************
+*        TEST FOR PRESCENCE OF VALID DDNAME                           *
+***********************************************************************
+         SPACE 2
+TESTDDNM DS    0H
+         LTR   REG8,REG8           TEST FOR MISSING OPERAND
+         BZ    INVLDJCL            WHOLE CARD IS MISSING.
+         L     REG9,4(REG8)        ADDRESS OF FIRST OPERAND.
+         XR    REG10,REG10         CLEAR REGISTER 10
+         IC    REG10,4(REG8)       PICK UP LENGTH OF OPERAND.
+         CH    REG10,EIGHT         TEST MAX LENGTH OF DDNAME.
+         BH    INVLDJCL            NO GOOD. JCL ERROR COMING UP!
+         CLI   0(REG9),X'F0'       IS THE FIRST CHARACTER NUMERIC ?
+         BNL   INVLDJCL            YES. NOT VALID DDNAME.
+         LA    REG0,S99TUBSE(REG10) LOAD LENGTH OF GETMAIN FOR TXT UNIT
+         GETMAIN R,LV=(0)          GETMAIN THE CORE FOR TEXT UNIT.
+         ST    REG0,S99FRDET       SAVE DETAILS FOR FREEMAIN
+         MVC   S99TUKEY,DDNMKEY    MOVE KEY VALUE TO TEXT UNIT
+         MVC   S99TUNUM,ONE        MOVE OPERAND COUNT.
+         STH   REG10,S99TULNG      STORE LENGTH OF OPERAND
+         BCT   REG10,*+10          SUBTRACT 1 FROM LENGTH
+         MVC   S99TUPAR,0(REG9)    MOVE PARAMETER TO TXT UNIT
+         EX    REG10,*-6           EXECUTE THE MOVE INST
+         LA    REG1,4(REG1)        STEP OVER FREEMAIN DETAILS
+         ST    REG1,S99TUPL        STORE TEXT UNIT ADDRESS
+         OI    S99TUPL,X'80'       TURN ON LAST ENTRY BIT
+         L     REG4,UNLOCLST       LOAD ADDRES UNALLOCATION LIST
+         ST    REG1,S99TUPL        STORE TEXT UNIT ADDRESS
+         OI    S99TUPL,X'80'       TURN ON LAST ENTRY BIT
+         L     REG4,ALLOCLST       RESTORE ADDRESS ALLOCATION LIST
+         L     REG8,0(REG8)        LOAD ADDRESS NEXT SCAN DESCR BLK
+         BR    REG11               RETURN TO MAINLINE
+ONE      DC    H'1'                OPERAND COUNT CONSTANT
+EIGHT    DC    H'8'                MAX DDNAME LENGTH CONSTANT
+DDNMKEY  DC    H'0001'
+         EJECT
+***********************************************************************
+*        VERIFY THAT 'DD' IS PRESENT.                                 *
+***********************************************************************
+TESTDD   DS    0H
+         LTR   REG8,REG8           TEST CONTENTS OF REG8
+         BZ    INVLDJCL            RUN OUT OF OPERANDS TOO SOON
+         L     REG9,4(REG8)        LOAD ADDRESS OF OPERAND
+         XR    REG10,REG10         CLEAR REGISTER 10
+         IC    REG10,4(REG8)       PICK UP LENGTH OF OPERAND
+         CH    REG10,TWO           TEST FOR CORRECT LENGTH
+         BNE   INVLDJCL            JCL ERROR NO DD KEYWORD.
+         BCT   REG10,*+10          SUBTRACT ONE FROM THE LENGTH
+         CLC   0(0,REG9),DDCHARS   COMPARE WITH CORRECT VALUE
+         EX    REG10,*-6           EXECUTE THE COMPARE
+         BNE   INVLDJCL            WON'T DO. ERROR
+         L     REG8,0(REG8)        ADDRESS NEXT DESCR BLOCK
+         BR    REG11               RETURN TO MAINLINE
+TWO      DC    H'2'                LENGTH OF KEYWORD CONSTANT
+DDCHARS  DC    C'DD'               KEYWORD VALUE
+         EJECT
+***********************************************************************
+*        LOCATE ALL OPERANDS CODED & ANALYSE EACH                     *
+***********************************************************************
+SCANKEYS DS    0H
+         ST    REG11,SAVER111      SAVE THE LINK REGISTER
+         LTR   REG8,REG8           ANY DD OPERANDS PRESENT
+         BZ    INVLDJCL            DOESN'T MAKE SENSE
+         L     REG9,4(REG8)        LOAD ADDRESS OF OPERAND STRING
+         XR    REG10,REG10         CLEAR REG 10
+         IC    REG10,4(REG8)       PICK UP LENGTH OF OPERANDS
+         PRINT NOGEN
+         SCAN  DATA=(REG9),LENGTH=(REG10),RETAREA=CHAIN,               X
+               DELIM=(',','(',')','''','=')
+         L     REG8,CHAIN          ADDRESS FIRST SCAN DESCR BLK
+         DO    WHILE=(LTR,REG8,REG8,NZ)  LOOP FOR EACH OPERAND KEYWORD
+             BAL   REG11,TESTIT    GO PROCESS THE KEYWORD
+             L     REG8,0(REG8)    ADDRESS NEXT MAJOR KEYWORD
+         ENDDO
+         PRINT GEN
+         L     REG11,SAVER111      RESTORE LINK REGISTER
+         BR    REG11               RETURN TO MAINLINE
+         EJECT
+***********************************************************************
+*        SCAN KEYWORD TABLE & FIND ADDRESS OF PROCESSOR               *
+***********************************************************************
+TESTIT   DS    0H
+         ST    REG11,SAVER112      SAVE LINK REGISTER
+         L     REG9,4(REG8)        LOAD ADDRESS OF OPERAND
+         XR    REG10,REG10         CLEAR REGISTER 10
+         IC    REG10,4(REG8)       LOAD LENGTH OF OPERAND
+         LA    REG15,0(REG10,REG9) ADDRESS NEXT BYTE AFTER KEYWORD
+         CLC   DUMMYX,0(REG9)      TEST FOR 'DUMMY' KEYWORD.
+         BE    TEST01              DUMMY HAS NO OPERANDS.
+         CLI   0(REG15),C'='       DO WE HAVE AN EQUALS SIGN
+         BNE   INVLDJCL            POSITIONAL NOT VALID ON A DD CARD
+TEST01   MVC   FKEYAREA,BLANKS     BLANK KEYWORD AREA
+         BCT   REG10,*+10          DECREMENT LENGTH BY ONE
+         MVC   FKEYAREA(0),0(REG9) MOVE TO 8 BYTE AREA
+         EX    REG10,*-6           EXECUTE THE MOVE
+         LA    REG15,SCANTBLE      TABLE OF VALID KEYWORDS
+         USING TABENTRY,REG15      ADDRESS EACH TABLE ENTRY
+         PRINT NOGEN
+         DO    UNTIL=(CLC,TABKEYWD,EQ,EOTABLE), LOOP TO END OF TABLE   X
+               WHILE=(CLC,FKEYAREA,NE,TABKEYWD) OR UNTIL KEY FOUND
+             LA    REG15,TABENLEN(REG15) ADDRESS NEXT TABLE ENTRY
+         ENDDO
+         PRINT GEN
+         L     REG8,0(REG8)        ADDRESS ENTRY FOR SUB-OPERAND(S).
+         BAL   REG11,TABPRCSR      BRANCH TO TABLE ENTRY
+         L     REG11,SAVER112      RESTORE LINK REGISTER
+         BR    REG11               RETURN TO CALLER
+BLANKS   DC    CL8' '              USED TO BLANK FKEYAREA.
+DUMMYX   DC    C'DUMMY'            USED TO TEST FOR DUMMY KEYWORD.
+         EJECT
+***********************************************************************
+*        SCAN KEYWORD TABLE OF VALID KEYWORDS & THEIR PROCESSOR ADDRESS
+***********************************************************************
+         SPACE 2
+SCANTBLE DS    0D                  START OF KEYWORD TABLE
+         IEFKEYS
+         BAL   REG1,INVLDJCL       WILL BE TAKEN IF KEY NOT FOUND
+EOTABLE  DC    8X'FF'              END OF TABLE
+         EJECT
+***********************************************************************
+*        THIS IS THE BASIC TEXT UNIT BUILD ROUTINE. IT IS CALLED IN   *
+*        DIFFERENT WAYS BY THE OTHER KEYWORD PROCESSORS. ON ENTRY,    *
+*        REGISTER 1 IS ASSUMED TO POINT TO AN IEFKEYS ENTRY CONTAINING*
+*        THE KEYWORD CODE FOR THIS OPERAND. CORE FOR A TEXT UNIT IS   *
+*        GETMAINED AND FILLED IN. THE TEXT UNIT POINTER ADDRESSES     *
+*        ARE ALSO UPDATED. (REG1=IEFENTRY+4)                          *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+         DROP  REG15
+         USING S99TUNIT,REG1
+         USING TABENTRY+4,REG14
+#BASIC   DS    0H
+         ST    REG11,BASICR11      SAVE LINK REGISTER.
+         LR    REG14,REG1          SAVE ADDRESS OF THE IEFKEYS ENTRY.
+         L     REG9,4(REG8)        LOAD THE ADDRESS OF THE OPERAND
+         XR    REG10,REG10         CLEAR REG10
+         IC    REG10,4(REG8)       LOAD LENGTH OF THE OPERAND
+         TM    TABFLAGS,KEYCNVRT+NUMCNVRT OPERAND NEED CONVERSION ?
+         BZ    NOCNVRT             NO. CARRY ON AS BEFORE
+         BAL   REG11,CONVERT       GO MAKE NECCESSARY CONVERSION
+NOCNVRT  TM    TABFLAGS,MANYOPS    ARE MULTIPLE OPERANDS POSSIBLE
+         BO    #BASIC2             YES. GO TO DIFFERENT ROUTINE
+ONLY1OP  LA    REG0,S99TUBSE(REG10) CALCULATE LENGTH OF CORE NEEDED
+         GETMAIN R,LV=(0)          GETMAIN CORE FOR TEXT UNIT
+         ST    REG0,S99FRDET       SAVE DETAILS FOR FREEMAIN
+         MVC   S99TUKEY,TABCODE    MOVE KEYWORD CODE TO TEXT UNIT
+         XC    S99TUNUM,S99TUNUM   ZEROISE NUMBER OF OPERANDS
+         XC    S99TULNG,S99TULNG   CLEAR OPERAND LENGTH FIELD
+         TM    TABFLAGS,ZEROLEN    TEXT UNIT NEEDS NO OPERAND ?
+         BNZ   CHAINING            TRUE. BYPASS OPERAND INSTALL
+         MVC   S99TUNUM,DEFNUM     MOVE IN DEFAULT NUMBER OF OPERANDS
+         STH   REG10,S99TULNG      STORE LENGTH OF OPERAND
+         BCT   REG10,*+10          SUBTRACT 1 FROM LENGTH OF OPERAND
+         MVC   S99TUPAR(0),0(REG9) MOVE PARAMETER TO TEXT UNIT
+         EX    REG10,*-6           EXECUTE THE MOVE
+CHAINING L     REG14,NXTTUNAD      ADDRESS OF NEXT FREE TXTUNIT PTR
+         NI    0(REG14),X'7F'      TURN OFF LAST ENTRY FLAG
+         LA    REG14,4(REG14)      STEP UP TO NEXT PTR ENTRY
+         LA    REG1,4(REG1)        STEP OVER FREEMAIN DETAILS
+         ST    REG1,0(REG14)       STORE ADDRESS OF THIS TXT UNIT
+         OI    0(REG14),X'80'      TURN ON LAST ENTRY FLAG
+         ST    REG14,NXTTUNAD      SAVE ADDRESS OF POINTER
+         L     REG9,4(REG8)        RESTORE ADDRESS OF OPERAND
+         IC    REG10,4(REG8)       RESTORE LENGTH OF OPERAND
+         L     REG11,BASICR11      RESTORE LINK REGISTER.
+         BR    REG11               RETURN TO CALLER-
+DEFNUM   DC    H'1'                DEFAULT NUMBER OF OPERANDS.
+         EJECT
+***********************************************************************
+*        THIS IS THE VERSION OF #BASIC TO HANDLE MULTIPLE OPERANDS    *
+***********************************************************************
+         SPACE 2
+#BASIC2  DS    0H
+         XR    REG10,REG10         CLEAR LENGTH REGISTER
+         IC    REG10,4(REG8)       LOAD LENGTH OF FIRST OPERAND
+         L     REG9,4(REG8)        LOAD ADDRESS OF FIRST OPERAND
+         BCTR  REG9,0              SUBTRACT 1 FROM THIS ADDRESS
+         CLI   0(REG9),C'('        IS THERE MORE THAN 1 OPERAND CODED
+         LA    REG9,1(REG9)        RESET POINTER TO START OF OPERAND
+         BNE   ONLY1OP             NO.  RETURN TO NORMAL CODE
+         LA    REG15,0(REG10,REG9) LOAD ADDRESS OF END OF THIS OPERAND
+         CLI   0(REG15),C')'       ARE WE BEING KIDDED ?
+         BE    ONLY1OP             YES. ONLY 1 OPERAND IN BRKTS
+         LR    REG9,REG8           USE 9 TEMPORARILY FOR DESCR BLKS
+         LA    REG2,1              USE AS COUNTER NUMBER OPERANDS
+OPNDLOOP L     REG9,0(REG9)        LOAD ADDRES DESCR BLK NEXT OPERAND
+         LA    REG2,1(REG2)        INCREMENT OPERAND COUNT
+         XR    REG11,REG11         USE LINK REGISTER AS TEMP WORK REG
+         IC    REG11,4(REG9)       LOAD LENGTH OF NEXT OPERAND
+         LA    REG10,2(REG11,REG10) ADD SUITABLE AMOUNT TO LENGTH REG
+         A     REG11,4(REG9)       LOAD END ADDRESS THIS OPERAND
+         CLI   0(REG11),C')'       END OPERAND LIST YET ?
+         BNE   OPNDLOOP            NO. LOOP FOR NEXT OPERAND
+         LA    REG0,S99TUBSE(REG10) CALCULATE LENGTH CORE NEEDED
+         GETMAIN R,LV=(0)          GETMAIN CORE FOR TEXT UNIT
+         ST    REG1,WORKF          SAVE START ADDRESS OF THE BLOCK
+         ST    REG0,S99FRDET       SAVE DETAILS FOR FREEMAIN
+         MVC   S99TUKEY,TABCODE    MOVE KEYWORD CODE TO TEXT UNIT
+         STH   REG2,S99TUNUM       STORE NUMBER OF OPERANDS
+         B     *+8                 JUMP OVER LOAD INSTRUCTION
+STORLOOP L     REG8,0(REG8)        LOAD DESCR BLK ADDRESS FOR NEXT OPRD
+         XR    REG10,REG10         CLEAR LENGTH REGISTER
+         IC    REG10,4(REG8)       LOAD LENGTH OF NEXT OPERAND
+         STH   REG10,S99TULNG      STORE LENGTH OF OPERAND IN LIST
+         L     REG9,4(REG8)        LOAD ADDRESS OF THIS OPERAND
+         BCT   REG10,*+10          SUBTRACT 1 FOR EXECUTE
+         MVC   S99TUPAR(0),0(REG9) MOVE OPERAND TO TEXT LIST
+         EX    REG10,*-6           EXECUTE THE MOVE
+         LA    REG1,3(REG10,REG1)  STEP OVER THIS ENTRY READY FOR NEXT
+         BCT   REG2,STORLOOP       LOOP FOR ALL APPLICABLE OPERANDS
+         L     REG1,WORKF          RELOAD START ADDRESS OF BLOCK
+         B     CHAINING            ALL DONE. RETURN TO NORMAL CODE
+         EJECT
+***********************************************************************
+*        ROUTINE TO CONVERT THE FORMAT OF CERTAIN OPERANDS            *
+***********************************************************************
+         SPACE 2
+CONVERT  DS    0H
+         TM    TABFLAGS,NUMCNVRT   IS THIS A NUMBER CONVERSION ?
+         BNZ   BINARY              BRANCH TO TEST, PACK& CONVERT.
+         MVC   FKEYAREA,BLANKS     CLEAR AREA FOR KEYWORD
+         BCT   REG10,*+10          SUBTRACT 1 FROM LENGTH
+         MVC   FKEYAREA(0),0(REG9) MOVE KEYWORD TO BLANK AREA
+         EX    REG10,*-6           EXECUTE MOVE TO PADDED AREA
+         LA    REG15,CNVTABLE      TABLE OF VALID OPERANDS & CODES
+         PRINT NOGEN
+         DO    WHILE=(CLC,FKEYAREA,NE,0(REG15)), LOOP ROUND ALL ENTRIES,
+               UNTIL=(C,REG15,EQ,CNVTEND) OR UNTIL END OF TABLE
+               LA    REG15,9(REG15) STEP TO NEXT ENTRY
+         ENDDO
+         PRINT GEN
+         C     REG15,CNVTEND       DID WE GET TO END OF TABLE
+         BE    INVLDJCL            YES. OPERAND NOT VALID
+         LA    REG9,8(REG15)       MAKE CODE THE REAL OPERAND
+         LA    REG10,1             INDICATE LENGTH 1 BYTE
+         BR    REG11               RETURN TO CALLER
+         SPACE 2
+BINARY   BCT   REG10,EXECUTE       SUBTRACT 1 FROM LENGTH OF NUMBER
+         TRT   0(0,REG9),TRTTABLE  TEST FOR VALID NUMERIC
+         PACK  DBLWORD,0(0,REG9)   CONVERT TO PACKED DECIMAL
+EXECUTE  EX    REG10,*-12          EXECUTE THE NUMERIC TEST
+         BNZ   INVLDJCL            OPERAND NOT NUMERIC
+         EX    REG10,*-14          EXECUTE THE PACK INST
+         CVB   REG0,DBLWORD        CONVERT THE NUMBER TO BINARY
+         ST    REG0,DBLWORD        STORE IN TEMPORARY AREA
+         XR    REG10,REG10         CLEAR LENGTH REGISTER
+         IC    REG10,TABFLAG2      LOAD LENGTH OF OPERAND NEEDED
+         LA    REG9,DBLWORD+4      LOAD ADDRESS OF END OF OPERAND
+         SR    REG9,REG10          SUTRACT TO GIVE ADDRESS START NUMBER
+         BR    REG11               RETURN TO CALLER
+         SPACE 2
+TRTTABLE DC    256X'FF'            TRANSLATE TABLE FOR NUMERIC TESTS
+         ORG   TRTTABLE+C'0'
+         DC    10X'00'
+         ORG
+         EJECT
+***********************************************************************
+*        TABLE OF OPERANDS WHICH NEED CONVERSION TO A 1 BYTE CODE.    *
+***********************************************************************
+         SPACE 2
+CNVTABLE DS    0D
+OLD      DC    CL8'OLD     ',X'01'
+NEW      DC    CL8'NEW     ',X'04'
+SHR      DC    CL8'SHR     ',X'08'
+MOD      DC    CL8'MOD     ',X'02'
+KEEP     DC    CL8'KEEP    ',X'08'
+DELETE   DC    CL8'DELETE  ',X'04'
+CATLG    DC    CL8'CATLG   ',X'02'
+UNCATLG  DC    CL8'UNCATLG ',X'01'
+         DC    CL8'F       ',X'80'
+         DC    CL8'FA      ',X'84'
+         DC    CL8'FB      ',X'90'
+         DC    CL8'FBA     ',X'94'
+         DC    CL8'V       ',X'40'
+         DC    CL8'VA      ',X'44'
+         DC    CL8'VB      ',X'50'
+         DC    CL8'VBA     ',X'54'
+         DC    CL8'U       ',X'C0'
+         DC    CL8'        ',X'00'
+         DC    CL8'        ',X'00'
+         DC    CL8'        ',X'00'
+CNVTTABE EQU   *
+CNVTEND  DC    A(CNVTTABE)         ADDRESS OF END OF TABLE
+         EJECT
+***********************************************************************
+*        KEYWORD PROCESSING ROUTINES.                                 *
+***********************************************************************
+#DSN     DS    0H                  BUILD TEXT UNITS FOR DSN & DSNAME
+         ST    REG11,SAVER113      SAVE LINK REGISTER.
+         BAL   REG11,#BASIC        CREATE TEXT FOR DSN
+         LA    REG1,0(REG10,REG9)  NEXT BYTE AFTER DSNAME
+         CLI   0(REG1),C'('        TEST FOR MEMBER NAME/GENERATION
+         BNE   NOMEMB              NOT PRESENT. EXIT
+         L     REG8,0(REG8)        LOAD ADDRESS OF ITS DESCR BLK
+         BAL   REG11,MEMBER        BRANCH TO AN IEFKEYS ENTRY.
+NOMEMB   L     REG11,SAVER113      RESTORE LINK REGISTER
+         BR    REG11               RETURN TO CALLER
+         SPACE 2
+         IEFENTRY MEMBER,0003,#BASIC IEFKEYS ENTRY VALID FOR DSN
+         EJECT
+#DISP    DS    0H                  PROCESS DISP=(NN,NN,NN)
+         ST    REG11,SAVER114      SAVE LINK REGISTER
+         L     REG9,4(REG8)        LOAD ADDRESS OF FIRST OPERAND CODED
+         IC    REG10,4(REG8)       LOAD LENGTH OF THIS OPERAND
+         BCTR  REG9,0              ADDRESS BYTE IN FRONT OF IT
+         CLI   0(REG9),C','        IS THERE A MISSING OPERAND ?
+         BE    DISP2ND             YES. GO STRAIGHT TO NORM DISPOSITION
+DISPNORM BAL   REG11,DISP1         GO BUILD TEXT UNIT FOR 1ST OPERAND
+         LA    REG10,0(REG9,REG10) NEXT BYTE AFTER CURRENT OPERAND
+         CLI   0(REG10),C')'       END OF DISP OPERANDS ?
+         BE    DISPEND             YES. END OF KEYWORD PROCESSING.
+         BCTR  REG9,0              ADDRESS BYTE BEFORE THE CURRENT ONE
+         CLI   0(REG9),C'('        ARE WE WORKING IN BRACKETS ?
+         BNE   DISPEND             NO. END OF PROCEESSING AFTER 1 OPRND
+         L     REG8,0(REG8)        MUST BE 2ND OPERAND. ADDR DESCR BLK
+DISP2ND  BAL   REG11,DISP2         GO TO PROCESSOR FOR DISP 2ND OPERAND
+         LA    REG10,0(REG9,REG10) ADDRESS NEXT BYTE AFTER OPERAND
+         CLI   0(REG10),C')'       IS THIS LAST SUBOPERAND ?
+         BE    DISPEND             YES. END OF PROCESSING.
+         L     REG8,0(REG8)        MUST BE 3RD. ADDRESS OF  DESCR BLK
+         BAL   REG11,DISP3         BRANCH TO PROCESSOR.
+         LA    REG10,0(REG9,REG10) ADDRESS BYTE AFTER CURRENT OPERAND
+         CLI   0(REG10),C')'       SHOULD BE END OF DISP
+         BNE   INVLDJCL            NO. JCL ERROR EVIDENT
+DISPEND  L     REG11,SAVER114      RESTORE LINK REGISTER
+         BR    REG11               RETURN TO CALLER
+         SPACE 2
+         IEFENTRY DISP1,0004,#BASIC,FLGS=0100
+         IEFENTRY DISP2,0005,#BASIC,FLGS=0100
+         IEFENTRY DISP3,0006,#BASIC,FLGS=0100
+         EJECT
+#SPACE   DS    0H
+         ST    REG11,SPACER11      SAVE LINK REGISTER
+         L     REG9,4(REG8)        LOAD ADDRESS OF OPERAND
+         XR    REG10,REG10         CLEAR REGISTER 10
+         IC    REG10,4(REG8)       LOAD LENGTH OF OPERAND
+         MVC   FKEYAREA,BLANKS     MOVE BLANKS TO PADDED AREA
+         BCT   REG10,*+10          SUBTRACT 1 FROM LENGTH
+         MVC   FKEYAREA(0),0(REG9) MOVE OPERAND TO PADDED AREA
+         EX    REG10,*-6           EXECUTE THE MOVE
+         LA    REG11,RETSPACE      LOAD RETURN LINK ADDRESS
+         CLC   FKEYAREA,TRK+4      TEST FOR TRACK SPECIFICATION
+         BE    TRK                 YES. BRANCH TO TRK PROCESSOR
+         CLC   FKEYAREA,CYL+4      TEST FOR CYLINDER SPECIFICATION
+         BE    CYL                 YES. BRANCH TO PROCESSOR
+         B     BLK                 ASSUME BLOCK SPECIFICATION
+RETSPACE EQU   *                   RETURN FROM PROCESSORS
+         L     REG8,0(REG8)        ADDRESS NEXT OPERAND DESCR BLK
+         BAL   REG11,PRIME         FORMAT PRIMARY SPACE ALLOCATION
+         LA    REG1,0(REG10,REG9)  NEXT BYTE AFTER PRIME QUANTITY
+         CLI   0(REG1),C')'        END OF SPACE PARAMETERS ?
+         BE    ENDSPACE            YES. EXIT
+         L     REG8,0(REG8)        LOAD ADDRESS OF NEXT OPERAND
+         BAL   REG11,SECONDRY      FORMAT SECONDARY SPACE ALLOCATION
+         LA    REG1,0(REG10,REG9)  ADDRESS NEXT BYTE AFTER OPERAND
+         CLI   0(REG1),C')'        END OF SPACE PARAMETERS?
+         BE    ENDSPACE            YES. EXIT
+         L     REG8,0(REG8)        ADDRESS NEXT OPERAND DESCR. BLK
+         BAL   REG11,DIRECTRY      GO FORMAT DIRECTORY ENTRY
+         LA    REG1,0(REG10,REG9)  ADDRESS NEXT BYTE AFTER OPERAND
+         CLI   0(REG1),C')'        END OF SPACE OPERANDS ?
+         BNE   INVLDJCL            NO. ERROR IN CODING
+ENDSPACE L     REG11,SPACER11      RELOAD LINK REGISTER
+         BR    REG11               RETURN TO CALLER
+         SPACE  2
+         IEFENTRY TRK,0007,#BASIC,FLGS=0200
+         IEFENTRY CYL,0008,#BASIC,FLGS=0200
+         IEFENTRY BLK,0009,#BASIC,FLGS=0403
+         IEFENTRY PRIME,000A,#BASIC,FLGS=0403
+         IEFENTRY SECONDRY,000B,#BASIC,FLGS=0403
+         IEFENTRY DIRECTRY,000C,#BASIC,FLGS=0403
+         EJECT
+#VOL     DS    0H
+         ST    REG11,VOLR11        SAVE LINK REGISTER
+         L     REG9,4(REG8)        LOAD ADDRESS OF PARAMETER
+         XR    REG10,REG10         CLEAR LENGTH REGISTER
+         IC    REG10,4(REG8)       LOAD LENGTH OF OPERAND
+         L     REG8,0(REG8)        LOAD ADDRESS NEXT PARAMETER
+         LA    REG11,VOLRETRN      FUDGE A BRANCH AND LINK RETURN ADD
+         EX    REG10,SERCLC        TEST FOR 'SER='
+         BE    SER                 YES GO LOAD UP VOL SERIALS
+         EX    REG10,REFCLC        IS THIS A VOLUME REFERENCE
+         BE    REF                 YES. GO PROCESS VOL=REF=DSNAME
+         B     INVLDJCL            OPERAND NOT RECOGNISED
+VOLRETRN L     REG11,VOLR11        RELOAD LINK REGISTER
+         BR    REG11               RETURN TO CALLER
+         SPACE 2
+SERCLC   CLC   0(0,REG9),=C'SER=  '
+REFCLC   CLC   0(0,REG9),=C'REF=  '
+         SPACE 2
+         IEFENTRY SER,0010,#BASIC,FLGS=0800
+         IEFENTRY REF,0014,#BASIC
+         EJECT
+#DCB     DS    0H
+*        THE DCB KEYWORD IS LARGELY IRRELEVANT FOR THIS PURPOSE. IT
+*        IS IGNORED. IT CAN AND SHOULD BE CODED FOR COMPLETENESS, BUT
+*        MAY BE OMITTED IN THE JCL PASSED TO THIS ROUTINE. SCANNING IS
+*        IN FACT CONTROLLED BY THE INDIVIDUAL KEYWORDS WITHIN THE DCB
+*        PARAMETER ITSELF.
+         BR    REG11               RETURN TO MAINLINE
+         EJECT
+***********************************************************************
+*        COMMON EXIT. RETURN CONTROL TO CALLER.                       *
+***********************************************************************
+         SPACE 2
+PGMEXIT  DS    0H
+         L     REG1,4(REG13)       LOAD ADDRESS OF PREVIOUS SAVE AREA
+         L     REG1,24(REG1)       RELOAD PARAMETRE REGISTER
+         LM    REG6,REG8,0(REG1)   LOAD 1ST 3 PARAMETERS
+         CLC   RETCODE,GOODEXIT    WAS JCL OK ?
+         BE    DOALLOC             YES. EPILOGUE THE ALLOCATION
+         MVI   0(REG8),JCLERROR    SIGNAL JCL ERROR
+         BAL   REG11,FREETEXT      FREEMAIN CORE USED
+ZRETURN  ZRETURN RC=0
+         EJECT
+***********************************************************************
+*        A SERIOUS ERROR WAS ENCOUNTERED. ABEND IS NEEDED.            *
+***********************************************************************
+         SPACE 2
+ABEND    DS    0H
+         ABEND 10,DUMP,STEP        ISSUE ABEND SVC
+         DC    C'ABEND USER 10  UT501 INVOKED IN MFT OR BY NON-DYNAMIC X
+               LINKAGE.'
+         EJECT
+***********************************************************************
+*        THIS ROUTINES PERFORMS THE ALLOCATION IF REQUESTED.          *
+***********************************************************************
+         SPACE 2
+DOALLOC  DS    0H
+         LTR   REG8,REG8           WAS THIS THE END OF THE LIST ?
+         BM    ZRETURN             YES. DONT STORE TEXT ADDRESSES
+         L     REG9,12(REG1)       LOAD ADDRESS FULLWORD FOR ALLOC TEXT
+         MVC   0(4,REG9),ALLOCLST  MOVE ADDRESS OF TEXT TO AREA
+         LTR   REG9,REG9           IS THERE ANOTHER ADDRESS ?
+         BM    ZRETURN             NO. BYPASS SECOND STORE
+         L     REG10,16(REG1)      LOAD ADDRESS OF THE WORD PROVIDED
+         MVC   0(4,REG10),UNLOCLST MOVE IN ADDRESS OF TEXT STRING
+         CLI   0(REG7),C'C'        CONVERSION ONLY RQUEST ?
+         BE    ZRETURN             RETURN TO EXIT ROUTINE PROPER
+ALLOCTST CLI   0(REG7),C'A'        IS ALLOCATION REQUESTED ?
+         BNE   UNLOCTST            NO.TRY UNALLOCATION
+         LA    REG1,ALLOCLST       LOAD UP PARAMETER REGISTER
+         OI    ALLOCLST,X'80'      TURN ON TOP BIT
+         B     DYNALLOC            GO ISSUE SVC
+UNLOCTST CLI   0(REG7),C'D'        DEALLOCATION REQUESTED ?
+         BNE   ALLOC001            MUST BE INVALID REQUEST
+         LA    REG1,UNLOCLST       LOAD PARAMETER REGISTER
+         OI    UNLOCLST,X'80'      TURN ON TOP BIT
+DYNALLOC SVC   99                  PERFORM THE ALLOCATION
+         LTR   REG15,REG15         TEST RETURN CODE
+         BNZ   ALLOCERR            SOMETHING IS WRONG.
+         MVI   0(REG8),ALLOK       SIGNAL OPERATION SUCCESSFUL
+         BAL   REG11,FREETEXT      GO FREE CORE USED
+         B     ZRETURN             RETURN TO EXIT ROUTINE
+ALLOC001 MVI   0(REG8),INVREQST    SIGNAL INVALID REQUEST
+         BAL   REG11,FREETEXT      FREE UP THE WORK AREA AND TEXT LISTS
+         B     ZRETURN             RETURN TO EXIT ROUTINE
+         EJECT
+***********************************************************************
+*        ALLOCATION HAS FAILED. SET RETURN INFORMATION FOR CALLER     *
+***********************************************************************
+         SPACE 2
+ALLOCERR DS    0H
+         MVI   0(REG8),NOALLOC     SIGNAL FAILURE OF ALLOCATION
+         ZRETURN RC=(15)           RETURN TO CALLER
+         EJECT
+***********************************************************************
+*        FREE UP CORE USED IN THE PROGRAM                             *
+***********************************************************************
+         SPACE 2
+FREETEXT DS    0H
+         L     REG4,ALLOCLST       LOAD ADDRESS OF ALLOCATION LIST
+         L     REG6,S99TXTPP       LOAD ADDRESS OF TEXT POINTERS
+FREELOOP L     REG1,0(REG6)        LOAD ADDRESS OF FIRST/NEXT TEXT UNIT
+         S     REG1,=F'4'          STEP BACK TO REAL START ADDRESS
+         L     REG0,S99FRDET       LOAD FREEMAIN DETAILS
+         FREEMAIN R,LV=(0),A=(1)   FREE UP THE TEXT UNIT
+         TM    0(REG6),X'80'       TEST FOR END OF POINTERS
+         BO    LOOPEXIT            END OF LIST EXIT FROM LOOP
+         LA    REG6,4(REG6)        LOAD ADDRESS NEXT POINTER
+         B     FREELOOP            LOOP FOR ALL TEXT UNIT POINTERS
+LOOPEXIT LR    REG1,REG3           LOAD ADDRESS OF WORK AREA
+         L     REG0,GETMNLEN       LOAD DETAILS FOR FREEMAIN
+         FREEMAIN R,LV=(0),A=(1)   FREE UP THE WORK AREA
+         BR    REG11               RETURN TO CALLER
+         EJECT
+***********************************************************************
+*        FREEMAIN FUNCTION REQUESTED. SET UP REGISTERS                *
+***********************************************************************
+         SPACE 2
+SETADDR  DS    0H
+         L     REG4,12(REG1)       RELOAD ADDRESS OF USER WORD
+         L     REG4,0(REG4)        LOAD ADDRESS OF ALLOCATION LIST
+         L     REG3,S99WAREA       RELOAD ADDRESS OF WORK AREA
+         BAL   REG11,FREETEXT      GO FREEMAIN THE CORE
+         B     ZRETURN             RETURN TO CALLER
+         EJECT
+         LTORG
+         END

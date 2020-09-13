@@ -1,0 +1,852 @@
+*        FROM  CBT TAPE FILE 316                          *LBD 02/84*
+         TITLE '   S Y S R E P R O    '
+*$DOC@*****************************************************************
+*                                                                     *
+*   SYSREPRO - ORIGINALLY DEVELOPED BY B GODFREY,                     *
+*              PRC COMPUTER CENTER INC, MCLEAN VA                     *
+*                                                                     *
+*   THIS PROGRAM COPIES A SEQUENTIAL DATA SET OR A MEMBER OF          *
+*   A PARTITIONED DATA SET.  IT IS FASTER THAN IEBGENER               *
+*   AND PRINTS A SUMMARY OF THE COPY OPERATION, INCLUDING             *
+*   RECORD COUNTS.                                                    *
+*                                                                     *
+*   SAMPLE JCL                                                        *
+*     //STEP EXEC PGM=SYSREPRO                                        *
+*     //SYSPRINT DD SYSOUT=A                                          *
+*     //SYSUT1   DD DSN=INPUT.DATA,DISP=SHR                           *
+*     //SYSUT2   DD DSN=OUTPUT.DATA,DISP=(NEW,KEEP),                  *
+*     //            UNIT=,VOL=,LABEL=,SPACE=                          *
+*                                                                     *
+*   IF THE OUTPUT FILE DOES NOT HAVE DCB ATTRIBUTES, THE              *
+*   ATTRIBUTES WILL BE COPIED FROM THE INPUT FILE.                    *
+*                                                                     *
+*   THE PARM FIELD MAY BE USED FOR PARTIAL COPIES.                    *
+*   IT MAY CONTAIN ONE INTEGER, INDICATING THE NUMBER OF              *
+*   RECORDS TO COPY, OR TWO INTEGERS SEPARATED BY A COMMA,            *
+*   INDICATING THE NUMBER OF RECORDS TO COPY AND THE NUMBER           *
+*   OF RECORDS TO SKIP.  TO SKIP SOME RECORDS AND THEN COPY           *
+*   ALL SUBSEQUENT RECORDS, SPECIFY JUST A COMMA FOLLOWED BY          *
+*   THE NUMBER OF RECORDS TO SKIP.                                    *
+*                                                                     *
+*   THE PROGRAM DOES NOT COPY KEYED RECORDS, NOR DOES IT COPY         *
+*   USER DATA FROM A PDS DIRECTORY ENTRY WHEN COPYING A MEMBER.       *
+*                                                                     *
+*$DOC$*****************************************************************
+         EJECT
+***********************************************************************
+*                                                                     *
+*        'SYSREPRO'                                                   *
+*                                                                     *
+***********************************************************************
+         SPACE
+*        WRITTEN BY. BILL GODFREY, PLANNING RESEARCH CORPORATION.
+*        INSTALLATION. PRC COMPUTER CENTER INC, MCLEAN VA.
+*        DATE WRITTEN. AUGUST 17 1977.
+*        DATE UPDATED. JULY 8 1981.
+*        ATTRIBUTES. NOT REENTRANT.
+*        REMARKS.
+*            THIS PROGRAM COPIES PART OR ALL OF A SEQUENTIAL
+*            DATASET OF FIXED, VARIABLE, OR UNDEFINED RECORDS.
+*
+*            THE PARM FIELD CAN SPECIFY
+*            1) A LIMIT ON THE NUMBER OF RECORDS TO COPY,
+*            2) THE NUMBER OF RECORDS TO SKIP BEFORE COPYING,
+*            3) THAT ONLY N OUT OF EVERY D RECORDS ARE TO BE
+*               COPIED, WHERE D IS THE THIRD NUMBER IN THE PARM
+*               FIELD AND N IS THE FOURTH.
+*
+*            21APR80 - SYSPRINT CHANGED TO FIXED LENGTH. ATTRIB ADDED.
+*            21APR80 - DEVTYPE AND RDJFCB ADDED.
+*            25APR80 - MEMBER FROM JFCB SHOWN.
+*            08JUL81 - RECFM U NOW SUPPORTED.  LONGEST AND SHORTEST.
+*                      FREEPOOLS ADDED. ADD INPLRECL, OUTLRECL, WHICH
+*                      CONTAIN BLKSI IF LRECL ZERO. ALLOW EXPAND.
+*            09NOV81 - MAKE EXPAND FILL NEW AREA WITH BLANKS.
+         SPACE
+         MACRO
+&N       PUTM  &M
+         AIF   (T'&M EQ 'O').MO
+         MVC   MSG,MSG-1
+         MVC   MSG(&M.L),&M
+.MO      BAL   R12,PUTPRT
+         MEND
+         SPACE
+         MACRO
+         STAMP
+         DC    CL16' &SYSDATE &SYSTIME ' DATE AND TIME ASSEMBLED
+         MEND
+         SPACE
+SYSREPRO CSECT
+         USING *,R10,R11
+         B     @PROLOG-*(,15)
+         DC    AL1(11),CL11'SYSREPRO'
+         STAMP
+@PROLOG  STM   14,12,12(13)
+         LR    R10,15              BASE REGISTER
+         LA    R15,1
+         LA    R11,4095(R15,R10)   BASE REGISTER
+         LA    R15,SAVE
+         ST    R15,8(,R13)         PUT NEW ADDRESS IN OLD SAVE AREA
+         ST    R13,4(,R15)         PUT OLD ADDRESS IN NEW SAVE AREA
+         LR    R13,R15             SWITCH TO NEW SAVEAREA
+         SPACE
+         MVI   MSG-1,C' '
+         MVC   MSG,MSG-1
+         XC    OUTBUFF,OUTBUFF
+         MVI   OPTSW,C'N'
+         L     R1,0(,R1)           GET PARM ADDRESS
+         ST    R1,PARMPTR          SAVE POINTER TO PARM
+         L     R4,=F'9999999'      RECORDS TO COPY
+         SLR   R5,R5               RECORDS TO SKIP
+         LA    R6,1                EVERY NTH RECORD TO COPY
+         LA    R7,1                FIRST F OF EVERY N RECORDS
+         LH    R3,0(,R1)           GET PARM LENGTH
+         LTR   R3,R3               PARM PRESENT?
+         BNP   NOPARM              NO - BRANCH
+         LA    R2,2(,R1)           POINT TO PARM
+         LR    R0,R3
+         SLR   R15,R15
+         SPACE
+         LR    R1,R2               BEGIN FIRST NUMBER
+SCAN01   CLI   0(R1),C'0'
+         BL    SCAN01A
+         CLI   0(R1),C'9'
+         BH    SCANERR
+         LA    R15,1(,R15)
+         LA    R1,1(,R1)
+         BCT   R0,SCAN01
+SCAN01A  LTR   R15,R15             FIRST NUMBER PRESENT?
+         BNP   SCAN01B             NO - BRANCH
+         CH    R15,=H'7'
+         BH    SCANERR
+         BCTR  R15,0
+         EX    R15,SCANPACK
+         CVB   R4,DOUBLE
+SCAN01B  SLR   R15,R15
+         BCTR  R0,0
+         LTR   R0,R0
+         BM    SCAN99              BRANCH IF NOTHING FOLLOWS
+         BZ    SCAN98              ENDING COMMA
+         CLI   0(R1),C','          COMMA MUST FOLLOW
+         BNE   SCANERR
+         LA    R1,1(,R1)           POINT BEYOND COMMA
+         SPACE
+         LR    R2,R1               BEGIN SECOND NUMBER
+SCAN02   CLI   0(R1),C'0'
+         BL    SCAN02A
+         CLI   0(R1),C'9'
+         BH    SCANERR
+         LA    R15,1(,R15)
+         LA    R1,1(,R1)
+         BCT   R0,SCAN02
+SCAN02A  LTR   R15,R15             SECOND NUMBER PRESENT?
+         BNP   SCAN02B             NO - BRANCH
+         CH    R15,=H'7'
+         BH    SCANERR
+         BCTR  R15,0
+         EX    R15,SCANPACK
+         CVB   R5,DOUBLE
+SCAN02B  SLR   R15,R15
+         BCTR  R0,0
+         LTR   R0,R0
+         BM    SCAN99
+         BZ    SCAN98
+         CLI   0(R1),C','
+         BNE   SCANERR
+         LA    R1,1(,R1)
+         SPACE
+         LR    R2,R1               BEGIN THIRD NUMBER
+SCAN03   CLI   0(R1),C'0'
+         BL    SCAN03A
+         CLI   0(R1),C'9'
+         BH    SCANERR
+         LA    R15,1(,R15)
+         LA    R1,1(,R1)
+         BCT   R0,SCAN03
+SCAN03A  LTR   R15,R15             SECOND NUMBER PRESENT?
+         BNP   SCAN03B             NO - BRANCH
+         CH    R15,=H'7'
+         BH    SCANERR
+         BCTR  R15,0
+         EX    R15,SCANPACK
+         CVB   R6,DOUBLE
+SCAN03B  SLR   R15,R15
+         BCTR  R0,0
+         LTR   R0,R0
+         BM    SCAN99
+         BZ    SCAN98
+         CLI   0(R1),C','
+         BNE   SCANERR
+         LA    R1,1(,R1)
+         SPACE
+         LR    R2,R1               BEGIN FOURTH NUMBER
+SCAN04   CLI   0(R1),C'0'
+         BL    SCANERR
+         CLI   0(R1),C'9'
+         BH    SCANERR
+         LA    R15,1(,R15)
+         LA    R1,1(,R1)
+         BCT   R0,SCAN04
+         LTR   R15,R15             THIRD NUMBER PRESENT?
+         BNP   SCAN99              NO - BRANCH
+         CH    R15,=H'7'
+         BH    SCANERR
+         BCTR  R15,0
+         EX    R15,SCANPACK
+         CVB   R7,DOUBLE
+         B     SCAN99
+SCANPACK PACK  DOUBLE(8),0(0,R2)
+SCANERR  LA    R15,12
+         ST    R15,RC
+         B     BYPRINT
+SCAN98   CLI   0(R1),C','
+         BNE   SCANERR
+SCAN99   EQU   *
+NOPARM   EQU   *
+         SPACE
+         LA    R1,EXTPRT
+         ST    R1,EXLPRT
+         MVI   EXLPRT,X'85'
+         SPACE
+         OPEN  (SYSPRINT,OUTPUT)
+         SPACE
+         B     OKOPENP
+EXTPRT   CLC   BLKSI(2,R1),LRECL(R1)    IS PRINT BLKSIZE OK
+         BER   R14                      YES, RETURN
+         CLC   BLKSI(2,R1),=H'0'        IS PRINT BLKSIZE UNSPECIFIED
+         BE    DEFPRT                   YES, BRANCH
+         LH    R3,BLKSI(,R3)            PREPARE TO DIVIDE
+         SR    R2,R2                    PREPARE TO DIVIDE
+         LH    R8,LRECL(,R1)            PREPARE TO DIVIDE
+         DR    R2,R8                    DIVIDE BLKSI BY LRECL
+         LTR   R2,R2                    IS THERE A REMAINDER
+         BZR   R14                      NO, BLKSIZE IS OK
+DEFPRT   MVC   BLKSI(2,R1),LRECL(R1)
+         BR    R14
+OKOPENP  EQU   *
+         PUTM  MSGH
+         MVC   MSG,MSG-1
+         PUTM
+         L     R1,PARMPTR
+         LH    R15,0(,R1)
+         LTR   R15,R15
+         BZ    NOMSGP
+         MVC   MSG,MSG-1
+         MVC   MSG+1(5),=C'PARM='
+         BCTR  R15,0
+         B     *+10
+         MVC   MSG+6(0),2(R1)
+         EX    R15,*-6
+         PUTM
+         MVC   MSG,MSG-1
+         PUTM
+NOMSGP   EQU   *
+         SPACE
+************************************************************
+*                                                          *
+*        OPEN SYSUT1                                       *
+*                                                          *
+************************************************************
+         SPACE
+         LA    R1,EXLUT1
+         LA    R0,EXTUT1
+         ST    R0,0(,R1)
+         MVI   0(R1),X'05'
+         LA    R0,UT1JFCB
+         ST    R0,4(,R1)
+         MVI   4(R1),X'87'
+         SPACE
+         DEVTYPE SYSUT1+DDNAM,UT1DEV
+         SPACE
+         RDJFCB (SYSUT1)
+         SPACE
+         OPEN  (SYSUT1,INPUT)
+         LA    R15,12
+         TM    SYSUT1+OFLGS,X'10'
+         BNO   ERRXIT
+         B     OKOPEN1
+EXTUT1   TM    RECFM(R1),X'C0'
+         BOR   R14
+         TM    RECFM(R1),X'48'     VARIABLE SPANNED?
+         BNOR  R14
+         OI    BFTEK(R1),X'60'     BFTEK=A
+         BR    R14
+OKOPEN1  EQU   *
+         MVC   OBTRECFM,SYSUT1+RECFM
+         MVC   OBTLRECL,SYSUT1+LRECL
+         MVC   OBTBLKSI,SYSUT1+BLKSI
+         MVC   WRKRECFM,OBTRECFM
+         TM    WRKRECFM,X'C0'      RECFM U
+         BNO   *+8                 NO
+         NI    WRKRECFM,255-X'C0'  YES, SET BOTH F AND V OFF
+         MVC   INPLRECL,OBTLRECL
+         CLC   INPLRECL,=H'0'      IF NO LRECL
+         BNE   *+10                   THEN
+         MVC   INPLRECL,OBTBLKSI      LRECL = BLKSIZE
+         SPACE
+************************************************************
+*                                                          *
+*         SHOW SYSUT1 CHARACTERISTICS                      *
+*                                                          *
+************************************************************
+         SPACE
+         MVC   MSG7A(6),=C'INPUT '
+         MVI   MSG7B,C' '
+         MVC   MSG7B+1(53),MSG7B
+         MVC   MSG7B(44),UT1JFCB
+         LA    R15,UT1JFCB+44      POINT TO MEMBER
+         CLI   0(R15),C' '         IS MEMBER ABSENT
+         BE    UT1NOMEM            YES, BRANCH
+         CLI   0(R15),0            IS MEMBER ABSENT
+         BE    UT1NOMEM            YES, BRANCH
+         LA    R1,MSG7B+44
+UT1JFEND CLI   0(R1),C' '
+         BNE   *+8
+         BCT   R1,UT1JFEND
+         MVI   1(R1),C'('
+         MVC   2(8,R1),0(R15)      MOVE MEMBER
+         LA    R1,10(,R1)          POINT PAST MEMBER
+         CLI   0(R1),C' '
+         BNE   *+8
+         BCT   R1,*-8
+         MVI   1(R1),C')'
+UT1NOMEM EQU   *
+         PUTM  MSG7
+         TM    UT1DEV+2,X'A0'        TAPE OR DASD
+         BZ    UT1NOV                BRANCH IF NEITHER
+         MVC   MSG8A(6),=C'INPUT '
+         MVC   MSG8C(8),SPACES
+         MVC   MSG8B(6),UT1JFCB+118
+         TM    UT1DEV+2,X'80'        TAPE
+         BZ    UT1NOP                NO, SKIP FILE POS
+         LH    R0,UT1JFCB+68         FILE SEQUENCE NUMBER
+         CVD   R0,DOUBLE
+         MVC   MSG8D,=X'40202120'
+         ED    MSG8D,DOUBLE+6
+         MVC   MSG8C(5),=C'FILE='
+UT1NOP   EQU   *
+         PUTM  MSG8
+UT1NOV   EQU   *
+         LA    R1,SYSUT1
+         MVC   MSG6A(6),=C'INPUT '
+         BAL   R14,ATTRIB
+         PUTM  MSG6
+         MVC   MSG,MSG-1
+         PUTM
+         SPACE
+************************************************************
+*                                                          *
+*        OPEN SYSUT2                                       *
+*                                                          *
+************************************************************
+         SPACE
+         LA    R1,EXLUT2
+         LA    R0,EXTUT2
+         ST    R0,0(,R1)
+         MVI   0(R1),X'05'
+         LA    R0,UT2JFCB
+         ST    R0,4(,R1)
+         MVI   4(R1),X'87'
+         SPACE
+         DEVTYPE SYSUT2+DDNAM,UT2DEV
+         SPACE
+         RDJFCB (SYSUT2)
+         SPACE
+         OPEN  (SYSUT2,OUTPUT)
+         LA    R15,12
+         TM    SYSUT2+OFLGS,X'10'
+         BNO   ERRXIT
+         B     OKOPEN2
+EXTUT2   EQU   *
+         CLI   RECFM(R1),0
+         BNE   *+14
+         MVC   RECFM(2,R1),OBTRECFM
+         OI    OBTSW,X'80'
+         TM    RECFM(R1),X'10'     IS IT BLOCKED
+         BO    EXTUT2L             YES, GO CHECK LRECL
+         TM    RECFM(R1),X'48'     IS IT V SPANNED
+         BNO   EXTUT2B             NO, SKIP LRECL
+EXTUT2L  CLC   LRECL(2,R1),=H'0'
+         BNE   *+14
+         MVC   LRECL(2,R1),INPLRECL
+         OI    OBTSW,X'40'
+EXTUT2B  CLC   BLKSI(2,R1),=H'0'
+         BNE   *+14
+         MVC   BLKSI(2,R1),OBTBLKSI
+         OI    OBTSW,X'20'
+         BR    R14
+OKOPEN2  EQU   *
+         MVC   OUTLRECL,SYSUT2+LRECL
+         CLC   OUTLRECL,=H'0'      IF NO LRECL
+         BNE   *+10                   THEN
+         MVC   OUTLRECL,SYSUT2+BLKSI  LRECL = BLKSIZE
+         SPACE
+************************************************************
+*                                                          *
+*         SHOW SYSUT2 CHARACTERISTICS                      *
+*                                                          *
+************************************************************
+         SPACE
+         MVC   MSG7A(6),=C'OUTPUT'
+         MVI   MSG7B,C' '
+         MVC   MSG7B+1(53),MSG7B
+         MVC   MSG7B(44),UT2JFCB
+         LA    R15,UT2JFCB+44         POINT TO MEMBER
+         CLI   0(R15),C' '            IS MEMBER ABSENT
+         BE    UT2NOMEM               YES, BRANCH
+         CLI   0(R15),0               IS MEMBER ABSENT
+         BE    UT2NOMEM               YES, BRANCH
+         LA    R1,MSG7B+44
+UT2JFEND CLI   0(R1),C' '
+         BNE   *+8
+         BCT   R1,UT2JFEND
+         MVI   1(R1),C'('
+         MVC   2(8,R1),0(R15)      MOVE MEMBER
+         LA    R1,10(,R1)          POINT PAST MEMBER
+         CLI   0(R1),C' '
+         BNE   *+8
+         BCT   R1,*-8
+         MVI   1(R1),C')'
+UT2NOMEM EQU   *
+         PUTM  MSG7
+         TM    UT2DEV+2,X'A0'        TAPE OR DASD
+         BZ    UT2NOV                BRANCH IF NEITHER
+         MVC   MSG8A(6),=C'OUTPUT'
+         MVC   MSG8C(8),SPACES
+*        MVC   MSG8B(6),UT2JFCB+118  (REPLACED BELOW)
+         LA    R1,SYSUT2
+         LH    R0,40(,R1)            GET TIOT OFFSET
+         L     R1,16                 CVTPTR
+         L     R1,0(,R1)             TCB WORDS
+         L     R1,4(,R1)             CURRENT TCB
+         L     R1,12(,R1)            TIOT
+         AR    R1,R0                 DD ENTRY FOR SYSUT2
+         L     R1,16(,R1)            UCB ADDRESS
+         MVC   MSG8B(6),28(R1)       VOLUME FROM UCB
+         TM    UT2DEV+2,X'80'        TAPE
+         BZ    UT2NOP                NO, SKIP FILE
+         LH    R0,UT2JFCB+68         FILE SEQUENCE NUMBER
+         CVD   R0,DOUBLE
+         MVC   MSG8D,=X'40202120'
+         ED    MSG8D,DOUBLE+6
+         MVC   MSG8C(5),=C'FILE='
+UT2NOP   EQU   *
+         PUTM  MSG8
+UT2NOV   EQU   *
+         LA    R1,SYSUT2
+         MVC   MSG6A(6),=C'OUTPUT'
+         BAL   R14,ATTRIB
+         PUTM  MSG6
+         MVC   MSG,MSG-1
+         PUTM
+         B     COMPARE
+         SPACE
+************************************************************
+*                                                          *
+*         CONVERT DCB ATTRIBUTES                           *
+*                                                          *
+************************************************************
+         SPACE
+ATTRIB   LA    R15,MSG6B
+         MVC   0(5,R15),=C'U    '
+         TM    RECFM(R1),X'C0'
+         BO    ATT2
+         BZ    ATTQ
+         MVI   0(R15),C'F'
+         TM    RECFM(R1),X'80'
+         BO    ATT2
+         MVI   0(R15),C'V'
+         B     ATT2
+ATTQ     MVI   0(R15),C'*'
+ATT2     LA    R15,1(,R15)
+         TM    RECFM(R1),X'10'     BLOCKED
+         BZ    *+12
+         MVI   0(R15),C'B'
+         LA    R15,1(,R15)
+         TM    RECFM(R1),X'04'     ASA
+         BZ    *+12
+         MVI   0(R15),C'A'
+         LA    R15,1(,R15)
+         TM    RECFM(R1),X'02'     MACHINE
+         BZ    *+12
+         MVI   0(R15),C'M'
+         LA    R15,1(,R15)
+         TM    RECFM(R1),X'20'     TRKOV
+         BZ    *+12
+         MVI   0(R15),C'T'
+         LA    R15,1(,R15)
+         TM    RECFM(R1),X'08'     STANDARD/SPANNED
+         BZ    *+8
+         MVI   0(R15),C'S'
+         LH    R15,LRECL(,R1)
+         CVD   R15,DOUBLE
+         MVC   MSG6C,MSG6P
+         ED    MSG6C,DOUBLE+5
+         MVC   MSG6C(5),MSG6C+1
+         MVI   MSG6C+5,C' '
+         LH    R15,BLKSI(,R1)
+         CVD   R15,DOUBLE
+         MVC   MSG6D,MSG6P
+         ED    MSG6D,DOUBLE+5
+         MVC   MSG6D(5),MSG6D+1
+         MVI   MSG6D+5,C' '
+         BR    R14
+         SPACE
+************************************************************
+*                                                          *
+*        CHECK FOR VALID RECORD FORMATS                    *
+*                                                          *
+************************************************************
+         SPACE
+COMPARE  EQU   *
+         LA    R2,SYSUT2
+         TM    RECFM(R2),X'C0'
+         BO    OKUND
+         TM    OBTRECFM,X'80'
+         BO    OKFIXED
+OKVAR    EQU   *
+         TM    RECFM(R2),X'40'     IS OUTPUT ALSO V
+         BO    OKEQUAL
+CONFLICT EQU   *
+         PUTM  MSGE3
+         LA    R15,12
+         B     ERRXIT
+OKUND    EQU   *
+         TM    RECFM(R2),X'C0'     IS OUTPUT ALSO U
+         BO    OKEQUAL
+         B     CONFLICT
+OKFIXED  EQU   *
+         TM    RECFM(R2),X'80'     IS OUTPUT ALSO F
+         BNO   CONFLICT
+         CLC   INPLRECL,OUTLRECL
+         BNL   OKEQUAL             OK TO TRUNCATE
+         LH    R0,OUTLRECL         OUTPUT IS LONGER, GET A WORK AREA
+         GETMAIN R,LV=(0)
+         ST    R1,OUTBUFF
+         MVI   0(R1),C' '          FILLER CHARACTER
+         LA    R15,1(,R1)          POINT TO AREA TO PROPOGATE CHAR
+         LH    R0,OUTLRECL         GET LENGTH OF AREA
+         BCTR  R0,0                MINUS THE FIRST BYTE
+         BAL   R14,@MVCL           PROPOGATE THE FILLER CHAR
+OKEQUAL  EQU   *
+         MVC   LOLRECL,=H'32767'   SHORTEST RECORD READ
+         MVC   HILRECL,=H'0'       LONGEST RECORD READ
+         SPACE
+READLOOP EQU   *
+         NI    SWIT1,B'01111111'   SET OFF SYNAD SWITCH
+         SPACE
+         GET   SYSUT1
+         SPACE
+         LR    R8,R1
+         L     R14,COUNTB
+         AH    R14,=H'1'
+         ST    R14,COUNTB          ADD 1 TO NO. OF RECORDS READ
+         SPACE
+         LH    R0,SYSUT1+LRECL     GET RECORD LENGTH
+         TM    WRKRECFM,X'40'      RECFM V
+         BNO   *+14                NO
+         MVC   DOUBLE(2),0(R8)     YES, GET LRECL FROM RDW
+         LH    R0,DOUBLE           GET LRECL FROM RDW
+         CH    R0,LOLRECL          IS IT SHORTEST
+         BNL   *+8                 NO
+         STH   R0,LOLRECL          YES, SAVE LOW WATER MARK
+         CH    R0,HILRECL          IS IT LONGEST
+         BNH   *+8                 NO
+         STH   R0,HILRECL          YES, SAVE HIGH WATER MARK
+         SPACE
+         CR    R14,R5              BEYOND SKIPPED RECORDS YET?
+         BNH   READLOOP            NO - KEEP SKIPPING
+         SPACE
+         TM    SWIT1,B'10000000'   WAS SYNAD EXIT TAKEN DURING GET?
+         BNZ   IOERR               YES - BRANCH
+         SPACE
+         L     R14,COUNTN
+         A     R14,=F'1'
+         ST    R14,COUNTN
+         CR    R14,R7
+         BH    BYPUT
+         SPACE
+         TM    SYSUT1+RECFM,X'C0'  RECFM U
+         BNO   *+10                NO
+         MVC   SYSUT2+LRECL(2),SYSUT1+LRECL RECFM U, COPY LRECL
+         SPACE
+         L     R15,OUTBUFF
+         LTR   R15,R15             IS RECORD TO BE EXPANDED
+         BZ    NOMOVE              NO, BRANCH
+*        TM    INPRECFM,X'80'      RECFM F
+*        BZ    NOMOVE              NO, BRANCH
+         LR    R1,R8               POINT TO RECORD
+         LH    R0,INPLRECL         GET LENGTH OF RECORD
+         BAL   R14,@MVCL           MOVE IT TO R15
+         L     R8,OUTBUFF          POINT TO NEW RECORD
+NOMOVE   EQU   *
+         SPACE
+         PUT   SYSUT2,(R8)
+         SPACE
+         L     R14,COUNTP
+         A     R14,=F'1'
+         ST    R14,COUNTP
+         CR    R14,R4              MAXIMUM RECORDS COPIED YET?
+         BNL   EODUT1              YES - STOP
+         SPACE
+BYPUT    SLR   R14,R14
+         C     R6,COUNTN           COUNTN REACHED NTH RECORD?
+         BH    *+8
+         ST    R14,COUNTN          YES - RESET COUNTN TO ZERO
+         SPACE
+         B     READLOOP
+         SPACE
+IOERR    AP    CTRRDERR,P1
+         BAL   R14,FORMAT3
+         PUTM  MSG2
+         LA    R15,12
+         B     ERRXIT
+         SPACE
+SYNAD    EQU   *
+         SYNADAF ACSMETH=QSAM
+         OI    SWIT1,X'80'
+         MVC   MSG2M(78),50(R1)
+         SYNADRLS
+         SR    15,15
+         BR    R14
+         SPACE
+FORMAT3  STM   R14,R1,FORMAS
+         L     R1,COUNTB
+         CVD   R1,DOUBLE
+         MVC   MSG3B,=X'4020202020202020'
+         ED    MSG3B,DOUBLE+4
+         PUTM  MSG3
+         LM    R14,R1,FORMAS
+         BR    R14
+         SPACE
+@MVCL    CH    R0,@MVCLH .         TOO LONG FOR ONE MVC
+         BNH   @MVCLR .            NO, BRANCH
+         MVC   0(256,R15),0(R1) .  MOVE A 256 BYTE CHUNK
+         LA    R15,256(,R15) .     POINT PAST LAST BYTE MOVED
+         LA    R1,256(,R1) .       POINT TO NEXT CHUNK TO MOVE
+         SH    R0,@MVCLH .         REDUCE LENGTH BY 256
+         BP    @MVCL .             LOOP IF MORE DATA REMAINS
+         BR    R14 .               NO REMAINDER
+@MVCLI   MVC   0(0,R15),0(R1)      (EXECUTED)
+@MVCLH   DC    H'256'
+@MVCLR   XR    R14,R0 .            SWAP R0 AND R14
+         XR    R0,R14 .            SWAP R0 AND R14
+         XR    R14,R0 .            SWAP R0 AND R14
+         BCTR  R14,0 .             LENGTH MINUS 1 FOR EX
+         EX    R14,@MVCLI          MOVE REMAINDER
+         LA    R15,1(R14,R15) .    POINT PAST LAST BYTE MOVED
+         LR    R14,R0 .            GET RETURN ADDRESS
+         BR    R14 .               RETURN
+         SPACE
+PUTPRT   TM    SYSPRINT+OFLGS,X'10'
+         BNOR  R12
+         PUT   SYSPRINT,MSG
+         BR    R12
+         SPACE
+ERRXIT   EQU   *
+         ST    R15,RC
+EODUT1   EQU   *
+         L     R1,OUTBUFF
+         LTR   R1,R1
+         BZ    NOFREE
+         LH    R0,OUTLRECL
+         FREEMAIN R,LV=(0),A=(1)
+NOFREE   EQU   *
+         CLOSE (SYSUT2)
+         FREEPOOL SYSUT2
+         CLOSE (SYSUT1)
+         FREEPOOL SYSUT1
+         L     R1,COUNTB
+         CVD   R1,DOUBLE
+         ED    MSG5A,DOUBLE+4
+         MVC   MSG5A(8),MSG5A+1
+         CLI   MSG5A,C' '
+         BE    *-10
+         L     R1,COUNTP
+         CVD   R1,DOUBLE
+         ED    MSG5B,DOUBLE+4
+         MVC   MSG5B(8),MSG5B+1
+         CLI   MSG5B,C' '
+         BE    *-10
+         TM    SYSPRINT+OFLGS,X'10'
+         BNO   BYPRINT
+         CP    CTRRDERR,P0         ANY ERRORS?
+         BE    NOERRS              NO - BRANCH
+         LA    R15,4               YES - SET RC TO AT LEAST 4
+         C     R15,RC
+         BNH   *+8
+         ST    R15,RC
+         ED    MSG1A(6),CTRRDERR
+         PUTM  MSG1
+NOERRS   EQU   *
+         PUTM  MSG5
+         TM    OBTRECFM,X'40'      WAS RECFM V OR U
+         BZ    NOWATER             NEITHER, BYPASS WATER MARKS
+         L     R1,COUNTB
+         LTR   R1,R1               ANY RECORDS READ
+         BZ    NOWATER             NO, BYPASS WATER MARKS
+         LH    R0,LOLRECL
+         CVD   R0,DOUBLE
+         ED    MSG9A,DOUBLE+5
+         MVC   MSG9A(6),MSG9A+1
+         CLI   MSG9A,C' '
+         BE    *-10
+         LH    R0,HILRECL
+         CVD   R0,DOUBLE
+         ED    MSG9B,DOUBLE+5
+         MVC   MSG9B(6),MSG9B+1
+         CLI   MSG9B,C' '
+         BE    *-10
+         PUTM  MSG9
+NOWATER  EQU   *
+         CLOSE (SYSPRINT)
+         FREEPOOL SYSPRINT
+BYPRINT  L     R13,SAVE+4
+         L     R15,RC
+         LM    0,12,20(R13)
+         L     R14,12(,R13)
+         BR    R14
+         DC    0D'0'
+         PRINT NOGEN
+         SPACE 3
+SYSUT1   DCB   DDNAME=SYSUT1,DSORG=PS,MACRF=(GL),EXLST=EXLUT1,         X
+               EODAD=EODUT1,SYNAD=SYNAD
+         DC    0D'0'
+         SPACE 3
+SYSUT2   DCB   DDNAME=SYSUT2,DSORG=PS,MACRF=(PM),EXLST=EXLUT2
+         DC    0D'0'
+         SPACE 3
+SYSPRINT DCB   DDNAME=SYSPRINT,DSORG=PS,MACRF=PM,                      X
+               RECFM=FBA,LRECL=121,EXLST=EXLPRT
+         DC    0D'0'
+         PRINT GEN
+         SPACE 3
+SAVE     DC    18F'0'
+PTREOB   DC    F'0'
+PTRIN    DC    F'0'
+PTROUT   DC    F'0'
+OBTRECFM DC    X'00'
+OBTSW    DC    X'00'
+OBTLRECL DC    H'0'
+OBTBLKSI DC    H'0'
+INPLRECL DC    H'0'                INPUT LRECL (OR BLKSIZE IF UNBLKED)
+OUTLRECL DC    H'0'                OUTPUT RECL (OR BLKSIZE IF UNBLKED)
+HALF     DC    H'0'
+LOLRECL  DC    H'0'
+HILRECL  DC    H'0'
+WRKRECFM DC    X'00'
+OUTBUFF  DC    F'0'
+EXLPRT   DC    F'0'
+EXLUT1   DC    2F'0'
+EXLUT2   DC    2F'0'
+CTRRDERR DC    P'00000'
+CTRMULTI DC    P'00000'
+CTRTOOBG DC    P'00000'
+RC       DC    F'0'
+SWIT1    DC    X'00000000'
+MSGH     DC    C'1'
+         DC    C'SYSREPRO - SEQUENTIAL COPY UTILITY'
+MSGHL    EQU   *-MSGH
+MSG1     DC    C'0'
+         DC    C'  '
+MSG1A    DC    X'402020202120'
+         DC    C' I/O ERRORS.'
+MSG1L    EQU   *-MSG1
+MSG2     DC    C' '
+         DC    27C' '
+         DC    CL10'I/O ERROR '
+MSG2M    DC    CL78' '
+MSG2L    EQU   *-MSG2
+MSG3     DC    C' '
+         DC    C'ERROR IN RECORD NO.'
+MSG3B    DC    CL8' '
+MSG3L    EQU   *-MSG3
+MSG4     DC    C' '
+         DC    34C' '
+MSG4M    DC    CL40' '
+         DC    CL2' '
+MSG4HX   DC    CL48' '
+MSG4L    EQU   *-MSG4
+MSG5     DC    C'0'
+         DC    C'RECORDS READ = '
+MSG5A    DC    X'4020202020202120'
+         DC    C'   RECORDS COPIED = '
+MSG5B    DC    X'4020202020202120'
+         DC    C' '
+MSG5L    EQU   *-MSG5
+MSG9     DC    C'0'
+         DC    C'LENGTH OF SHORTEST RECORD = '
+MSG9A    DC    X'402020202120'
+         DC    C' LENGTH OF LONGEST RECORD = '
+MSG9B    DC    X'402020202120'
+         DC    C' '
+MSG9L    EQU   *-MSG9
+MSG6     DC    C' '
+MSG6A    DC    C'INPUT '
+         DC    C'  RECFM='
+MSG6B    DC    CL5' '
+         DC    C'  LRECL='
+MSG6C    DC    X'402020202120'
+         DC    C'  BLKSIZE='
+MSG6D    DC    X'402020202120'
+MSG6L    EQU   *-MSG6
+MSG6P    DC    X'402020202120'
+MSG7     DC    C' '
+MSG7A    DC    C'INPUT '
+         DC    C'  DSNAME='
+MSG7B    DC    CL54' '
+MSG7L    EQU   *-MSG7
+MSG8     DC    C' '
+MSG8A    DC    C'INPUT '
+         DC    C'  VOLUME='
+MSG8B    DC    CL6' ',CL3' '
+MSG8C    DC    CL4' '              FILE=
+MSG8D    DC    CL4' '
+MSG8L    EQU   *-MSG8
+MSGE2    DC    C' *** ERROR ***   UNEQUAL LOGICAL RECORD LENGTHS'
+MSGE2L   EQU   *-MSGE2
+MSGE3    DC    C' *** ERROR ***   RECORD FORMATS ARE CONFLICTING'
+MSGE3L   EQU   *-MSGE3
+H4       DC    H'4'
+P1       DC    P'1'
+P0       DC    P'0'
+COUNTB   DC    F'0'
+COUNTP   DC    F'0'
+COUNTN   DC    F'0'
+DOUBLE   DC    D'0'
+FORMAS   DC    4F'0'
+PARMPTR  DS    F
+OPTSW    DS    CL1
+SPACES   DC    CL8' '
+         LTORG
+MSGMINUS DS    C                  MSG-1
+MSG      DS    CL133
+UT1DEV   DS    D
+UT2DEV   DS    D
+UT1JFCB  DS    0D,CL176
+UT2JFCB  DS    0D,CL176
+         DS    0D
+BFTEK    EQU   32
+RECFM    EQU   36
+DDNAM    EQU   40
+OFLGS    EQU   48
+BLKSI    EQU   62
+LRECL    EQU   82
+         SPACE
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         END

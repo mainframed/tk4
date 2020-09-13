@@ -1,0 +1,492 @@
+UTRKCALC TITLE ' '
+UTRKCALC CSECT ,
+*---------------------------------------------------------------K900071
+*        MAINTENANCE LOG                                        K900071
+*---------------------------------------------------------------K900071
+* 2002/03/16   Jim Morrison                                     K900071
+*              Fix IEBCOPY ABENDS0C4                            K900071
+*----------------------------------------------------------------------
+*
+*  TRKCALC macro support
+*
+*  Track balance is the number of bytes remaining on the track
+*  which are available to write data.  An empty track's track
+*  balance equals the device's track length (with an IBM standard
+*  Record Zero).  As each record is written, track balance moves
+*  towards zero.
+*
+*  This code refers to a physical data block as a record.
+*
+*  Attributes: Reentrant, any key, problem or supervisor state
+*----------------------------------------------------------------------
+*
+*  Zap to enter this code:
+*
+*        TM    DVCFLAGS,DVCMODU        modular device?
+*        BNO   PATCH2
+*        L     R11,DVCUFIX1            @ UTRKCALC CSECT
+*        L     R11,0(,R11)             TRKCALC support addr
+*        BR    R11                     branch to new code
+* PATCH2 ICM   R10,1,STARKL
+*        B     BACK1
+*
+*----------------------------------------------------------------------
+*  TRKCALC macro support for 3380s
+*----------------------------------------------------------------------
+*
+         DC    A(TRKCALC)              IEC0SCR1 TRKCALC support
+         DC    A(0)                    subsequent zaps
+         DC    A(0)                    subsequent zaps
+         DC    A(0)                    subsequent zaps
+         DC    C'UTRKCALC'
+         DC    C'&SYSDATE'
+         EJECT ,
+R0       EQU   0                       return value
+R1       EQU   1                       TRKCALC parmlist ptr
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9                       DVCT entry ptr
+R10      EQU   10                      work
+R11      EQU   11                      work
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14                      return address
+R15      EQU   15                      program base/return code
+*
+*  Only the above commented registers may be used
+*
+         EJECT ,
+TRKCALC  BALR  R15,0
+         USING *,R15
+         L     R15,MYBASE              reset base reg
+         USING UTRKCALC,R15
+         USING STAR,R1
+*
+         SLR   R10,R10
+         SLR   R11,R11
+         L     R9,0(,R1)               UCB/DCTE/DEVTYPE
+*
+*  STARDTU = X'06' so we test both bits at once
+*  B'.... .00.' = DVCT entry address
+*  B'.... .10.' = UCB address
+*  B'.... .11.' = devtype supplied in STARTYPE
+*
+         TM    STARFLGS,STARDTU        DEVTYPE provided?
+         BZ    HAVEDVCT                DVCT, br
+         IC    R11,STARTYPE            TYPE from TRKCALC macro  K900071
+         BO    HAVEDEVT                UCB, br                  K900071
+         IC    R11,19(,R9)             UCB.devtype              K900071
+*
+*  Have devtype in lo order byte of R11
+*
+HAVEDEVT DS    0H
+         L     R9,16                   CVT ADDRESS
+         L     R9,64(,R9)              IECZDTAB - IHADVCT macro
+         IC    R10,0(R11,R9)           device sysgen'd?
+         LTR   R10,R10
+         BZ    BADRC12
+         AR    R9,R10                  @ DVCT (also called DCTE)
+         USING DVCT,R9
+*
+HAVEDVCT DS    0H
+         EJECT ,
+***********************************************************************
+*  sort out what we are willing to support
+***********************************************************************
+         TM    DVCMOD1+1,X'22'
+         BO    DT3390
+*
+         LA    R0,20                   bad patch, not 3380
+         TM    DVCMOD1+1,X'20'
+         BO    DT3380                  3375 & 3380 use same code
+*
+         LA    R0,24
+         CLC   DVCTRKLN,=AL2(47968)    3380 bytes/track
+         BE    DT3380
+*
+DIE      DS    0H
+         DC    H'0'                    catastrophic error
+*
+*  Sorry, no ABEND macro is used since we really care about all
+*  the registers in the dump
+*
+DT3390   DS    0H
+         L     R15,=V(UTRK3390)        support code
+         BR    R15                     UTRK3390 returns to IEC0SCR1
+         DC    H'0'                    via R14
+         EJECT ,
+*----------------------------------------------------------------------
+*
+*  3380 Device Characteristics Table entry - IHADVCT2 macro
+*
+*       FIELD     HEX
+*       --------  ----
+*  +00  DVCCYL    0376    # cylinders/device
+*  +02  DVCTRK    000F    tracks/cyl
+*  +04  DVCTRKLN  BB60    bytes/track
+*  +06  DVCOVH1   0100    overhead value 1
+*  +08  DVCOVNK   00      overhead decrement not keyed
+*  +09  DVCFLAGS  10      flags: modulo device
+*  +0A  DVCOVH2   010B    overhead value 2
+*  +0C  DVCALT    000F    alternate tracks/volume
+*  +0E  DVCOVR0   04E0    RPS: R0 overhead
+*  +10  DVCSECT   DD      RPS: sectors in full track
+*  +11  DVCSECTD  D6      RPS: data sectors
+*  +12  DVCBPSEC  00E0    bytes/sector
+*  +14  DVCMOD1   0020    modulo factor = 32 bytes/cell
+*
+*  Space on 3380s is arranged in cells, which are 32 bytes in size.
+*  With a standard R0 on the track, a CKD record will consume from
+*  16 to 1499 cells; without R0, it's 16 to 1515 cells.
+*
+*  The number of cells occupied by a record is:  8 + K + D.
+*
+*  For key length zero, K = 0
+*  Else K = 7 + ( (KL + 12) / 32 )   round up to integer value
+*
+*  D = 7 + ( (DL + 12) / 32)         round up to integer value
+*
+*        KL = key length; DL = data length
+*
+*  Space occupied by a record on a 3380 (in cells):
+*
+*  GAP + COUNT+ECC + [GAP + KEY+ECC   ]  + GAP + DATA+ECC
+*  7     1            7     (KL+12)/32     7     (DL+12)/32
+*
+*        ECC = error correcting code, which consumes 12 bytes
+*        Round up following division, space described in 32 byte cells
+*
+*  In code below, GCE = GAP + COUNT+ECC
+*                 GKE = GAP + KEY+ECC
+*                 GDE = GAP + DATA+ECC
+*
+         EJECT ,
+*
+*  DVCOVH1 represents GAP + COUNT+ECC = (7 + 1) * 32 = 256 bytes.
+*
+*  DVCOVH2 is somewhat more clever, as it incorporates a "round up"
+*  factor which is equal to "modulo factor" minus one, thereby
+*  saving a LTR, BC, and possible LA instructions to round up
+*  following the division.
+*  DVCOVH2 = (GAP * 32) + ECC + "roundup factor"
+*          = (7   * 32) + 12  + (modulo factor - 1)
+*          =  224       + 12  + (32            - 1)
+*          =  267 bytes
+*  DVCOVH2 is utilized for both KL and DL.
+*  At least that's the way IBM does it.
+*
+*  Personally, I prefer:
+*  DVCOVH1 = (GAP*32) + (COUNT+ECC)*32 + (GAP*32) + 12 + (32 - 1)
+*          = 492 bytes overhead for DATA (and COUNT+ECC and two gaps)
+*  DVCOVH2 = (GAP*32) + 12 + (32 - 1)
+*          = 267 bytes overhead for KEY (and one gap)
+*  BUT ... there's maintenance on MVS38j, and some of it probably
+*  "knows" how IBM does it, so I'm going with IBM's way.
+*----------------------------------------------------------------------
+         EJECT ,
+*----------------------------------------------------------------------
+*  3380 support
+*----------------------------------------------------------------------
+DT3380   DS    0H
+         LH    R0,DVCMOD1              modulo factor = 32 bytes/cell
+         SLR   R10,R10
+         SLR   R11,R11
+*----------------------------------------------------------------------
+*  Calculate # bytes needed for GCE[GKE]GDE for one record
+*----------------------------------------------------------------------
+*
+*  calculate key overhead
+*
+         ICM   R11,1,STARKL            keyed?
+         BZ    NOKEY
+         AH    R11,DVCOVH2             add key overhead
+         DR    R10,R0                  divide by modulo factor
+*                                      r11=GKE cells needed
+NOKEY    DS    0H
+*
+*  calculate data overhead
+*
+         SLR   R10,R10
+         ICM   R10,3,STARDL            caller's data length
+         BNZ   HAVEDL
+         LA    R10,1                   default data length = 1
+HAVEDL   DS    0H
+         AH    R10,DVCOVH2             add data overhead (GE)
+         LR    R15,R11                 save key overhead cells
+         LR    R11,R10
+         SLR   R10,R10
+         DR    R10,R0                  convert to cells
+         AR    R11,R15                 r11 = [GKE]GDE cells needed
+*
+         BALR  R15,0                   restore base reg
+         USING *,R15
+         L     R15,MYBASE
+         USING UTRKCALC,R15
+*
+*  account for leading GAP + COUNT+ECC
+*
+         MR    R10,R0                  bytes for [GKE]GDE
+*
+         AH    R11,DVCOVH1             add GAP + COUNT+ECC overhead
+         LR    R10,R11                 bytes for GCE[GKE]GDE
+         EJECT ,
+*----------------------------------------------------------------------
+*  Calculate provisional balance
+*----------------------------------------------------------------------
+*  Applies to both FUNCTN=TRKBAL and FUNCTN=TRKCAP
+*
+         CLI   STARR,X'01'             RECORD=1?
+         BNE   NOTR1
+*
+** record 1
+*
+         SLR   R11,R11
+         ICM   R11,3,DVCTRKLN          track balance = track length
+         STH   R11,STARBAL             also provide to caller
+*
+*  REMOVE=YES only supported by FUNCTN=TRKBAL
+*
+         TM    STARFLGS,STARREMV       REMOVE=YES?
+         BNO   HAVEBAL                 no, br to LEAVE Rec1 on track
+*
+* record 1, remove ... just return track capacity w/ Standard R0
+*
+         LR    R0,R11                  R0 = track balance
+         SLR   R15,R15                 rc=0
+         BR    R14                     return to caller
+*
+** not record 1
+*
+NOTR1    DS    0H
+         TM    STARFLGS,STARUBAL       caller provided BALANCE?
+         BO    HAVEBAL
+*
+*  calculate balance, given record #
+*  R10 = bytes for GCE[GKE]GDE per record
+CALCBAL  DS    0H
+         LR    R0,R10                  save bytes/rec
+         SLR   R11,R11
+         IC    R11,STARR               record #
+         TM    STARFLGS,STARREMV       REMOVE=YES?
+         BO    CALCBAL2
+         BCTR  R11,0                   remove the record
+CALCBAL2 DS    0H
+         MR    R10,R0                  # records * (# bytes/rec)
+         SLR   R10,R10
+         ICM   R10,3,DVCTRKLN          track length
+         SR    R10,R11                 minus bytes needed
+         STH   R10,STARBAL             new balance
+         LR    R10,R0                  # bytes/rec
+*
+*  STARBAL SET (via caller or just calculated)
+*
+HAVEBAL  DS    0H
+         SLR   R0,R0
+         ICM   R0,3,STARBAL            track balance
+         EJECT ,
+*----------------------------------------------------------------------
+*  Select FUNCTION= routine
+*----------------------------------------------------------------------
+         TM    STARFLGS,STARFUNC       FUNCTN=TRKCAP?
+         BNO   TRKBAL                  no, br to TRKBAL function
+         EJECT ,
+*----------------------------------------------------------------------
+*  TRKCAP
+*
+*  Calculates and returns in R0 the number of fixed-length records
+*  that may be written on a whole track (R=1) or on a partially
+*  filled track (R not = 1).
+*  TRKCAP does not support REMOVE=YES or MAXSIZE=YES.
+*
+*  Refer to the TRKCALC macro documentation for further details.
+*----------------------------------------------------------------------
+*  R10 = bytes/rec
+*  R0  = balance
+TRKCAP   DS    0H
+*
+*  Does at least one block fit on the space remaining on the track?
+*
+         LR    R11,R0                  balance
+         LR    R0,R10                  bytes/rec
+         SLR   R10,R10
+         DR    R10,R0                  balance / (bytes/rec)
+         LTR   R0,R11                  = # blks/trk
+         BNP   CAPNOFIT                doesn't fit; rc=4
+*
+*  R0 contains the number of records that fit on the
+*  track if R=1, or # records that fit on the remainder
+*  of the track if R not = 1.
+*
+         SLR   R15,R15                 fits; rc=0
+         BR    R14                     return to caller
+*
+CAPNOFIT DS    0H
+         SLR   R0,R0
+         LA    R15,4                   doesn't fit; rc=4
+         BR    R14                     return to caller
+*
+         EJECT ,
+*----------------------------------------------------------------------
+*  TRKBAL
+*
+*  If REMOVE=NO, calculates whether an additional record fits on the
+*  track and what the new track balance would be if the record
+*  were added.
+*
+*  If REMOVE=YES, calculates what the new track balance would be if
+*  a record were removed from the track.
+*
+*  The record to be added or removed is defined by the RKDD
+*  (or R, K, and DD) parm(s).
+*
+*  If R=1 & REMOVE=NO, R1 is added to an empty track.
+*  If R=1 & REMOVE=YES, R1 is removed from the track, leaving an
+*  empty track.
+*
+*  If R not = 1, the specified record is added/removed from the track.
+*  The input track balance may be supplied via the BALANCE parm;
+*  if not supplied, the track is assumed to contain equal-sized
+*  records as specified by RKDD (or R, K, and DD) parm(s).
+*
+*  Refer to the TRKCALC macro documentation for further details.
+*----------------------------------------------------------------------
+*  R10 = # bytes needed per record
+*  R0  = balance
+*
+TRKBAL   DS    0H
+         TM    STARFLGS,STARREMV       REMOVE=YES?
+         BNO   BALEAVE
+*
+         AR    R0,R10                  reclaim removed rec's space
+         STH   R0,STARBAL              return new balance to caller
+         SLR   R15,R15                 rc=0
+         BR    R14                     return to caller
+*
+BALEAVE  CR    R0,R10                  record fits?
+         BL    CKMAX                   doesn't fit, check MAXSIZE
+*
+         SR    R0,R10                  fits, calculate new balance
+         STH   R0,STARBAL              return new balance to caller
+         SLR   R15,R15                 rc=0
+         BR    R14                     return to caller
+         EJECT ,
+*
+*  TRKBAL record doesn't fit, see if MAXSIZE specified
+*
+CKMAX    DS    0H
+         TM    STARFLGS,STARMAXS       MAXSIZE=YES?
+         BNO   NOFITRC
+*
+*  TRKBAL: MAXSIZE=YES, record doesn't fit
+*
+*  Record does not fit on the track.  MAXSIZE=YES was specified
+*  and a partial record might fit.  If it does, RC=8, and R0 is
+*  set to the maximum number of data bytes that fit on the
+*  remainder of the track with the specified key length.
+*
+*  NOTE: The key length is excluded from the count of
+*  maximum data bytes returned to the caller.
+*
+*  Notation used below:
+*        Dc = Caller's DL
+*        Dm = MAXSIZE DL
+*
+*  Here's the situation visually:
+*
+*  |-------------track length-----------|
+*  |-----old data-----|-----balance-----|
+*  |-----old data-----|-----GCE[GKE]GDcE-----|
+*
+*  To calculate the MAXSIZE value, we reduce DL such that
+*
+*  |-------------track length-----------|
+*  |-----old data-----|-----balance-----|
+*  |-----old data-----|---GCE[GKE]GDmE--|
+*
+*  The reduced DL (Dm) is what is returned to the caller.
+*  STARBAL is not updated in this instance.
+*
+*  We want BALANCE = GCE[GKE]GDmE
+*  such that the returned DL will cause record to use
+*  the rest of the track.
+*
+*  Some "formulas" to keep in mind:
+*  BALANCE - GCE[GKE] = GDmE
+*  GCE[GKE] = GCE[GKE]GDcE - GDcE
+*
+*  R10 = GCE[GKE]GDcE (caller's DL)
+*  R0  = balance
+*
+*  BALANCE - GCE[GKE] = GDmE
+*  BALANCE - (GCE[GKE]GDcE - GDcE) = GDmE
+*  BALANCE - (R10 - mod((DL + DVCOVH2), 32)) = GDmE
+*  BALANCE - R10 + mod((DL + DVCOVH2),32) = GDmE
+*
+         SR    R0,R10                  BALANCE - GCE[GKE]GDcE
+*
+         SLR   R11,R11
+         SLR   R10,R10
+         ICM   R11,3,STARDL            data length
+         LH    R1,DVCMOD1              modulo factor
+         DROP  R1
+         AH    R11,DVCOVH2             = GDcE bytes + round up
+         DR    R10,R1                  R11 = # cells for GDcE
+         MR    R10,R1                  R11 = GDcE bytes
+         AR    R0,R11                  R0 = BALANCE + GDcE = GDmE
+*
+*  R0 now contains GDmE, proceed to calculate Dm:
+*  GDE = mod((GAP + DL + 12), 32)
+*  but since we want to use all bytes in each cell, this
+*  should do the trick (assuming GDmE represents an
+*  integral number of cells, which it should):
+*  GDmE = GAP + DL + ECC
+*      = (7x32) + DL + 12
+*      = 236 + DL
+*  GDE - 236 = DL
+*  To use DVCOVH2 = 267 = 236 + (32 - 1):
+*  GDE - DVCOVH2 + DVCMOD1 - 1 = DL
+*
+         SH    R0,DVCOVH2              - DVCOVH2
+         AR    R0,R1                   + DVCMOD1
+         LA    R11,1
+         SR    R0,R11                  - 1
+         BNP   NOFITRC                 still doesn't fit
+*
+NFMAXRC  DS    0H
+         LA    R15,8                   record d/n fit, MAXSIZE spec'd
+         BR    R14                     return w/ rc=8, R0=Dm
+*
+*  doesn't fit
+*
+NOFITRC  DS    0H
+         SLR   R0,R0
+         LA    R15,4                   rc=4
+         BR    R14                     return to caller
+*
+BADRC12  DS    0H
+         LA    R15,12                  device type not in system
+         SLR   R0,R0
+         BR    R14
+         EJECT ,
+*----------------------------------------------------------------------
+*  DATA AREAS and PATCH AREA
+*----------------------------------------------------------------------
+*
+MYBASE   DC    A(UTRKCALC)             base reg value
+*
+         LTORG ,
+*
+         PRINT DATA
+PATCH    DC    32S(*)                  patch area
+         PRINT NODATA
+         EJECT ,
+         IHADVCT2 ,                    DVCT for 3380s & 3390s
+         EJECT ,
+STAR     DSECT ,
+         TRKCALC MF=D
+         END   ,

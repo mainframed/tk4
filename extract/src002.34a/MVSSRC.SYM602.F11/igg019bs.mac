@@ -1,0 +1,435 @@
+   TITLE 'IGG019BS - CHECK ROUTINE, VS-BDAM DATA SET CREATION'
+IGG019BS CSECT
+*MODULE NAME = IGG019BS                                               *
+*                                                                     *
+*DESCRIPTIVE NAME = BDAM CREATE CHECK MODULE FOR VS RECORD FORMAT     *
+*                                                                     *
+*COPYRIGHT = NONE                                                     *
+*                                                                     *
+*CHANGE ACTIVITY                                                      *
+*                                                                     *
+*        VS1-1 CHANGES/DELETIONS
+*        VS2-1 CHANGES/DELETIONS
+*        VS1-2 CHANGES/DELETIONS
+*        VS2-2 CHANGES/DELETIONS
+*153000,201000,219000,222000,267000,270000,285000,291000-297000,309000,
+*312000,522000,552000-561000                                     Y02072
+*
+*STATUS CHANGE LEVEL 1
+*
+*FUNCTIONS- THIS ROUTINE IS ENTERED BY THE CHECK MACRO ISSUED BY THE
+*    PROBLEM PROGRAM FOLLOWING A WRITE.
+*    1. IT RECEIVES CONTROL WHEN THE PROCESSING PROGRAM USES THE
+*       CHECK MACRO-INSTRUCTION.
+*    2. IF THE CHANNEL PROGRAM IS NOT YET EXECUTED, THE MODULE
+*       ISSUES A WAIT MACRO-INSTRUCTION.
+*    3. IF A USER SPECIFIES WRITE-SFR, THE NEXT RECORD ADDRESS
+*       (TTR) IS SUPPLIED IN THE NEXT ADDRESS FIELD OF THE DECB.
+*    4. IF THE EXECUTION OF THE CHANNEL PROGRAM ENCOUNTERED A
+*       PERMANENT ERROR CONDITION, THE MODULE PASSES CONTROL TO
+*       THE PROCESSING PROGRAM'S SYNAD ROUTINE.  IF CONTROL IS
+*       RETURNED FROM THE SYNAD ROUTINE, OR IF THERE IS NO SYNAD
+*       ROUTINE, THE MODULE ISSUES AN DMABCOND OR EOV MACRO.
+*    5. IF THE WRITE ROUTINE ENCOUNTERED AN EOV CONDITION (AND,
+*       THEREFORE DID NOT REQUEST SCHEDULING OF THE CHANNEL PROGRAM
+*       FOR EXECUTION), THIS MODULE PASSES CONTROL TO THE SYNAD/EOV
+*       EXECUTOR (IGG0005E) BY ISSUING AN SVC 55 INSTRUCTION.  ON
+*       RETURN OF CONTROL THIS MODULE TESTS FOR COMPLETION OF THE
+*       CHANNEL PROGRAM.
+*
+*ENTRY POINTS- 'IGG019BS' IS THE ENTRY FROM THE CHECK MACRO EXPANSION
+*    BY THE CALLING SEQUENCE-      L    15,DCBCHECK
+*                                  BALR 14,15
+*
+*INPUT- INPUT TO THE CHECK MACRO IS THE ADDRESS OF THE DECB ASSIGNED TO
+*    THE WRITE TO BE CHECKED. THIS ADDRESS WILL BE LOADED INTO
+*    REGISTER 1 PRIOR TO ENTERING THIS ROUTINE.
+*
+*OUTPUT- THE IOB USED FOR THE WRITE IS MADE AVAILABLE SO THAT IT MAY
+*    BE REUSED BY THE WRITE ROUTINE.
+*    IF THE EXIT TO THE USER'S ERROR ROUTINE IS TAKEN, REGISTER 0 WILL
+*    CONTAIN THE DECB ADDRESS AND REGISTER 1 THE DCB ADDRESS AND A
+*    WRITE INDICATOR.
+*    IF THE USER SPECIFIED 'NEXT ADDRESS' THE RELATIVE ADDRESS (TTR)
+*    OF THE NEXT RECORD (NOT YET WRITTEN) WILL BE RETURNED
+*
+*EXTERNAL ROUTINES-
+*
+*EXITS- 'USEREXIT' IS THE EXIT TO RETURN TO THE PROBLEM PROGRAM ON
+*    NORMAL COMPLETION.
+*    'SYNCEXIT' IS THE EXIT TO THE USER'S SYNCHRONOUS ERROR ROUTINE.
+*    'ABEXIT' IS AN EOV EXIT WHEN THE WRITE COMPLETED IN ERROR AND NO
+*    SYNCHRONOUS ERROR ROUTINE IS SPECIFIED. ABEND 001 AND WTP RESULTS.
+*    'SYNCRET' AND 'SYNCRET1' ARE ABENDS WHICH WILL OCCUR IF THE USER
+*    RETURNS FROM HIS SYNAD ROUTINE EITHER WHEN NO SPACE ON THE
+*    VOLUMES IS AVAILABLE OR THE USER HAS HAD AN IO ERROR AND WENT TO
+*    HIS SYNAD ROUTINE FIRST. DMABCOND MACRO IS ISSUED TO TRANSFER
+*    CONTROL TO PROBLEM DETERMINATION WHICH WILL ISSUE A WTP MESSAGE
+*    AND GTRACE PERTINENT CONTROL BLOCKS BEFORE ABENDING WITH A 008.
+*
+*TABLES/WORK AREAS-
+*
+*ATTRIBUTES- THIS ROUTINE IS REENTRANT AND EXECUTED ENABLED.
+*
+*
+*                         REGISTER EQUATES
+*
+RWORK0   EQU   0                        WORK REG
+R0       EQU   0                        DECB REG-USER SYNAD EXIT Y02072
+RPARM    EQU   1                        PARAMETER REG
+RWORK3   EQU   1                        WORK REG                 Y02072
+R1       EQU   1                        DCB REG-USER SYNAD EXIT  Y02072
+RPARM2   EQU   2                        PARM REG FOR CONVERSION ROUT
+R2       EQU   2                        SAVE/RESTORE REG         Y02072
+RDCB     EQU   3                        DCB REG
+RDECB    EQU   4                        DECB REG
+RIOB     EQU   5                        IOB REG
+RBASE    EQU   6                        BASE REG
+RWORK1   EQU   7                        WORK REG
+RCVT     EQU   8                        CVT REG
+R8       EQU   8                        SAVE/RESTORE REG         Y02072
+R10      EQU   10                       SAVE/RESTORE REG         Y02072
+R11      EQU   11                       SAVE/RESTORE REG         Y02072
+R12      EQU   12                       SAVE/RESTORE REG
+SAVEREG  EQU   13                       SAVE REGISTER
+RETURN   EQU   14                       RETURN REG
+R14      EQU   14                       SAVE/RESTORE REG         Y02072
+RENTER   EQU   15                       ENTRY REG
+*
+*                         CONSTANT EQUATES
+*
+NULL     EQU   0                        ZERO
+TWO      EQU   2                        CONSTANT = 2
+ADDRLEN  EQU   3                        LENGTH OF AN ADDRESS
+MBBLEN   EQU   3                        LENGTH OF MBB FIELD
+CHAIN    EQU   4                        OFFSET TO IOB CHAIN
+FOUR     EQU   4                        CONSTANT
+CCHHRLEN EQU   5                        LENGTH OF CCHHR FIELD
+VOLMTT   EQU   8                        OFFSET TO THE VOL TT IN SWA CB
+MSTRTT   EQU   10                       OFFSET TO MASTER TT IN SWA CB
+BYTELEN  EQU   8                        BITS PER BYTE
+DECBERBT EQU   X'60'                    DECB ERROR BITS
+AVAIL    EQU   X'7F'                    AVAILABILITY BIT
+UNITEXCP EQU   X'01'                    UNIT EXCEPTION BIT
+WRITE    EQU   X'40'                    WRITE INDICATOR IN DECB
+SYNADBIT EQU   X'01'                    SYNC ROUTINE BIT IN DCB
+EOVBIT   EQU   X'80'                    EOV BIT IN IOB
+APRLTV   EQU   X'20'                    OFFSET TO CONVERSION ROUTINE
+R0WRITE  EQU   X'04'                    WRITE R0 BIT IN SWA
+NXTADDR  EQU   X'01'                    TYPE = 'R'
+INCRTT   EQU   X'000101'                TO INCREMENT RELATIVE TRACK
+INCRR    EQU   X'000001'                TO INCREMENT RELATIVE RECORD
+ONE      EQU   1                        CONSTANT = 1
+NOT      EQU   X'FF'                    CONSTANT = X'FF'
+         USING IGG019BS,RBASE
+         USING IOBDEF,RIOB
+         USING IHADCB,RDCB
+         USING DECBDEF,RDECB
+         USING SAVEAREA,SAVEREG                                  Y02072
+         USING SGWKAREA,RWORK1
+         USING CVT,RCVT
+SAVEREGS EQU   *                        INITIALIZE REGS          Y02072
+*
+*  REGISTERS 14-10 ARE SAVED AT AN OFFSET OF 20 IN THE SAVEAREA TO
+*  MAINTAIN COMPATABILITY WITH SAM AND PROVIDE EOV WITH A SINGLE
+*  SAM/DAM INTERFACE. IT IS LIKEWISE NECESSARY, HOWEVER, TO SAVE REGS
+*  11 AND 12 BECAUSE THEY ARE CLOBBERED BY THE SYSTEM CONVERT ROUTINE.
+*
+         STM   R14,R10,SAVER14          SAVE USER REGS           Y02072
+         STM   R11,R12,SAVER11          SAVE REGS 11 AND 12 TOO  Y02072
+         LR    RBASE,RENTER             SET BASE REG
+         LR    RDECB,RPARM              SAVE DECB ADDR
+         L     RDCB,DECDCBAD            DCB ADDR
+         L     RIOB,DECIOBPT            IOB ADDR
+         SH    RIOB,PREFXLEN            SAM IOB ADDR
+         TM    IOBLINK,EOVBIT           WAS THIS IOB SCHEDULED
+         BZ    POSTCHK                  YES--BRANCH
+*                                       NO--SET UP FOR  EOV
+EOVGO    EQU   *
+         L     RWORK1,DCBIOBA           ADDR OF LAST IOB USED
+         IC    RWORK0,CHAIN(RWORK1)     SAVE FIRST BYTE OF EOV IOB PTR
+         ST    RIOB,CHAIN(RWORK1)       LINK THIS IOB TO EOV IOB
+         STC   RWORK0,CHAIN(RWORK1)     RESTORE FIRST BYTE
+         LR    RWORK0,RIOB              IOB ADDR
+         OI    IOBSTAT1,UNITEXCP        TURN ON UNIT EXCEPTION BIT
+         EOV   (RDCB)                   GO TO EOV                Y02072
+         LTR   RENTER,RENTER            OUT OF SPACE
+         BZ    SPACE                    NO--BRANCH
+         BALR  RETURN,RENTER            YES--GO TO SYNAD, EOV HAS
+*                                       LOADED USER SYNAD ADDR IN R15
+         USING *,RETURN
+SYNCRET1 EQU   *                        GO TO PROB DET-NO SPACE  Y02072
+         L     RDECB,SAVER1             GET INPUT DECB ADDR      Y02072
+         L     RDCB,DECDCBAD            GET DCB ADDR AGAIN       Y02072
+         DMABCOND  209,SVC=YES,DCB=(RDCB)  BR TO PROB DETERMIN   Y02072
+*                                       TO ABEND WITH 008        Y02072
+         DROP  RETURN
+*
+SPACE    EQU   *
+*
+         L     RDCB,DECDCBAD            RESTORE DCB ADDR
+POSTCHK  EQU   *
+         TM    DECSDECB,DECBERBT        WAS DECB POSTED WITHOUT ERROR
+         BO    TTRFDBAK                 YES--GO CALCULATE NEXT ADDR
+         BZ    CHKWAIT                  NOT POSTED--SET UP FOR WAIT
+*                                       ERROR CONDITION
+         TM    DCBSYNAD+ADDRLEN,SYNADBIT WAS SYNAD SPECIFIED
+         BZ    SYNCEXIT                 YES
+*
+ABEXIT   EQU   *
+         LH    RWORK0,ABCODE1           PUT 001 ABEND CODE IN R0 Y02072
+         EOV   (RDCB)                   GO TO EOV TO ABEND 001   Y02072
+*
+SYNCEXIT EQU   *
+*  SET UP FOR USER'S SYNCHRONOUS ERROR ROUTINE
+*
+         LR    R0,RDECB                 PUT DECB ADDR IN R0      Y02072
+         MVI   DECDCBAD,WRITE           SET WRITE INDICATOR IN DECB
+         L     R1,DECDCBAD              PUT DCB ADDR IN R1       Y02072
+         L     RENTER,DCBSYNAD          PUT SYNAD ADDR IN R15    Y02072
+         LM    R2,R8,SAVER2             RESTORE REGS 2-8         Y02072
+         BALR  RETURN,RENTER            GO TO SYNC ERROR ROUTINE
+         USING *,RETURN
+*
+SYNCRET  EQU   *                        ABEND WITH IO ERROR      Y02072
+         L     RDECB,SAVER1             GET INPUT DECB ADDR      Y02072
+         L     RDCB,DECDCBAD            GET DCB ADDR AGAIN       Y02072
+         DMABCOND  210,SVC=YES,DCB=(RDCB)  BR TO PROB DETERMIN   Y02072
+*                                       ABEND 008 WITH IO ERROR  Y02072
+         DROP  RETURN
+*
+TTRFDBAK EQU   *
+*
+*   THE WRITE HAS COMPLETED SUCCESSFULLY, NOW THE RELATIVE TTR OF
+*   WHERE THE NEXT RECORD WILL BE WRITTEN MUST BE CALCULATED.  THIS
+*   TTR WILL BE RELATIVE TO THE BEGINNING OF THE DATA SET, NOT THE
+*   EXTENT.
+*
+         LA    RPARM2,IOBSEEK           ADDR OF ACTUAL BLK ADDR
+         L     RPARM,DCBDEBAD           ADDR OF DEB
+         L     RCVT,CVTPTR              CVT ADDR
+         L     RENTER,CVTPRLTV          CONVERSION ROUTINE ADDR
+         LR    RCVT,SAVEREG             SAVE REG
+         BALR  RETURN,RENTER            BRANCH TO IECPRLTV
+         LR    SAVEREG,RCVT             RESTORE REG
+         SRL   RWORK0,BYTELEN           RIGHT ADJUST TTR IN REGISTER
+         IC    RWORK0,IOBDNRCF+FOUR     SET R=R
+         LR    RPARM2,RWORK0            SAVE TTR REG.
+*
+*   IF A TRACK HAS JUST BEEN FILLED, RELATIVE TRACK MUST BE INCREMENTED
+*   IF NOT, RELATIVE RECORD MUST BE INCREMENTED.
+*
+         LR    RWORK1,RIOB              IOB ADDR
+         LA    RWORK1,NULL(RWORK1)
+         SR    RWORK3,RWORK3            CLEAR FOR IC
+         IC    RWORK3,DCBOFFSW          OFFSET TO WRITE CCW
+         AR    RWORK1,RWORK3            WRITE CCW ADDR
+         L     RWORK1,NULL(RWORK1)      PTR TO SWA + 10
+         LA    RWORK1,NULL(RWORK1)
+         SH    RWORK1,SWAPRFXL          SWA ADDR
+         TM    SGWKRCRD,R0WRITE         WAS R0 INCLUDED IN LAST WRITE
+         BZ    INCRMNTR                 NO--BRANCH
+         NI    SGWKFLAG,NOT-R0WRITE     RESET WRITE/R0 BIT
+         SRL   RPARM2,BYTELEN           ZERO RELATIVE RECORD
+         SLL   RPARM2,BYTELEN           SET TO TTR R=0
+         LA    RPARM2,INCRTT(RPARM2)    INCREMENT RELATIVE TRACK
+         B     ADDMASTR                 GO TO ADD TTR TO MASTER TTR
+INCRMNTR EQU   *
+         LA    RPARM2,INCRR(RPARM2)     INCREMENT RELATIVE RECORD
+ADDMASTR EQU   *
+         L     RCVT,DCBEOBW             SWA CONTROL BLOCK ADDR
+         LH    RWORK3,MSTRTT(RCVT)      MASTER TTR
+         SLL   RWORK3,BYTELEN           SHIFT FOR 0TTR ALLIGNMENT
+         LR    RETURN,RPARM2            SAVE VOLUME 'TT'
+         AR    RPARM2,RWORK3            ADD TTR AND MASTER TT
+         TM    DECTYPE+ONE,NXTADDR      TEST IF NEXT ADDR IS SPECIFIED
+         BNO   GOSPNVLM                 NO,GOTO CHECK SPAN VOLUME
+         L     RPARM,DECNEXT            PTR TO NEXT ADDRESS FIELD
+         STC   RPARM2,TWO(RPARM)        STORE R OF TTR IN USER'S AREA
+         SRL   RPARM2,BYTELEN           DELETE LAST BYTE
+         STC   RPARM2,ONE(RPARM)        STORE T1 OF TTR IN USER'S AREA
+         SRL   RPARM2,BYTELEN           DELETE LAST BYTE
+         STC   RPARM2,NULL(RPARM)       STORE T2 OF TTR IN USER'S AREA
+*
+GOSPNVLM EQU   *
+*
+*   TEST IF THIS WAS A SPANNED VOLUME RECORD
+*        YES - GOTO EOV ROUTINE TO ALLOCATE MORE SPACE
+*        NO  - GO BACK TO THE USER
+*
+         SRL   RETURN,BYTELEN           SET TO TT
+         STH   RETURN,VOLMTT(RCVT)      STORE UPDATED MASTER TTR
+*
+         TM    SGWKFLAG,SPANVLM         TEST IF THIS IS SPANNED VOLUME
+         BO    EOVGO                    YES,GOTO TO ISSUE EOV
+*
+USEREXIT EQU   *
+         NI    IOBIOBA,AVAIL            MAKE IOB AVAILABLE
+         LM    R14,R10,SAVER14          RESTORE USER REGS        Y02072
+         LM    R11,R12,SAVER11          RESTORE R11 AND R12      Y02072
+         BR    R14                      RETURN TO USER           Y02072
+*
+*
+CHKWAIT  EQU   *
+         LR    RPARM,RDECB              PUT DECB ADDR IN R1 FOR WAIT
+         WAIT  ,ECB=(1)                 WAIT FOR WRITE TO COMPLETE
+         B     SPACE                    GO TO CHECK FOR ERROR
+*
+*
+         DS    0H                       ALIGNMENT                Y02072
+ABCODE1  DC    XL2'1000'                NO SYNAD RTN - IO ERROR  Y02072
+PREFXLEN DC    H'8'                     IOB PREFIX LENGTH
+SWAPRFXL DC    H'10'                    SWA PREFIX LENGTH
+PATCH    DC    XL50'0'                  PATCH AREA               Y02072
+         EJECT
+**********************************************************************
+*
+*    CONTROL BLOCK DEFINITIONS FOLLOW
+*
+**********************************************************************
+SAVEAREA DSECT                          USER SAVEAREA            Y02072
+         DS    XL12                     UNUSED BY THIS MOD       Y02072
+SAVER11  DS    A                        REG 11 SAVED             Y02072
+SAVER12  DS    A                        REG 12 SAVED             Y02072
+SAVER14  DS    A                        REG 14 SAVED             Y02072
+SAVER15  DS    A                        REG 15 SAVED             Y02072
+SAVER0   DS    A                        REG 0 SAVED              Y02072
+SAVER1   DS    A                        REG 1 SAVED              Y02072
+SAVER2   DS    A                        REG 2 SAVED              Y02072
+SAVER3   DS    A                        REG 3 SAVED              Y02072
+SAVER4   DS    A                        REG 4 SAVED              Y02072
+SAVER5   DS    A                        REG 5 SAVED              Y02072
+SAVER6   DS    A                        REG 6 SAVED              Y02072
+SAVER7   DS    A                        REG 7 SAVED              Y02072
+SAVER8   DS    A                        REG 8 SAVED              Y02072
+SAVER9   DS    A                        REG 9 SAVED              Y02072
+SAVER10  DS    A                        REG 10 SAVED             Y02072
+*
+*
+CVT      DSECT
+*
+         CVT
+*
+         SPACE 2
+*
+**********************************************************************
+*
+         DCBD  DSORG=(PS),DEVD=(DA)
+*
+***********************************************************************
+*
+*   DSECT FOR IOB
+***********************************************************************
+*
+IOBDEF   DSECT           I/O BLOCK DEFINITION
+IOBLINK  DS    F         IOB LINK ADDRESS
+IOBIOBA  DS    F         IOB ADDRESS FOR EOV
+IOBFLAG1 DS    CL1       ERROR FLAG 1
+IOBFLAG2 DS    CL1       ERROR FLAG 2
+IOBSENSE DS    CL2       I/O SENSE BITS
+IOBECBPT DS    F         ECB ADDRESS
+IOBCSW   DS    D         CSW STORED BY IOS
+IOBSTAT1 EQU   IOBCSW+4  CSW STATUS BYTE
+IOBSIOCC DS    0BL1      SIO CONDITION CODE
+IOBSTART DS    F         CHANNEL PROGRAM STARTING CCW
+IOBDCBPT DS    F         DCB ADDRESS
+IOBRESTR DS    F         CHANNEL PROGRAM RESTART ADDRESS
+IOBINCAM DS    CL2       BLOCK INCREMENT AMOUNT
+IOBERRCT DS    CL2       ERROR COUNTS
+IOBSEEK  DS    D         SEEK ADDRESS
+IOBDNRCF DS    D         NEW RECORD COUNT FIELD
+IOBR0CNT DS    D         COUNT FIELD OF R0
+IOBR0DAT DS    D         DATA FIELD OF R0
+IOBCCW1  DS    D         FIRST CCW OF CHANNEL PROGRAM
+IOBCCW2  DS    D         2ND CCW OF CHANNEL PROGRAM
+IOBCCW3  DS    D         3RD CCW OF CHANNEL PROGRAM
+IOBCCW4  DS    D         4TH CCW OF CHANNEL PROGRAM
+IOBCCW5  DS    D         5TH CCW OF CHANNEL PROGRAM
+IOBCCW6  DS    D         6TH CCW OF CHANNEL PROGRAM
+IOBCCW7  DS    D         7TH CCW OF CHANNEL PROGRAM
+IOBCCW8  DS    D         8TH CCW OF CHANNEL PROGRAM
+IOBCCW9  DS    D         9TH CCW OF CHANNEL PROGRAM
+IOBCCW10 DS    D         10TH CCW OF CHANNEL PROGRAM
+IOBCCW11 DS    D         11TH CCW OF CHANNEL PROGRAM
+IOBCCW12 DS    D         12TH CCW OF CHANNEL PROGRAM
+IOBCCW13 DS    D         13TH CCW OF CHANNEL PROGRAM
+IOBCCW14 DS    D         LAST CCW OF LONGEST CHANNEL PROGRAM
+*
+OFFTOMAX EQU   IOBCSW-IOBDEF
+OFFTONEW EQU   IOBCSW+FOUR-IOBDEF
+*
+         SPACE 2
+**********************************************************************
+*
+*  DSECT FOR DECB
+*
+***********************************************************************
+DECBDEF  DSECT           DATA EVENT CONTROL BLOCK
+DECSDECB DS    F         STANDARD ECB
+DECTYPE  DS    CL2       TYPE AND OPTIONS
+DECLNGTH DS    CL2       DATA LENGTH
+DECDCBAD DS    F         DCB ADDRESS
+DECAREA  DS    F         AREA ADDRESS
+DECIOBPT DS    F         IOB ADDRESS
+DECNEXT  DS    F         NEXT ADDRESS
+         SPACE 2
+         SPACE 3
+*
+***********************************************************************
+*
+*   DSECT FOR SEGMENT WORK AREA CONTROL BLOCK - 8 BYTES
+*
+***********************************************************************
+*
+SWACB    DSECT
+*
+SWACBPTR DS    AL4       POINTER TO THE 1ST SEG. WORK AREA
+SWACBNO  DS    H         NUMBER OF SEGMENT WORK AREAS
+SWACBLNG DS    H         LENGTH OF A SEGMENT WORK AREA
+SWACBTT  DS    H         TT OF THIS VOLUME RELATIVE TO THE
+*                        BEGINNING OF DATA SET
+         DS    H         NOT USED
+*
+         SPACE 3
+***********************************************************************
+*
+*   DSECT FOR SEGMENT WORK AREA
+*
+***********************************************************************
+*
+SGWKAREA DSECT
+*
+SGWKPTR  DS    AL4       POINTER TO NEXT SEG WORK AREA
+SGWKRCRD DS    AL4       POINTER TO RECORD AREA
+*
+SGWKFLAG EQU   SGWKRCRD  FLAG BYTES
+*
+SPANVLM  EQU   X'80'     SPAN VOLUME
+LASTSEG  EQU   X'40'     LAST SEGMENT WAS WRITTEN
+*
+SGWKOFF  DS    H         OFFSET OF THE CURRENT SEGMENT
+SGWKDATA DS    0H        SEGMENT AREA
+*
+         SPACE 3
+***********************************************************************
+*
+*   DSECT FOR DASD DEVICE CHARACTERISTIC TABLE
+*
+***********************************************************************
+*
+DASDTBL  DSECT
+*
+DASDCYL  DS    H         NO. OF CYLINDERS
+DASDTRK  DS    H         NO. OF TRACKS/CYLINDER
+DASDLNGH DS    H         TRACK LENGTH
+DASDINTR DS    AL1       OVERHEAD FOR INTERMEDIATE RECORD
+DASDLAST DS    AL1       OVERHEAD FOR LAST RECORD
+DASDKEY  DS    AL1       OVERHEAD FOR KEY
+DASDFLAG DS    AL1       FLAGS
+*
+BYTEMODE EQU   X'02'     MBBCCHHR IS BY BYTE (2321)
+TOLERANC EQU   X'01'     TOLERANCE FACTOR MUST BE ADDED
+*
+DASDTOL  DS    AL2       TOLERANCE FACTOR
+*
+         END

@@ -1,0 +1,145 @@
+ /* CORTNES */
+ /**********************************************************************
+ *                                                                     *
+ * CORTNES IS A COMMAND PROCESSOR WHICH ALLOWS TWO COMMANDS TO         *
+ * PROCESS CONCURRENTLY.  SYNTAX FOR INVOKING THIS COMMAND IS AS       *
+ * FOLLOWS:                                                            *
+ *                                                                     *
+ *   CORTNES (<CMD1>) (<CMD2>)                                         *
+ *                                                                     *
+ * <CMD1> AND <CMD2> SHOULD BE TWO SEPARATE TSO COMMANDS.  THE TWO     *
+ * TSO COMMANDS WILL BE PROCESSED AS FOLLOWS:                          *
+ *                                                                     *
+ * 1.  IF CMD1 HAS NOT YET BEEN ATTACHED,                              *
+ *       THEN ATTACH CMD1.                                             *
+ *       ELSE POST ECBB1.                                              *
+ *                                                                     *
+ * 2.  WAIT FOR ANY ONE OF THE ECBS ECBA1, SUBECB1, AND STAIECB1.      *
+ *                                                                     *
+ * 3.  IF SUBECB1 OR STAIECB1 IS POSTED, DETACH CMD1.                  *
+ *     IF BOTH CMD1 AND CMD2 DETACHED, EOJ.                            *
+ *                                                                     *
+ * 5.  IF CMD2 HAS NOT YET BEEN ATTACHED,                              *
+ *       THEN ATTACH CMD2.                                             *
+ *       ELSE POST ECBB2.                                              *
+ *                                                                     *
+ * 6.  WAIT FOR ANY ONE OF THE ECBS ECBA2, SUBECB2, AND STAIECB2.      *
+ *                                                                     *
+ * 7.  IF SUBECB2 OR STAIECB2 IS POSTED, DETACH CMD2.                  *
+ *     IF BOTH CMD1 AND CMD2 DETACHED, EOJ.                            *
+ *                                                                     *
+ * 8.  GOTO 1.                                                         *
+ *                                                                     *
+ * THE PROGRAMS INVOKED BY <CMD1> AND <CMD2> MUST COORDINATE THEIR     *
+ * ACTIONS SO THAT THEY EXECUTE SERIALLY.  THAT IS, ONLY ONE OF THEM   *
+ * CAN BE RUNNING AT A TIME.  SUPPOSE THAT THE PROGRAM REPRESENTING    *
+ * <CMD1> WOULD LIKE TO GO INTO A WAIT STATE AFTER TELLING THE         *
+ * PROGRAM REPRESENTING <CMD2> TO EXECUTE FOR A PERIOD.  IT CAN DO     *
+ * THIS BY DYNAMICALLY INVOKING PROGRAM DSNLINK, WHICH RESIDES IN A    *
+ * LINKLST LIBRARY.  THE PROGRAM REPRESENTING <CMD2> CAN GO INTO A     *
+ * WAIT STATE AFTER TELLING <CMD1> TO EXECUTE FOR A PERIOD BY ALSO     *
+ * INVOKING PROGRAM DSNLINK.  BY REPEATED INVOCATIONS OF DSNLINK,      *
+ * PROGRAMS REPESENTING <CMD1> AND <CMD2> CAN ALTERNATE EXECUTING AND  *
+ * WAIT STATES, THEREBY SERIALIZING THEIR EXECUTION.                   *
+ *                                                                     *
+ **********************************************************************/
+   %INCLUDE CPINIT1;
+   %@CMP = 'O';
+   %INCLUDE CPINIT2;
+   DCL PLIRETC BUILTIN;
+   DCL PSTR ENTRY(CHAR(*) VAR, FIXED BIN(15,0))
+     RETURNS(FIXED BIN(15,0));
+   DCL SYSPOST ENTRY(FIXED BIN(31,0),FIXED BIN(31,0));
+   DCL PUTLINE ENTRY;
+   DCL (SYSCMD,SYSWAIT) ENTRY;
+   DCL PREFIX ENTRY(CHAR(*),CHAR(*))
+     RETURNS(FIXED BIN(15,0));
+   DCL SETCAPS ENTRY;
+
+   DCL 1 MYBUF(2),
+      2 LEN FIXED BIN(15,0) INIT(0,0),
+      2 OFF FIXED BIN(15,0) INIT(0,0),
+      2 DATA CHAR(1024) INIT('','');
+   DCL 1 CBUF UNALIGNED BASED(CPPLCBUF),
+     2 LEN FIXED BIN(15,0),
+     2 OFF FIXED BIN(15,0),
+     2 DATA CHAR(1024);
+   DCL 1 CMDSTR(2),
+     2 CMDNAME CHAR(8),
+     2 SUBTCBP PTR,
+     2 SUBECB FIXED BIN(31,0) INIT(0),
+     2 STAIECB FIXED BIN(31,0) INIT(0),
+     2 STAIECB2 FIXED BIN(31,0) INIT(0),
+     2 STAICMPL FIXED BIN(31,0) INIT(0),
+     2 STAIPGM CHAR(8) INIT('');
+   DCL RETCODE FIXED BIN(31,0) INIT(0);
+   DCL (ECBA(2),ECBB(2)) FIXED BIN(31,0) INIT(0,0);
+   DCL ATTACHED(2) BIT(1) INIT('0'B);
+   DCL CNT FIXED BIN(15,0) INIT(1);
+   DCL USERWORK CHAR(8);
+   DCL 1 USERDEF BASED(ADDR(USERWORK)),
+     2 PTRA PTR,
+     2 PTRB PTR;
+   DCL SAVEUSER CHAR(8);
+   DCL (PCMD,SCMD) CHAR(8);
+
+   /* SAVE PCMD,SCMD */
+   PCMD=ECTPCMD;
+   SCMD=ECTSCMD;
+
+   /* NOW SETUP SUBCOMMANDS*/
+   ON CONDITION(BAD_TAX) BEGIN;
+     @WRITE('SYNTAX ERROR');
+     SIGNAL ERROR;
+     END;
+   DO J=1 TO 2;
+     DO CBUF.OFF=CBUF.OFF TO CBUF.LEN-1
+       WHILE(SUBSTR(CBUF.DATA,CBUF.OFF+1,1)^='(');
+       END;
+     IF SUBSTR(CBUF.DATA,CBUF.OFF+1,1)^='('
+       THEN SIGNAL CONDITION(BAD_TAX);
+     I=PSTR(CBUF.DATA,CBUF.OFF+1);
+     IF I=0
+       THEN SIGNAL CONDITION(BAD_TAX);
+     MYBUF.LEN(J) = I - CBUF.OFF+2;
+     MYBUF.DATA(J) = SUBSTR(CBUF.DATA,CBUF.OFF+2,MYBUF.LEN(J)-4);
+     IF MYBUF.DATA(J)=''
+       THEN SIGNAL CONDITION(BAD_TAX);
+     MYBUF.DATA(J)=SUBSTR(MYBUF.DATA(J),PREFIX(MYBUF.DATA(J),' '));
+     CMDNAME(J)=SUBSTR(MYBUF.DATA(J),1,INDEX(MYBUF.DATA(J),' ')-1);
+     CALL SETCAPS(CMDNAME(J));
+     CBUF.OFF = CBUF.OFF + MYBUF.LEN(J)-2;
+     END;
+
+   SAVEUSER=ECTUSER;
+   DO I=1 REPEAT MOD(I,2)+1 UNTIL(^ATTACHED(1) & ^ATTACHED(2));
+     /* SET UP ECT WITH ADDRESSES OF TWO ECBS */
+     PTRA=ADDR(ECBA(I)); /* POSTED BY OTHER */
+     PTRB=ADDR(ECBB(I)); /* POSTED BY ME */
+     ECTUSER=USERWORK;
+     CPPLCBUF=ADDR(MYBUF(I));
+     /* NOW INVOKE COMMAND */
+     IF ^ATTACHED(I)
+       THEN DO;
+         ATTACHED(I)='1'B;
+         CALL SYSCMD(CPPL,RETCODE,'START',ADDR(CMDSTR(I)));
+         IF RETCODE^=0
+           THEN DO;
+             PUT LIST('RETURN CODE FROM SYSCMD=',RETCODE);
+             SIGNAL ERROR;
+             END;
+         END;
+       ELSE CALL SYSPOST(ECBB(I),0);
+     /* NOW WAIT ON ECBS */
+     CALL SYSWAIT(CNT,ECBA(I),SUBECB(I),STAIECB(I));
+     IF ^SUBSTR(UNSPEC(ECBA(I)),2,1)
+       THEN DO;
+         ATTACHED(I)='0'B;
+         CALL SYSCMD(CPPL,RETCODE,'STOP',ADDR(CMDSTR(I)));
+         END;
+       ELSE ECBA(I)=0;
+     END;
+   ECTUSER=SAVEUSER;
+
+   CALL PLIRETC(0);
+   END;

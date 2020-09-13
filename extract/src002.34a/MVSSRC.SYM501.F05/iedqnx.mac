@@ -1,0 +1,888 @@
+         TITLE 'IEDQNX - OPERATOR AWARENESS MESSAGE ROUTER'
+IEDQNX   CSECT
+         SPACE 3
+***********************************************************************
+*                                                                     *
+* MODULE NAME = IEDQNX (TCAM, TERMINATION)                            *
+*                                                                     *
+* DESCRIPTIVE NAME = OPERATOR AWARENESS MESSAGE ROUTER                *
+*                                                                     *
+* COPYRIGHT = NONE                                                    *
+*                                                                     *
+* STATUS = VERSION 10.0                                               *
+*                                                                     *
+* FUNCTION = THIS MODULE BUILDS ERROR MESSAGES AND SENDS THEM TO      *
+* THE PRIMARY OPERATOR CONTROL TERMINAL.                              *
+*                                                                     *
+* WHEN IEDQBD DETECTS AN ERROR SITUATION, CONTROL IS PASSED TO        *
+* THIS ROUTINE WHERE ERROR ANALYSIS IS PERFORMED AND THE              *
+* APPROPRIATE ERROR MESSAGE IS CONSTRUCTED IN AVTSAVE4. IF THE        *
+* PRIMARY OPERATOR CONTROL TERMINAL IS THE SYSTEM CONSOLE THE         *
+* MESSAGE IS DELIVERED VIA THE WTO SVC. OTHERWISE A BUFFER IS         *
+* ACQUIRED FROM THE FREE POOL, ITS PREFIX AND THE SCB INITIALIZED     *
+* FOR TPOST TO THE PRIMARY TERMINAL'S DESTINATION QUEUE, AND THE      *
+* ERROR MESSAGE IS MOVED INTO THE BUFFER. THE ERROR INDICATOR IS      *
+* RESET AND THE LCB IS INITIALIZED FOR TPOST TO IEDQBD TO CONTINUE    *
+* LCB CLEANUP PROCESSING. THE BUFFER AND LCB ARE PASSED TO THE        *
+* TCAM DISPATCHER AT DSPCHAIN.                                        *
+*                                                                     *
+* THIS MODULE'S ADDRESS IS CONTAINED IN THE TCAM AVT (AVTNX). IT IS   *
+* LOADED AT TCAM INITIALIZATION IF THE 'PRIMARY' OPERAND ON THE       *
+* INTRO MACRO IS NOT 'SYSCON'. IT IS ALSO LOADED EACH TIME A 3705     *
+* DCB IS OPENED.                                                      *
+*                                                                     *
+* FOR 270X, WHEN I/O ERRORS OCCUR THE APPROPRIATE ERROR RECOVERY      *
+* (ERP) ROUTINES GAIN CONTROL. AFTER THE ERROR IS DECLARED PERMANENT  *
+* THE PRIMARY OPERATOR CONTROL STATION IS CHECKED FOR THE SYSTEM      *
+* CONSOLE, AND IF NOT AN ERROR INDICATION IS SET IN THE LCB FOR THE   *
+* LINE (LCBERMSG) AND INFORMATION PERTINENT TO THE ERROR IS           *
+* INITIALIZED IN THE LCB AS FOLLOWS:                                  *
+*                                                                     *
+* LCBRESTR-THE COMMAND CODE OF THE FAILING CCW                        *
+* LCBCSWST-THE TWO STATUS BYTES OF THE CSW                            *
+* LCBSENS0-THE FIRST SENSE BYTE IN THE IOB                            *
+* LCBFLAG2-THE TP OP CODE OF THE LAST RETRY CCW                       *
+* LCBSENS1-THE TP OP CODE OF THE FIRST FAILING CCW                    *
+* LCBERRCT-ADDRESSING CHARACTERS,LAST FOUR DIAL DIGITS,OR POLLING     *
+*          CHARACTERS                                                 *
+*                                                                     *
+* WHEN IEDQBD DETECTS THE ERROR INDICATOR, CONTROL IS PASSED TO       *
+* IEDQNX TO RECOVER INFORMATION FROM THE LCB AND CONSTRUCT THE        *
+* IEA000I ERROR MESSAGE IN AVTSAVE4.                                  *
+*                                                                     *
+* FOR 370X, ERRORS MAY BE ASSOCIATED WITH THE 3705 ITSELF OR WITH     *
+* RESOURCES ATTACHED TO THE 3705.                                     *
+*                                                                     *
+* FOR ERRORS ASSOCIATED WITH THE 3705 CHANNEL, 3705 ERP ROUTINES      *
+* INITIALIZE CERTAIN INFORMATION IN THE 3705 LCB AS FOLLOWS:          *
+*                                                                     *
+* LCBUNADD-ADDRESS OF EBCDIC NAME OF THE 3705 CHANNEL UNIT ADDRESS    *
+* LCBQNXMN-ERROR MESSAGE INDICATOR (IED064I,IED142I,IED162I)   @OX21816
+* LCBRESTR-COMMAND CODE OF FAILING CCW                                *
+*                                                                     *
+* THE RESULTING INOPERATIVE PIU IS PASSED TO THE SSCP WHO SETS THE    *
+* ERROR INDICATOR (LCBERMSG) BEFORE PASSING THE INOPERATIVE THROUGH   *
+* THE SSCP MESSAGE HANDLER. IEDQNX GAINS CONTROL AND RECOVERS CERTAIN *
+* INFORMATION FROM THE 3705 LCB TO BUILD THE APPROPRIATE ERROR        *
+* MESSAGE.                                                            *
+*                                                                     *
+* FOR 3705 ERROR MESSAGES NOT ASSOCIATED WITH THE 3705 CHANNEL THE    *
+* SSCP SAVES THE REQUEST UNIT COMMAND IN THE FIELD 'LCBNXCMD' AND     *
+* THE TNT INDEX OF THE 3705 RESOURCE IN THE FIELD 'LCBLNENT'. THESE   *
+* FIELDS ARE ANALYZED BY IEDQNX IN ORDER TO BUILD THE APPROPRIATE     *
+* ERROR MESSAGE (IED403I OR IED509I).                                 *
+*                                                                     *
+* NOTES - SEE BELOW                                                   *
+*                                                                     *
+*    DEPENDENCIES = EBCDIC CHARACTER CODE DEPENDENCIES - CORRECTABLE  *
+*    BY RECOMPILE                                                     *
+*                                                                     *
+*    RESTRICTIONS = NONE                                              *
+*                                                                     *
+*    REGISTER CONVENTIONS = ALL OF THE REGISTER SYMBOLS USED BY THIS  *
+*    MODULE ARE DEFINED IN THE EQUATE STATEMENTS                      *
+*                                                                     *
+*    PATCH LABEL = NONE                                               *
+*                                                                     *
+* MODULE TYPE = PROCEDURE                                             *
+*                                                                     *
+*    PROCESSOR = ASSEMBLER F                                          *
+*                                                                     *
+*    MODULE SIZE = 1200 DECIMAL BYTES                                 *
+*                                                                     *
+*    ATTRIBUTES = SERIALLY REUSABLE, PROBLEM PROGRAM STATE            *
+*                                                                     *
+* ENTRY POINT = IEDQNX                                                *
+*                                                                     *
+*    PURPOSE = SEE FUNCTION                                           *
+*                                                                     *
+*    LINKAGE= AT ENTRY R12 CONTAINS THE ENTRY POINT ADDRESS OF THIS   *
+*    MODULE.                                                          *
+*                                                                     *
+* INPUT = REGISTERS 3,4,11,12,13 CONTAIN THE FOLLOWING VALUES:   S22025
+* 3-ADDRESS OF SCB                                                    *
+* 4-ADDRESS OF LCB                                                    *
+* 11-ADDRESS OF TCAM DISPATCHER                                       *
+* 12-ADDRESS OF IEDQNX                                                *
+* 13-ADDRESS OF AVTSAVE2                                              *
+*                                                                     *
+* OUTPUT = AN ERROR MESSAGE IS BUILT FOR THE PRIMARY CONTROL TERMINAL *
+*                                                                     *
+* EXITS-NORMAL = THIS MODULE BRANCHES TO DSPCHAIN WITH A CHAIN OF     *
+* ELEMENTS IN REG1. THE BUFFER WITH THE ERROR MESSAGE IS THE FIRST    *
+* IN THE CHAIN.                                                       *
+*                                                                     *
+* EXITS-ERROR = IF THERE ARE NO AVAILABLE BUFFERS,THIS MODULE BRANCHES*
+* TO DSPCHAIN WITH THE LCB AS THE FIRST ELEMENT IN THE CHAIN          *
+*                                                                     *
+* EXTERNAL REFERENCES = SEE BELOW                                     *
+*                                                                     *
+*    ROUTINES = IEDQTNT  (TNT INDEX TO TRM CONVERSION)                *
+*               IEDIAP04 (TNT INDEX TO NETWORK ADDRESS CONVERSION)    *
+*               IEDIAP06 (NETWORK ADDRESS TO LCB ADDRESS CONVERSION)  *
+*               IEDQTL   (DEVICE DEPENDENT SECTION ADDRESS LOOKUP)    *
+*               IEDQGA02 (BUFFER STEAL ROUTINE)                       *
+*                                                                     *
+*    DATA AREAS = AVTSAVE4                                            *
+*                                                                     *
+*    CONTROL BLOCKS = AVT                                             *
+*                     DCB                                             *
+*                     DEB                                             *
+*                     LCB                                             *
+*                     PRF                                             *
+*                     QCB                                             *
+*                     SCB                                             *
+*                     TNT                                             *
+*                     TRM                                             *
+*                     UCB                                             *
+*                                                                     *
+* TABLES = LINE TRACE TABLE CONTROL WORDS                             *
+*                                                                     *
+* MACROS = IEDHJN                                                     *
+*          WTO                                                        *
+*                                                                     *
+* CHANGE ACTIVITY = SEE BELOW                                         *
+*A389500,441000,667000,677000                                    S22026
+*C098000,198000,628000,660000-666000,676000,692000,712000        S22025
+*D714000                                                         S22025
+*A233000,270200-271800,273000,294200-295200,332060-333620        S22024
+*A333680-333740,333860-333920,373000,380200-381200               S22024
+*A670400-671600,675000-676000,684600-685200,686400-687600        S22024
+*C014000,333800,348000,676500,738000,746000                      S22024
+*D552000                                                         S22024
+*C675000                                                        SA61080
+*C352000,360000                                                 SA66363
+*A333560,677000,702000                                         @YA05956
+*A319000,326000                                                @YA07494
+*D330000                                                       @YA07494
+*C352000,C360000,A364600                                       @OY11534
+*A295200,A666000                                               @OX14080
+*C677500,677506,677524                                         @OS77924
+*A088000,096000,148000,184000,196000,204000,206000,208000      @Y17XATI
+*A210000,214000,226000,236000,270000,272000,274000,294000      @Y17XATI
+*A294800,312000,326500,333140,333170,333380,408000,612000      @Y17XATI
+*A652000,656000,666000,677500,709000                           @Y17XATI
+*C014000,014800,015200,018000-020000,080000-082000,090000      @Y17XATI
+*C146000,150000-182000,200000-202000,228000-230000,270000      @Y17XATI
+*C270400,270600-271600,271800,272000-273000,276000-294000      @Y17XATI
+*C294200-294600,295000,304000,312000,318000,319600,326500      @Y17XATI
+*C332300-333140,333440-333600,333860,376000-384000,388000      @Y17XATI
+*C389500,402000,412000,418000-420000,430000,434000             @Y17XATI
+*C440000-446000,456000-458000,490000,496000-500000,526000      @Y17XATI
+*C542000,546000,564000,568000,586000-588000,592000-597000      @Y17XATI
+*C598000-600000,618000,638000,642000-644000,656000             @Y17XATI
+*C684600-709000                                                @Y17XATI
+*D002400-003013,010000-012000,084000-086000,092000-094000      @Y17XATI
+*D100000,126000-128000,198000,232000,302000,310000,316000      @Y17XATI
+*D319000-319200,324000-326000,333320,333680,333920-365200      @Y17XATI
+*D372000,390000,422000,426000-428000,436000-438000             @Y17XATI
+*D462000-484000,488000,530000,677700                           @Y17XATI
+*C295290-297660,C326760,C326800,A666600,A718000,D297720        @OX16393
+*A272490,A272550,A333620                                       @OY16369
+*A296190,C296390,C296590,C296690,A718120                       @OZ24288
+*C270005,A270010,C270050,C333280                               @OX19662
+*C272340                                                       @OY20726
+*C066000,272440,272675-272680,272690-272695,677626,684160      @OX21816
+*                                                                     *
+***********************************************************************
+         EJECT
+*REGISTER ASSIGNMENTS
+         SPACE 1
+R0       EQU   0                        REG 0                    S22024
+R1       EQU   1                        REG 1                    S22024
+RMSG     EQU   2                        MESSAGE WORKAREA BASE  @Y17XATI
+RSCB     EQU   3                        ADDRESS OF SCB         @Y17XATI
+RLCB     EQU   4                        ADDRESS OF LCB         @Y17XATI
+R5       EQU   5                        REG 5                    S22024
+RPLCB    EQU   5                        PLCB BASE REGISTER     @Y17XATI
+R6       EQU   6                        REG 6                    S22024
+RPRF     EQU   6                        BASE FOR BUFFER        @Y17XATI
+R7       EQU   7                        ADDRESS OF BUFFER
+RQCB     EQU   7                        BASE FOR QCB           @Y17XATI
+RUCB     EQU   7                        BASE FOR UCB           @Y17XATI
+R8       EQU   8                        ADDRESS OF DATA IN BUFFER
+RTRM     EQU   8                        BASE FOR TRM           @Y17XATI
+RINDEX   EQU   9                        RESOURCE TNT INDEX     @Y17XATI
+R9       EQU   9                        LENGTH OF UNIT
+R10      EQU   10                       LENGTH OF DATA IN UNIT
+RDCB     EQU   10                       BASE FOR DCB           @Y17XATI
+RDEB     EQU   10                       BASE FOR DEB           @Y17XATI
+R11      EQU   11                       REG 11                   S22024
+R12      EQU   12                       BASE REG
+R13      EQU   13                       ADDRESS OF AVTSAVE2
+R14      EQU   14                       ADDRESS OF DATA WORK AREA
+R15      EQU   15                       BRANCH REG
+         SPACE 3
+         USING IEDQMSGD,RMSG            BASE FOR MSG WORKAREA  @Y17XATI
+         USING IEDQSCB,RSCB             BASE FOR SCB           @Y17XATI
+         USING IEDQLCB,RLCB             BASE FOR LCB           @Y17XATI
+         USING IEDQPRF,RPRF             BASE FOR BUFFER        @Y17XATI
+         USING IEDQQCB,RQCB             BASE FOR QCB           @Y17XATI
+         USING IEDNTRM,RTRM             BASE FOR TRM           @Y17XATI
+         USING IHADCB,RDCB              BASE FOR DCB           @YM07042
+         USING IEDQDISP,R11             DISPATCHER BASE          S22024
+         USING *,R12                    BASE
+         USING AVTSAVE2,R13             BASE FOR AVT
+         USING IEDNSVTD,R14             BASE FOR SAVT          @Y17XATI
+         EJECT                                                 @Y17XATI
+IEDQNX   IEDHJN QNX00                                            S22026
+         SPACE 1
+*        BUILD THE ERROR MESSAGE IN A WORK AREA.
+*        GET THE ERROR INFORMATION FROM THE LCB.
+         SPACE 1
+         LA    RLCB,0(RLCB)             CLEAR FOR COMPARE      @Y17XATI
+         LA    RMSG,AVTSAVE4            MESSAGE WORKAREA       @Y17XATI
+         SR    R1,R1                    CLEAR WORK REGISTER    @Y17XATI
+         STH   R1,AVTDOUBL              CLEAR HALFWORD         @OX19662
+         ICM   R1,HALF,AVTOPCIN         TNT INDEX OF PRIMARY   @OX19662
+         BZ    SYSCON                   BR IF PRIMARY=SYSCON   @Y17XATI
+         C     RLCB,SAVTSLCB            IS THIS SSCP'S PLCB?   @OX19662
+         BNE   NOTSSCP                  BRANCH IF NO           @OX19662
+         CLM   R1,HALF,LCBLNENT         WAS ERROR ON PRIMARY LU@OX19662
+         BE    SYSCON                   BRIF YES MSG TO SYSCON @OX19662
+NOTSSCP  EQU   *                                               @OX19662
+         L     R15,AVTRNMPT             GET IEDQTNT BASE       @Y17XATI
+         BALR  R14,R15                  GET TRM OF PRIMARY     @Y17XATI
+         LR    RTRM,R1                  COPY TRM TO TRM BASE   @Y17XATI
+         SH    RTRM,TRMBCKUP            ASSUME NEGATIVE PREFIX @Y17XATI
+         TM    TRMSTATE,TRMPREF         PRIMARY A 3705 TERM    @Y17XATI
+         BNO   NOT3705                  BR NO, ADD IDLES       @Y17XATI
+         CLI   TRMTYPE,TRMLUNT          PRIMARY AN LU          @Y17XATI
+         BNE   NOT3705                  BRIF NO, USE PREFIX    @OX19662
+PRITRMPU EQU   *                                               @OX19662
+         SR    R10,R10                  CLEAR REGISTER         @OX19662
+         ICM   R10,3,TRMCOHRT           COHORT POINTER OF PRI  @OX19662
+         BNZ   CHRTOK                   BRIF IF ONE THERE      @OX19662
+         TM    TRMBYTE0,TRMDIAL         THIS SHOULD BE DIAL    @OX19662
+         BZ    GETTRM                   BR ERROR NOT DIAL      @OX19662
+         L     R8,TRMDESTQ-1            DEST QCB ADDRESS       @OX19662
+         L     R15,AVTRNMPT             IEDQTNT BASE ADDRESS   @OX19662
+         LH    R10,TNTLEN-IEDQTNTD(,R15) HIGHEST TTCIN         @OX19662
+AGAIN    EQU   *                                               @OX19662
+         LR    R1,R10                   COPY INTO PARM REG     @OX19662
+         BALR  R14,R15                  CALC TERM ENTRY        @OX19662
+         TM    TRMSTATE-IEDQTRM(R1),TRMLINE LINE?              @OX19662
+         BNO   BCT                      BRANCH NO              @OX19662
+         L     R1,TRMDESTQ-1-IEDQTRM(R1) GET QCB ADDRESS       @OX19662
+         CLC   QCBRELLN-IEDQQCB(4,R1),QCBRELLN-IEDQQCB(R8)     @OX19662
+*                                       DO LGB AND RLN MATCH?  @OX19662
+         BNE   BCT                      BRANCH NO              @OX19662
+         LR    R1,R0                    COPY TTE ADDRESS       @OX19662
+         B     GOTIT                    WE HAVE RIGHT ENTRY    @OX19662
+BCT      EQU   *                                               @OX19662
+         BCT   R10,AGAIN                LOOP BACK              @OX19662
+         B     GETTRM                   NEVER FOUND LINE       @OX19662
+CHRTOK   EQU   *                                               @OX19662
+         LR    R1,R10                   COPY COHORT POINTER    @OX19662
+         L     R15,AVTRNMPT             GET TNT CODE ADDRESS   @OX19662
+         BALR  R14,R15                  GET TERM ENTRY FOR CHRT@OX19662
+GOTIT    EQU   *                                               @OX19662
+         LR    R8,R1                    COPY TTE ADDRESS       @OX19662
+         LA    R14,TRMPRFSZ             LENGTH OF NEG PREFIX   @OX19662
+         SR    R8,R14                   AND BACK UP            @OX19662
+         TM    TRMSTATE,TRMPREF         3705 TERM?             @OX19662
+         BZ    GETTRM                   BRIF NO- PUNT NOT FOUND@OX19662
+         CLI   TRMTYPE,TRMPUNT          IS THIS PUNT?          @OX19662
+         BNE   PRITRMPU                 NO- LOOP BACK AGAIN    @OX19662
+         STH   R10,AVTDOUBL             KEEP FOR FUTURE REF    @OX19662
+         B     SYSCON                   PRIMARY'S PU HAD ERROR @OX19662
+         SPACE
+NOT3705  EQU   *                                               @Y17XATI
+         MVC   MSGPREF(L'IDLES),IDLES   SET CARRIAGE RETURN    @Y17XATI
+*                                       AND FIFTEEN IDLES      @Y17XATI
+         LA    RMSG,L'IDLES(RMSG)       ADJUST PAST PREFIX     @Y17XATI
+         B     GETTRM                   BR TO GET TRM          @Y17XATI
+         SPACE 1                                               @Y17XATI
+SYSCON   EQU   *                                               @Y17XATI
+         MVC   MSGWTOFL,WTOMCS          SET MCS FLAGS          @Y17XATI
+         LA    RMSG,MSGWTO              ADJUST PAST WTO PREFIX @Y17XATI
+         SPACE 1                                               @Y17XATI
+GETTRM   EQU   *                                               @Y17XATI
+         SR    R1,R1                    CLEAR FOR INSERT       @Y17XATI
+         ICM   R1,HALF,LCBTTCIN         GET RESOURCE TNT INDEX @Y17XATI
+         TM    AVTSAVTF,AVTVTMCP        NCP ENVIRONMENT        @YM07997
+         BNO   GOTTCIN                  BR NO                  @YM07997
+         L     R14,AVTSAVTP             GET SAVT BASE ADDRESS  @Y17XATI
+         C     RLCB,SAVTSLCB            SSCP'S LCB             @Y17XATI
+         BNE   GOTTCIN                  BR NO, INDEX CORRECT   @Y17XATI
+         NC    LCBLNENT(2),LCBLNENT     3705 RESOURCE ERROR    @YM06008
+         BZ    GOTTCIN                  BR NO, INDEX CORRECT   @Y17XATI
+         ICM   R1,HALF,LCBLNENT         GET RESOURCE INDEX     @Y17XATI
+GOTTCIN  EQU   *                                               @Y17XATI
+         LR    RINDEX,R1                SAVE RESOURCE INDEX    @Y17XATI
+         L     R15,AVTRNMPT             GET IEDQTNT BASE       @Y17XATI
+         BALR  R14,R15                  GET RESOURCE TRM       @Y17XATI
+         LR    RTRM,R1                  COPY TRM TO TRM BASE   @Y17XATI
+         SH    RTRM,TRMBCKUP            ASSUME NEGATIVE PREFIX @Y17XATI
+         CLI   LCBFLAG1,AVTEZERO        IS IT A 3705 PLCB        S22024
+         BE    CHKPLCB                  YES, BRANCH            @Y17XATI
+         SPACE 1                                               @Y17XATI
+BLD000I  EQU   *                                               @Y17XATI
+         SR    RPLCB,RPLCB              INDICATE NOT 3705 TERM @Y17XATI
+         MVC   MSGPREF(L'IEA000I),IEA000I SET MESSAGE PREFIX   @Y17XATI
+         LA    RMSG,L'IEA000I-1(RMSG)   ADJUST PAST PREFIX     @Y17XATI
+         B     COMMAS                   BR TO FINISH MESSAGE   @Y17XATI
+         SPACE 1                                               @Y17XATI
+CHKPLCB  EQU   *                                               @Y17XATI
+         MVC   LCBCSWST,LCBCSWRC        SET ERROR STATUS       @YM08042
+         LR    R1,RINDEX                GET SOURCE TNT INDEX   @Y17XATI
+         L     R14,AVTSAVTP             GET SAVT BASE ADDRESS  @Y17XATI
+         L     R15,SAVTTNTX             IEDIAP04 BASE ADDRESS  @Y17XATI
+         BALR  R14,R15                  GET NETWORK ADDRESS    @Y17XATI
+         SPACE 1                                               @Y17XATI
+         LR    R1,R15                   COPY NETWORK ADDRESS   @Y17XATI
+*                                       AS PARM TO IEDIAP06    @Y17XATI
+         L     R14,AVTSAVTP             GET SAVT BASE ADDRESS  @Y17XATI
+         L     R15,SAVTLCBS             IEDIAP06 BASE REGISTER @Y17XATI
+         BALR  R14,R15                  GET 3705 LCB ADDRESS   @Y17XATI
+         SPACE 1                                               @Y17XATI
+         LR    RPLCB,RLCB               COPY PLCB ADDRESS      @Y17XATI
+         LA    RLCB,0(R15)              COPY TRUE LCB ADDRESS  @Y17XATI
+         L     R14,AVTSAVTP             GET SAVT BASE ADDRESS  @Y17XATI
+         C     RPLCB,SAVTSLCB           PLCB OF THE SSCP       @Y17XATI
+         BNE   BLD162I                  BR NO, BUILD IED162I   @Y17XATI
+         SPACE 1                                               @Y17XATI
+         CLI   LCBQNXMN,AVTEZERO        INOP FROM TCAM PU      @Y17XATI
+         BNE   CHKINOP                  BR YES, DETERMINE      @Y17XATI
+*                                       WHICH MSG TO BUILD     @Y17XATI
+         SPACE 1                                               @Y17XATI
+         CLI   TRMTYPE,TRMLNCP          RESOURCE A 3705        @Y17XATI
+         BE    TYPCMD                   BR YES, SEPARATE TYPE  @YM07042
+         SPACE 1                                               @Y17XATI
+         CLC   RLTD,LCBNXCMD-IEDQLCB(RPLCB) LINE TRACE ENDED   @Y17XATI
+         BNE   BLD509I                  BR NO, BUILD IED509I   @Y17XATI
+         SPACE 1                                               @Y17XATI
+BLD403I  EQU   *                                               @YM06033
+         ICM   R1,HALF,LCBTTCIN         GET 3705 TNT INDEX     @Y17XATI
+         L     R15,AVTRNMPT             IEDQTNT BASE ADDRESS   @Y17XATI
+         BALR  R14,R15                  GET 3705 TRM ADDRESS   @Y17XATI
+         SPACE 1                                               @Y17XATI
+         LA    R0,TRMNCPI               SELECT NCP DEVICE      @Y17XATI
+*                                       DEPENDENT FIELD        @Y17XATI
+         L     R15,AVTDDFT              IEDQTL BASE ADDRESS    @Y17XATI
+         BALR  R14,R15                  GET NCPID              @Y17XATI
+         SPACE 1                                               @Y17XATI
+         USING IEDNCP,R15               ADDRESSIBILITY         @Y17XATI
+         ICM   R15,ALL,NCPLTRAC         GET TRACE TABLE ADDR   @Y17XATI
+         DROP  R15                                             @Y17XATI
+         USING HEDCNTRL,R15             ADDRESSIBILITY         @Y17XATI
+         ICM   R15,AD,HEDFSTHF          GET TABLE FIRST HALF   @Y17XATI
+         DROP  R15                                             @Y17XATI
+         USING TABHALF,R15              ADDRESSIBILITY         @Y17XATI
+         MVC   MSGPREF(L'IED403I),IED403I SET MESSAGE PREFIX   @YM06033
+         MVC   MSG403I(L'TABLINUM),TABLINUM INCLUDE GROUPNAME  @YM06033
+*                                       AND RELATIVE LINE NO   @Y17XATI
+         DROP  R15                                             @Y17XATI
+         LA    RMSG,L'IED403I(RMSG)     POINT TO END OF        @OY20726
+*                                       MESSAGE                @Y17XATI
+         B     CHECKWTO                 BR SET TO OUTPUT MSG   @Y17XATI
+         SPACE 1                                               @Y17XATI
+CHKINOP  EQU   *                                               @Y17XATI
+         TM    LCBQNXMN,LCBNX064        CONTROL UNIT NOT       @Y17XATI
+*                                       OPERATIONAL            @Y17XATI
+         BO    BLD064I                  BR YES, BUILD IED064I  @Y17XATI
+         SPACE 1                                               @Y17XATI
+         TM    LCBQNXMN,LCBNX142        IPL REQUIRED           @Y17XATI
+         BO    BLD142I                  BR YES, BUILD IED142I  @OX21816
+         SPACE 1                                               @Y17XATI
+         B     BLD162I                  ELSE BUILD IED162I     @Y17XATI
+         SPACE 1                                               @Y17XATI
+BLD064I  EQU   *                                               @Y17XATI
+         SR    R1,R1                   CLEAR FOR TEST          @XM05822
+         CH    R1,AVTOPCON             IS PRIMARY SYSCON       @XM05822
+         BE    DONTWTO                 DONT PRINT AGAIN        @XM05846
+         MVC   MSGPREF(L'IED064I),IED064I SET MESSAGE PREFIX   @Y17XATI
+         ICM   R1,AD,LCBUNADD           GET ADDRESS OF CUA     @Y17XATI
+         MVC   MSG064I(L'UCBNAME),0(R1) INSERT CUA             @Y17XATI
+         LA    RMSG,L'IED064I(RMSG)     POINT TO END OF MSG    @Y17XATI
+         B     CHECKWTO                 BR SET TO OUTPUT MSG   @Y17XATI
+DONTWTO  EQU   *                                               @XM05846
+         LR    RLCB,RPLCB               RESTORE LCB ADDRESS    @XM05846
+         B     BYWTO                    BYPASS WTO             @XM05846
+         SPACE 1                                               @Y17XATI
+BLD142I  EQU   *                                               @OX21816
+         MVC   MSGPREF(L'IED142I),IED142I SET MESSAGE PREFIX   @OX21816
+         ICM   R1,AD,LCBUNADD           GET ADDRESS OF CUA     @Y17XATI
+         MVC   MSG142I(L'UCBNAME),0(R1) INSERT CUA             @OX21816
+         LA    RMSG,L'IED142I(RMSG)     POINT TO END OF MSG    @OX21816
+         B     CHECKWTO                 BR SET TO OUTPUT MSG   @Y17XATI
+         SPACE 1                                               @Y17XATI
+BLD162I  EQU   *                                               @Y17XATI
+         MVC   MSGPREF(L'IED162I),IED162I SET MESSAGE PREFIX   @Y17XATI
+         LA    RMSG,L'IED162I-1(RMSG)   ADJUST PAST PREFIX     @Y17XATI
+         SPACE 1                                               @Y17XATI
+COMMAS   EQU   *                                               @Y17XATI
+         MVC   MSGCOMA1+1(19),MSGCOMA1  FILL IN COMMAS
+         LA    RMSG,1(RMSG)             POINT PAST COMMA       @Y17XATI
+         BAL   R14,SETCUA               SET CUA IN MSG AND RTN @YM07042
+         L     RDCB,LCBDCBPT            DCB BASE               @Y17XATI
+         TM    DCBDSRG2,DCBDSGTR        IS THIS A 3705 DCB     @Y17XATI
+         BNO   QNX02                    BRANCH NO                S22024
+         SPACE 1                                               @Y17XATI
+         LTR   RPLCB,RPLCB              3705 RESOURCE          @YM06937
+         BZ    QNX02                    BR NO, HAVE LCB        @YM06937
+         SPACE 1                                               @Y17XATI
+         CLI   TRMTYPE,TRMLNCP          IS IT THE 3705         @YM06937
+         BE    QNX02                    BR YES, HAVE LCB       @YM06937
+         SPACE 1                                               @Y17XATI
+         LR    RLCB,RPLCB               GET PLCB BASE          @Y17XATI
+         SPACE 1                                               @Y17XATI
+QNX02    EQU   *                                                 S22024
+         LTR   RPLCB,RPLCB              ENTERED WITH PLCB      @OX14080
+         BNZ   IS3705                   YES-CONTINUE           @OX14080
+         SR    R8,R8                    CLEAR REGISTER         @OX16393
+         SR    R14,R14                  CLEAR REGISTER         @OX16393
+         L     R1,DCBDEBAD              DEB ADDRESS            @OX16393
+         USING DEBTCBAD,R1              BASE FOR DEB           @OX16393
+         IC    R8,DEBNMEXT              NUMBER OF EXTENTS      @OX16393
+         SLL   R8,TWO                   SIZE OF UCB ADDRESSES  @OX16393
+         L     R8,DEBUCBAD(R8)          THRESHOLD AREA         @OX16393
+         IC    R14,LCBUCBX              RLN MINUS ONE          @OX16393
+         SLL   R14,THREE                MULT BY NO OF BYTES    @OX16393
+         AR    R8,R14                   BUMP TO SAVE OFFSET    @OX16393
+         SRL   R14,1                    HALF AGAIN FOR ERRMSG  @OZ24288
+         AR    R8,R14                   SAVED INFORMATION      @OZ24288
+         USING LCBEXTX,R8               ADDRESSABILITY         @OX16393
+         MVC   LCBSENS0,IEASENS0        RESTORE SENSE INFO     @OZ24288
+         MVC   LCBRESTR+2(L2),IEADVCHS  RESTORE DEV CHARS      @OX16393
+         MVC   LCBRESTR(L1),IEACMD      RESTORE COMMAND CODE   @OZ24288
+         MVC   LCBCSW+3(2),IEACSW       RESTORE CSW            @OZ24288
+         MVC   LCBFLAG2(1),IEALTPCD     RESTORE LAST TP OP CDE @OX16393
+         MVC   LCBSENS1(1),IEAFTPCD     RESTORE FIRST TP CODE  @OX16393
+IS3705   EQU   *                                               @OX14080
+         USING IEDNTRM,RTRM                                    @OX14080
+         SR    R8,R8                    CLEAR                      0802
+         IC    R8,LCBRESTR              COMMAND CODE-FAILING CCW   0730
+         BAL   R14,QNX80                CONVERT TO EBCDIC      @Y17XATI
+         SPACE 1
+         IC    R8,LCBCSWUS              STAT BYTE OF CSW
+         BAL   R14,QNX80                CONVERT TO EBCDIC      @Y17XATI
+         SPACE 1                                               @Y17XATI
+         BCTR  RMSG,0                   PREVENT SKIP OF COMMA  @Y17XATI
+         IC    R8,LCBCSWCS              2ND STAT BYTE IN CSW
+         BAL   R14,QNX80                CONVERT TO EBCDIC      @Y17XATI
+         SPACE 1                                               @Y17XATI
+         CLI   LCBFLAG1,AVTEZERO        IS IT 3705 PLCB?       @YA07494
+         BE    NOSENSE                  BR YES, ZERO SENSE     @Y17XATI
+         SPACE 1
+         IC    R8,LCBSENS0              SENSE BYTE IN IOB
+         B     QNX025                   CONTINUE               @YA07494
+         SPACE 1                                               @Y17XATI
+NOSENSE  EQU   *                                               @Y17XATI
+         SR    R8,R8                    USE SENSE OF ZERO      @Y17XATI
+         SPACE 1                                               @Y17XATI
+QNX025   EQU   *                                               @Y17XATI
+         BAL   R14,QNX80                CONVERT TO EBCDIC      @Y17XATI
+         SPACE 1                                               @Y17XATI
+         BCTR  RMSG,0                   PREVENT SKIP OF COMMA  @Y17XATI
+         SR    R8,R8                    SECOND SENSE BYTE OF 0 @Y17XATI
+         BAL   R14,QNX80                CONVERT TO EBCDIC      @Y17XATI
+         SPACE 1                                               @Y17XATI
+         LTR   RPLCB,RPLCB              ENTRY WITH PLCB        @Y17XATI
+         BZ    NOPLCB                   BR NO, CONTINUE        @Y17XATI
+         SPACE 1                                               @Y17XATI
+         LA    RMSG,NEXT(RMSG)          POINT TO NEXT POSITION @Y17XATI
+         B     QNX002                   GO INSERT RESOURCENAME @Y17XATI
+         SPACE 1
+NOPLCB   EQU   *                                               @Y17XATI
+         IC    R8,LCBFLAG2              TP OP CODE OF LAST RETRY   0725
+         BAL   R14,QNX80                CONVERT TO EBCDIC      @Y17XATI
+         SPACE 1                                               @Y17XATI
+         BCTR  RMSG,0                   PREVENT SKIP OF COMMA  @Y17XATI
+         IC    R8,LCBSENS1              TP OP CODE OF FAILING CCW  0730
+         BAL   R14,QNX80                CONVERT TO EBCDIC      @Y17XATI
+         SPACE 1
+         BCTR  RMSG,0                   PREVENT SKIP OF COMMA  @Y17XATI
+         IC    R8,LCBRESTR+2            ADDR CHAR,POLL CHAR OR @OX16393
+         BAL   R14,QNX80                CONVERT TO EBCDIC      @Y17XATI
+         SPACE 1                                               @Y17XATI
+         BCTR  RMSG,0                   PREVENT SKIP OF COMMA  @Y17XATI
+         IC    R8,LCBRESTR+3            SECOND CHARACTER       @OX16393
+         BAL   R14,QNX80                CONVERT TO EBCDIC      @Y17XATI
+         SPACE 1                                               @Y17XATI
+         SR    R1,R1                    CLEAR REG              @OY11534
+         STH   R1,LCBTTBIN              CLEAR TERM INDEX       @OY11534
+         B     QNX04                    WRITE OUT ERROR MSG    @Y17XATI
+TYPCMD   EQU   *                                               @YM07042
+*                                       ENTERING SLOWDOWN      @YM07994
+         CLC   LCBNXCMD-IEDQLCB(L'LCBNXCMD,RPLCB),ENTSLO       @YM07994
+         BE    BLD412                   YES, BUILD IED411I     @YM07042
+*                                       EXITING SLOWDOWN       @YM07994
+         CLC   LCBNXCMD-IEDQLCB(L'LCBNXCMD,RPLCB),EXTSLO       @YM07994
+         BE    BLD412                   YES, BUILD IED412      @YM07042
+         SPACE 1                                               @Y17XATI
+BLD509A  EQU   *                                               @Y17XATI
+         MVC   MSGPREF(L'IED509I),IED509I SET MESSAGE PREFIX   @Y17XATI
+         MVC   MSG509I(L'MSGANS),MSGANS INSERT ANS CHARS       @Y17XATI
+         LA    RMSG,L'IED509I(RMSG)     POINT TO END OF MSG    @Y17XATI
+         B     QNX002                   BR TO INSERT TERMNAME  @Y17XATI
+         SPACE 1                                               @Y17XATI
+BLD412   EQU   *                                               @YM07042
+         MVC   MSGPREF(L'IED412I),IED412I ASSUME IED412I MSG   @YM07042
+*                                       EXITING SLOWDOWN       @YM07994
+         CLC   LCBNXCMD-IEDQLCB(L'LCBNXCMD,RPLCB),EXTSLO       @YM07994
+         BE    BLD412A                  YES, NO MODIFY         @YM07042
+         MVC   MSG41EXT(L'MSGENT),MSGENT  MODIFY FOR ENTERING  @YM07042
+         MVI   MSG11,IED411I            MODIFY MSG ID          @YM07042
+BLD412A  EQU   *                                               @YM07042
+         LA    RMSG,MSG41               POINT TO CUA POSITION  @YM07042
+         BAL   R14,SETCUA               GO INSERT CUA          @YM07042
+         LA    RMSG,MSG41END-MSG41-L'UCBNAME(RMSG) ADJUST TO   @YM07042
+*                                       LAST POSITION OF MSG   @YM07042
+         B     CHECKWTO                                        @YM07042
+BLD509I  EQU   *                                               @Y17XATI
+         MVC   MSGPREF(L'IED509I),IED509I SET MESSAGE PREFIX   @Y17XATI
+         MVC   MSG509I(L'MSGINOP),MSGINOP INSERT INOP CHARS    @Y17XATI
+         LA    RMSG,L'IED509I(RMSG)     POINT TO END OF MSG    @Y17XATI
+         SPACE 1
+QNX002   EQU   *                                               @YA07494
+         L     R15,AVTRNMPT             ADDRESS OF TERMNAME TBL  S22024
+         USING IEDQTNTD,R15             BASE                     S22024
+         LR    R0,RINDEX                SAVE RESOURCE INDEX    @Y17XATI
+         SR    R9,R9                    ZERO REGISTER          @Y17XATI
+         IC    R9,TNTENLEN              GET LENGTH OF AN ENTRY   S22024
+         LA    R7,3(R9)                 LENGTH OF FULL ENTRY   @Y17XATI
+         BCTR  R0,R0                    SUBTRACT ONE             S22024
+         MR    R6,R0                    OFFSET TO TERMNAME     @Y17XATI
+         LA    R7,TNTFIRST(R7)          ADDRESS OF TERMNAME    @Y17XATI
+         BCTR  R9,R0                    SUBTRACT ONE           @Y17XATI
+         EX    R9,MVCNM                 MOVE NAME INTO MESSAGE @Y17XATI
+         LA    RMSG,NEXT(R9,RMSG)       POINT TO END OF MSG    @Y17XATI
+         SPACE 1                                               @Y17XATI
+CHECKWTO EQU   *
+         LR    RLCB,RPLCB               ELSE RECOVER LCB BASE  @Y17XATI
+         SPACE 1                                               @Y17XATI
+SKIPSET  EQU   *                                               @Y17XATI
+         SR    R1,R1                    ZERO FOR COMPARE         S22024
+         CH    R1,AVTOPCON              IS PRIMARY=SYSCON        S22024
+         BE    MSGTOCNS                 BRANCH YES TO WTO      @OX19662
+         C     RLCB,SAVTSLCB            IS THIS SSCP'S PLCB?   @OX19662
+         BNE   QNX04                    BRANCH NO              @OX19662
+         CLC   AVTOPCIN,LCBLNENT        WAS ERR ON PRITRM LU?  @OX19662
+         BE    MSGTOCNS                 YES MSG TO SYSCON      @OX19662
+         CLC   AVTDOUBL(2),AVTFZERO     WAS ERROR ON PRITRM PU?@OX19662
+         BE    QNX04                    BRANCH NO MSG TO PRITRM@OX19662
+MSGTOCNS EQU   *                                               @OX19662
+         SPACE 1                                               @Y17XATI
+         MVC   MSGMCS(L'MCSWORD),MCSWORD MCS CONSTANT          @Y17XATI
+         LR    R1,RMSG                  END OF MESSAGE         @Y17XATI
+         LA    RMSG,AVTSAVE4            ADDR OF WTO MESSAGE    @Y17XATI
+         SR    R1,RMSG                  COMPUTE MESSAGE LENGTH @Y17XATI
+         STH   R1,MSGWTOLN              SET WTO MESSAGE LENGTH @Y17XATI
+         SPACE 1                                               @Y17XATI
+         WTO   MF=(E,(RMSG))            WRITE MESSAGE TO CONSOLE S22024
+BYWTO    EQU   *                                               @XM05822
+         SPACE 1                                               @Y17XATI
+         SR    R5,R5                    FORCE ONLY PLCB TPOST    S22024
+         B     QNX50                    POST BFR                 S22024
+         SPACE 1                                               @Y17XATI
+*        MOVE ERROR MESSAGE FROM WORK AREA TO BUFFER
+         SPACE 1
+QNX04    EQU   *                                                 S22024
+         SR    R5,R5                    CLEAR ADDR OF 1ST UNIT     0606
+         LA    R0,UNITCNT               COUNT OF UNITS/BUFFER  @Y17XATI
+         LA    R1,BFRCNT                COUNT OF BUFFERS       @Y17XATI
+         L     R15,AVTSTEAL             BUFFER STEAL ROUTINE   @Y17XATI
+         BALR  R14,R15                  ATTEMPT BUFFER STEAL   @Y17XATI
+         SPACE 1                                               @Y17XATI
+         LTR   R15,R15                  BFR STEAL SUCCESSFUL   @Y17XATI
+         BZ    QNX50                    BR NO, ERROR EXIT      @Y17XATI
+         SPACE 1                                               @Y17XATI
+         LR    RPRF,R15                 SET FIRST BUFFER ADDR  @Y17XATI
+         LR    R5,RPRF                  SAVE 1ST UNIT IN BFR   @Y17XATI
+         LR    R7,RMSG                  COPY END OF MSG ADDR   @Y17XATI
+         LA    RMSG,AVTSAVE4            BEGINNING OF MESSAGE   @Y17XATI
+         SR    R7,RMSG                  MESSAGE LENGTH         @Y17XATI
+         LA    R7,AVTHDRSZ(R7)          ADD HEADER SIZE        @Y17XATI
+         XC    PRFSUNIT(PRFSHDR-PRFSUNIT),PRFSUNIT CLEAR PREFIX@Y17XATI
+         ST    RLCB,PRFLCB-1            PUT LCB ADDR IN PREFIX @Y17XATI
+         MVI   PRFNBUNT,UNITCNT         COUNT OF UNITS
+         STH   R7,PRFSIZE               PUT LENGTH INTO PREFIX @Y17XATI
+         MVI   PRFSTAT1,PRFERMGN        SET AS ERRORMSG TO PREVENT
+*                                       MULTI-ROUTE ON THE ERP
+*                                       MSG AND ALLOW IT ON ORIG
+         MVI   PRFSCAN,AVTHDRSZ         SET SCAN PTR FOR ERROR MSG 0212
+         MVC   PRFTIC,TIC               SET TIC FIELD          @Y17XATI
+         LH    R9,AVTKEYLE              LENGTH OF UNIT
+         LA    R0,AVTHDRSZ              LENGTH OF PREFIX
+         LR    R10,R9
+         SR    R10,R0                   LENGTH OF DATA IN UNIT
+         SPACE 1                                               @Y17XATI
+         BCTR  R10,0                    SUBTRACT ONE FOR EXEC  @Y17XATI
+         EX    R10,QNXINST1             MOVE MSG
+         SPACE 1
+*        CHECK LENGTH OF MSG TO SEE IF MULTIPLE UNITS REQUIRED
+         SPACE 1
+QNX10    EQU   *                                               @Y17XATI
+         LA    RMSG,NEXT(R10,RMSG)      BUMP ADDRESS OF MSG    @Y17XATI
+         SH    R7,AVTKEYLE              REMAINING LENGTH       @Y17XATI
+         BNP   QNX20                    BRANCH IF END OF MSG       0603
+         SPACE 1                                               @Y17XATI
+         LR    R9,RPRF                  SAVE PREVIOUS UNIT     @Y17XATI
+         LA    R0,UNITCNT               COUNT OF UNITS/BUFFER  @Y17XATI
+         LA    R1,BFRCNT                COUNT OF BUFFERS       @Y17XATI
+         L     R15,AVTSTEAL             BUFFER STEAL ROUTINE   @Y17XATI
+         BALR  R14,R15                  ATTEMPT BUFFER STEAL   @Y17XATI
+         SPACE 1                                               @Y17XATI
+         LTR   R15,R15                  BFR STEAL SUCCESSFUL   @Y17XATI
+         BZ    QNX50                    BR NO, ERROR EXIT      @Y17XATI
+         SPACE 1                                               @Y17XATI
+         LR    RPRF,R15                 SET FIRST BUFFER ADDR  @Y17XATI
+         IC    R15,PRFNBUNT-IEDQPRF(R5) COUNT OF UNITS IN BFR  @Y17XATI
+         LA    R15,1(,R15)              ADD 1 TO COUNT             0603
+         STC   R15,PRFNBUNT-IEDQPRF(R5)                        @Y17XATI
+         ST    RPRF,PRFTIC-IEDQPRF(R9)  LINK UNITS             @Y17XATI
+         MVC   PRFTIC,TIC               SET TIC FIELD          @Y17XATI
+         LH    R10,AVTKEYLE             DATA LENGTH IN UNIT    @Y17XATI
+         BCTR  R10,0                    DECREMENT FOR EXEC     @Y17XATI
+         EX    R10,QNXINST2             MOVE DATA TO THIS UNIT @Y17XATI
+         B     QNX10                    BR TO CHECK FOR MORE   @Y17XATI
+         SPACE 1
+*        FIND TERMINAL ENTRY ADDRESS AND QCB ADDRESS FOR PRIMARY TERM
+         SPACE 1
+QNX20    EQU   *                                                   0603
+         LR    RPRF,R5                  GET 1ST UNIT IN BUFFER @Y17XATI
+         LH    R1,AVTOPCIN              TNT INDEX OF PRIMARY   @Y17XATI
+         N     R1,AVTCLRHI              CLEAR HIGH ORDER HALF WORD
+         SPACE 1                                               @Y17XATI
+QNX23    EQU   *                                                   1009
+         STH   R1,PRFDEST               PUT OFFSET INTO PREFIX @Y17XATI
+         L     R15,AVTRNMPT
+         BALR  R14,R15                  GET TERM ENTRY ADDRESS
+         SPACE 1                                               @Y17XATI
+         LR    RTRM,R1                  BASE FOR TERM ENTRY    @Y17XATI
+         SH    RTRM,TRMBCKUP            GET NEGATIVE PREFIX    @Y17XATI
+         L     RQCB,TRMDESTQ-1          ADDRESS OF QCB         @Y17XATI
+         ST    RQCB,PRFQCBA-1           PUT QCB ADDR IN PRF    @Y17XATI
+         CLI   QCBDSFLG,QCBFQCB         CHECK FOR PUT PROCESS ENTRY1009
+         BNE   QNX25                    BRANCH IF NOT PUT PROCESS  1009
+         SPACE 1                                               @Y17XATI
+         LH    R1,TRMALTD               GET ALTERNATE DEST     @Y17XATI
+         N     R1,AVTCLRHI              CLEAR HIGH ORDER HALF  @Y17XATI
+         BZ    QNX50                    BRANCH IF NO ALT DESTINATN 1009
+         SPACE 1                                               @Y17XATI
+         B     QNX23                    GET TERM ENTRY FOR ALT DEST1009
+         SPACE 1
+*        SET UP THE SCB-USUALLY DONE BY FORWARD MACRO
+         SPACE 1
+QNX25    EQU   *                                                   1009
+         IC    R15,SCBSTATE             SAVE STATUS BYTE
+         ST    RQCB,SCBDESTQ-1          PUT QCB ADDRESS IN SCB @Y17XATI
+         STC   R15,SCBSTATE             RESTORE STATUS BYTE
+         MVC   SCBPRI,QCBPRIPQ          MOVE HIGHEST PRIORITY TO SC0730
+         SPACE 1
+*        POST CHAIN OF ELEMENTS TO THE READY QUEUE.
+         SPACE 1
+QNX30    EQU   *                                                   0606
+         ST    RLCB,PRFLINK-1           LINK LCB TO THIS BFR   @Y17XATI
+         MVI   PRFPRI,PRIDESTQ          SET PRIORITY
+         LR    R1,RPRF                  GET ADDRESS OF CHAIN   @Y17XATI
+         SPACE 1                                               @Y17XATI
+QNX40    EQU   *
+         XC    LCBLINK,LCBLINK          CLEAR LINK FIELD           0120
+         NI    LCBCHAIN,X'FF'-LCBERMSG  CLEAR ERROR MSG REQUEST BIT
+         BAL   R14,DSPCHAIN       EXIT AND POST CHAIN OF ELEM  @Y17XARX
+         SPACE 1
+*        THERE ARE NO AVAILABLE BUFFERS-RETURN TO BUFFER DISPOSITION
+         SPACE 1
+QNX50    EQU   *
+         LR    R1,RLCB                  ADDR OF LCB IS FIRST   @Y17XATIX
+                                        ELEMENT IN CHAIN
+         LTR   RPRF,R5                  CHECK FOR PARTIAL BFR  @Y17XATI
+         BZ    QNX40                    BRANCH IF NO UNITS OUT     0606
+         SPACE 1                                               @Y17XATI
+         LA    R1,AVTBFRTB              ADDR OF BFR RETURN QCB     0606
+         ST    R1,PRFQCBA-1             STORE IN 1ST UNIT OF BFR   0606
+         B     QNX30                    POST BFR BACK TO BFR DISPOS0606
+         EJECT                                                 @Y17XATI
+*        SUBROUTINE TO CONVERT HEX TO PRINTABLE HEX
+         SPACE 1
+QNX80    EQU   *
+         LA    RMSG,NEXT(RMSG)          SKIP ONE COMMA         @Y17XATI
+         LR    R10,R8                   COPY THE 1 BYTE OF HEX
+         SRL   R10,4                    SHIFT OUT RIGHT HAND HALF
+         N     R8,QNXMASK3              MASK OUT FIRST BYTE    @Y17XATI
+         CH    R10,QNXNINE              CHECK FOR ALPHABETIC
+         BH    QNX85                    BRANCH IF ALPHABETIC
+         SPACE 1                                               @Y17XATI
+         O     R10,QNXMASK1             PRINTABLE NUMERIC
+         B     QNX90                    GO STORE BYTE            S22025
+         SPACE 1                                               @Y17XATI
+QNX85    EQU   *
+         SH    R10,QNXNINE
+         O     R10,QNXMASK2             PRINTABLE ALPHABETIC
+         SPACE 1                                               @Y17XATI
+QNX90    EQU   *
+         STC   R10,0(RMSG)              STORE CONVERTED BYTE   @Y17XATI
+         LA    RMSG,NEXT(RMSG)          GET NEXT BYTE          @Y17XATI
+         CH    R8,QNXNINE               CHECK FOR ALPHABETIC   @Y17XATI
+         BH    QNX95                    BRANCH IF ALPHABETIC   @Y17XATI
+         SPACE 1                                               @Y17XATI
+         O     R8,QNXMASK1              PRINTABLE NUMERIC      @Y17XATI
+         B     QNX100                   GO STORE BYTE          @Y17XATI
+         SPACE 1                                               @Y17XATI
+QNX95    EQU   *                                               @Y17XATI
+         SH    R8,QNXNINE                                      @Y17XATI
+         O     R8,QNXMASK2              PRINTABLE ALPHABETIC   @Y17XATI
+         SPACE 1                                               @Y17XATI
+QNX100   EQU   *                                               @Y17XATI
+         STC   R8,0(RMSG)               STORE CONVERTED BYTE   @Y17XATI
+         LA    RMSG,NEXT(RMSG)          POINT PAST INSERT      @Y17XATI
+         BR    R14                      RETURN TO INLINE       @Y17XATI
+         SPACE 1
+SETCUA   EQU   *                                               @YM07042
+         SR    R7,R7                                           @Y17XATI
+         IC    R7,LCBUCBX               GET UCB INDEX          @Y17XATI
+         SLL   R7,2                     MULTIPLY BY 4          @Y17XATI
+         L     RDCB,LCBDCBPT            ADDRESS OF LINE DCB    @Y17XATI
+         L     RDEB,DCBDEBAD            ADDRESS OF DEB         @Y17XATI
+         USING DEBTCBAD,RDEB            BASE FOR DEB           @YM06937
+         L     RUCB,DEBUCBAD(R7)        ADDRESS OF UCB         @YM06937
+         USING IEDQUCB,RUCB             BASE FOR UCB           @Y17XATI
+         MVC   MSGLINE(L'UCBNAME),UCBNAME MOVE CUA TO MESSAGE  @Y17XATI
+         LA    RMSG,L'UCBNAME(RMSG)     POINT TO NEXT POSITION @Y17XATI
+         BR    R14                      RETURN                 @YM07042
+         EJECT                                                 @Y17XATI
+MVCNM    MVC   0(1,RMSG),0(R7)          OBJECT OF EXECUTE      @Y17XATI
+QNXINST1 MVC   PRFSHDR(0),0(RMSG)       BUFFER WORK AREA       @Y17XATI
+QNXINST2 MVC   PRFSUNIT(0),0(RMSG)      BUFFER WORK AREA       @Y17XATI
+QNXNINE  DC    H'9'                     CONSTANT
+         DS    0F                       FORCE BOUNDARY ALIGNMENT S22025
+QNXMASK1 DC    X'000000F0'              MASK FOR PRINTABLE       S22025
+*                                       NUMERIC CHARACTER        S22025
+QNXMASK2 DC    X'000000C0'              MASK FOR PRINTABLE       S22025
+*                                       ALPHABETIC CHARACTER     S22025
+QNXMASK3 DC    X'0000000F'              MASK TO CLEAR ALL BUT    S22025
+*                                       RIGHT HALF OF LOW ORDER  S22025
+*                                       BYTE                     S22025
+L1       EQU   1                        LENGTH OF ONE          @OX14080
+L2       EQU   2                        LENGTH OF TWO          @OX14080
+L3       EQU   3                        LENGTH OF THREE        @OX14080
+L4       EQU   4                        LENGTH OF FOUR         @OX14080
+DIALDIG  EQU   17                       DIAL DIGIT SHIFT OFFSET@OX14080
+LTPOP    EQU   8                        OFFSET TO LAST TP OP   @OX14080
+FTPOP    EQU   9                        OFFSET TO FIRST TP OP  @OX14080
+L7       EQU   7                        LENGTH OF SEVEN        @OX14080
+FIVE     EQU   5                        LENGTH OF FIVE         @OX14080
+SIX      EQU   6                        CONSTANT               @OX14080
+UNITCNT  EQU   1                        UNITS/BUFFER REQUEST   @Y17XATI
+BFRCNT   EQU   1                        BUFFER REQUEST COUNT   @Y17XATI
+NEXT     EQU   1                        NEXT DATA POSITION     @Y17XATI
+HALF     EQU   3                        MASK FOR ICM OF HLFWRD @Y17XATI
+AD       EQU   7                        MASK FOR ICM OF ADDRESS@Y17XATI
+ALL      EQU   15                       MASK FOR ICM OF WORD   @Y17XATI
+TWO      EQU   2                                               @OX16393
+THREE    EQU   3                                               @OX16393
+TIC      DC    X'08000002'              TIC CCW                  S22026
+MCSWORD  DC    X'10000100'              MCS DESCR & ROUTING    @OS77924
+         DC    X'10'                    EVENTUAL ACTION REQ'ED @OS77924
+         DC    X'00'                                           @Y17XATI
+*                                       ROUTING CODES          @Y17XATI
+         DC    X'01'                    MASTER CONSOLE INFO    @OS77924
+         DC    X'00'                                           @Y17XATI
+WTOMCS   DS    0XL2                     MCS FLAGS              @Y17XATI
+         DC    X'80'                                           @Y17XATI
+         DC    X'00'                                           @Y17XATI
+RLTD     DS    0XL3                     RECORD LINE TRACE CMD  @Y17XATI
+         DC    AL1(CD1NETS)             NETWORK SERVICES       @Y17XATI
+         DC    AL1(CD1MAINT)            PHYSICAL MAINTENANCE   @Y17XATI
+         DC    AL1(CD1RTRD)             RECORD TRACE DATA      @Y17XATI
+ENTSLO   DS    0XL3                     ENTER SLOWDOWN COMMAND @YM07042
+         DC    AL1(CD1NETS)             NETWORK SERVICES       @YM07042
+         DC    AL1(CD1CONFS)            CONFIGURATION SERVICES @YM07042
+         DC    AL1(CD1ESLOW)            ENTER SLOWDOWN         @YM07042
+EXTSLO   DS    0XL3                     EXIT SLOWDOWN COMMAND  @YM07042
+         DC    AL1(CD1NETS)             NETWORK SERVICES       @YM07042
+         DC    AL1(CD1CONFS)            CONFIGURATION SERVICES @YM07042
+         DC    AL1(CD1EXSLW)            EXIT SLOWDOWN          @YM07042
+TRMBCKUP DS    0H                       TRM PREFIX SIZE        @Y17XATI
+         DC    AL2(IEDQTRM-IEDNTRM)                            @Y17XATI
+         EJECT                                                 @Y17XATI
+IDLES    DS    0XL16                                           @Y17XATI
+         DC    X'15'                    CARRIAGE RETURN AND    @Y17XATI
+         DC    15X'32'                  FIFTEEN IDLES          @Y17XATI
+IEA000I  DC    CL18'IEA000I I/O ERROR,' IEA000I PREFIX         @Y17XATI
+IED064I  DC    CL45'IED064I LINE --- CONTROL UNIT NOT OPERATIONAL'
+IED142I  DC    CL33'IED142I --- IPL REQUIRED FOR 3705'         @OX21816
+IED162I  DC    CL23'IED162I 3705 I/O ERROR,' IED162I PREFIX    @Y17XATI
+IED403I  DC    CL47'IED403I LINE TRACE FOR ------------ DEACTIVATED'
+IED412I  DC    CL34'IED412I 3705 --- EXITING  SLOWDOWN'        @YM07042
+*                                       IED411I/IED412I MSGS   @YM07042
+IED509I  DC    CL26'IED509I ---- RECEIVED FOR ' IED509I PREFIX @Y17XATI
+         SPACE 3                                               @Y17XATI
+MSGANS   DC    CL4'ANS'                 INSERT TO IED509I      @Y17XATI
+MSGINOP  DC    CL4'INOP'                INSERT TO IED509I      @Y17XATI
+MSGENT   DC    CL8'ENTERING'            INSERT TO IED412I/411I @YM07042
+IED411I  EQU   C'1'                     INSERT TO IED412I/411I @YM07042
+         EJECT                                                 @Y17XATI
+*DSECT FOR ERROR MESSAGE WORK AREA
+         SPACE 1
+IEDQMSGD DSECT
+MSGWTOPF DS    0F                       WTO MESSAGE PREFIX     @Y17XATI
+MSGWTOLN DS    H                        WTO MESSAGE LENGTH     @Y17XATI
+MSGWTOFL DS    H                        WTO MESSAGE FLAGS      @Y17XATI
+MSGWTO   DS    0C                       WTO MESSAGE START      @Y17XATI
+         ORG   MSGWTOPF                 REDEFINE MESSAGE DSECT @Y17XATI
+MSGPREF  DS    0C                       NON-WTO MESSAGE PREFIX @Y17XATI
+MSG064I  EQU   MSGPREF+13               IED064I INSERT OFFSET  @Y17XATI
+MSG142I  EQU   MSGPREF+8                IED142I INSERT OFFSET  @OX21816
+MSG403I  EQU   MSGPREF+23               IED403I OFFSET INSERT  @YM06033
+MSG41    EQU   MSGPREF+13               IED411/412 INSRT OFFSET@YM07042
+MSG41EXT EQU   MSGPREF+17               IED411/412 INSRT OFFSET@YM07042
+MSG11    EQU   MSGPREF+5                IED411/412 INSRT OFFSET@YM07042
+MSG41END EQU   MSGPREF+L'IED412I        END OF IED412I MESSAGE @YM07042
+MSG509I  EQU   MSGPREF+8                IED509I INSERT OFFSET  @Y17XATI
+MSGCOMA1 DS    0C                       FIRST COMMA            @Y17XATI
+MSGMCS   DS    0C                       MCS CONSTANT           @Y17XATI
+MSGLINE  DS    0C                       CHANNEL UNIT ADDRESS   @Y17XATI
+         EJECT                                                 @Y17XATI
+HEDCNTRL DSECT                          3705 TRACE TABLE       @Y17XATI
+*                                       CONTROL WORDS DSECT    @Y17XATI
+         DS    F                                               @Y17XATI
+         DS    F                                               @Y17XATI
+         DS    CL1                                             @Y17XATI
+HEDFSTHF DS    AL3                      ADDRESS OF FIRST HALF  @Y17XATI
+*                                       OF TRACE TABLE         @Y17XATI
+         SPACE 3                                               @Y17XATI
+TABHALF  DSECT                          3705 TRACE TABLE DSECT @Y17XATI
+         DS    CL16                                            @Y17XATI
+TABLINUM DS    CL12                     GROUPNAME,RLN          @Y17XATI
+         EJECT                                                 @Y17XATI
+         TAVTD
+         EJECT                                                 @Y17XATI
+         TCD1D                                                 @Y17XATI
+         EJECT                                                 @Y17XATI
+         DCBD  DSORG=TX                                        @Y17XATI
+         EJECT                                                 @Y17XATI
+         TDEBD                                                 @Y17XATI
+         EJECT                                                 @Y17XATI
+         TDISPD                                                @Y17XATI
+         EJECT                                                 @Y17XATI
+         TLCBD
+         EJECT                                                 @OX16393
+LCBEXTX  DSECT                                                 @OX16393
+THRWORD  DS    F                        FOUR BYTE THRESH INFO  @OX16393
+IEALTPCD DS    CL1                      SAVED LAST TP OP CODE  @OX16393
+IEAFTPCD DS    CL1                      SAVED FIRST TP OP CODE @OX16393
+IEADVCHS DS    CL2                      SAVED DEVICE CHARACTERS@OX16393
+IEASENS0 DS    CL1                      SENSE INFORMATION      @OZ24288
+IEACMD   DS    CL1                      SAVED COMMAND CODE     @OZ24288
+IEACSW   DS    CL2                      SAVED CSW              @OZ24288
+         EJECT                                                 @Y17XATI
+         TNCPID                                                @Y17XATI
+         EJECT                                                 @Y17XATI
+         TPRFD                                                 @Y17XATI
+         EJECT                                                 @Y17XATI
+         TPRIOR
+         EJECT                                                 @Y17XATI
+         TQCBD                                                 @Y17XATI
+         EJECT                                                 @Y17XATI
+         TSCBD                                                 @Y17XATI
+         EJECT                                                 @Y17XATI
+         TTNTD                                                 @Y17XATI
+         EJECT                                                 @Y17XATI
+         TTRMD
+         EJECT                                                 @Y17XATI
+IEDQUCB  DSECT                                                 @Y17XATI
+         IEFUCBOB                                              @Y17XATI
+         END

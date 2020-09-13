@@ -1,0 +1,191 @@
+**********************************************************************
+*                                                                    *
+* THIS PROGRAM IS USED TO CALCULATE THE NUMBER OF UNITS USED AT ANY  *
+* GIVEN TIME DURING A TSO SESSION. IT CANNOT CALCULATE THE EXACT     *
+* NUMBER OF UNITS FOR THE SESSION BECAUSE SOME UNITS ARE USED        *
+* DURING LOGOFF.                                                     *
+*                                                                    *
+* SEE THE SMF CHARGING ALGORITHM FOR DETAILS OF HOW CHARGES ARE      *
+* CALCULATED. (SMF TEAM -JOHN MC'KAY)                                *
+*                                                                    *
+* CPU TIME - (1000 UNITS PER HOUR)                                   *
+*   THIS VALUE IS FOUND IN STCK  UNITS IN THE ASCB. THE VALUE IS     *
+*   THEN CONVERTED TO 100THS OF AN SECOND AND THEN MULTIPLIED BY     *
+*   1000 TO CALCULATE NUMBER OF UNITS.                               *
+*                                                                    *
+* CORE TIME - (1 UNIT PER KBYTE PER HOUR)                            *
+*   THE REGION SIZE IS FOUND IN 2K UNITS IN THE PSCB. THE CPU TIME   *
+*   IS OBTAINED FROM ABOVE AND THE EXCP COUNT IS FOUND IN TCTIOT     *
+*   (POINTED TO BY THE TIMING CONTROL TABLE, TCT).                   *
+*  EQUATION IS REGIONSIZE(CPUTIME IN 100THS + EXCPTIME IN 100THS)    *
+*                                                                    *
+*                                                                    *
+* NOTE -                                                             *
+*   EXCP COUNTER - EACH COUNT IS EQUAL TO 20 MILLISECONDS.           *
+*                                                                    *
+*   STCK - STORE CLOCK INSTRUCTION. SEE POP FOR DETAILS OF THE TOD   *
+*   CLOCK OPERATION.                                                 *
+*                                                                    *
+* AUTHOR - M.J.BOYD MET O 12B  7/7/76                                *
+* UPDATED - APRIL 80. SINCE MVS-SE2.TWO HIGH-ORDER BYTES OF          *
+*                     EXCP FIELD ARE SOMETIMES SET BY SYSTEM.        *
+*                     NOW ONLY TWO LOW-ORDER BYTES USED AS           *
+*                     EXCP COUNTS.                J.HAND MET.0.12B   *
+* UPDATED - SEPT 80.  ACCOUNT MAC ADDED.          J.HAND MET.0.12B   *
+*                                                                    *
+* UPDATED - AUGUST 83. CALCULATION FOR 3081.      J.HAND MET.O.12B   *
+*                      CHANGE CPUVAL FROM 200 TO 1000                *
+*                      REMOVE CODE THAT ASSIGNS A WEIGHT BASED ON    *
+*                      THE TIME OF DAY.                              *
+*                      DO NOT ADD 'LOGGED-ON' COST OF 2 UNITS/HOUR.  *
+*                      DO NOT DIVIDE CPU TIME BY 5 WHEN CALCULATING  *
+*                      CORE CHARGE.                                  *
+*                                                                    *
+* UPDATED - MARCH  84. CORRECT ERROR INTRODUCED 4/80.    R.T.SUGGITT *
+*                      SUMMATION OF EXCP COUNT INCORRECT.  AND-ING   *
+*                      WITH ZERONE (X'0000FFFF') IS OK IN PRINCIPLE  *
+*                      BUT ZERONE'S INITIAL VALUE IS NOT PRESERVED - *
+*                      IT WILL EVENTUALLY BECOME '00000000'.         *
+*                      CHANGE EDIT PATTERN TO CORRECTLY DISPLAY THE  *
+*                      NUMBER OF UNITS - WAS GIVING POWER OF 10 TOO  *
+*                      LOW.                                          *
+*                                                                    *
+* UPDATED - SEPT 84.   ACCOUNT MES ADDED.    R.ARMSTRONG MET.0.12B   *
+*                                                                    *
+**********************************************************************
+         EJECT
+UNITS    CSECT
+         PRINT NOGEN
+         SAVE  (14,12)        SAVE REGISTERS
+         BALR  12,0           PROVIDE ADDRESSIBILITY
+         USING *,12           PROVIDE BASE ADDRESS
+*
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+         GETMAIN R,LV=96
+         LR    R8,R1          SAVE R1(R1=ADDR. OF GETMAIN AREA)
+         USING WORK,R8
+*
+         LA    R2,16          CVT POINTER IN R2
+         L     R3,0(,R2)       CVT ADDRESS IN R3
+         L     R4,0(,R3)       TCB ADDRESS IN R4
+         L     R5,4(,R4)       ADDRESS OF ACTIVE CURRENT TCB
+         MVC   ASCB,12(R4)       STORE A(ASCB)
+         L     R6,180(,R5)     ADDRESS OF JSCB IN R6
+         L     R7,264(,R6)     ADDRESS OF PSCB IN R7
+         L     R9,164(,R5)     ADDRESS OF TIME CONTROL TABLE
+*
+* ACCOUNT
+*
+         L       R5,28(,R9)   ADDRESS OF JOB MANAGEMENT RECORD
+         CLI     21(R5),X'22'
+         BH      ODD
+         MVC     ACCOUNT(1),=C'M'  PUT M INTO ACCOUNT FIELD
+         UNPK    ACCOUNT+1(3),21(2,R5)    PUT BRANCH INTO ACCOUNT FIELD
+         B       MOVEON
+ODD      LA        R2,10     COUNTER FOR NUMBER OF ENTRIES IN ODDS
+         LA        R3,ODDS
+ODD1     CLC       21(1,R5),0(R3)
+         BE        FOUND
+         LA        R3,4(,R3)
+         BCT       R2,ODD1
+         MVC       ACCOUNT(3),=C'XXX'  ACCOUNT NOT KNOWN
+         TPUT      MESS,47
+         B         MOVEON
+FOUND    MVC       ACCOUNT(3),1(R3)
+MOVEON   MVC     ACCOUNT+3(3),23(R5) PUT PROJECT ID INTO ACCOUNT FIELD
+*
+*  CPU TIME
+*
+         L     R4,ASCB        LOAD ADDRESS OF ASCB
+         L     R3,64(R4)      LOAD 1ST WORD OF CPU TIME
+         FLOAT 0,R3           CONVERT TIME TO SECONDS*100
+         ME    0,=E'104.8576'
+         AE    0,=E'0.5'      ROUND
+         FIX   R5,0           CONVERT BACK TO FIXED POINT
+         ST    R5,COREUNIT    SAVE CPUTIME FOR CORE CALCULATION
+         MH    R5,CPUVAL      CPU IN 100TH OF UNITS PER SECOND IN R5
+         ST    R5,CPUNIT     STORE AWAY TOTAL CPU UNITS
+*
+* CALCULATE CORE TIME.
+*
+*        SUM EXCP COUNTS
+         SR    R10,R10        ZERO R10 - TO BE USED TO HOLD SUM
+         L     R6,12(,R9)     LOAD ADDR OF TCTIOT
+         LA    R3,10(,R6)     LOAD ADDR OF FIRST DD OFFSET IN TCTIOT
+AGAIN    LR    R2,R6          LOAD REG2 WITH ADDR OF START OF TCTIOT
+         AH    R2,0(,R3)      ADD OFFSET TO GET ADDR OF DD ENTRY
+         A     R10,4(R2)      SUM EXCP COUNTS
+         CLC   2(4,R3),=F'0'  ARE THERE MORE DD ENTRIES?
+         BE    CALCCORE       NO - BRANCH
+         LA    R3,4(,R3)      YES - GET ADDR OF NEXT TCTIOT DD OFFSET
+         B     AGAIN          AND GO BACK TO START OF LOOP
+*        CALCULATE CORE TIME.
+CALCCORE LR    R2,R10    TOTAL EXCP COUNTS IN R2
+         SRDL  R2,32(0)        PREPARE FOR DIVIDE
+         MH    R3,TWO    EXCP IN 100THS OF SECS IN R3 (TWO=20/1000*100)
+         L     R5,COREUNIT     GET CPUTIME IN R5
+         AR    R5,R3       ADD CPU TIME & EXCP TIME
+         L     R3,60(,R7)      REGION SIZE IN 2K UNITS IN R3
+         MH    R3,TWO         REGION SIZE IN UNITS IN R3
+         MR    R2,R5          CORE IN 100TH OF UNITS PER SECOND IN R3
+*
+*
+*
+         A     R3,CPUNIT      R3-TOTAL UNITS PER SECOND IN 100TH
+         SR    R2,R2        PREPARE FOR DIVIDE
+         D     R2,THR600    R3-TOTAL UNITS PER HOUR IN 100THS
+         A     R3,ADJUST  ALLOWANCE FOR LOGGING OFF(0.06 UNITS)
+*
+*
+*  SET UP MESSAGE AND OUTPUT
+*
+         MVC   PATT(9),PATTERN      GET READY
+         CVD   R3,DECUNIT           FOR EDIT
+         ED    PATT,DEC2
+         MVC   WORDS,MESSAGE     PUT WORDS INTO MESS
+         MVC   HOLE,PATT+1       INSERT UNITS INTO MESS
+         MVC   WORDS+26(6),ACCOUNT    LOAD ACCOUNT INTO OUTPUT MESSAGE
+         LA    R3,41         LOAD LENGHT OF MESS INTO R3
+         TPUT  (R8),(R3)     OUTPUT MESS
+         LA    R0,96
+         FREEMAIN R,LV=(R0),A=(R8)
+         RETURN (14,12)
+PATTERN  DC    X'4020202021204B2020'
+MESSAGE  DC    CL41'APPROXIMATE UNITS USED ON       =        '
+MESS     DC    C'ACCOUNT NOT IN PROGRAM. CONTACT TERMINALS TEAM. '
+ASCB     DS    F
+ADJUST   DC    F'6'
+THR600   DC    F'3600'
+TWO      DC    H'2'
+CPUVAL   DC    H'1000'
+ODDS     DC    X'32',C'MRF'
+         DC        X'28',C'MOP'
+         DC        X'8C',C'EXT'
+         DC        X'96',C'ECM'
+         DC        X'82',C'IBM'
+         DC        X'25',C'MOC'
+         DC        X'3D',C'MAC'
+         DC        X'A0',C'CMP'
+         DC        X'37',C'CRD'
+         DC        X'3C',C'MES'
+WORK     DSECT
+WORDS    DS    CL33
+HOLE     DS    CL8
+CPUNIT   DS    F
+COREUNIT DS    F
+DECUNIT  DS    0D
+DEC1     DS    F
+DEC2     DS    F
+PATT     DS    CL9
+ACCOUNT  DS    CL6
+         END

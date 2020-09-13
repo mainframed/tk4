@@ -1,0 +1,359 @@
+         TITLE  'DQNAME - Display information about Qname requestors'
+***********************************************************************
+*                                                                     *
+* Program to print out all requestors for a particular major name.    *
+* This program extends the D GRS,RES- or D DLF limitation of 30 byte  *
+* rname length to 60 characters.   The length is determined by the    *
+* variable defined at label RESRNAME.                                 *
+*                                                                     *
+* This program must run from an APF authorized library in order to    *
+* use the CONNECT option on the WTO macro.                            *
+*                                                                     *
+* Sample linkedit JCL:                                                *
+*                                                                     *
+*   //LINK      EXEC PGM=IEWLF880,                                    *
+*   //    PARM='XREF,LET,LIST,NCAL,SIZE=(750K,200K)'                  *
+*   //SYSUT1   DD UNIT=SYSDA,SPACE=(1024,(200,20))                    *
+*   //OBJLIB   DD DSN=USERID.MY.OBJ,DISP=SHR                          *
+*   //SYSLMOD  DD DSN=APF.AUTHORIZED.LIB,DISP=OLD,UNIT=3380           *
+*   //SYSPRINT DD SYSOUT=*                                            *
+*   //SYSLIN   DD *                                                   *
+*       INCLUDE OBJLIB(DQNAME)                                        *
+*       ENTRY DQNAME                                                  *
+*       SETCODE AC(1)                                                 *
+*       NAME DQNAME(R)                                                *
+*   /*                                                                *
+*                                                                     *
+* SAMPLE SYS1.PROCLIB MEMBER(DGRS)                                    *
+*                                                                     *
+*   //DGRS      PROC Q='SPFEDIT '                                     *
+*   //RUNSTEP EXEC PGM=DQNAME,PARM='&Q'                               *
+*   //*  Invoke from console with                                     *
+*   //*                                                               *
+*   //*       S DGRS                                                  *
+*   //*    or                                                         *
+*   //*       S DGRS,Q=nnn                                            *
+*   //*                                                               *
+*   //*  where nnn is the QNAME of the resource                       *
+*                                                                     *
+***********************************************************************
+         EJECT
+DQNAME   CSECT
+DQNAME   AMODE 31
+DQNAME   RMODE ANY
+         STM   14,12,12(13)       Standard entry
+         BALR  12,0
+         USING *,12
+         ST    13,SAVEAREA+4
+         LA    15,SAVEAREA
+         ST    15,8(,13)
+         LR    13,15
+*
+* Get input QNAME parameter
+*
+         L     1,0(,1)            Get addressability to PARM
+         USING PARMAREA,1
+         LH    2,PARMLEN          Get length of parameter
+         SR    3,3                Make sure a QNAME was specified
+         CR    2,3                and has length > 0 and < 9
+         BE    BADPARM
+         LA    3,9
+         CR    2,3
+         BNL   BADPARM
+         ST    2,QSIZE            Save length for GQSCAN
+         BCTR  2,0                Subtract 1 from length for MVC
+         EX    2,MVCPARM          Get the QNAME
+*
+* Issue initial WTO/C and save the CONNECT value
+*
+         SR    0,0                Let WTO know this is the first line
+         WTO   ('DQNAME: RESOURCE STATUS',C)
+         ST    1,CONNECT          Save CONNECT value
+*
+* Scan the queues for all requestors of the QNAME
+*
+         MVC   RETCODE,=F'0'      Initialize our return code
+         MVC   SCANTOKN,=F'0'     Initialize GQSCAN token
+SCANLOOP EQU   *
+         L     4,QSIZE            Get size of QNAME
+         GQSCAN AREA=(QAREA,L'QAREA),TOKEN=SCANTOKN,                   X
+               SCOPE=ALL,                                              X
+               RESNAME=(QNAME,,,GENERIC,(4))
+         B     QRETURN(15)        Process based on RC from GQSCAN
+QRETURN  B     PROCESS            RC=0 Last buffer of data
+         B     NODATA             RC=4 No data matched
+         B     PROCESS            RC=8 Match, go process this buffer
+         B     QERROR             RC=12 GQSCAN error
+         B     QERROR             RC=16 GQSCAN error
+         B     QERROR             RC=20 GQSCAN error
+         EJECT
+*
+* Subroutine to process the area returned by GQSCAN
+*
+PROCESS  DS    0H
+         ST    0,LENGTHS          Save (and set) RIB and RIBE lengths
+         LA    3,QAREA            Get GQSCAN AREA address
+         USING RIB,3              Get address of 1st RIB
+         LR    2,1                Get number of RIBS
+*
+PROCRIB  EQU   *                  Top of RIB loop
+         MVI   NEWRIB,C'Y'        Indicate this is a new RIB
+         LH    5,LENRIB           Get length of each RIB
+         AR    5,3                Get address of RNAME
+         USING RIBVAR,5
+*
+         LR    7,5                Get address of 1st RIBE
+         AH    7,RIBVLEN
+         USING RIBE,7
+         L     6,RIBNRIBE         Get number of RIBEs
+*
+PROCRIBE EQU   *                  Top of RIBE loop
+         BAL   14,WRITEIT         Write data about this requester
+*
+         AH    7,LENRIBE          Point to next RIBE
+         BCT   6,PROCRIBE         Process the next RIBE
+*
+         LR    3,7                Point to next RIB
+         BCT   2,PROCRIB          Process the next RIB
+*
+         CLC   SCANTOKN,=F'0'     More GQSCAN data?
+         BNE   SCANLOOP           Yes, go issue another GQSCAN
+*
+* Issue WTO/E to complete multi-line WTO and then return:
+*
+COMPLETE DS    0H
+         WTO   ('E',E),CONNECT=CONNECT
+         L     13,SAVEAREA+4
+         LM    14,12,12(13)
+         L     15,RETCODE         Set RC
+         BR    14
+         EJECT
+*
+* Subroutine to write out the request along with a heading.  If this
+* is an old RIB, or a new RIB but identical to a GQSCAN resume, then
+* don't write the heading.
+*
+WRITEIT  DS    0H
+         STM   14,12,12(13)       Save caller's REGS
+*
+         CLI   NEWRIB,C'Y'        This is a new RIB?
+         BNE   NOHEADER           If not, don't write heading
+*
+         SR    4,4                New RIB, but may be a GQSCAN resume
+         IC    4,RIBRNMLN         Get RNAME length
+         EX    4,COMPRNM          This an old RNAME in a GQSCAN resume?
+         BNE   NEEDHDR            No - need a heading
+         CLC   QSAVE,RIBQNAME     Yes- check if same QNAME and RNAME
+         BE    NOHEADER           If same, then don't need a heading
+*
+NEEDHDR  EQU   *
+         EX    4,SAVERNM          Save the new RNAME for next time
+         MVC   QSAVE,RIBQNAME     Save the new QNAME, too
+         LA    6,L'RESRNAME       Check if RNAME too big for output
+         CR    4,6                Too big?
+         BL    NOTBIG             No - use as is
+         LR    4,6                Yes- use max value
+NOTBIG   EQU   *
+         MVI   RESRNAME,C' '      Blank out the RNAME field
+         MVC   RESRNAME+1(L'RESRNAME-1),RESRNAME
+         BCTR  4,0
+         EX    4,MOVERNM          Move in the new RNAME
+         MVC   RESQNAME(8),RIBQNAME Get QNAME, too
+*
+         TM    RIBSCOPE,RIBSYS    Set SCOPE of request
+         BO    SCSYS
+         TM    RIBSCOPE,RIBSYSS
+         BO    SCGBL
+         MVC   RESSCOPE(8),=C'STEP    '
+         B     SCOPEND
+SCSYS    DS    0H
+         MVC   RESSCOPE(8),=C'SYSTEM  '
+         B     SCOPEND
+SCGBL    DS    0H
+         MVC   RESSCOPE(8),=C'SYSTEMS '
+SCOPEND  EQU   *
+*
+WRITERES EQU   *                  Write the resource and heading
+         WTO   TEXT=((RESMSG,D)),CONNECT=CONNECT
+         ST    1,CONNECT
+         WTO   TEXT=((REQHDR,D)),CONNECT=CONNECT
+         ST    1,CONNECT
+         MVC   NEWRIB,C'N'        Now this is an old RIB
+NOHEADER EQU   *
+*
+         MVC   REQSYSN(8),RIBESYSN Get SYSNAME
+         MVC   REQJOBN(8),RIBEJBNM Get JOBNAME
+*
+         LH    2,RIBEASID         Get ASID in binary
+         LA    1,4                Number of binary digits
+         BAL   14,CONVERT         Call the CONVERT routine
+         MVC   REQASID(4),CHARDATA+4 Get ASID in EBCDIC
+*
+         L     2,RIBETCB          TCB in binary
+         LA    1,8                Number of binary digits
+         BAL   14,CONVERT         Call the CONVERT routine
+         MVC   REQTCB(8),CHARDATA Get TCB in EBCDIC
+*
+         TM    RIBERFLG,RIBETYPE  Determine if SHARE or EXCL
+         BO    SHREQ
+         MVC   REQSHR(10),=CL10'EXCLUSIVE'
+         B     SHREND
+SHREQ    EQU   *
+         MVC   REQSHR(10),=CL10'  SHARE  '
+SHREND   EQU   *
+*
+         TM    RIBESFLG,RIBESTAT  Determine if WAIT or OWN
+         BO    OWNREQ
+         MVC   REQOWN(5),=CL5' WAIT'
+         B     OWNEND
+OWNREQ   EQU   *
+         MVC   REQOWN(5),=CL5' OWN '
+OWNEND   EQU   *
+*
+* Write out this request and then return
+*
+         WTO   TEXT=((REQMSG,D)),CONNECT=CONNECT
+         ST    1,CONNECT
+*
+         LM    14,12,12(13)       RESTORE REGS
+         BR    14
+         EJECT
+*
+* Subroutine to convert BINARY to EBCDIC
+*
+* REG1 is the value to convert
+* REG2 is the length
+*
+* Output saved in variable CHARDATA
+*
+CONVERT  DS    0H
+         LA    8,LASTC
+         LA    10,10
+HEXLOOP  EQU   *
+         SR    3,3
+         SRDL  2,4
+         SRL   3,28
+         CR    3,10
+         BL    NOTHEX
+         S     3,=F'9'
+         LA    3,192(,3)
+         B     NEXTHEX
+NOTHEX   LA    3,240(,3)
+NEXTHEX  EQU   *
+         STC   3,0(0,8)
+         BCTR  8,0                SUBTRACT 1 FROM R8
+         BCT   1,HEXLOOP
+         BR    14
+         EJECT
+*
+* Subroutines to write error messages and set return codes
+*
+         SPACE 2
+NODATA   DS    0H
+         MVC   NONEQNM,QNAME
+         WTO   TEXT=((NONEMSG,D)),CONNECT=CONNECT
+         ST    1,CONNECT
+         B     COMPLETE
+         SPACE 2
+BADPARM  DS    0H
+         WTO   TEXT=((PARMERR,D)),CONNECT=CONNECT
+         ST    1,CONNECT
+         MVC   RETCODE,=F'4'
+         B     COMPLETE
+         SPACE 2
+QERROR   DS    0H
+         ST    15,RETCODE
+         WTO   TEXT=((QSCNERR,D)),CONNECT=CONNECT
+         ST    1,CONNECT
+         B     COMPLETE
+         EJECT
+*
+* Executed instructions
+*
+MVCPARM  MVC   QNAME(0),PARM
+MOVERNM  MVC   RESRNAME(0),RIBRNAME
+COMPRNM  CLC   RSAVE(0),RIBRNAME
+SAVERNM  MVC   RSAVE(0),RIBRNAME
+         EJECT
+*
+* Data areas
+*
+SAVEAREA DC    18F'0'             REG save area
+*
+SCANTOKN DS    F                  GQSCAN Token
+RETCODE  DS    F                  Return code
+CONNECT  DS    F                  Connect value for WTO
+*
+LENGTHS  DS    F                  Data lengths return by GQSCAN
+         ORG   LENGTHS
+LENRIB   DS    H                  Length of RIB
+LENRIBE  DS    H                  Length of RIBE
+*
+QSIZE    DS    F                  Size of QNAME from input parm
+QNAME    DC    CL8' '             QNAME of resource
+*
+CHARDATA DC    CL8' '             Work area for CONVERT routine
+LASTC    EQU   *-1
+*
+NEWRIB   DC    C' '               Flag used to indicate a new RIB
+QSAVE    DC    CL8' '             Old (saved) QNAME
+RSAVE    DC    CL255' '           Old (saved) RNAME
+         EJECT
+*
+* Messages used by WTO
+*
+RESMSG   DC    AL2(RESLEN)
+RESTEXT  DC    C'S='
+RESSCOPE DC    CL8' '
+RESQNAME DC    CL9' '
+RESRNAME DC    CL60' '
+RESLEN   EQU   *-RESTEXT
+*
+REQHDR   DC    AL2(REHLEN)
+REHTEXT  DC    C'SYSNAME  JOBNAME  ASID TCBADDR  '
+         DC    C' EXC/SHR  OWN/WAIT'
+REHLEN   EQU   *-REHTEXT
+*
+REQMSG   DC    AL2(REQLEN)
+REQTEXT  EQU   *
+REQSYSN  DC    CL9' '
+REQJOBN  DC    CL9' '
+REQASID  DC    CL5' '
+REQTCB   DC    CL9' '
+REQSHR   DC    CL11' '
+REQOWN   DC    CL8' '
+REQLEN   EQU   *-REQTEXT
+*
+PARMERR  DC    AL2(ERRLEN)
+ERRTEXT  DC    C'INPUT PARAMETER '
+         DC    C'MUST BE 1 TO 8 CHARACTER QNAME'
+ERRLEN   EQU   *-ERRTEXT
+*
+NONEMSG  DC    AL2(NONELEN)
+NONETXT  DC    C'NO REQUESTORS FOR RESOURCE  '
+NONEQNM  DC    CL8' '
+NONELEN  EQU   *-NONETXT
+*
+QSCNERR  DC    AL2(QERLEN)
+QERTEXT  DC    C'GQSCAN ERROR'
+QERLEN   EQU   *-QERTEXT
+         EJECT
+         LTORG
+         EJECT
+*
+* GQSCAN area and input parameter DSECT
+*
+         SPACE 2
+QAREA    DS    CL4000
+         SPACE 2
+PARMAREA DSECT
+PARMLEN  DS    H
+PARM     DS    CL8
+         EJECT
+*
+* Included macros
+*
+         SPACE 2
+         ISGRIB
+         CVT   DSECT=YES
+         END

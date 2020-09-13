@@ -1,0 +1,1672 @@
+RELO  TITLE 'HEWLRELO-OBJECT MODULE PROCESSING AND RELOCATION'
+*STATUS - CHANGE LEVEL 20                                             *
+*    INCREMENTAL 288 - W-CON ADDED        INC288
+*A073800                                                         A39336
+*C244900-245000                                                  A39336
+*                                                                A46172
+*                                                                A47048
+*                                                               SA49491
+*                                                               SA56381
+*              APAR FIX 27445 - ZERO/LENGTH CSECTS OKAY
+*    APAR  30142   DUPLICATE CSECTS            $256300-256400,257200
+*                                              $257400-258000
+*    APAR  30162   BAD IEW1182 MSG             $119100,131200
+*                                                               YA00226
+*                                                               YA00379
+*                                                                YM5575
+*I084200,120900,278300,A128200,278200,M298220-298340            ZA01335
+*A062500-062520                                                 OZ04727
+*DEL062430--062680 REMOVE CODE FOR Z04727(UZ2075)              @ZA10552
+*ADD0624100,0624200  APAR  Z16098 DUPLICATE LRS                @ZA16098
+*D062500-062600                                                @ZA29882
+*        TSO CHANGES FOR IDENTIFY AND INCORE DATA SET                 *
+*FUNCTION/OPERATION:                                                  *
+*        1)HEWLRELO-DETERMINES RECORD TYPE,THEN PASSES CONTROL TO THE *
+*              APPROPRIATE ROUTINE FOR RECORD PROCESSING              *
+*        2)HEWLESD-PROCESSES ESD RECORDS,BUILDS AND MAINTAINS CESD    *
+*        3)HEWLTXT-PROCESSES TXT RECORDS                              *
+*        4)HEWLRLD-PROCESSES RLD RECORDS, BUILDS AND MAINTAINS RLD    *
+*              TABLE                                                  *
+*        5)HEWLEND-PROCESSES END RECORDS,DEFINES ENTRY POINT,UPDATES  *
+*              THE TEXT LOCATION POINTER, CLEARS THE TRANSLATION      *
+*              TABLE                                                  *
+*        6)ALLOCATE-ALLOCATES STORAGE FOR THE CESD,RLD TABLE AND      *
+*              TRANSLATION TABLE                                      *
+*        7)TRANSID-TRANSLATES ESDID TO TRANSLATION TABLE ENTRY ADDRESS*
+*        8)HEWLERTN-RELOCATES RLDS                                    *
+*        9)HEWLMAP-CREATES MAP PRINTOUT                               *
+*       10)HEWLCNVT-CONVERTS BINARY QUANTITIES TO PRINT CHARACTERS    *
+*       11)HEWLMOD - PROCESSES MOD RECORDS                            *
+*ENTRY POINTS:                                                        *
+*        1)HEWLRELO-FOR OBJECT MODULE PROCESSING                      *
+*        2)HEWLESD-FOR ESD PROCESSING                                 *
+*        3)HEWLRLD-FOR RLD PROCESSING                                 *
+*        4)HEWLEND-FOR END OF MODULE PROCESSING                       *
+*        5)TRANSID-FOR ESDID-TRANSLATION TABLE ADDRESS CONVERSION     *
+*        6)HEWLERTN-FOR RELOCATION OF RLDS ON CHAIN                   *
+*        7)HEWLCNVT-FOR CONVERSION TO PRINT CHARACTERS                *
+*        8)HEWLMAP-FOR MAKING MAP ENTRIES                             *
+*INPUT:  ALL ROUTINES EXPECT:                                         *
+*             #13-ADDR OF SAVE AREA                                   *
+*             #14-RETURN ADDRESS                                      *
+*             #11-ADDR.OF COMMUNICATIONS AREA                         *
+*        IN ADDITION:                                                 *
+*           HEWLESD EXPECTS:                                          *
+*             #5-ID OF FIRST ESD ITEM                                 *
+*             #7-LENGTH OF ESD INFORMATION                            *
+*             #8-ADDRESS OF ESD INFORMATION                           *
+*           HEWLRLD EXPECTS:                                          *
+*             #7-LENGTH OF RLD INFORMATION                            *
+*             #8-ADDRESS OF RLD INFORMATION                           *
+*          TRANSID EXPECTS:                                           *
+*             #5-ID TO BE TRANSLATED                                  *
+*           HEWLERTN EXPECTS:                                         *
+*             #1-STARTING ADDRESS OF RLD CHAIN                        *
+*             #9-ADDRESS OF CESD ENTRY TO BE USED FOR RELOCATION      *
+*           HEWLCNVT EXPECTS:                                         *
+*             #1-QUANTITY TO BE CONVERTED                             *
+*           HEWLMAP EXPECTS:                                          *
+*             #9-ADDRESS OF CESD ENTRY TO BE MAPPED                   *
+*           HEWLMOD EXPECTS:                                          *
+*             #7=LENGTH OF MOD INFO                                   *
+*             #8=ADDRESS OF MOD INFO                                  *
+*OUTPUT:    HEWLCNVT: CMXDBLWD CONTAINS CONVERTED VALUE               *
+*          TRANSID:#1-CONTAINS TRANSLATION TABLE ENTRY ADDRESS        *
+*EXTERNAL ROUTINES:                                                   *
+*           HEWLREAD-READ AND DEBLOCK OBJECT RECORDS                  *
+*           HEWLPRNT-PRINT MAP                                        *
+*           HEWERROR-LOG ERRORS                                       *
+*EXITS-NORMAL:TO CALLER                                               *
+*     -ERROR: TO HEWERROR    LA   0,ERRCODE                           *
+*                            L    15,=V(HEWERROR)                     *
+*                             BALR 14,15                              *
+*                                                                     *
+*TABLES/WORKAREAS: REFER TO LOADER PLM FOR DETAILED DESCRIPTION       *
+*        1)CESD                                                       *
+*        2)RLD TABLE                                                  *
+*        3)TRANSLATION TABLE                                          *
+*        4)COMMUNICATIONS AREA(HEWLDCOM)                              *
+*ATTRIBUTES: READ ONLY,REUSABLE,REENTRANT                             *
+*NOTES:  NONE                                                         *
+***********************************************************************
+         EJECT
+HEWLRELO CSECT
+*                       REGISTER ASSIGNMENTS                          *
+*                                                                     *
+BRANCH   EQU   15                       BRANCH REGISTER
+RETURN   EQU   14                       LINK REGISTER
+SAVEREG  EQU   13                       SAVE AREA POINTER
+BASE     EQU   12                       BASE REGISTER
+CMPTR    EQU   11                       POINTER TO COMMUNICATIONS AREA
+BASE2    EQU   10                       SECOND BASE REG         SA49491
+CESD     EQU   9                        CESD ENTRY ADDR
+PTR      EQU   8                        USED FOR POINTER VALUE
+*                                           -POINTER WITHIN INPUT BUF.
+*                                           -POINTER WITHIN OUTPUT BUF.
+LNG      EQU   7                        LENGTH OF INFORMATION
+ADR      EQU   6                        ADDR FROM OBJECT RECORD
+ID       EQU   5                        ID
+WORKC    EQU   4                        WORK REG.-EVEN FOR DEV
+WORKA    EQU   3                        WORK REG.-ODD FOR BXLE
+WORKB    EQU   2                        WORK REG.
+PARM     EQU   1                        PARAMETER REGISTER
+ZERO     EQU   0
+*                                                                     *
+*                    MAP FORMAT DISPLACEMENTS                         *
+PREFIXNM EQU   2
+NAME     EQU   3
+TYPE     EQU   14
+ADDR     EQU   17
+SUFFIXNM EQU   11
+ENTRYSZ  EQU   24
+*                                                                     *
+*                     CESD  DISPLACEMENTS                             *
+*                                                                     *
+CNAME    EQU   4
+CTYPE    EQU   12
+CADR     EQU   12
+CREL     EQU   16
+CLNG     EQU   16
+*                                                                     *
+*                       CESD  INDICATORS                              *
+*                                                                     *
+SD       EQU   X'00'                    SECTION DEFINITION
+LD       EQU   X'01'                    LABEL DEFINITION
+ER       EQU   X'02'                    EXTERNAL REFERENCE
+LR       EQU   X'03'                    LABEL REFERENCE
+PC       EQU   X'04'                    PRIVATE CODE
+CM       EQU   X'05'                    COMMON
+PR       EQU   X'06'                    PSEUDO REGISTER
+NULL     EQU   X'07'                    NULL ENTRY
+DELETE   EQU   X'80'                    DELETE  INDICATOR
+NOLEN    EQU   X'20'               ZERO LENGTH                  27445
+DELINK   EQU   X'80'                    RLD'S FOR ENTRY NEED DELINKING
+LDCHAIN  EQU   X'40'                    ON LD CHAIN,ALREADY PROCESSED
+*                                            THIS RECORD
+WX       EQU   X'0A'               W-CON - EXTERNAL FORMAT  INC288
+WEAKCALL EQU   X'40'               W-CON - INTERNAL FORMAT  INC288
+NEVERCAL EQU   X'08'                   'ER' NEVER CALL
+BLANK    EQU   C' '
+ERWEAK   EQU   X'42'               FOR ER AND WEAKCALL BIT CHECK A39336
+********                                                       ********
+*                       TRANSLATION TABLE INDICATORS                  *
+********                                                       ********
+ERMATCH  EQU   X'80'                    ABSOLUTE RELOCATION INDIC.
+*                                                                     *
+*                       ESD DISPLACEMENTS                             *
+*                                                                     *
+ENAME    EQU   0
+ETYPE    EQU   8
+EADR     EQU   8
+ELNG     EQU   12
+ESUBTYP  EQU   13                      SUBTYPE FIELD
+EID      EQU   14
+ESDADDR  EQU   12
+ESEGNO   EQU   12                       SEGMENT NUMBER
+*                                                                     *
+*                            RLD  FLAGS                               *
+*                                                                     *
+CONT     EQU   X'01'
+VCON     EQU   X'10'                    CHECK FOR ABSOLUTE RELOCATION
+PRRLD    EQU   X'20'                    PSEUDO REGISTER RLD INDICATOR
+ACCUMPR  EQU   X'30'                   ACCUMULATIVE PSEUDO REGISTER
+*                                                                     *
+*                      RLD DISPLACEMENTS                              *
+*                                                                     *
+P        EQU   2                        P PTR DISPLACEMENT
+R        EQU   0                        R PTR DISPLACEMENT
+RLDFLG   EQU   4                        FLAG FIELD
+RLDADR   EQU   4                        ADDRESS FIELD
+*                                                                     *
+*                   DISPLACEMENTS WITHIN OBJECT BUFFER                *
+*                                                                     *
+COL1     EQU   0
+COL5     EQU   4
+COL11    EQU   10
+COL15    EQU   14
+COL29    EQU   12                       ADDED TO INFO ADDR TO GET COL.
+*                                                  29 ADDR.
+CQFF     EQU   X'FF'                   USED TO TURN OFF INDIC.
+         EJECT
+         ENTRY HEWLERTN           EXTERNAL REFERENCE RESOLUTION
+         ENTRY HEWLMAP            MAP PROCESSING
+         ENTRY HEWLCNVT           CONVERSION
+         ENTRY HEWLRLD            RLD RECORD PROCESSING
+         ENTRY HEWLESD            ESD RECORD PROCESSING
+         ENTRY HEWLEND            END OF MODULE PROCESSING
+         ENTRY TRANSID                 TRANSLATE ID ROUTINE
+         SAVE  (14,12),T,*              SAVE REGISTERS
+         USING HEWLRELO,BRANCH
+         LR    BASE,BRANCH        SET BASE TO START             SA49491
+         USING HEWLRELO,BASE      ESTABLISH ADDRESSABILITY
+         DROP  BRANCH
+         L     SAVEREG,8(SAVEREG)       PICK UP NEXT SAVE AREA
+         USING HEWLDCOM,CMPTR     ESTABLISH ADDR. TO COMM. AREA
+         USING ERCODES,0               ERROR CODE DSECT
+         L     BASE2,ABEG4096          SET UP SECOND BASE REG   SA49491
+         USING HEWLRELO+4096,BASE2     ESTABLISH ADDRESSABILITY SA49491
+         B     RELOREAD
+         DC    C'OZ29882 '         LATEST APAR NUMBER
+         DC    C'03/13/78'         DATE LAST CHANGED
+         DC    0H'0'                    ALIGN
+         EJECT
+***********************************************************************
+*              GET A RECORD TO PROCESS                                *
+***********************************************************************
+RELOREAD L     BRANCH,ADREAD
+         BALR  RETURN,BRANCH            GO TO READ A RECORD
+         TM    CMIOFLGS,CQEOCB          END OF CONCATENATION?
+         BZ    RELO10                   NO, PROCESS RECORD
+         TM    CMRELFLG,CQNOEND        WAS AN END CARD RECEIVED
+         BO    RELO1                   YES
+         TM    CMRELFLG,CQINPUT        WAS IT A DUMMY DATA SET
+         BZ    RELO1                   YES,RETURN
+         BAL   RETURN,HEWLEND     GO TO PERFORM CLOSE-OUT PROC.
+        BAL    RETURN,RERINPTA          WARNING--NO END CARD
+RELO1    NI    CMRELFLG,CQFF-CQNOEND   SET OFF END CARD INDIC.
+         L     SAVEREG,4(SAVEREG)
+         RETURN (14,12),T
+*                                                                     *
+*                  SET-UP FOR RECORD PROCESSING                       *
+*                                                                     *
+RELO10   L     PTR,CMGETREC            LOAD ADDR. OF OBJ. BUFFER A30162
+         CLI   0(PTR),BLANK             CHECK FOR L.E.CONTROL CARD
+         BNE   RELO20                   IT IS NOT A CONTROL CARD
+         BAL   RETURN,RERINPT8          WARNING-CARD NOT AN OBJ.CARD
+         B     RELOREAD                GO TO READ NEXT RECORD
+RELO20   L     ADR,COL5(PTR)            LOAD COLS 5 THRU 8 - ADDRESS
+         LA    ADR,0(ADR)
+         LH    LNG,COL11(PTR)           LOAD COLS 11 AND 12 -BYTE CT
+         LH    ID,COL15(PTR)            LOAD COLS IS AND 16 - ID
+         L     WORKA,COL1(PTR)          LOAD COLS 1 THRU 4-CARD IDENT.
+         LA    PTR,16(PTR)              ADDR. OF COL 17- ADDR.OF INFO
+*                                                                     *
+*   THE FOLLOWING CODE DETERMINES TYPE OF RECORD AND THEN BRANCHES TO *
+*            THE APPROPRIATE ROUTINE FOR PROCESSING                   *
+*                                                                     *
+         LA    WORKC,6             GET TABLE ENTRY NUMBER
+         LA    WORKB,TYPETBLE           GET TABLE ADDRESS
+RELO30   LM    RETURN,BRANCH,0(WORKB)   PICK UP TABLE ENTRY
+         CR    WORKA,RETURN             ARE TYPES EQUAL
+         BC    7,RELO40                 NO , CONTINUE SEARCH
+         OI    CMRELFLG,CQINPUT        SET INDICATOR FOR VALID INPUT
+*                                      RECEIVED                  A30162
+         BALR  RETURN,BRANCH            YES, THEN GO TO PROCESS REC.
+         B     RELOREAD                 GO TO READ NEXT RECORD
+RELO40   LA    WORKB,8(WORKB)           UPDATE TABLE PTR
+         BCT   WORKC,RELO30             LOOP AGAIN
+         BAL   RETURN,RERINPT9         INVALID INPUT FROM OBJ.MODULE
+         B     RELOREAD                 GO TO READ NEXT RECORD
+         EJECT
+*                                                                     *
+**************************  ESD PROCESSOR  ****************************
+*                                                                     *
+*   THIS SUBROUTINE CREATES THE CESD FROM THE ESD/CESD SENT TO IT.    *
+*     IT EXPECTS                                                      *
+*            #LNG-LENGTH OF ESD INFORMATION                           *
+*            #PTR- ADR. OF ESD INFORMATION                            *
+*            #ID- ID OF FIRST ESD ITEM OTHER THAN LD
+*                                                                     *
+***********************************************************************
+HEWLESD  EQU   *
+         STM   14,12,12(13)             SAVE REGISTERS
+         BALR  BASE,0
+         USING *,BASE
+         L     BASE,ABEGIN
+         USING HEWLRELO,BASE      RESET BASE TO INITIAL VALUE
+         L     BASE2,ABEG4096           SET UP SECPND BASE REG  SA49491
+         USING HEWLRELO+4096,BASE2     ESTABLISH ADDRESSABILITY SA49491
+         B     NESD+8
+NESD     DC    C'HEWLESD '
+         L     SAVEREG,8(SAVEREG)          GET NEXT SAVE AREA
+ESDSTART STH   ID,CMCURRID              SAVE CURRENT ID
+         OI    CMFLAG4,CQESDS     SHOW ESDS RECHD FOR THIS MODULE
+         TM    CMIOFLGS,CQRECFM         IS A LOAD MODULE BEING PROC.
+         BO    LOADPROC                 YES
+****                                                               ****
+*                       INPUT ESD TYPE IS 'NULL'                      *
+****                                                               ****
+ESD10    TM    ETYPE(PTR),WX       IS INPUT TYPE WX         INC288
+         BNO   ESD12               NO. BRANCH               INC288
+         MVI   ETYPE(PTR),WEAKCALL+ER  YES. SET ER WITH WEAKCALL INC288
+*                                     FLAG ON               INC288
+ESD12    TM    ETYPE(PTR),NULL     IS INPUT ESD TYPE NULL   INC288
+         BZ    CESDSRCH                 NO, TYPE IS SD - SEARCH CESD
+         BC    6,ESD20                  NO, CHECK FOR TYPE 'PC'
+ESD15    L     CESD,CMNULCHN            IS THE CESD NULL ENTRY CREATED
+*                                       ALL NULL ENTRIES ARE RENUMBERED
+*                                         TO THE SAME CESD'DELETE'ENTRY
+         LTR   CESD,CESD
+         BC    7,TRANSLAT               YES
+         BAL   RETURN,CESDENT           NO, GET CESD ENTRY
+         XC    0(20,CESD),0(CESD)       CLEAR ENTRY
+         OI    CTYPE(CESD),DELETE       SET DELETE INDICATOR
+         ST    CESD,CMNULCHN            SAVE CESD ADDR.FOR FUTURE NULLS
+         B     TRANSLAT                 GO TO TRANSLATE ID
+********                                                        *******
+*                         INPUT ESD TYPE IS 'PC'                      *
+********                                                        *******
+ESD20    TM    ETYPE(PTR),X'03'         IS INPUT ESD TYPE 'PC'
+         BC    7,ESD35                  NO, CHECK FOR 'LD'/'LR'
+ESD30    BAL   RETURN,CESDENT           GET CESD ENTRY
+         BAL   RETURN,ENTER             MAKE CESD ENTRY
+         BAL   RETURN,CHECKEP          CHECK FOR EP NAME
+         B     MATERSD2                 GO TO TEST LNG.AND MAP
+********                                                        *******
+*                        INPUT ESD TYPE IS 'LR'OR'LD'                 *
+********                                                        *******
+ESD35    TM    ETYPE(PTR),CM           IS ESD TYPE'LR'OR'LD'
+         BC    11,CESDSRCH             NO
+         TM    ETYPE(PTR),PR           IS ESD TYPE 'PR'
+         BO    CESDSRCH                YES
+         LH    ID,EID(PTR)              GET 'SD' ID
+         OI    CMRELFLG,CQESD          ESD CALLER INDICATOR
+         BAL   RETURN,TRANSID           TRANSLATE ID
+         NI    CMRELFLG,CQFF-CQESD     SET ESD CALLER INDIC. OFF
+         LH    ID,CMCURRID              RESTORE ID
+         LTR   PARM,PARM                WAS AN INVALID ID FOUND
+         BZ    NEXTESD                  YES
+         L     CESD,0(PARM)             GET'SD' CESD ADDR.
+         LTR   CESD,CESD                IS 'SD' DEFINED YET
+         BZ    ESD40                    NO
+         ST    CESD,ESDADDR(PTR)        SAVE 'SD' CESD ADDR.
+         B     CESDSRCH                GO TO SEARCH CESD
+*   THE SECTION DEFINITION(SD) FOR A LABEL DEFINITION(LD) MUST BE     *
+*    DEFINED BEFORE THE LD CAN BE PROCESSED. THEREFORE, ALL LDS WHOSE *
+*    SD IS NOT DEFINED WHEN ENCOUNTERED ARE PLACED ON A CHAIN UNTIL   *
+*    THEIR CORRESPONDING SD IS DEFINED. THE CHAIN IS PROCESSED AT     *
+*    THE END OF EACH RECORD.(THIS SPECIAL CASE SHOULD OCCUR ONLY IF   *
+*    THE USER REARRANGES THE OBJECT DECK IN THIS MANNER.              *
+ESD40    LR    CESD,PTR                GET CESD ENTRY ADDR
+         SH    CESD,CONT4
+         TM    ETYPE(PTR),LDCHAIN      HAS CESD ENTRY BEEN CREATED
+         BO    ESD50                    YES, RECHAIN
+         BAL   RETURN,CESDENT          GET CESD ENTRY
+         MVC   CNAME(16,CESD),ENAME(PTR) MOVE ESD INFO TO CESD
+ESD50    L     WORKC,CMLDCHN
+         ST    CESD,CMLDCHN
+         ST    WORKC,0(CESD)            CHAIN ENTRY TO 'LD' CHAIN
+         B     NEXTESD                  GET NEXT ESD ITEM
+         EJECT
+****************************  CESD SEARCH  ****************************
+*                                                                     *
+*      THIS ROUTINE SEARCHES THE CESD FOR A GIVEN NAME. IT USES       *
+*        HIERTBLE TO DETERMINE WHICH CESD CHAINS TO SEARCH AND THEN   *
+*        GETS THE CHAIN BEGINNING ADDRESSES FROM THE CMTYPCHN TABLE   *
+*                                                                     *
+***********************************************************************
+CESDSRCH XC    CMPREVPT(4),CMPREVPT     CLEAR PREVIOUS CHAIN POINTER
+         IC    WORKA,ETYPE(PTR)         GET INPUT ESD TYPE
+         N     WORKA,TYPEONLY           CLEAR ALL BUT TYPE FIELD
+         CH    WORKA,ONE               IS INPUT TYPE 'LD'
+         BNE   SRCH05                  NO
+         LA    WORKA,3                 SET TYPE TO 'LR'
+SRCH05   SLL   WORKA,2
+         LA    WORKA,HIERTBLE(WORKA)   CALC HIERTBLE ENTRY ADDR
+SRCH10   IC    CESD,0(WORKA)            GET CESD TYPE
+         N     CESD,TYPEONLY           CLEAR ALL BUT TYPE
+         SLL   CESD,2
+         LA    CESD,CMTYPCHN(CESD)     CALC CHAIN TABLE ENTRY ADDR
+SRCH20   L     CESD,0(CESD)             GET ADDR. OF FIRST ON CHAIN
+         LTR   CESD,CESD                IS THIS END OF CHAIN
+         BZ    SRCH30                   YES
+         CLC   CNAME(8,CESD),ENAME(PTR)  ARE NAMES EQUAL
+         BE    MATCHED                  YES, GO TO MATCH PROCESSING
+         ST    CESD,CMPREVPT            SAVE PREVIOUS CHAIN POINTER
+         B     SRCH20                   GET NEXT IN CHAIN
+SRCH30   TM    0(WORKA),X'80'           LAST ENTRY IN HIERTBLE
+         BO    NOMATCH                  YES, GO TO NO MATCH PROCESSING
+         LA    WORKA,1(WORKA)           UPDATE TO NEXT ENTRY
+         XC    CMPREVPT(4),CMPREVPT     CLEAR PREVIOUS CHAIN POINTER
+         B     SRCH10                   CONTINUE SEARCH
+         EJECT
+***********************************************************************
+*                                                                     *
+***********************  NO MATCH PROCESSING   ************************
+*                                                                     *
+***********************************************************************
+********                                                        *******
+*                          INPUT ESD TYPE IS 'SD'                     *
+********                                                        *******
+NOMATCH  EQU   *
+         TM    ETYPE(PTR),NULL          IS INPUT ESD TYPE 'SD'
+         BZ    ESD30                    YES, HANDLE SAME AS 'PC'
+         BAL   RETURN,CESDENT           GET CESD ENTRY FOR NOMATCH PROC
+********                                                        *******
+*                          INPUT ESD TYPE IS 'PR'                     *
+********                                                        *******
+         TM    ETYPE(PTR),PR            IS INPUT ESD TYPE 'PR'
+         BZ    NOMATLD1                 NO, TYPE IS'LD'
+         BC    6,NOMATCM                NO, CHECK FOR 'CM'
+         MVC   CNAME(16,CESD),ENAME(PTR) YES, MOVE ESD INFO.TO CESD
+         XC    CTYPE+1(3,CESD),CTYPE+1(CESD)  CLEAR RLD CHAIN FIELD
+*                                       CHAIN PR TO END OF PR CHAIN IN
+*                                       ORDER TO MAINTAIN INPUT PR
+*                                       ORDER.
+         LA    WORKB,CMPRCHN
+         L     WORKC,CMPRCHN            GET ADDRESS OF 1ST PR ENTRY
+NOMATPR1 LTR   WORKC,WORKC              IS THIS LAST ON CHAIN
+         BZ    NOMATPR2                 YES
+         LR    WORKB,WORKC              NO,SAVE PREVIOUS ENTRY ADDRESS
+         L     WORKC,0(WORKC)           GET ADDR. OF NEXT PR ENTRY
+         B     NOMATPR1
+NOMATPR2 ST    CESD,0(WORKB)            CHAIN PR AT END OF CHAIN
+         XC    0(4,CESD),0(CESD)        CLEAR CHAIN FIELD
+         B     TRANSLAT                 GO TO TRANSLATE ID
+********                                                        *******
+*                          INPUT ESD TYPE IS 'CM'                     *
+********                                                        *******
+NOMATCM  TM    ETYPE(PTR),CM            IS TYPE 'CM'
+         BC    14,NOMATLD               NO
+         MVC   CTYPE(8,CESD),ETYPE(PTR)  KEEP INPUT ADDR.AND LNG.
+         LR    WORKC,CESD               SAVE EXTENDED ENTRY ADDR
+         BAL   RETURN,CESDENT           GET ANOTHER CESD ENTRY
+         MVC   CNAME(9,CESD),ENAME(PTR) MOVE NAME AND TYPE
+         NI    CTYPE(CESD),X'07'        CLEAR FLAGS EXCEPT TYPE
+         XC    CTYPE+1(3,CESD),CTYPE+1(CESD) CLEAR ER CHAIN
+         ST    WORKC,CREL(CESD)         SAVE PTR TO EXTENDED ENTRY
+         B     CHAINING                 GO TO CHAIN AND TRANSLATE
+********                                                        *******
+*                          INPUT ESD TYPE IS 'LR' OR 'LD'             *
+********                                                        *******
+NOMATLD  TM    ETYPE(PTR),LR            IS TYPE'LR'
+         BM    NOMATER                  NO, TYPE IS 'ER'
+NOMATLD1 L     WORKC,ESDADDR(PTR)       CESD ADDR OF SD ENTRY
+         MVC   CNAME(8,CESD),ENAME(PTR) YES, MOVE NAME TO CESD
+         TM    CTYPE(WORKC),DELETE      IS 'SD' FOR 'LR' DELETE
+         BZ    NOMATLD2                 NO
+         MVI   ETYPE(PTR),ER            SET TYPE TO 'ER'
+         MVI   CTYPE(CESD),ER+DELINK    SET CESD TYPE TO ER WITH DELINK
+         MVC   CREL+1(3,CESD),EADR+1(PTR) SAVE DELINKING FACTOR
+         XC    CADR+1(3,CESD),CADR+1(CESD) CLEAR RLD CHAIN FIELD
+         OI    CREL(CESD),X'80'        TURN SPEC DELETE BIT ON  ZA01335
+         B     CHAINING                 GO TO CHAIN ENTRY
+NOMATLD2 BAL   RETURN,ENTERLR           MAKE LR CESD ENTRY
+         BAL   RETURN,CHECKEP          CHECK FOR EP NAME
+         BAL   RETURN,HEWLMAP     GO TO MAKE MAP ENTRY
+         B     CHAINING                 GO TO CHAIN AND TRANSLATE
+********                                                        *******
+*                         INPUT ESD TYPE IS 'ER'                      *
+********                                                        *******
+NOMATER  MVC   CNAME(16,CESD),ENAME(PTR) MOVE ESD INFO. TO CESD ENTRY
+         CLI   ETYPE(PTR),ERWEAK   IS THIS W-CON                 A39336
+         BE    NOMATER1            YES, DON'T CLEAR FLAGS        A39336
+         NI    CTYPE(CESD),X'07'         CLEAR FLAGS EXCEPT FOR TYPE
+NOMATER1 EQU   *                                            INC288
+         XC    CADR+1(7,CESD),CADR+1(CESD) CLEAR ALL BUT NAME AND TYPE
+         CLI   ESUBTYP(PTR),X'06'      IS ESD MARKED NEVER-CALL
+         BNE   ENTERCH                 NO                        XA1803
+         OI    CTYPE(CESD),NEVERCAL    SET NEVER-CALL INCIC IN CESD'ER'
+ENTERCH  LA    WORKB,CMERCHN           PT TO ER CHAIN            XA1803
+         L     WORKC,CMERCHN           GET ADDR OF 1ST ER ENTRY  XA1803
+NOMATER2 LTR   WORKC,WORKC             IS THIS LAST ON CHAIN     XA1803
+         BZ    NOMATER3                YES                       XA1803
+         LR    WORKB,WORKC             SAVE PREV ENTRY ADDR      XA1803
+         L     WORKC,0(WORKC)          GET ADDR OF NEXT ER ENTRY XA1803
+         B     NOMATER2                CONTINUE SEARCH           XA1803
+NOMATER3 ST    CESD,0(WORKB)           CHAIN ER AT END OF CHAIN  XA1803
+         XC    0(4,CESD),0(CESD)       CLEAR CHAIN FIELD         XA1803
+         B     TRANSLAT                GO TO TRANSLATE ID        XA1803
+         EJECT
+***********************************************************************
+**************************  MATCH  PROCESSING  ************************
+*                                                                     *
+***********************************************************************
+********                                                        *******
+*                CESD TYPE IS 'SD' --- INPUT ESD TYPE IS 'SD'         *
+********                                                        *******
+MATCHED  EQU   *
+         TM    CTYPE(CESD),NULL         IS CESD TYPE 'SD'
+         BC    7,MATCHPR                NO
+         TM    ETYPE(PTR),NULL          IS INPUT ESD TYPE 'SD'
+         BC    7,MATSDER                NO
+DELETE1  TM    CMFLAG4,CQMOD       IS THIS CMPLER-LDED TXT       A30142
+         BZ    DELETE2             NO. WE WON'T READ TEXT
+         L     WORKC,ELNG(PTR)     YES. GET ESD LENGTH
+         LA    WORKC,0(WORKC)      CLEAR HI-ORDER BYTE
+         A     WORKC,CMMODLNG      UPDATE MODULE LENGTH
+         LA    WORKC,7(WORKC)      AND ROUND IT
+         N     WORKC,DBLWRD
+         ST    WORKC,CMMODLNG      STORE IT BACK
+DELETE2  TM    CTYPE(CESD),DELETE  IS ORIGINAL DELETE            A30142
+         BO    UPDATERC            YES, USE IT                   A30142
+         ST    CESD,CMESDSAV       SAVE CESD ADDR               SA56381
+         BAL   RETURN,CESDENT      GET CESD ENTRY                A30142
+         MVC   CNAME(8,CESD),ENAME(PTR)  MOVE NAME AND TYPE      A30142
+         L     WORKC,CMESDSAV      GET ORIGINAL'S ADDR          SA56381
+         L     WORKC,CADR(WORKC)   INTO WORKC                   SA49491
+         LA    WORKC,0(WORKC)                                    A30142
+         ST    WORKC,CADR(CESD)    STORE IT HERE                 A30142
+         L     WORKB,EADR(PTR)     GET ESD INPUT ADDR            A30142
+         LA    WORKB,0(WORKB)      CALC RELOCATION CONSTANT      A30142
+         SR    WORKC,WORKB                                       A30142
+         ST    WORKC,CREL(CESD)    STORE IT                      A30142
+         MVC   CTYPE(1,CESD),ETYPE(PTR)  SET TYPE                A30142
+         OI    CTYPE(CESD),DELETE  SET TO DELETE                 A30142
+         B     CHAINING            GO TO CHAIN AND TRANSLATE     A30142
+********                                                        *******
+*                CESD TYPE IS 'SD' --- INPUT ESD TYPE IS 'ER'         *
+********                                                        *******
+MATSDER  TM    ETYPE(PTR),CM            IS INPUT ESD TYPE 'ER'
+         BZ    TRANSLAT                YES,GO TO TRANSLATE
+********                                                        *******
+*                CESD TYPE IS 'SD' --- INPUT ESD TYPE IS 'CM'         *
+********                                                        *******
+MATSDCM  BO    UPDATERC                 BRANCH IF INPUT TYPE IS CM
+********                                                        *******
+*                CESD TYPE IS 'SD' --- INPUT ESD TYPE IS 'LD'/'LR'    *
+********                                                        *******
+MATSDLR  L     WORKC,ESDADDR(PTR)       GET'SD' ADDR
+         TM    CTYPE(WORKC),DELETE      IS'SD' MARKED DELETE
+         BO    UPDATERC                 GO TO UPDATE RELOC. CONSTANT
+         BAL   RETURN,RERINPT4         DUPLIC.SYMBOL-CONFLICTING TYPE
+         B     UPDATERC                 GO TO UPDATE RELOC. CONSTANT
+********                                                        *******
+*                CESD TYPE IS 'PR'---INPUT ESD TYPE IS 'PR'           *
+********                                                        *******
+MATCHPR  TM    CTYPE(CESD),PR           IS CESD TYPE 'PR'
+         BC    14,MATCHCM               NO
+         BNH   MATPRPR1                 NO, GO TO CHECK ALIGNMENT
+         MVC   CLNG+1(3,CESD),ELNG+1(PTR) YES, USE ESD LNG
+MATPRPR1 OC    CLNG(1,CESD),ELNG(PTR)   SET ALIGN. TO HIGHER VALUE
+         B     TRANSLAT                 GO TO TRANSLATE
+********                                                        *******
+*               CESD TYPE IS 'CM' --- INPUT ESD TYPE IS 'SD'          *
+********                                                        *******
+MATCHCM  TM    CTYPE(CESD),CM           IS CESD TYPE 'CM'
+         BZ    MATCHER                  NO, CESD TYPE IS 'ER'
+         BC    6,MATCHLR                NO, CESD TYPE IS 'LR'
+         TM    ETYPE(PTR),NULL          YES, IS INPUT ESD TYPE 'SD'
+         BC    7,MATCMER                NO
+         L     ADR,CREL(CESD)           GET ADDR OF EXTENDED ENTRY
+         CLC   ELNG+1(3,PTR),CLNG+1(ADR) IS INPUT LNG GT CESD LNG
+         BNL   MATCMSD1                  YES,USE INPUT LNG
+         LA    ZERO,22                   MSG IEW1232             YM5575
+         LR    PARM,PTR                  PT TO ESD NAME          YM5575
+         L     BRANCH,ADERROR            ADDR OF ERROR ROUTINE   YM5575
+         BALR  RETURN,BRANCH             BR TO ERROR ROUTINE     YM5575
+MATCMSD1 L     WORKC,CMESDCHN
+         ST    ADR,CMESDCHN
+         ST    WORKC,0(ADR)             PUT EXTENDED ENTRY ON FREE CHN.
+         B     MATERSD0                 GO TO HANDLE SAME AS SD-ER
+********                                                        *******
+*           CESD TYPE IS 'CM' --- INPUT ESD TYPE IS 'ER'              *
+********                                                        *******
+MATCMER  L     WORKC,CREL(CESD)         GET ADDR OF EXTENDED ENTRY
+         MVC   CADR+1(3,WORKC),EADR+1(PTR)  SAVE INPUT ADDRESS
+         TM    ETYPE(PTR),CM            IS ESD TYPE 'ER'
+         BO    MATCMCM                  NO, ESD TYPE IS 'CM'
+         BM    MATCMLR                  NO, TYPE IS 'LR' OR 'LD'
+         XC    CADR+1(3,WORKC),CADR+1(WORKC)  MAKE SURE ADDR IS ZERO
+         B     TRANSLAT                 GO TO TRANSLATE ID
+********                                                        *******
+*           CESD  TYPE IS 'CM' --- INPUT ESD TYPE IS 'LR'/'LD'        *
+********                                                        *******
+MATCMLR  L     WORKC,ESDADDR(PTR)       GET 'SD' ADDR
+         TM    CTYPE(WORKC),DELETE      IS'SD' DELETE
+         BO    TRANSLAT                 YES
+         BAL   RETURN,RERINPT4         DUPLIC.SYMBOL-CONFLICTING TYPE
+         B     TRANSLAT                 GO TO TRANSLATE
+********                                                        *******
+*          CESD TYPE IS 'CM' --- INPUT ESD TYPE IS 'CM'               *
+********                                                        *******
+MATCMCM  CLC   CLNG+1(3,WORKC),ELNG+1(PTR) IS CESD LNG BT ESD LNG
+         BH    TRANSLAT                   YES, USE CESD LNG
+         MVC   CLNG+1(3,WORKC),ELNG+1(PTR) USE ESD LENGTH
+         B     TRANSLAT                  GO TO TRANSLATE
+********                                                        *******
+*               CESD TYPE IS 'LR' ---INPUT ESD TYPE IS 'SD'           *
+********                                                        *******
+MATCHLR  TM    ETYPE(PTR),NULL          IS ESD TYPE 'SD'
+         BC    7,MATLRER               NO
+         B     DELETE1             YES. GO TO DELETE
+********                                                        *******
+*               CESD TYPE IS 'LR'--- INPUT ESD TYPE IS  'ER'          *
+********                                                        *******
+MATLRER  TM    ETYPE(PTR),CM            IS ESD TYPE 'ER'
+         BZ    TRANSLAT                 YES, GO TO TRANSLATE
+********                                                        *******
+*               CESD TYPE IS 'LR' --- INPUT ESD TYPE IS 'LR'/'LD'     *
+********                                                        *******
+MATLRLR  BC    6,MATSDLR               HANDLE SAME AS 'SD'-'LR'MATCH
+********                                                        *******
+*           CESD TYPE IS 'LR' --- INPUT ESD TYPE IS 'CM'              *
+********                                                        *******
+         BAL   RETURN,RERINPT4         DUPLIC.SYMBOL-CONFLICTING TYPE
+         B     UPDATERC                 GO TO UPDATE RELOC.CONSTANT
+********                                                        *******
+*           CESD TYPE IS 'ER' --- INPUT ESD TYPE IS 'SD'              *
+********                                                        *******
+MATCHER  TM    ETYPE(PTR),NULL          IS INPUT ESD TYPE 'SD'
+         BC    7,MATERLR                NO
+MATERSD0 L     WORKB,CMPREVPT           GET ADDR OF PREV ENTRY ON CHAIN
+         L     WORKC,0(CESD)
+         LTR   WORKB,WORKB              IS MATCH FIRST ON CHAIN
+         BZ    MATERSD5                 YES
+         ST    WORKC,0(WORKB)           DECHAIN ENTRY
+MATERSD1 L     PARM,CADR(CESD)          GET ADDR. OF RLD CHAIN
+         LA    PARM,0(PARM)            CLEAR TYPE FIELD
+         BAL   RETURN,ENTER             GO TO MAKE CESD  ENTRY
+         BAL   RETURN,CHECKEP          CHECK FOR EP NAME
+         BAL   RETURN,HEWLERTN    GO TO RESOLVE RLD CHAIN
+MATERSD2 L     WORKC,ELNG(PTR)          GET ESD LENGTH
+         LA    WORKC,0(WORKC)          CLEAR HIGH ORDER BYTE
+         LTR   WORKC,WORKC              IS LNG EQUAL TO ZERO
+         BC    7,MATERSD3               NO
+         OI    CMRELFLG,CQNOLNG         YES, SET NOLENGTH INDICATOR
+         OI    CTYPE(CESD),NOLEN   SET NOLENGTH INDICATOR       27445
+         B     MATERSD4
+MATERSD3 A     WORKC,CMMODLNG
+         ST    WORKC,CMMODLNG           UPDATE ACCUM. LENGTH
+MATERSD4 BAL RETURN,HEWLMAP       GO TO MAP ENTRY
+         B     CHAINING                 GO TO CHAIN AND TRANSLATE
+MATERSD5 TM    CTYPE(CESD),CM           IS 'CM' TO BE DECHAINED
+         BO    MATERSD6                 YES
+         ST    WORKC,CMERCHN            DECHAIN 'ER'
+         B     MATERSD1
+MATERSD6 ST    WORKC,CMCMCHN            DECHAIN 'CM'
+         B     MATERSD1
+********                                                        *******
+*           CESD TYPE IS 'ER' --- INPUT ESD TYPE IS 'LD'/'LR'         *
+********                                                        *******
+MATERLR  TM    ETYPE(PTR),CM            IS INPUT ESD TYPE'LD'OR'LR'
+         BZ    MATERER                  NO, TYPE IS 'ER'
+         BO    MATERCM                  NO, TYPE IS 'CM'
+         L     PARM,CADR(CESD)          GET ADDR. OF RLD CHAIN
+         LA    PARM,0(PARM)            CLEAR TYPE FIELD
+         LA    RETURN,MATERLR2          SET RETURN ADDR FOR ENTERLR RTN
+         L     WORKC,ESDADDR(PTR)      GET 'SD' CESD ADDR
+         NI    CREL(CESD),X'7F'        TURN OFF DELETE BIT      ZA01335
+         TM    CTYPE(WORKC),DELETE     IS 'SD' FOR 'LR' DELETE  ZA01335
+         BZ    ENTERLR                 NO,CONTINUE              ZA01335
+         OI    CREL(CESD),X'80'        TURN SPEC DELETE BIT ON  ZA01335
+         MVC   CREL+1(3,CESD),EADR+1(PTR) SAVE DELINKING FACTOR ZA01335
+         B     TRANSLAT                GO TO TRANSLATE ID       ZA01335
+ENTERLR  L     WORKB,EADR(PTR)          GET INPUT ADDR
+         LA    WORKB,0(WORKB)
+         LR    WORKA,WORKB              SAVE FOR RC CALC.
+         A     WORKB,CREL(WORKC)        CALC. LOADER ASSIGNED ADDR(LAA)
+         ST    WORKB,CADR(CESD)         PUT IN CESD ENTRY
+         TM    CMFLAG4,CQMOD       IS THIS COMPILER-LOADED TEXT
+         BO    MATERLR1            YES. DON'T WORRY
+         CL    WORKB,CMLOWTBL           HAVE TABLES BEEN EXCEEDED
+         BNH   MATERLR1                NO
+         B     RERSIZE2                PROGRAM TOO LARGE--ABORT
+MATERLR1 MVI   CTYPE(CESD),LR           SET TYPE TO 'LR'
+         SR    WORKB,WORKA              CALC RELOCATION CONSTANT
+         ST    WORKB,CREL(CESD)         PUT RC IN CESD ENTRY
+         BR    RETURN
+MATERLR2 BAL   RETURN,HEWLERTN    GO TO RESOLVE RLD CHAIN
+         BAL   RETURN,CHECKEP          CHECK FOR EP NAME
+         BAL   RETURN,HEWLMAP     GO TO MAKE MAP ENTRY
+         B     DECHAIN                  GO TO DECHAIN'ER',CHAIN 'LR',
+*                                            AND TRANSLATE ID
+********                                                        *******
+*           CESD TYPE IS 'ER' --- INPUT ESD TYPE IS 'CM'              *
+********                                                        *******
+MATERCM  LR    WORKC,CESD               SAVE CESD ADDR OF 'ER'
+         BAL   RETURN,CESDENT           GET CESD ENTRY FOR EXTENDED ENT
+         MVC   CADR(8,CESD),EADR(PTR)   MOVE TYPE,ADDR.AND LNG
+         ST    CESD,CREL(WORKC)         SAVE PTR TO EXTENDED ENTRY
+         LR    CESD,WORKC               RESTORE CESD ADDR OF 'ER'
+         MVI   CTYPE(CESD),CM           SET TYPE TO 'CM'
+         B     DECHAIN                  GO TO DECHAIN'ER',CHAIN'CM'
+*                                          AND TRANSLATE ID
+********                                                        *******
+*           CESD TYPE IS 'ER' --- INPUT ESD TYPE IS 'ER'              *
+********                                                        *******
+MATERER  CLI   CTYPE(CESD),ER+DELINK    IS ER MARKED DELINK
+         BNE   MATERER2                 NO
+         NI    CTYPE(CESD),X'FF'-DELINK SET DELINK INDIC OFF
+         XC    CREL(4,CESD),CREL(CESD) CLEAR DELINK FIELD       ZA01335
+MATERER2 TM    ETYPE(PTR),WEAKCALL IS WEAKCALL FLAG ON INC288
+         BO    MATERER3            YES. LEAVE CESD AS IS   INC288
+         NI    CTYPE(CESD),X'FF'-WEAKCALL  NO. MAKE SURE  INC288
+*                                  WX IS OFF   INC288
+MATERER3 CLI   ESUBTYP(PTR),X'06'  IS ESD MARKED NEVCAL  INC288
+         BNE   TRANSLAT                 NO, GO TO TRANSLATE ID
+         OI    CTYPE(CESD),NEVERCAL    SET NEVERCALL INDIC.IN CESD'ER'
+         B     TRANSLAT                GO TO TRANSLATE ID
+         EJECT
+********                                                        *******
+*        THIS ROUTINE DECHAINS CESD ENTRIES WHEN THEIR TYPE CHANGES   *
+********                                                        *******
+DECHAIN  L     WORKB,CMPREVPT           GET ADDR.OF PREV.ENTRY ON CHAIN
+         L     WORKC,0(CESD)            GET ADDR.OF NEXT ENTRY ON CHAIN
+         LTR   WORKB,WORKB             IS MATCH FIRST ON CHAIN
+         BZ    DECHAIN1                YES
+         ST    WORKC,0(WORKB)           DECHAIN ENTRY
+         B     CHAINING
+DECHAIN1 ST    WORKC,CMERCHN           DECHAIN FIRST 'ER' ENTRY
+********                                                        *******
+*        THIS ROUTINE CHAINS CESD ENTRIES ACCORDING TO TYPE           *
+********                                                        *******
+CHAINING IC    WORKC,CTYPE(CESD)        GET CESD TYPE
+         N     WORKC,TYPEONLY
+         SLL   WORKC,2
+         LA    WORKC,CMTYPCHN(WORKC)   CALC ADDR OF CHAIN TABLE
+         L     WORKB,0(WORKC)
+         ST    CESD,0(WORKC)            CHAIN NEW CESD ENTRY
+         ST    WORKB,0(CESD)
+********                                                        *******
+*        THIS ROUTINE MAKES A TRANSLATION TABLE ENTRY                 *
+********                                                        *******
+TRANSLAT TM    ETYPE(PTR),X'06'         IS INPUT TYPE 'LD'
+         BC    7,TRANS10                NO, GO TO TRANSLATE ID.
+         TM    ETYPE(PTR),LD
+         BO    NEXTESD                  YES,DON'T TRANSLATE
+TRANS10  OI    CMRELFLG,CQESD           YES, SET ESD CALLER INDICATOR
+         BAL   RETURN,TRANSID           GO TO TRANSLATE ID
+         NI    CMRELFLG,CQFF-CQESD      SET OFF ESD CALLER INDICATOR
+         LTR   PARM,PARM                WAS BAD ID ENCOUNTERED
+         BZ    NEXTESD                  YES, GET NEXT ESD ITEM
+         ST    CESD,0(PARM)             MAKE TRANSLATION TABLE ENTRY
+         TM    ETYPE(PTR),X'05'         IS ESD TYPE 'ER'
+         BC    7,NEXTESD               NO
+         TM    ETYPE(PTR),X'02'
+         BZ    NEXTESD         '       NO
+         OI    0(PARM),ERMATCH         YES, SET INDIC FOR ABS. FACTOR
+*                                            IF AN 'A'TYPE ADCON IS
+*                                            USED TO REFERENCE THIS
+*                                            EXTERNAL REFERENCE, THE
+*                                            LOADER ASSIGNED ADDR.MUST
+*                                            BE USED FOR RELOCATION
+*                                            INSTEAD OF THE NORMAL
+*                                            RELATIVE RELOCATION FACTOR
+********                                                       ********
+*  THIS ROUTINE PREPARES TO PROCESS THE NEXT ESD IF THERE IS ONE      *
+********                                                       ********
+NEXTESD  TM    ETYPE(PTR),X'06'         IS INPUT ESD TYPE'LD'
+         BC    7,NEXT10                 NO
+         TM    ETYPE(PTR),LD
+         BO    NEXT20                   YES, DON'T UPDATE ID
+NEXT10   LA    ID,1(ID)                 UPDATE ID
+NEXT20   LA    PTR,16(PTR)              UPDATE INPUT RECORD PTR
+         SH    LNG,CONT16
+         BP    ESDSTART                 GO TO PROCESS NEXT ESD
+         EJECT
+********                                                        *******
+*   THIS ROUTINE DOES END OF RECORD PROCESSING FOR THE LD CHAIN,IF IT *
+*     EXISTS. THIS CHAIN CONSISTS OF LDS WHOSE SD WAS NOT DEFINED WHEN*
+*     THE LD WAS PROCESSED.                                           *
+********                                                        *******
+LDRTN    L     PTR,CMLDCHN             GET BEGINNING OF 'LD' CHAIN
+         LTR   PTR,PTR                  IS THERE AN LD CHAIN
+         BZ    LD20                     NO
+         TM    CTYPE(PTR),LDCHAIN       HAS CHAIN BEEN PROCESSED FOR
+*                                            THIS RECORD
+         BZ    LD10                     NO
+         NI    CTYPE(PTR),X'FF'-LDCHAIN TURN OFF PROCESSED INDIC
+         B     ESDEND                   BRANCH TO RETURN
+LD10     L     WORKB,0(PTR)             DECHAIN LD ENTRY
+         ST    WORKB,CMLDCHN
+         LA    LNG,16                   SET ESD LENGTH TO ONE ENTRY
+         OI    CTYPE(PTR),LDCHAIN       SET PROCESSED THIS RECORD INDIC
+         LA    PTR,4(PTR)              POINT TO ESD ITEM
+         B     ESD35
+LD20     TM    CMLIBFLG,CQCESDR         IS THIS END OF CESD PROCESSING
+         BZ    CESDEND                  YES,CONTINUE END OF CESD PROC.
+ESDEND   L     SAVEREG,4(SAVEREG)       RESTORE SAVE AREA PTR
+         RETURN (14,12),T
+         EJECT
+**********************  SPECIAL LOAD MODULE PROCESSING ****************
+*     THIS ROUTINE SETS ASIDE ALL PC,SD,AND LR CESD TYPES FOR A LOAD  *
+*       MODULE AND THEN PROCESSES THEM AT END OF CESD.  THIS IS NEEDED*
+*       BECAUSE SOME LOAD MODULES ARE NOT ASSIGNED ADDRESSES ACCORDING*
+*       TO THE ORDER IN THE CESD.                                     *
+***********************************************************************
+LOADPROC TM    CMLIBFLG,CQCESDR         IS THIS END OF CESD
+         BZ    CESDEND                  YES,GO TO END OF CESD PROCESS
+         TM    ETYPE(PTR),NULL          IS TYPE SD,PC OR LR
+         BO    ESD15                    TYPE IS NULL
+         BZ    LOAD20                   TYPE IS SD
+         TM    ETYPE(PTR),LR
+         BC    6,ESD10                  TYPE IS CM,PR,OR ER
+         BZ    LOAD10                   TYPE IS PC
+         OI    CMCURRID,X'80'           IDENTIFY TYPE AS LR
+         B     LOAD20
+LOAD10   TM    ETYPE(PTR),X'10'        IS PC DELETE(ENTAB-SEGTAB)
+         BO    ESD15                   GO TO PROCESS AS NULL
+LOAD20   BAL   RETURN,CESDENT           GET CESD ENTRY
+         MVC   CNAME(16,CESD),ENAME(PTR) MOVE  INFO.TO CESD ENTRY
+         MVC   CTYPE+2(3,CESD),EADR+1(PTR) CREATE SPECIAL ENTRY FOR ID
+         MVC   CTYPE(2,CESD),CMCURRID   MOVE ID AND TYPE TO CESD ENTRY
+         NI    CMCURRID,X'7F'          CLEAR LR INDIC
+         LA    WORKA,CMLOADCH           SET AS PREVIOUS CHAIN ADDR
+         L     WORKC,CMLOADCH           GET BEGINNING CHAIN ADDR
+LOAD25   LA    WORKC,0(WORKC)           CLEAR SEGMENT NUMBER
+         LTR   WORKC,WORKC              IS THIS END OF CHAIN
+         BZ    LOAD45                   YES,GO TO CHAIN ENTRY
+         CLC   ESEGNO(1,PTR),0(WORKC)   COMPARE SEGMENT NUMBERS
+         BL    LOAD45                   CHAIN BEFORE
+         BH    LOAD30                   CONTINUE SEARCH
+         CLC   EADR+1(3,PTR),CADR+2(WORKC) COMPARE ADDRESSES
+         BE    LOAD40                   ADDR. EQUAL
+         BL    LOAD45                   INPUT ADDR. LT EXISTING ADDR.
+LOAD30   LR    WORKA,WORKC              SAVE AS RPEVIOUS CHAIN ADDR
+         L     WORKC,0(WORKC)           GET NEXT ENTRY FROM CHAIN
+         B     LOAD25                   CONTINUE SEARCH
+LOAD40   TM    ETYPE(PTR),X'03'        CHAIN LRS AFTER SDS,PCS  YA00379
+         BO    LOAD30                  TYPE IS LR. CONT SEARCH  YA00379
+LOAD45   LR    WORKC,WORKA              CHAIN BEFORE MATCHED ENTRY
+LOAD50   L     WORKB,0(WORKC)           CHAIN AFTER  MATCHED ENTRY
+         ST    WORKB,0(CESD)
+         MVC   0(1,CESD),ESEGNO(PTR)    ENTER SEGMENT NUMBER
+         ST    CESD,0(WORKC)
+         SRL   WORKB,24                 RIGHT ADJUST SEGMENT NUMBER
+         STC   WORKB,0(WORKC)           PRESERVE SEGMENT NUMBER
+         B     NEXTESD                  GET NEXT ESD
+CESDEND  L     WORKC,CMTEMPCH           GET ADDR.OF FREE LOAD CHN.ENTRY
+         LTR   WORKC,WORKC             IS THERE A LOAD CH ENTRY TO FREE
+         BZ    CESDEND0                NO
+         L     WORKB,CMESDCHN          YES,CHAIN IT TO FREE ESD CHAIN
+         ST    WORKC,CMESDCHN
+         ST    WORKB,0(WORKC)
+         XC    CMTEMPCH(4),CMTEMPCH    CLEAR CHAIN POINTER
+CESDEND0 L     PTR,CMLOADCH            GET NEXT ESD
+         LA    PTR,0(PTR)               CLEAR SEGMENT NUMBER
+         LTR   PTR,PTR                  ANY ENTRIES ON CHAIN
+         BZ    ESDEND                   NO, RETURN TO CALLER
+         LA    LNG,16                   SET LENGTH EQ TO ONE ESD ENTRY
+         LH    ID,CTYPE(PTR)            GET  ID
+         MVC   CADR+1(3,PTR),CADR+2(PTR) READJUST INPUT ADDR FIELD
+         MVI   CREL(PTR),X'00'         CLEAR HIGH BYTE OF R.C.
+         TM    CTYPE(PTR),X'80'         IS TYPE'LR'
+         BZ    CESDEND1                 NO
+         SLL   ID,17                    YES, ZERO HIGH ORDER BITS OF ID
+         SRL   ID,17
+         MVI   CTYPE(PTR),LR           SET TYPE TO 'LR'
+         B     CESDEND2
+CESDEND1 MVI   CTYPE(PTR),SD           SET TYPE TO 'SD'
+         CLI   CNAME(PTR),C' '         IS TYPE 'PC'
+         BNE   CESDEND2                NO
+         MVI   CTYPE(PTR),PC           SET TYPE TO 'PC'
+CESDEND2 L     WORKC,0(PTR)             TAKE ENTRY OFF LOAD CHAIN
+         LA    WORKC,0(WORKC)           CLEAR SEGMENT NUMBER
+         ST    WORKC,CMLOADCH
+         LA    PTR,0(PTR)               CLEAR SEGMENT NUMBER
+         ST    PTR,CMTEMPCH            SAVE ESD PTR TO FREE AFTER PROC.
+         LA    PTR,4(PTR)               UPDATE PAST CHAIN FIELD
+         STH   ID,CMCURRID             SAVE ID
+         B     ESD10                    GO TO PROCESS ESD
+         EJECT
+********************  CESD ENTRY ALLOCATION  **************************
+*                                                                     *
+*    THIS SUBROUTINE GETS A CESD ENTRY FROM CESD FREE ENTRIES CHAIN   *
+*       OR CALLS THE ALLOCATE ROUTINE FOR ALLOCATION OF ONE ENTRY     *
+*       THE ENTRY ADDRESS IS RETURNED IN #PARM AND #CESD              *
+*                                                                     *
+***********************************************************************
+CESDENT  STM   14,1,12(13)              SAVE REGISTERS 14-1
+         L     PARM,CMESDCHN            GET BEGINNING OF FREE CESD CHN
+         LTR   PARM,PARM                IS IT EMPTY
+         BC    7,CESDDCHN              NO
+         LA    ZERO,20                  SET ENTRY LENGTH
+         BAL   RETURN,ALLOCATE          GO TO ALLOCATE A CESD ENTRY
+CESDRTRN LM    14,0,12(13)              YES,RESTORE REGS. 14-0
+         LR    CESD,PARM
+         BR    RETURN                   RETURN
+CESDDCHN L     ZERO,0(PARM)            DECHAIN ENTRY FROM FREE CHAIN
+         ST    ZERO,CMESDCHN
+         B     CESDRTRN                 GO TO RETURN
+         EJECT
+**********************  MAKE CESD ENTRY FOR PC AND SD  ****************
+*                          #CESD-ADDR.OF CESD ENTRY                   *
+*                          #PTR-ADDR.OF INPUT ESD ITEM                *
+***********************************************************************
+ENTER    MVC   CNAME(8,CESD),ENAME(PTR) MOVE NAME TO CESD
+         L     WORKC,CMMODLNG          GET ACCUM. LENGTH
+         LA    WORKC,7(WORKC)
+         N     WORKC,DBLWRD            ROUND TO DOUBLE WORD
+         ST    WORKC,CMMODLNG          SAVE ROUNDED LENGTH
+         TM    CMFLAG4,CQMOD      IS THIS COMPILER-LOADED TEXT
+         BZ    ENTER05            NO
+         A     WORKC,CMCORE1      YES. USE COMPILER-ASSIGNED ADR
+         B     ENTER10
+ENTER05  A     WORKC,CMNXTTXT     CALCUATE NEXT CSECT ADDRESS
+         CL    WORKC,CMLOWTBL           HAS CORE BEEN EXCEEDED
+         BH    RERSIZE2                 YES,PROGRAM TOO LARGE-ABORT
+ENTER10  ST    WORKC,CADR(CESD)         LOADER ASSIGNED ADDR TO CESD
+         MVC   CTYPE(1,CESD),ETYPE(PTR) MOVE FLAG FIELD TO CESD
+         NI    CTYPE(CESD),X'07'        CLEAR FLAGS EXCEPT FOR TYPE
+         L     WORKB,EADR(PTR)          GET INPUT ADDR.
+         LA    WORKB,0(WORKB)           CLEAR HIGH ORDER BYTES
+         SR    WORKC,WORKB              RELOC.VALUE=LAA-INPUT ADDR
+         ST    WORKC,CREL(CESD)         RELOC.VALUE TO CESD
+         BR    RETURN                   RETURN
+         EJECT
+********                                                        *******
+*    THIS ROUTINE UPDATE THE RELOCATION CONSTANT,THEN GOES TO TRANSLAT*
+********                                                        *******
+UPDATERC L     WORKC,EADR(PTR)          GET ESD INPUT ADDR.
+         LA    WORKC,0(WORKC)
+         L     WORKB,CADR(CESD)        GET LOADER ASSIGNED ADDR.
+         LA    WORKB,0(WORKB)
+         SR    WORKB,WORKC              CALC. RELOCATION CONSTANT
+         ST    WORKB,CREL(CESD)         UPDATE RC.
+         B     TRANSLAT                 GO TO TRANSLATE
+         EJECT
+********                                                        *******
+*                        CHECK FOR ENTRY POINT NAME                   *
+********                                                        *******
+CHECKEP  TM    CMPRMFLG,CQEPNAME+CQEPADDR HAS ENTRY PT.BEEN DEFINED
+         BCR   9,RETURN                 YES OR AN ENTRY POINT WAS NOT
+*                                            SPECIFIED
+         TM    CMPRMFLG,CQEPNAME        WAS A NAME DEFINED
+         BCR   8,RETURN                 NO,RETURN
+         CLC   CMEPNAME(8),CNAME(CESD)  IS CURRENT CESD THE ENTRY POINT
+         BCR   7,RETURN                NO
+         MVC   CMEPADDR+1(3),CADR+1(CESD) YES, SAVE EP  ADDR
+         OI    CMPRMFLG,CQEPADDR        SET EP ADDR DEFINED INDICATOR
+         BR    RETURN
+         EJECT
+***************************  TEXT PROCESSOR  **************************
+*                                                                     *
+*    THIS ROUTINE LOADS TEXT INTO MAIN STORAGE.   IT  EXPECTS THE     *
+*        FOLLOWING REGISTER CONTENT:                                  *
+*                                                                     *
+*             #ID - TEXT ID                                           *
+*             #ADR- DISPLACEMENT ADDR OF TEXT                         *
+*             #LNG- LENGTH OF TEXT                                    *
+*             #PTR- ADDRESS OF TEXT IN BUFFER                         *
+*                                                                     *
+***********************************************************************
+HEWLTXT  LTR   LNG,LNG            IS THERE ANY TEXT
+         BZ    RELOREAD                 NO, GO TO READ NEXT RECORD
+         TM    CMFLAG4,CQMOD      WAS MOD RECORD ALSO RECEIVED
+         BO    RELOREAD           IGNORE THIS TEXT
+         BAL   RETURN,TRANSID           CONVERT ID TO TRANS.TABLE ADDR
+         LTR   PARM,PARM                WAS CONVERSION POSSIBLE
+         BZ    RELOREAD                 NO,BAD ID ENCOUNTERED
+TXT10    TM    CTYPE(CESD),DELETE       SHOULD TEXT BE DELETED
+         BO    RELOREAD                 TEXT IS DELETE,GO TO READ
+         OI    CMLIBFLG,CQNOTXT        SET TEXT RECEIVED INDICATOR
+         TM    CTYPE(CESD),NOLEN   WAS THIS ZERO-LENGTH CSECT   27445
+         BNO   TXT20               NO                           27445
+         OI    CMRELFLG,CQNOLNTX   SHOW TEXT WAS RECEIVED       27445
+TXT20    A     ADR,CREL(CESD)      CALC MAIN STORAGE TEXT ADR   27445
+         LA    WORKC,0(LNG,ADR)        CALC END TEXT ADDR.
+         CL    WORKC,CMLOWTBL          WILL TEXT OVERLAP TABLES
+         BH    RERSIZE2                YES,PROGRAM TOO LARGE--ABORT
+         BCTR  LNG,0
+         EX    LNG,MOVE2                MOVE TEXT INTO MAIN STORAGE
+         LA    ADR,1(ADR,LNG)          CALC. EXTENT OF TEXT ADDED
+         CL    ADR,CMLSTTXT             IS HIGHEST TEXT ADDR.EXCEEDED
+         BNH   RELOREAD                 NO
+         ST    ADR,CMLSTTXT             UPDATE HIGHEST TXT ADDR
+         B     RELOREAD                GO TO READ NEXT RECORD
+         EJECT
+****************************MOD PROCESSOR******************************
+*                                                                     *
+*        THIS ROUTINE PICKS UP ORIGIN AND EXTENT INFORMATION          *
+*        FOR COMPILER-LOADED TEXT FROM MOD CARDS PASSED THROUGH AN    *
+*        INCORE DATA SET.  IT EXPECTS THE FOLLOWING REGISTER CONTENT  *
+*                                                                     *
+*              #LNG - LENGTH OF INFO                                  *
+*         #PTR - ADDRESS OF INFO IN BUFFER                            *
+*                                                                     *
+***********************************************************************
+HEWLMOD  TM    CMFLAG3,CQINCORE   IS THIS INCORE DATA SET
+         BZ    RELOREAD           NO. IGNORE IT
+         TM    CMFLAG4,CQESDS     ESD CARDS ALREADY RECEIVED
+         BNZ   RELOREAD           YES. IGNORE THIS THEN
+         LTR   LNG,LNG            ANY MOD INFO
+         BZ    RELOREAD           NO. IGNORE IT
+         OI    CMLIBFLG,CQNOTXT    SET TEXT RECEIVED
+         OI    CMFLAG4,CQMOD      SET MOD RECEIVED
+         L     WORKC,0(PTR)       GET ORIGIN OF TEXT
+         LTR   WORKC,WORKC         WAS IT SPECIFIED
+         BZ    MODEXTNT            NO. SEE IF EXTENTS DEFINED
+MOD10    ST    WORKC,CMCORE1      SAVE ORIGIN OF TEXT
+         L     WORKC,4(PTR)       GET LAST ADDRESS
+         ST    WORKC,CMCORE2      SAVE IT
+MODEXTNT LA    WORKC,8             SEE IF THERE'S EXTENT INFO
+         SR    LNG,WORKC           IS LENGTH GREATER THAN 8
+         BNP   RELOREAD            NO. BRANCH
+MODEXT   LA    ZERO,12             GET THREE WORDS TO SAVE
+         BAL   RETURN,ALLOCATE     EXTENT INFO IN
+         L     WORKC,CMLOWTBL      FIND ADDRESS
+         MVC   0(4,WORKC),CMXLCHN  CHAIN IT
+         MVC   CMXLCHN(4),CMLOWTBL TO OTHER EXTENTS
+         MVC   4(8,WORKC),8(PTR)   MOVE IN EXTENT INFO
+         LH    WORKC,CMNUMXS       PICK UP NUMBER OF EXTENTS
+         TM    CMPRMFLG,CQEPNAME+CQEPADDR   HAS ENTRY POINT BEEN DEF
+         BNZ   MODEXT1             YES.
+         LTR   WORKC,WORKC         NO. IS THIS FIRST EXTENT
+         BNZ   MODEXT1             NO
+         MVC   CMEPADDR(4),8(PTR)  YES. USE IT AS ENTRY POINT
+MODEXT1  LA    WORKC,1(WORKC)      ADD AN EXTENT
+         STH   WORKC,CMNUMXS       TO TOTAL
+         B     RELOREAD            GO GET ANOTHER RECORD
+         EJECT
+*************************   RLD PROCESSOR   ***************************
+*                                                                     *
+*    THIS SUBROUTINE RELOCATES ADDRESS CONSTANTS USING THE RELOCATION *
+*      DICTIONARY (RLDS) ENTRIES SENT IT.  IF RELOCATION IS NOT       *
+*      POSSIBLE, THE RLDS ARE CHAINED OFF OF THE R PTR CESD ENTRY.    *
+*      IT EXPECTS:                                                    *
+*            #PTR-POINTER TO RLD INFORMATION                          *
+*            #LNG-LENGTH OF RLD INFORMATION                           *
+***********************************************************************
+HEWLRLD  EQU   *
+         STM   14,12,12(13)             SAVE REGISTERS
+RLDBASE  BALR  BASE,0
+         USING *,BASE
+         L     BASE,ABEGIN
+         USING HEWLRELO,BASE      RESET BASE TO INITIAL VALUE
+         L     BASE2,ABEG4096           SET UP SECOND BASE REG  SA49491
+         USING HEWLRELO+4096,BASE2     ESTABLISH ADDRESSABILITY SA49491
+         B     NRLD+8
+NRLD     DC    C'HEWLRLD '
+         L     SAVEREG,8(SAVEREG)       PICK UP NEXT SAVE AREA ADDR.
+RLD10    LTR   LNG,LNG                  ARE ALL RLDS PROCESSED
+         BC    2,RLD30                  NO.
+RLD19    L     SAVEREG,4(SAVEREG)       RESTORE SAVE AREA PTR
+         RETURN (14,12),T
+*                                                                     *
+*                    CHECK VALIDITY OF P PTR                          *
+*                                                                     *
+RLD30    TM    CMRELFLG,CQENTRY         IS THIS THE ENTRY POINT RLD
+         BO    RLD35                    YES
+         LH    ID,P(PTR)                GET P PTR
+         BAL   RETURN,TRANSID           GET TRANS. TABLE ENTRY ADDR
+         LTR   PARM,PARM                WAS TRANSLATION POSSIBLE
+         BZ    RLD65                    NO
+         L     WORKA,0(PARM)            GET CESD ENTRY ADDR
+         TM    CTYPE(WORKA),DELETE      IS CSECT MARKED DELETE
+         BO    RLD65                    YES
+         TM    RLDFLG(PTR),ACCUMPR     IS RLD CXD PSEUDO REG. TYPE
+         BO    RLD40                   YES
+*                                                                     *
+*                       CHECK VALIDITY OF R PTR                       *
+*                                                                     *
+RLD35    LH    ID,R(PTR)                GET R PTR
+         BAL   RETURN,TRANSID           GET TRANS, TABLE ENTRY ADDR
+         LTR   PARM,PARM                WAS TRANSLATION POSSIBLE
+         BZ    RLD65                    NO
+*                                                                     *
+*           RELOCATE ADCON ADDRESS - MAKE RLD TABLE ENTRY             *
+*                                                                     *
+RLD40    L     PARM,CMRLDCHN            GET BEG.ADDR OF FREE RLD TABLE
+*                                            ENTRIES
+         LTR   PARM,PARM                IS IT EMPTY
+         BC    7,RLD45                  NO
+         LA    ZERO,8                   YES, INDICATE ENTRY SIZE
+         BAL   RETURN,ALLOCATE          GO TO ALLOCATE ENTRY
+         B     RLD48                    NO, CONTINUE PROCESSING
+RLD45    L     ZERO,0(PARM)             DECHAIN ENTRY FROM FREE CHAIN
+         ST    ZERO,CMRLDCHN
+RLD48    L     WORKB,RLDADR(PTR)
+         LA    WORKB,0(WORKB)
+         A     WORKB,CREL(WORKA)        CALC. ADCON ADDRESS
+         ST    WORKB,4(PARM)            SAVE ADCON ADDRESS IN RLD TABLE
+         TM    RLDFLG(PTR),ACCUMPR     IS RLD CXD PSEUDO REG. TYPE
+         BO    RLD100                  YES
+         MVC   4(1,PARM),RLDFLG(PTR)    SAVE FLAG FIELD IN RLD TABLE
+         LTR   CESD,CESD               IS ABSOLUTE FACTOR NEEDED
+         BC    11,RLD49                NO
+         OI    4(PARM),ERMATCH         USE ABSOLUTE FACTOR
+*                                                                     *
+*        CHECK R PTR TYPE --- RELOCATE RLD OR CHAIN IT TO CESD ENTRY  *
+*                                                                     *
+RLD49    TM    CTYPE(CESD),LR          R PTR TYPE IS SD,PC,OR LR
+         BM    RLD70                    NO
+         XC    0(4,PARM),0(PARM)       CLEAR CHAIN FIELD
+         BAL   RETURN,HEWLERTN    GO TO RELOCATE RLD
+RLD50    TM    RLDFLG(PTR),CONT         IS NEXT RLD ITEM CHAINED
+         BC    14,RLD60                 NO, GO TO GET NEXT R-P PTR
+*                                                                     *
+*                     UPDATE TO NEXT FA FIELD                         *
+*                                                                     *
+         LA    PTR,4(PTR)               UPDATE TO NEXT FA FIELD
+         SH    LNG,CONT4
+         CH    LNG,CONT4                ARE ANY RLDS LEFT
+         BH    RLD40                    YES, GO TO PROCESS NEXT RLD
+         BAL   RETURN,RERINPT9          INVALID INPUT FROM OBJ MODULE
+         B     RLD19                   RETURN
+*                                                                     *
+*              UPDATE TO NEXT R-P PTR                                 *
+*                                                                     *
+RLD60    LA    PTR,8(PTR)               UPDATE RLD PTR
+         SH    LNG,CONT8                DECR. LENGTH
+         B     RLD10                    GO TO PROCESS NEXT R-P PTR
+RLD65    TM    RLDFLG(PTR),CONT         NEXT ITEM CHAINED
+         BZ    RLD60                    NO
+         LA    PTR,4(PTR)               UPDATE POINTER
+         SH    LNG,CONT4
+         LTR   LNG,LNG                  HAS RECORD END BEEN REACHED
+         BC    2,RLD65                  NO, CONTINUE SEARCH FOR R-P
+         B     RLD19                    YES, RETURN TO CALLER
+*                                                                     *
+*     R PTR TYPE IS CM,PR,OR ER  - CHAIN RLD TO CESD ENTRY            *
+*                                                                     *
+RLD70    TM    CTYPE(CESD),CM          IS CESD TYPE COMMON
+         BO    RLD75                   YES
+         BZ    RLD72                    NO, CESD TYPE IS ER
+         OI    4(PARM),PRRLD            CESD TYPE IS 'PR',SET PR FLAG
+         B     RLD80
+*                                       PRECEDING CODING TO MARK RLD AS
+*                                       DISPLACEMENT PR IS INCLUDED
+*                                       BECAUSE THE ASSEMBLER PUTS OUT
+*                                       NON-BRANCH RLDS FOR Q-TYPE
+*                                       ADDRESS CONSTANTS
+RLD72    TM    CTYPE(CESD),DELINK       DOES RLD NEED DELINKING
+         BZ    RLD80                    NO
+RLD75    OI    CMRELFLG,CQDELINK        SET SPECIAL RELOCATION INDIC.
+         BAL   RETURN,HEWLERTN    GO TO DELINK ADCON
+RLD80    L     WORKC,CADR(CESD)
+         ST    PARM,CADR(CESD)
+         ST    WORKC,0(PARM)            CHAIN RLD TO CESD ENTRY
+         MVC   CADR(1,CESD),0(PARM)    PRESERVE TYPE INDIC
+         MVI   0(PARM),X'00'           CLEAR TYPE FROM CHAIN ADDR
+         B     RLD50                    GO TO CHECK IF NEXT R-P OR ADDR
+*                                                                     *
+*                 RLD IS CXD PSEUDO REGISTER TYPE                     *
+*                                                                     *
+RLD100   L     WORKB,CMCXDPT           CHAIN ACCUM PSEUDO REGISTER
+         ST    PARM,CMCXDPT
+         ST    WORKB,0(PARM)
+         B     RLD50                   GO TO CHECK IF NEXT R-P OR ADDR
+         EJECT
+****************************  END PROCESSOR  **************************
+*                                                                     *
+*    THIS ROUTINE PROCESSES THE END CARD FOR LENGTH AND ENTRY POINT.  *
+*      IT ALSO CLEARS THE TRANSLATION TABLE.  IT EXPECTS:             *
+*              #ID - CONTAINS ID OF ASSEMBLED ADDR. ENTRY             *
+*              #PTR- ADDR OF SYMBOLIC ENTRY POINT NAME                *
+*              #ADR- ENTRY POINT ADDRESS IF PRESENT                   *
+*                                                                     *
+***********************************************************************
+HEWLEND  EQU   *
+         STM   14,12,12(13)             SAVE REGISTERS
+         BALR  BASE,0
+         USING *,BASE
+         L     BASE,ABEGIN
+         USING HEWLRELO,BASE
+         L     BASE2,ABEG4096           SET UP SECOND BASE REG  SA49491
+         USING HEWLRELO+4096,BASE2     ESTABLISH ADDRESSABILITY SA49491
+         B     NEND+8
+NEND     DC    C'HEWLEND '
+         L     SAVEREG,8(SAVEREG)       PICK UP NEXT SAVE AREA
+         TM    CMIOFLGS,CQEOCB+CQRECFM  IS THIS END OF MODULE PROCESS
+         BC    7,ENDLNG                YES
+         OI    CMRELFLG,CQNOEND        SET END CARD RECEIVED INDIC
+         L     WORKB,CMLDCHN           GET START OF 'LD' CHAIN
+         LTR   WORKB,WORKB             IS 'LD' CHAIN EMPTY
+         BZ    ENDEPCHK                YES
+         BAL   RETURN,RERINPT7         INVALID ID ON 'LD' ENTRY
+ENDEPCHK TM    CMPRMFLG,CQEPNAME+CQEPADDR HAS ENTRY POINT BEEN DEFINED
+         BZ    ENDENTRY                 NO
+********                                                     **********
+*                  DEFINE CSECT LENGTH AND MODULE EXTENT              *
+********                                                     **********
+ENDLNG   L     WORKA,CMNXTTXT           GET MODULE START ADDR
+         TM    CMFLAG4,CQMOD      IS THIS COMPILER-LOADED TEXT
+         BZ    END05              NO
+         BAL   RETURN,SWITCH      SWITCH LIMIT ADDRESSES
+END05    EQU   *
+         TM    CMRELFLG,CQNOLNG         WAS LENGTH ALREADY SPECIFIED
+         BZ    END19                    YES
+         TM    CMRELFLG,CQNOEND        WAS END CARD MISSING
+         BZ    END12                   YES
+END10    L     LNG,COL29(PTR)           GET LENGTH FIELD
+         CLI   COL29(PTR),X'00'         IS LENGTH ON END CARD
+         BE    END13                    YES
+END12    TM    CMRELFLG,CQNOLNTX   WAS TEXT RECEIVED            27445
+         BNO   END12A              NO. CSECT WITH LNG ZERO OKAY 27445
+         BAL   RETURN,RERINPT2     YES. ERROR                   27445
+END12A   EQU   *                                                SA49491
+         SR    LNG,LNG                  CSECT LENGTH 0          SA49491
+         C     LNG,CMMODLNG             MORE THAN ONE CSECT?    SA49491
+         BL    END12B                   MULT CSECTS, ONE ZERO   SA49491
+         L     WORKA,CMLSTTXT           USE CMLSTTXT            SA49491
+         B     END20                                            SA49491
+END12B   EQU   *                                                SA49491
+         L     LNG,CMMODLNG             USE CMMODLNG            SA49491
+         L     WORKA,CMOBJST            GET BEGINING ADDRESS    YA00226
+         B     END20                                            SA49491
+END13    EQU   *                                                SA49491
+         A     LNG,CMMODLNG             UPDATE NEW ACCUM LENGTH SA49491
+         ST    LNG,CMMODLNG             STORE IT BACK           SA49491
+         A     LNG,CMOBJST              COMPUTE HIGH ADDRESS    YA00226
+         CL    LNG,CMLSTTXT             ACCUM GREATER THAN TXT? YA00226
+         L     LNG,CMMODLNG             RESTORE LNG REGISTER    SA49491
+         BH    END20                    YES, GO USE IT          SA49491
+         L     WORKA,CMNXTTXT           GET LENGTH              SA49491
+         ST    WORKA,CMOBJST            SAVE IT                 SA49491
+         B     END20                    GO CALCULATE MODULE LNG SA49491
+END19    L     LNG,CMMODLNG             NO,USE ACCUM MODULE LNG
+END20    AR    WORKA,LNG                CALC. PROGRAM HIGHEST ADDR.
+         LA    WORKA,7(WORKA)
+         N     WORKA,DBLWRD             UPDATE TO DBLE. WORD BOUNDARY
+         CL    WORKA,CMLSTTXT           HAS TEXT EXCEEDED SPECIFIED LNG
+         BNL   END25                    NO
+         L     WORKA,CMLSTTXT           YES,USE ACTUAL TEXT LENGTH
+         LA   WORKA,7(WORKA)            ROUND OFF TO             A47048
+         N    WORKA,DBLWRD              DOUBLEWORD BOUNDARY      A47048
+         BAL   RETURN,RERINPT2          ERROR,TXT RECEIVED EXCEEDS LNG
+END25    ST    WORKA,CMNXTTXT           UPDATE NEXT TEXT ADDRESS
+         ST    WORKA,CMOBJST            SAVE AMOUNT IN OBJST    SA49491
+         ST    WORKA,CMLSTTXT          INITIAL TEXT POINTER
+         TM    CMFLAG4,CQMOD      IS THERE INCORE TEXT
+         BZ    END26              NO
+         BAL   RETURN,SWITCH
+END26    EQU   *
+         CL    WORKA,CMHITBL            HAS CORE EXTENT BEEN EXCEEDED
+         BNH   ENDTRCLR                NO
+         B     RERSIZE2                PROGRAM TOO LARGE--ABORT
+SWITCH   L     WORKB,CMCORE1      SWITCH ADDRESSES
+         ST    WORKA,CMCORE1      FOR  COMPILER-LOADED TEXT
+         ST    WORKB,CMNXTTXT
+         ST    WORKB,CMOBJST            SAVE IT                 SA49491
+         L     WORKA,CMCORE2
+         L     WORKB,CMLSTTXT
+         ST    WORKA,CMLSTTXT
+         ST    WORKA,CMLSTTXT
+         ST    WORKB,CMCORE2
+         BR    RETURN
+********                                                        *******
+*                       CLEAR TRANSLATION TABLE                       *
+********                                                        *******
+ENDTRCLR LA    WORKC,CQMAXEXT           NO. OF TRANS. TABLE EXTENTS
+         BCTR  WORKC,0
+         SLL   WORKC,2                  CALC. DISP INTO TRANS. CTRL.TBL
+         LA    WORKB,CMTRCTRL           ADDR. OF TRANS.CTRL. TABLE
+         LH    WORKA,NEG4
+ENDCLEAR L     PTR,0(WORKB,WORKC)       GET ADDR OF EXTENT
+         LTR   PTR,PTR                  HAS EXTENT BEEN ALLOCATED
+         BZ    ENDLOOP                  NO
+         XC    0(CQEXTSIZ,PTR),0(PTR)   CLEAR EXTENT
+ENDLOOP  BXH   WORKC,WORKA,ENDCLEAR     DECR-TEST-LOOP OR CONTINUE
+         XC    CMMODLNG(4),CMMODLNG     CLEAR MODULE LENGTH
+         NI    CMRELFLG,CQNOEND+CQLIB   CLEAR FLAGS
+         NI    CMFLAG4,X'FF'-CQESDS-CQMOD    SET FLAGS 0
+         L     SAVEREG,4(SAVEREG)       RESTORE SAVE AREA PTR
+         RETURN (14,12),T
+********                                                        *******
+*                        ENTRY POINT DEFINITION                       *
+********                                                        *******
+ENDENTRY CH    ID,BLNK+2                IS ID PRESENT
+         BE    ENDSYM                   NO
+         CL    ADR,BLNK                 HAS ADDR.BEEN SPECIFIED
+         BNE   END100                   YES
+         SR    ADR,ADR                  NO, SET ADDR TO ZERO
+END100   ST    ADR,CMEPADDR             SAVE ENTRY POINT  ADDR.
+         BAL   RETURN,TRANSID           CONVERT ID TO TRANS.TABLE ADDR
+         LTR   PARM,PARM                WAS TRANSLATION POSSIBLE
+         BZ    ENDLNG                   NO
+         LA    WORKC,CMEPADDR           CREATE RLD FOR EP
+         ST    WORKC,CMEPNAME+4
+         MVI   CMEPNAME+4,X'0C'         SET FLAG  FIELD FOR EP RLD
+         STH   ID,CMEPNAME              SAVE R PTR FOR EP RLD
+         XC    CMEPCESD(4),CMEPCESD     SET RELOC VALUE TO ZERO
+         LA    WORKA,CMEPCESD-16        SIMULATE P PTR CESD ADDR
+         LA    LNG,8                    GET LENGTH OF RLD ENTRY
+         LR    WORKC,PTR                SAVE BUFFER POINTER
+         LA    PTR,CMEPNAME             GET ADDR OF RLD ENTRY
+         OI    CMRELFLG,CQENTRY         SET INDIC NOT TO TRANS P PTR
+         BAL   RETURN,HEWLRLD          GO TO PROCESS RLD FOR EP
+         LR    PTR,WORKC                RESTORE BUFFER POINTER
+ENDADDR  ST    CESD,CMEPCESD            SAVE ENTRY POINT CESD ADDR
+         OI    CMPRMFLG,CQEPADDR        SET EP ADDR RECEIVED
+         B     ENDLNG
+ENDSYM   CLI   0(PTR),BLANK             IS NAME ON END CARD
+         BE    ENDLNG                   NO
+         MVC   CMEPNAME(8),0(PTR)       SAVE ENTRY POINT NAME
+         OI    CMPRMFLG,CQEPNAME        SET EP NAME RECEIVED
+*                                                                     *
+*                 CHECK IF ENTRY POINT NAME DEFINED YET               *
+*                                                                     *
+         L     WORKC,CMSDCHN            CHECK 'SD' CHAIN
+         LA    RETURN,ENDLRCHN
+ENDEP    LTR   WORKC,WORKC              IS THIS END OF CHAIN
+         BCR   8,RETURN                 YES
+         CLC   CNAME(8,WORKC),CMEPNAME  CHECK FOR ENTRY POINT NAME
+         BE    ENDEPADR
+         L     WORKC,0(WORKC)           UPDATE TO NEXT ENTRY
+         B     ENDEP
+ENDLRCHN LA    RETURN,ENDLNG            SET RETURN REGISTER
+         L     WORKC,CMLRCHN            GET BEGINNING OF LR CHAIN
+         B     ENDEP                    GO TO SEARCH CHAIN
+ENDEPADR MVC   CMEPADDR+1(3),CADR+1(WORKC) SAVE ENTRY POINT ADDR.
+         OI    CMPRMFLG,CQEPADDR        SET INDICATOR FOR EP ADDR
+         B     ENDLNG                   GO TO CHECK LENGTH
+         EJECT
+***********************  TABLE ALLOCATION ROUTINE  ********************
+*                                                                     *
+*   THIS ROUTINE ALLOCATES TABLE EXTENTS AND RETURNS THE ENTRY ADDR.  *
+*     IN #PARM.  #ZERO MUST CONTAIN EXTENT SIZE ON ENTRY.             *
+*                                                                     *
+***********************************************************************
+ALLOCATE EQU   *
+         L     PARM,CMLOWTBL            ADDR OF LOWEST USED TABLE ADDR
+         SR    PARM,ZERO
+         C     PARM,CMLSTTXT            HAVE TABLES OVERLAPPED TEXT
+         BNL   ALLOC
+         B     RERSIZE2                PROGRAM TOO LARGE--ABORT
+ALLOC    ST    PARM,CMLOWTBL            UPDATE LOWEST TABLE ADDRESS
+         BR    RETURN                   RETURN
+         EJECT
+**************************  TRANSLATE ROUTINE  ************************
+*                                                                     *
+*  THIS SUBROUTINE TRANSLATES THE ESD ID TO A CORRESPONDING ENTRY     *
+*     ADDRESS IN  THE TRANSLATE TABLE.  #ID MUST CONTAIN THE ESD ID.  *
+*     THE LOW ORDER BIT OF CMRELFLG SHOULD BE SET TO INDICATE WHETHER *
+*     THE TRANSLATION TABLE ENTRY SHOULD EXIST OR NOT                 *
+*     THE ENTRY ADDRESS IS RETURNED IN #PARM. IF BAD ID,#PARM= 0.     *
+*     THE CONTENTS OF THE ENTRY(CESD ADDR) ARE RETURNED IN #CESD IF   *
+*     REQUESTED BY CQESD FLAG                                         *
+***********************************************************************
+TRANSID  EQU   *
+         STM   14,12,12(13)             SAVE REGISTERS
+         BALR  BASE,0
+         USING *,BASE
+         L     BASE,ABEGIN
+         USING HEWLRELO,BASE      RESET BASE TO INITIAL VALUE
+         L     BASE2,ABEG4096           SET UP SECOND BASE REG  SA49491
+         USING HEWLRELO+4096,BASE2     ESTABLISH ADDRESSABILITY SA49491
+         B     NTRAN+8
+NTRAN    DC    C'TRANSID '
+         L     SAVEREG,8(SAVEREG)       GET NEXT SAVE AREA
+         LTR   ID,ID                    IS ID EQ TO 0
+         BZ    TRBADID                  YES-ERROR
+         LA    ZERO,CQEXTSIZ            NO.OF TRANSLATE EXTENT ENTRIES
+         LA    WORKA,CQMAXEXT           MAX. NO. OF EXTENTS
+         SR    WORKC,WORKC              CLEAR EVEN DIVIDE REGISTER
+         DR    WORKC,ZERO               CALC.TRANSLATE CTRL ENTRY NO.
+         CR    ID,WORKA                 HAS EXTENT BEEN ALLOCATED
+         BNL   TRANSERR                 NO
+         SLL   ID,2                     CALC DISP
+         LA    ID,CMTRCTRL(ID)          CALC TRANSLATE CTRL ENTRY ADDR
+         L     PARM,0(ID)
+         LTR   PARM,PARM                HAS THE EXTENT BEEN ALLOCATED
+         BC    7,CALCADDR               YES, GO TO CALC ADDR
+         TM    CMRELFLG,CQESD           ERROR OR ALLOCATE MORE
+         BZ    TRBADID                  ERROR-BAD ID
+         LA    ZERO,CQEXTSIZ*4          SIZE OF EXTENT
+         BAL   RETURN,ALLOCATE          GO TO ALLOCATE EXTENT
+         ST    PARM,0(ID)               PUT EXTENT ADDR IN CTRL TABLE
+         XC    0(CQEXTSIZ*4,PARM),0(PARM) CLEAR TRANSLATION TABLE ENTRY
+CALCADDR SLL   WORKC,2
+         AR    PARM,WORKC               CALC TRANSLATE ENTRY ADDR
+         TM    CMRELFLG,CQESD           SHOULD ESD BE DEFINED
+         BO    ENDALLOC                 NO
+         L     CESD,0(PARM)             YES,CHECK IF IT IS DEFINED
+         LTR   CESD,CESD
+         BZ    TRBADID                  ERROR, IT IS NOT DEFINED
+ENDALLOC L     SAVEREG,4(SAVEREG)       RESTORE REGISTERS
+         LM    2,8,28(13)               PRESERVE REGISTER 1 AND 9
+         LM    10,12,60(13)
+         L     14,12(13)
+         MVI   12(13),X'FF'             FLAG SAVE AREA
+         BR    RETURN                   RETURN
+TRANSERR TM    CMRELFLG,CQESD           TABLE OVERFLOW OR BAD ID
+         BZ    TRBADID                  BAD ID
+         B     RERSIZE3                TRANS.TABLE SIZE EXCEEDED
+TRBADID  BAL   RETURN,RERINPT7         INVALID ID
+         SR    PARM,PARM                CLEAR PARM REG.
+         B     ENDALLOC                 RETURN TO CALLER
+         EJECT
+********************     EXTERNAL REFERENCE RESOLUTION  ***************
+*                                                                     *
+*   THIS SUBROUTINE RELOCATES ALL RLDS ON A CHAIN, THEN RETURNS. WHEN *
+*      ENTERED #PARM-MUST CONTAIN THE STARTING ADDR.OF THE ER CHAIN   *
+*              #CESD-MUST CONTAIN THE CESD ENTRY ADDR TO BE USED FOR  *
+*                    RELOCATION (R PTR ENTRY)                         *
+*                                                                     *
+***********************************************************************
+HEWLERTN EQU   *
+         STM   14,12,12(13)             SAVE REGISTERS
+RESOLVER BALR  BASE,0
+         USING *,BASE
+         L     BASE,ABEGIN
+         USING HEWLRELO,BASE      RESET BASE TO INITIAL VALUE
+         L     BASE2,ABEG4096           SET UP SECOND BASE REG  SA49491
+         USING HEWLRELO+4096,BASE2     ESTABLISH ADDRESSABILITY SA49491
+         B     NERTN+8
+NERTN    DC    C'HEWLERTN'
+         L     SAVEREG,8(SAVEREG)       GET NEXT SAVE AREA
+ERRTN    LTR   PARM,PARM                IS THIS LAST ON CHAIN
+         BC    7,ER5                   NO
+ER2      L     SAVEREG,4(SAVEREG)       RESTORE PTR TO SAVE AREA
+         RETURN (14,12),T
+ER5      LA    LNG,3                    SET LNG OF 4 FOR EX INSTRUCTION
+         TM    4(PARM),X'0C'            IS THE LENGTH EQ TO 4
+         BO    ER10                     YES
+         LA    LNG,2                    SET LNG OF 3 FOR EX INSTRUCTION
+         TM    4(PARM),X'04'            IS IT A TWO BYTE ADCON
+         BZ    ER10                     NO,CONTINUE RELOCATION
+         LA    LNG,1                    SET LNG EQ 1
+         TM    4(PARM),PRRLD            IS IT A VALID 2 BYTE PR
+         BO    ER10                     YES,CONTINUE RELOCATION
+         BAL   RETURN,RERINPT5         INVALID TWO BYTE ADCON
+*                                                                     *
+*        MOVE ADCON FROM TEXT TO WORK AREA                            *
+*                                                                     *
+ER10     L     WORKA,4(PARM)            GET TEXT ADDR. OF ADCON
+         LA    WORKA,0(WORKA)           CLEAR HIGH ORDER FLAG FIELD
+         LA    WORKB,CMADCON+3          END ADDR OF ADCON SAVE AREA
+         SR    WORKB,LNG
+         MVI   CMADCON,X'00'           CLEAR HIGH ORDER BYTE
+         EX    LNG,MOVEOUT              MOVE ADCON TO WORK AREA
+*                                                                     *
+*        TEST TYPE TO DETERMINE WHAT TYPE OF RELOCATION TO PERFORM    *
+*                                                                     *
+         TM    CMRELFLG,CQDELINK        IS DELINKING NEEDED
+         BO    ER60                     YES
+         TM    4(PARM),PRRLD           IS THIS A PR RLD
+         BO    ER15                    YES, GO FOR ABSOLUTE RELOCATION
+         TM    4(PARM),VCON             IS ADCON BRANCH TYPE
+         BZ    ER40                     NO, IT IS NON-BRANCH TYPE
+*                                                                     *
+*                       ABSOLUTE  RELOCATION                          *
+*                                                                     *
+ER15     MVC   CMADCON(4),CADR(CESD)   GET LOADER ASSIGNED ADDRESS
+         MVI   CMADCON,X'00'            CLEAR HIGH ORDER BYTE
+         EX    LNG,MOVEIN               SET ADCON=LOADER ASSIGNED ADDR
+*                                                                     *
+*              PUT RLD ENTRY ON FREE ENTRY CHAIN                      *
+*                                                                     *
+ER20     L     WORKA,0(PARM)            SAVE ER CHAIN PTR
+         L     WORKB,CMRLDCHN           GET START OF CHAIN
+         ST    WORKB,0(PARM)
+         ST    PARM,CMRLDCHN            ADD ENTRY TO TOP OF CHAIN
+         LR    PARM,WORKA
+         B     ERRTN                    CONTINUE RESOLUTION
+********                                                        *******
+*                 RELATIVE    RELOCATION                              *
+********                                                        *******
+ER40     L     WORKA,CREL(CESD)         GET RELOCATION VALUE
+         TM    4(PARM),X'80'           IS ABSOLUTE RELOC FACTOR NEEDED
+         BZ    ER45                    NO
+         CLI   CTYPE(CESD),CM          IS THIS COMMON            A46172
+         BE    ER45                    YES-ABSOL FACTOR IN CREL  A46172
+         L     WORKA,CADR(CESD)        GET ABSOLUTE RELOC FACTOR
+         LA    WORKA,0(WORKA)
+ER45     TM    4(PARM),X'02'           DOES RLD INDICATE SUBT.
+         BZ    ER50                     NO
+         LCR   WORKA,WORKA              COMPLEMENT VALUE
+ER50     A     WORKA,CMADCON           RELOCATE ADCON
+         ST    WORKA,CMADCON            STORE ADCON VALUE FOR MOVE
+         L     WORKA,4(PARM)            GET TEXT ADDR. FOR ADCON
+         EX    LNG,MOVEIN               MOVE RELOCATED ADCON TO TEXT
+         B     ER20
+*                                                                     *
+*       SPECIAL DELINKING FOR ADCONS POINTING TO COMMON AREAS.        *
+*                                                                     *
+ER60     L     WORKC,CREL(CESD)         GET ADDR OF EXTENDED CM ENTRY
+         TM    CTYPE(CESD),CM           DOES WORKC CONTAIN ADDR OF EXT.
+*                                          ENTRY(CM) OR INPUT ADDR(ER)
+         BNZ   ER65                     WORKC CONTAINS INPUT ADDR(ER)
+         NI    CREL(CESD),X'7F'        TURN OFF DELETE BIT      ZA01335
+         B     ER70                    CONTINUE                 ZA01335
+ER65     EQU   *                       HERE IF COMMON           ZA01335
+         L     WORKC,CADR(WORKC)        GET INPUT ADDR FOR COMMON
+         OI    4(PARM),X'80'            SHOW ABS RELO FAC NEEDED A46172
+ER70     LA    WORKC,0(WORKC)           CLEAR HIGH ORDER BYTE
+         L     ZERO,CMADCON             GET ADCON VALUE
+         SR    ZERO,WORKC               SUBTRACT INPUT ADDR
+         ST    ZERO,CMADCON
+         EX    LNG,MOVEIN               MOVE DELINKED VALUE BACK TO TXT
+         NI    CMRELFLG,CQFF-CQDELINK   SET DELINK INDICATOR OFF
+         B     ER2
+         EJECT
+******************************* IEWLMAP *******************************
+*                                                                     *
+* THIS SUBROUTINE FORMATS THE MAP PRINT LINE AND USES THE PRINT  RTN. *
+*     #CESD=ADDR OF CESD ENTRY TO BE MAPPED                           *
+*                                                                     *
+**********                                                      *******
+HEWLMAP  EQU   *
+         STM   14,12,12(13)             SAVE REGISTERS
+         BALR  BASE,0
+         USING *,BASE
+         L     BASE,ABEGIN
+         USING HEWLRELO,BASE
+         L     BASE2,ABEG4096           SET UP SECOND BASE REG  SA49491
+         USING HEWLRELO+4096,BASE2     ESTABLISH ADDRESSABILITY SA49491
+         B     NMAP+8
+NMAP     DC    C'HEWLMAP '
+         TM    CMPRMFLG,CQMAP           IS MAP OPTION SPECIFIED
+         BZ    MAPRETRN                 NO
+         L     SAVEREG,8(SAVEREG)       PICK UP NEXT SAVE AREA
+         CLC   CMWTBFCT(2),CMMAPLIN   IS LINE FULL
+         BL    MAP20                    NO,MAKE ENTRY
+         L     BRANCH,ADPRINT
+         BALR  RETURN,BRANCH            GO TO PRINT LINE-GET NEW LINE
+MAP20    L     PTR,CMPUTREC
+         AH    PTR,CMWTBFCT             CALC NEXT BUFFER ADDR.
+         TM    CMFLAG4,CQMOD       WAS THIS PASSED THROUGH MOD RECORD
+         BNO   MAP30               NO. CHECK AUTOCALL
+         MVC   SUFFIXNM(3,PTR),TRISTAR   YES. MARK AS PRE-LOADED TEXT
+         B     MAPNAME
+MAP30    EQU   *
+         TM    CMLIBFLG,CQAUTOC         WAS ENTRY CREATED BY AUTOCALL
+         BZ    MAPNAME                  NO
+         MVI   SUFFIXNM(PTR),C'*'       YES, MOVE IN LIBRARY DESIGNATOR
+         TM    CMRELFLG,CQLIB           IS RESOLUTION FROM SYSLIB
+         BO    MAPNAME                  YES
+         MVI   SUFFIXNM+1(PTR),C'*'     NO,FROM LINK PACK AREA
+MAPNAME  MVC   NAME(8,PTR),CNAME(CESD)  MOVE IN NAME
+         TM    CTYPE(CESD),NULL         IS IT AN 'SD'
+         BZ    MAPSD                    YES
+         TM    CTYPE(CESD),LR           IS IT AN 'LR'
+         BO    MAPLR                    YES
+         BZ    MAPPC                    IT IS 'PC'
+         TM    CTYPE(CESD),CM           IS IT A 'CM'
+         BO    MAPCM                    YES
+MAPPR    MVC   TYPE(2,PTR),PRTYPE       IT IS A 'PR',MOVE IN 'PR'TYPE
+         B     MAPADDR                  GO TO MAP ADDR
+MAPSD    MVC   TYPE(2,PTR),SDTYPE       IT IS AN 'SD'MOVE IN 'SD' TYPE
+         B     MAPADDR                  GO TO CHECK FOR EP NAME
+MAPLR    MVC   TYPE(2,PTR),LRTYPE       IT IS AN 'LR' MOVE IN 'LR'TYPE
+         B     MAPADDR                  GO TO CHECK FOR EP NAME
+MAPPC    MVC   PREFIXNM(13,PTR),PRIVATE IT IS A 'PC',MOVE IN PRIVATE
+         B     MAPADDR                               DESIGNATOR
+MAPCM    MVC   TYPE(2,PTR),CMNTYPE      IT IS CM, MOVE IN TYPE
+         CLI   CNAME(CESD),BLANK        IS IT BLANK COMMON
+         BNE   MAPADDR                  NO
+         MVC   PREFIXNM(9,PTR),BLANKCOM MOVE IN BLANK COMMON DESIGNATOR
+MAPADDR  L     PARM,CADR(CESD)          GET ADDR TO BE MAPPED
+         BAL   14,HEWLCNVT        GO TO CONVERSION ROUTINE
+         MVC   ADDR(6,PTR),CMXDBLWD+1   MOVE IN CONVERTED ADDR
+         LH    PARM,CMWTBFCT
+         LA    PARM,ENTRYSZ(PARM)
+         STH   PARM,CMWTBFCT            UPDATE BUFFER BYTE COUNT
+         L     SAVEREG,4(SAVEREG)       PICK UP LAST SAVE AREA
+MAPRETRN RETURN (14,12),T
+         EJECT
+************************ CONVERSION  ROUTINE  *************************
+*                                                                     *
+*   THIS SUBROUTINE CONVERTS A BINARY QUANTITY IN REGISTER 1  TO      *
+*       PRINT CHARACTERS.  THE RESULT IS IN THE COMMUNICATIONS AREA   *
+*       CMDBLEWD+1. REGISTERS  0 AND 1 DESTROYED                      *
+*                                                                     *
+***************                             ***************************
+HEWLCNVT EQU   *
+         BALR  BASE,0
+         USING *,BASE
+         L     BASE,ABEGIN
+         USING HEWLRELO,BASE      RESET BASE TO INITIAL VALUE
+         L     BASE2,ABEG4096           SET UP SECOND BASE REG  SA49491
+         USING HEWLRELO+4096,BASE2     ESTABLISH ADDRESSABILITY SA49491
+         LA    PARM,0(PARM)             CLEAR HIGH ORDER BITS
+         LTR   PARM,PARM                TEST FOR ZERO
+         BC    7,CVTCONT                NO
+         MVC   CMXDBLWD+1(6),ZEROADDR   STORE ZERO
+         BR    RETURN                   RETURN
+CVTCONT  ST    PARM,CMXDBLWD            PLACE BINARY QUANTITY IN AREA
+         UNPK  CMXDBLWD+1(7),CMXDBLWD+1(4) UNPACK BINARY QUANTITY
+         MVZ   CMXDBLWD+1(6),CMXDBLWD   ZERO ZONES FOR TRANSLATE
+         TR    CMXDBLWD+1(6),TRTABLE    TRANSLATE FOR PRINTING
+         LA    ZERO,1                   LOAD INCREMENT
+         LA    PARM,CMXDBLWD+1          GET ADDR. OF CONVERTED QUANTITY
+HIGHZERO CLI   0(PARM),C'0'             TEST FOR ZERO
+         BCR   7,RETURN                 NONE, SO RETURN
+         MVI   0(PARM),C' '             REPLACE ZERO WITH BLANK
+         BXH   PARM,ZERO,HIGHZERO       INCR AND LOOP TO NEXT DIGIT
+         EJECT
+         DS    0F                                       ZA01335,SA49491
+*    THE FOLOWING TWO CONSTANTS MUST BE WITH THE FIRST 2K       SA49491
+ABEGIN   DC    A(HEWLRELO)        USED TO ESTABLISH ADDR.
+ABEG4096 DC    A(HEWLRELO+4096)   ADCON FOR SECOND BASE         SA49491
+*                                                                     *
+***********************  ERROR  ROUTINES  *****************************
+*                                                                     *
+RERINPT2 LA    ZERO,ERINPT2             INVALID LNG SPECIFIED FOR CSECT
+         B     ERROR
+RERINPT4 LA    ZERO,ERINPT4            DOUBLY DEFINED SYMBOL----
+         LR    PARM,PTR                      CONFLICTING TYPES
+         B     ERROR
+RERINPT5 LA    ZERO,ERINPT5            INVALID TWO-BYTE ADCON
+         B     ERROR
+RERINPT7 LA    ZERO,ERINPT7            INVALID ID
+         B     ERROR
+RERINPT8 LA    ZERO,ERINPT8            CARD PRINTED NOT OBJECT CARD
+         B     ERR
+RERINPT9 LA    ZERO,ERINPT9            INVALID INPUT FROM OBJ. MODULE
+         B     ERR
+RERINPTA LA    ZERO,ERINPT10            WARNING--NO END CARD
+         B     ERROR
+RERSIZE2 LA    ZERO,ERSIZE2            PROGRAM TOO LARGE
+         B     ERROR
+RERSIZE3 LA    ZERO,ERSIZE3            TRANS. TABLE OVERFLOW
+         B     ERROR                        CONFLICTING TYPES
+ERR      L     PARM,CMGETREC           GET ADDR.OF BUF.TO BE PRINTED
+         TM    CMFLAG3,CQINCORE    IS THIS INCORE DATA SET
+         BZ    ERROR               NO. GO AHEAD
+         OI    CMIOFLGS,CQEOFB+CQEOCB  YES. SET FLAGS SO WE WON'T READ
+*                                           ANY MORE
+ERROR    LR    WORKC,RETURN            SAVE RETURN REGISTER
+         L     BRANCH,ADERROR
+         BALR  RETURN,BRANCH           GO TO LOG ERROR
+         LR    RETURN,WORKC            RESTORE RETURN REGISTER
+         BR    RETURN
+         EJECT
+MOVE2    MVC   0(1,ADR),0(PTR)          MOVE TEXT FROM REC.TO STORAGE
+MOVEOUT  MVC   0(1,WORKB),0(WORKA)      MOVE ADCON TO WORK AREA
+MOVEIN   MVC   0(1,WORKA),0(WORKB)      MOVE ADCON FROM WORK AREA
+         DS    0F                                               SA49491
+ADPRINT  DC    V(HEWLPRNT)        ADDRESS OF PRINT ROUTINE
+ADERROR  DC    V(HEWERROR)        ADDRESS OF ERROR ROUTINE
+ADREAD   DC    V(HEWLREAD)        ADDRESS OF OBJ. READ ROUTINE
+         DS    0F
+*                                                                     *
+* THIS TABLE IDENTIFIES THE CESD CHAINS TO BE SEARCHED FOR EACH INPUT *
+*                              ESD TYPE                               *
+*                                                                     *
+HIERTBLE EQU   *
+         DC    X'02000583'             SD--ER,SD,CM,LR
+         DC    X'80000000'             LD--NEVER SEARCHED
+         DC    X'00020385'             ER--SD,ER,LR,CM
+         DC    X'02030085'             LR--ER,LR,SD,CM
+         DC    X'80000000'             PC--NEVER SEARCHED
+         DC    X'05020083'             CM--CM,ER,SD,LR
+         DC    X'86000000'             PR--PR--------
+         DC    X'80000000'             NULL-----NEVER SEARCHED
+BLANKCOM DC    C'$BLANKCOM'             BLANK COMMON DESIGNATOR
+PRIVATE  DC    C'$PRIVATE   PC'         PRIVATE CODE DESIGNATOR
+TRTABLE  DC    C'0123456789ABCDEF'      TRANSLATION TABLE
+ZEROADDR DC    C'    00'                ADDR OR DISP VALUE EQ 0
+NEG4     DC    H'-4'                    DECR. FOR TRANS.TABLE CLEARING
+ONE      DC    H'1'
+CONT4    DC    H'4'
+CONT8    DC    H'8'
+CONT16   DC    H'16'
+TRISTAR  DC    C'***'              FLAG PRE-LOADED TEXT IN MAP
+         DS    0F                       ALIGNMENT
+BLNK     DC    X'00'                    BLANK ADDR. ON WORK BOUNDARY
+         DC    C'   '
+         DS    0F                                               SA49491
+DBLWRD   DC    X'FFFFFFF8'              MASK TO ZERO LAST 3 BITS
+TYPEONLY DC    X'00000007'              CLEAR ALL BUT TYPE FIELD
+PRTYPE   DC    C'PR'                    USED FOR MAPPING TYPE
+SDTYPE   DC    C'SD'                    USED FOR MAPPING TYPE
+CMNTYPE  DC    C'CM'                    USED FOR MAPPING TYPE
+LRTYPE   DC    C'LR'                    USED FOR MAPPING TYPE
+TYPETBLE DC    X'02'                    TYPE COMPARISON TABLE
+         DC    C'TXT'
+         DC    A(HEWLTXT)         TEXT PROCESSOR
+         DC    X'02'
+         DC    C'RLD'
+         DC    A(HEWLRLD)         RLD PROCESSOR
+         DC    X'02'
+         DC    C'ESD'
+         DC    A(HEWLESD)         ESD PROCESSOR
+         DC    X'02'
+         DC    C'SYM'
+         DC    A(RELOREAD)              READ REQUEST ROUTINE
+         DC    X'02'
+         DC    C'END'
+         DC    A(HEWLEND)         END PROCESSOR
+         DC    X'02'
+         DC    C'MOD'
+         DC    A(HEWLMOD)
+PATCH    DC    A(HEWLRELO)
+**************************************************************
+*        PATCH AREA
+**************************************************************
+         DC    40F'0'
+         EJECT
+         HEWLDCOM
+         END

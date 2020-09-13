@@ -1,0 +1,630 @@
+OMA      CSECT                         DEFINE CSECT
+***********************************************************************
+*
+*                  SP3 VERSION OF CONSOLE
+*
+* CONSOLE DISPLAYS ANY MVS CONSOLE ON THE CALLER'S TSO TUBE.
+*
+* CONSOLE REQUIRES THAT THE CALLER IS LOGGED ON AT A 3270 AND THAT THE
+* CURRENT MASTER CONSOLE IS A 3270-LIKE TERMINAL.
+*
+* TWO MODES OF OPERATION ARE AVAILABLE.  IN THE STATIC MODE, CONSOLE
+* ONLY UPDATES THE SCREEN WHEN THE USER DEPRESSES "ENTER".  IN THE ROLL
+* MODE, THE SCREEN IS UPDATED EVERY TWO SECONDS.  THE ROLL MODE IS
+* INITIATED BY PF2/14.  TO RETURN TO THE STATIC MODE, HIT PA1 OR ATTN.
+*
+* IN EITHER MODE OF OPERATION, THE SCREEN IS NOT ACTUALLY REWRITTEN
+* UNLESS THE MASTER CONSOLE BUFFER HAS CHANGED.
+*
+* MVS OR JES COMMANDS MAY BE ENTERED IN THE LOWER LEFT HAD CORNER
+* OF THE SCREEN.
+*
+* ONE ADDITIONAL COMMAND IS RECOGNIZED BY CONSOLE:
+* CID CC REDEFINES THE CONSOLE TO BE DISPLAYED. CC IS THE DESIRED
+*        CONSOLE ID IN HEX.
+*
+***********************************************************************
+*
+*     REGISTER EQUATES AND USAGE
+*
+         REGISTER LINK=14         REGISTER EQUATES
+*
+*     HOUSEKEEPING
+*
+         ENTER BASEREG=(R12,R11,R10), SET UP LINKAGE                   X
+               PARMREG=R3
+*
+*     WHO IS USING ME?
+*
+         L     R2,548(R0)              GET MY ASCB ADDR
+         MVC   MYASID,36(R2)           SAVE MY ASID
+         L     R2,176(R2)              LOAD MY USERID ADDR
+         MVC   PF12CMD+2(7),0(R2)      SAVE MY USERID TOO
+         CLC   0(1,R2),=C'S'           IS HE OK?
+         BE    OKUSER
+         ABEND 16                      BAD USER, ABEND
+OKUSER   EQU   *
+         MVI   OKSWTCH,OK              SET FULL AUTHORIZATION
+*
+*     CHECK FOR 3270 AND INFORM VTAM
+*
+         OI    FLAG,FULLSCRN      SET FULL SCREEN MODE
+         GTSIZE ,                      GET THE TERMINAL SIZE
+         CH    R0,=H'32'               CHECK NUMBER OF LINES
+         BE    OKTERM                  IF NOT ZERO, WE CAN BEGIN
+         TPUT  FULLMSG,L'FULLMSG,      LET HIM KNOW ABOUT TERMINAL     X
+               EDIT,WAIT,HOLD
+         NI    FLAG,255-FULLSCRN  RESET FULL SCREEN MODE
+OKTERM   EQU   *
+*
+*     LOCATE CONSOLE ADDRESS SPACE
+*
+         L     R1,16(0)                LOAD ADDR OF CVT
+         L     R1,556(R1)              LOAD ADDR OF ASVT
+         LA    R1,524(R1)              POINT BEFORE FIRST ENTRY
+ASVTLOOP LA    R1,4(R1)                POINT TO NEXT ENTRY
+         CLC   0(4,R1),=X'80000000'    END OF TABLE?
+         BE    ENDASVT
+         TM    0(R1),X'80'             AVAILABLE ASCB?
+         BO    ASVTLOOP                IF SO, IGNORE IT
+         L     R2,0(R1)                LOAD ADDR OF ASCB
+         ICM   R3,B'1111',176(R2)      LOAD & TEST PTR TO LOGON JOBNAME
+         BZ    ASVTLOOP                IF ZERO, KEEP GOING
+         CLC   0(8,R3),=C'CONSOLE '    IS THIS THE SPECIFIED JOB?
+         BE    FOUND                   IF SO, QUIT SEARCH
+         B     ASVTLOOP
+ENDASVT  EQU   *
+         TPUT  ERRMSG3,L'ERRMSG3       LET HIM KNOW ABOUT TERMINAL     X
+               EDIT,WAIT,HOLD
+         B     RETURN                  THAT'S ALL
+FOUND    EQU   *
+         MVC   CONSASID,36(R2)         SAVE CONSOLE'S ASID
+*
+*     NOW PREPARE FOR CROSS MEMORY STUFF
+*
+         BAL   R14,MODESETS            SET TO SUPERVISOR STATE
+         LA    R2,1
+         AXSET AX=(R2)
+         BAL   R14,MODESETP            SET BACK TO PROBLEN STATE
+         MVI   CONSID,X'FF'            DEFAULT TO MASTER CONSOLE
+         MVI   UCMID,0                 DEFAULT TO JUNK
+         BAL   LINK,FINDCON            LOCATE THE CONSOLE BUFFER
+         CLI   UCMID,0
+         BNE   HAVEMSTR
+         TPUT  CONSMSG,L'CONSMSG       LET HIM KNOW                    X
+               EDIT,WAIT,HOLD
+         B     RETURN                  THAT'S ALL
+HAVEMSTR EQU   *
+*
+*     INITIALIZE
+*
+         MVC   MSGAREA,FIXEDMSG        INITIALIZE MESSAGE AREA
+         MVC   ROLL,=C'----'           SET MODE TO NORMAL
+         MVI   ATTNFLAG,OFF            TURN OFF ATTNFLAG
+         TM    FLAG,FULLSCRN      Q. FULL SCREEN MODE?
+         BZ    LOOP               A. NO, SKIP FULL SCREEN STUFF
+         STFSMODE ON,INITIAL=YES       TELL =2AM WE'RE FULL SCREEN
+         TPUT  CLEAR,LCLEAR,           CLEAR THE SCREEN                X
+               FULLSCR,WAIT,NOHOLD
+*
+*     THIS IS THE MAIN PROGRAM LOOP
+*
+LOOP     EQU   *
+*
+*   COPY CONSOLE SCREEN TO OUR BUFFER
+*
+READMSTR BAL   R14,MODESETS
+         LH    R5,CONSASID             LOAD CONSOLE'S ASID
+         SSAR  R5                      SET SECONDARY ADDRESS SPACE
+         LA    R1,LTARGET              LENGTH TO MOVE
+         LA    R2,TARGET               THIS IS WHERE I WANT TO MOVE TO
+         L     R3,SCREENPT             MOVE FROM HERE
+         LA    R4,0                    PROTECT KEY IS ZERO
+MVCPLOOP MVCP  0(R1,R2),0(R3),R4       MOVE A CHUNK
+         BZ    MVCPDONE                QUIT IF EVERYTHING MOVED
+         SL    R1,=F'256'              DECREASE TRUE LENGTH
+         AL    R2,=F'256'              INCREASE TARGET ADDR
+         AL    R3,=F'256'              INCREASE SOURCE ADDR
+         B     MVCPLOOP
+MVCPDONE EQU   *
+         LH    R5,MYASID               LOAD MY ASID
+         SSAR  R5                      SET SECONDARY ADDRESS SPACE
+         BAL   R14,MODESETP
+BYPASS   TM    FLAG,FULLSCRN      Q. FULL SCREEN MODE?
+         BZ    TPUTEDIT           A. NO, SKIP FULL SCREEN STUFF
+         LA    R0,TARGET          GET ADDRESS OF DATA
+         LA    R1,LTARGET         GET LENGTH OF DATA
+         LA    R14,OLDBUFR        GET ADDRESS OF OLDDATA
+         LA    R15,LOLDBUFR       GET LENGTH OF OLDDATA
+         CLCL  R0,R14             Q. DATA UNCHANGED?
+         BE    TGET               A. YES SKIP TPUT
+         LA    R2,OLDBUFR         LOAD ADDRESS OF OLD BUFFER
+         LA    R3,LOLDBUFR        LOAD LENGTH OF OLD BUFFER
+         LA    R4,TARGET          GET ADDRESS OF DATA
+         LA    R5,LTARGET         GET LENGTH OF DATA
+         MVCL  R2,R4              MOVE DATA INTO OLD BUFFER
+         TPUT  MYBUFF,LBUFFER,    AND SEND IT                          X
+               FULLSCR,WAIT,NOHOLD
+TGET     EQU   *
+         CLC   ROLL,=C'ROLL'           ROLL MODE?
+         BNE   GETTERM                 NOPE
+         CLI   ATTNFLAG,ON             ATTN HIT?
+         BNE   TGETWAIT                NO, GO DO TGET AND/OR WAIT
+         MVI   ATTNFLAG,OFF            RESET ATTN FLAG
+         MVC   ROLL,=C'----'           BACK TO REGULAR MODE
+         MVC   OLDBUFR(4),=C'JUNK'     MAKE SURE WE REWRITE THE SCREEN
+         STAX  ,                       ELIMINATE ATTENTION EXIT
+         B     LOOP                    GO READ THE CONSOLE
+TGETWAIT EQU   *
+         STIMER WAIT,BINTVL=WAITIME    WAIT BRIEFLY
+         B     LOOP                    GO READ THE CONSOLE
+TPUTEDIT EQU   *
+         LA    R2,84              LOAD LENGTH OF LINE
+         LA    R3,TARGET+LTARGET  LOAD ADDRESS OF END
+         LA    R4,TARGET+5        GET ADDRESS OF DATA
+TPUTLOOP EQU   *
+         LA    R0,84              GET LINE LENGTH
+         LA    R1,OLDBUFR+LOLDBUFR GET ADDRESS OF END
+         LA    R5,OLDBUFR+5       GET ADDRESS OF START
+CHKLOOP  EQU   *
+         CLC   5(74,R5),5(R4)     Q. HAS MESSAGE ALREADY BEEN OUTPUT?
+         BE    NOTPUT             A. YES THEN SKIP TPUT
+         BXLE  R5,R0,CHKLOOP      LOOP FOR ALL LINES
+         TPUT  (R4),79,           TPUT LINE                            X
+               EDIT,WAIT,NOHOLD
+NOTPUT   EQU   *
+         BXLE  R4,R2,TPUTLOOP     LOOP TILL DONE
+         LA    R2,OLDBUFR         LOAD ADDRESS OF OLD BUFFER
+         LA    R3,LOLDBUFR        LOAD LENGTH OF OLD BUFFER
+         LA    R4,TARGET          GET ADDRESS OF DATA
+         LA    R5,LTARGET         GET LENGTH OF DATA
+         MVCL  R2,R4              MOVE DATA INTO OLD BUFFER
+         CLC   ROLL,=C'ROLL'           ROLL MODE?
+         BNE   TGETEDIT                NOPE
+         CLI   ATTNFLAG,ON             ATTN HIT?
+         BNE   TGETWAIT                NO, GO DO TGET AND/OR WAIT
+         MVI   ATTNFLAG,OFF            RESET ATTN FLAG
+         MVC   ROLL,=C'----'           BACK TO REGULAR MODE
+         MVC   TARGET(4),=C'JUNK'      MAKE SURE WE REWRITE THE SCREEN
+         STAX  ,                       ELIMINATE ATTENTION EXIT
+         B     LOOP                    GO READ THE CONSOLE
+TGETEDIT EQU   *
+         TGET  CMDBUFF,100,EDIT,WAIT
+         BAL   LINK,ISSUE         GO ISSUE COMMAND
+         B     LOOP               RETURN TO LOOP
+*
+*     ROUTINE TO READ SCREEN
+*
+*     LOCAL REGISTER USE:
+*
+*     R4  - PTR TO CURRENT BYTE IN CMDBUFF
+*     R5  - PTR TO CURRENT BYTE IN TGETAREA
+*     R6  - PTR TO LAST BYTE IN TGETAREA
+GETTERM  EQU   *
+         TGET  TGETAREA,100,ASIS,WAIT  READ THE TERMINAL
+GETDONE  EQU   *
+         MVI   MYBUFF,X'C1'            SET NORMAL WCC
+         MVC   CURSOR,=X'E4D1'         SET CURSOR TO ROW 30 COL 02
+         MVC   MSGAREA,FIXEDMSG        RESET MESSAGE AREA
+         CLI   TGETAREA,SHORT          WAS IT A SHORT READ?
+         BNE   USEINPUT                NOPE
+         MVC   TARGET(4),=C'JUNK'      MAKE SURE WE REWRITE THE SCREEN
+         B     LOOP                    AND GO DO IT
+USEINPUT EQU   *
+         LA    R4,CMDBUFF              POINT TO CMDBUFF
+         XC    CMDBUFF,CMDBUFF         SET CMDBUFF TO NULLS
+         LA    R5,TGETAREA             POINT TO TGETAREA
+         BCTR  R1,0                    R1 IS OFFSET TO LAST BYTE
+         AR    R1,R5                   COMPUTE ADDR OF LAST BYTE READ
+         LR    R6,R1                   AND SAVE IT
+         LA    R5,1(R5)                SKIP OVER AID BYTE
+         LA    R5,2(R5)                SKIP OVER CURSOR ADDRESS
+         CR    R5,R6                   ARE WE BEYOND LAST BYTE?
+         BH    ENDFIELD                YEP, QUIT
+*
+*     NOW PROCESS THE ONE AND ONLY MODIFIED FIELD
+*
+         CLC   0(3,R5),=X'11E4D1'      SBA, ROW 30, COL 2?
+         BE    OKFIELD                 MODIFIED FIELD IS AS EXPECTED
+         MVC   LASTCMD(9),=C'-BAD SBA-'
+         B     LOOP
+OKFIELD  LA    R5,3(R5)                SKIP OVER SBA
+NEXTBYTE CR    R5,R6                   BEYOND LAST BYTE IN TGETAREA?
+         BH    ENDFIELD                YEP
+         MVC   0(1,R4),0(R5)           MOVE BYTE TO CMDBUFF
+         LA    R4,1(R4)                POINT TO NEXT BYTE IN SCREEN
+         LA    R5,1(R5)                POINT TO NEXT BYTE IN TGETAREA
+         B     NEXTBYTE                GO GET ANOTHER BYTE
+ENDFIELD EQU   *
+*
+*     NOW PROCESS THE COMMAND
+*
+         CLI   TGETAREA,ENTER          WAS COMMAND ENTER?
+         BNE   NOTENTER                NOPE
+*
+*     ENTER HIT, IF NON BLANK - ISSUE COMMAND
+*
+         BAL   LINK,ISSUE
+         B     LOOP
+NOTENTER EQU   *
+         MVC   OLDBUFR(4),=C'JUNK'     MAKE SURE WE REWRITE THE SCREEN
+*
+*     IF PF13 - DISPLAY HELP INFO
+*
+         OI    TGETAREA,X'30'          CHANGE PF16-24 TO PF4-12
+         CLI   TGETAREA,PF1            WAS COMMAND FOR HELP?
+         BNE   NOTPF13                 NOPE
+         TPUT  HELPMSG,LHELPMSG,                                       X
+               FULLSCR,WAIT,NOHOLD
+         TGET  TGETAREA,100,ASIS,WAIT  READ THE TERMINAL
+         TPUT  CLEAR,LCLEAR,           CLEAR THE SCREEN                X
+               FULLSCR,WAIT,NOHOLD
+         B     LOOP                    GO READ THE CONSOLE
+NOTPF13  EQU   *
+*
+*     IF PF14 - INITIATE ROLL MODE
+*
+         CLI   TGETAREA,PF2            WAS COMMAND TO ROLL?
+         BNE   NOTPF14                 NOPE
+SETROLL  EQU   *
+         MVC   ROLL,=C'ROLL'           REMEMBER IT
+         STAX  STAXEXIT                SET UP ATTENTION EXIT
+         B     LOOP                    GO READ THE CONSOLE
+NOTPF14  EQU   *
+*
+*     IF PF15 - WE'RE THROUGH
+*
+         CLI   TGETAREA,PF3            WAS COMMAND TO END?
+         BE    DONE                    THEN QUIT
+*
+*     IF PF5 - INSERT LAST COMMAND
+*
+         CLI   TGETAREA,PF5            WAS COMMAND TO INSERT LAST CMD?
+         BNE   NOTPF5                  NOPE
+         MVC   CMDBUFF,LASTCMD         REMEMBER IT
+         B     LOOP                    GO READ THE CONSOLE
+NOTPF5   EQU   *
+*
+*     IF PF6 - REISSUE LAST COMMAND
+*
+         CLI   TGETAREA,PF6            WAS COMMAND TO ISSUE LAST CMD?
+         BNE   NOTPF6                  NOPE
+         MVC   CMDBUFF,LASTCMD         RECALL LAST COMMAND
+         BAL   LINK,ISSUE              AND ISSUE IT
+         B     LOOP
+NOTPF6   EQU   *
+*
+*     IF PF7 - CANNED COMMAND
+*
+         CLI   TGETAREA,PF7            RECALL A CANNED COMMAND?
+         BNE   NOTPF7                  NOPE
+         MVC   CMDBUFF(L'PF7CMD),PF7CMD
+         MVC   CURSOR,=X'E460'         SET CURSOR TO ROW 30 COL 17
+         B     LOOP                    GO READ THE CONSOLE
+NOTPF7   EQU   *
+*
+*     IF PF8 - CANNED COMMAND
+*
+         CLI   TGETAREA,PF8            RECALL A CANNED COMMAND?
+         BNE   NOTPF8                  NOPE
+         MVC   CMDBUFF(L'PF8CMD),PF8CMD
+         MVC   CURSOR,=X'E45C'         SET CURSOR TO ROW 30 COL 13
+         B     LOOP                    GO READ THE CONSOLE
+NOTPF8   EQU   *
+*
+*     IF PF9 - CANNED COMMAND
+*
+         CLI   TGETAREA,PF9            RECALL A CANNED COMMAND?
+         BNE   NOTPF9                  NOPE
+         MVC   CMDBUFF(L'PF9CMD),PF9CMD
+         MVC   CURSOR,=X'E45E'         SET CURSOR TO ROW 30 COL 15
+         B     LOOP                    GO READ THE CONSOLE
+NOTPF9   EQU   *
+*
+*     IF PF10 - CANNED COMMAND
+*
+         CLI   TGETAREA,PF10           RECALL A CANNED COMMAND?
+         BNE   NOTPF10                 NOPE
+         MVC   CMDBUFF(L'PF10CMD),PF10CMD
+         MVC   CURSOR,=X'E45A'         SET CURSOR TO ROW 30 COL 11
+         B     LOOP                    GO READ THE CONSOLE
+NOTPF10  EQU   *
+*
+*     IF PF11 - CANNED COMMAND
+*
+         CLI   TGETAREA,PF11           RECALL A CANNED COMMAND?
+         BNE   NOTPF11                 NOPE
+         MVC   CMDBUFF(L'PF11CMD),PF11CMD
+         MVC   CURSOR,=X'E45A'         SET CURSOR TO ROW 30 COL 11
+         B     LOOP                    GO READ THE CONSOLE
+NOTPF11  EQU   *
+*
+*     IF PF12 - CANNED COMMAND
+*
+         CLI   TGETAREA,PF12           RECALL A CANNED COMMAND?
+         BNE   NOTPF12                 NOPE
+         MVC   CMDBUFF(L'PF12CMD),PF12CMD
+         MVC   CURSOR,=X'E4D1'         SET CURSOR TO ROW 30 COL 02
+         B     LOOP                    GO READ THE CONSOLE
+NOTPF12  EQU   *
+*
+*     UNDEFINED PF KEY
+*
+         MVI   MYBUFF,X'C5'            SET WCC TO RING ALARM
+         MVC   MSGAREA,=CL35'INVALID PF KEY' RESET MESSAGE AREA
+         B     LOOP                    GO READ THE CONSOLE
+*
+*     CLEAR SCREEN AND LEAVE
+*
+DONE     DS    0H
+         TM    FLAG,FULLSCRN      Q. FULL SCREEN MODE?
+         BZ    RETURN             A. NO, SKIP FULL SCREEN STUFF
+         TPUT  CLEAR,LCLEAR,      CLEAR THE SCREEN                     X
+               FULLSCR,WAIT,NOHOLD
+         STFSMODE OFF                  TELL VTAM WE'RE THROUGH
+*
+*     TERMINATE
+*
+RETURN   DS    0H
+         LEAVE RETCODE=0
+*
+*     ROUTINE TO LOCATE A GIVEN CONSOLE'S BUFFER.
+*     THE DESIGNATED CONSOLE ID IS SPECIFIED AT CONSID.
+*     TO SELECT THE MASTER CONSOLE, SET CONSID TO FF
+*
+FINDCON  EQU   *
+         ST    LINK,FINDCON@           SAVE RETURN ADDRESS
+         L     R2,16                   POINT TO CVT
+         L     R2,100(R2)              POINT TO UCM BASE
+         CLI   CONSID,X'FF'            MASTER CONSOLE REQUESTED?
+         BNE   NOTMSTR                 NOPE
+         LR    R1,R2                   COPY UCM BASE PTR
+         S     R1,=F'4'                BACK UP 4
+         L     R1,0(R1)                LOAD PTR TO UCM PREFIX
+         L     R3,0(R1)                LOAD PTR TO MASTER CONSOLE UCME
+         B     HAVEUCME
+NOTMSTR  EQU   *
+         L     R3,72(R2)               POINT TO FIRST UCME
+UCMELOOP EQU   *
+         CLC   26(1,R3),CONSID         IS THIS THE CONSOLE DESIRED?
+         BNE   NEXTUCME                NO, KEEP LOOKING
+         TM    25(R3),B'00010000'      IS DEVICE ONLINE?
+         BO    ONLINE
+         MVI   MYBUFF,X'C5'            SET WCC TO RING ALARM
+         MVC   MSGAREA,=CL35'REQUESTED CONSOLE IS NOT ACTIVE'
+         B     FINDCONX
+ONLINE   CLC   28(4,R3),=F'0'          PTR TO RDCM ZERO?
+         BNE   HAVEUCME
+         MVI   MYBUFF,X'C5'            SET WCC TO RING ALARM
+         MVC   MSGAREA,=CL35'NO SCREEN BUFFER FOR THIS CONSOLE'
+         B     FINDCONX
+NEXTUCME A     R3,76(R2)               POINT TO NEXT UCME
+         C     R3,80(R2)               IS THIS THE LAST UCME?
+         BNH   UCMELOOP                NO, KEEP LOOKING
+         MVI   MYBUFF,X'C5'            SET WCC TO RING ALARM
+         MVC   MSGAREA,=CL35'UNKNOWN CONSOLE SPECIFIED'
+         B     FINDCONX
+HAVEUCME MVC   UCMID,26(R3)            SAVE THE CONSOLE ID
+         CALL  HEXCHAR,(ONE,UCMID,CONSID2)  CONVERT HEX TO CHAR
+         L     R2,12(R3)               LOAD UCMUCB
+         MVC   UCBNAME,13(R2)          MOVE IN UCB NAME
+         BAL   R14,MODESETS            SET TO SUPERVISOR STATE
+         L     R1,28(R3)               POINT TO RDCM
+         L     R1,0(R1)                POINT TO TDCM
+         LA    R3,48(R1)               POINT TO DCMASCRN FIELD
+         LA    R1,4                    THIS MANY BYTES
+         LA    R2,SCREENPT             THIS IS WHERE WE WANT TO MOVE TO
+         LA    R4,0                    PROTECT KEY IS ZERO
+         LH    R5,CONSASID             LOAD CONSOLE'S ASID
+         SSAR  R5                      SET SECONDARY ADDRESS SPACE
+         MVCP  0(R1,R2),0(R3),R4       MOVE THE POINTER
+         LH    R5,MYASID               LOAD MY ASID
+         SSAR  R5                      SET SECONDARY ADDRESS SPACE
+         L     R1,SCREENPT        GET SCREEN POINTER
+         S     R1,=F'6'           ADJUST FOR AID
+         ST    R1,SCREENPT        STORE SCREEN POINTER
+FINDCONX BAL   R14,MODESETP            GET BACK TO PROBLEM STATE
+         L     LINK,FINDCON@           RESTORE RETURN ADDRESS
+         BR    LINK                    RETURN
+FINDCON@ DS    F
+*
+*     STAX EXIT
+*
+STAXEXIT EQU   *
+         USING STAXEXIT,R15
+         MVI   ATTNFLAG,ON             SET FLAG SO CALLER KNOWS
+         DROP  R15
+         SR    R15,R15                 SET RETURN CODE TO ZERO
+         BR    LINK                    RETURN
+*
+*     ROUTINE TO ISSUE COMMAND
+*
+ISSUE    EQU   *
+         ST    LINK,ISSUE@             SAVE RETURN ADDRESS
+         MVC   COMMAND,CMDBUFF         COPY THE COMMAND
+         OC    COMMAND,BLANKS          TRANSLATE TO UPPER CASE
+         CLC   COMMAND,BLANKS          WAS COMMAND BLANKS?
+         BE    ISSUEX                  YEP, IGNORE IT
+         MVC   OLDBUFR(4),=C'JUNK'     MAKE SURE WE REWRITE THE SCREEN
+*
+*     WHAT TYPE OF COMANND IS IT??
+*
+         CLC   COMMAND(4),=C'END '     END CONSOLE COMMAND?
+         BE    DONE                    YES, -->
+         CLC   =C'ROLL ',COMMAND       SET ROLL MODE
+         BE    SETROLL                 YES, -->
+         CLC   =C'CID ',COMMAND        SET NEW CONSOLE ID?
+         BNE   NOTCID                  NO, -->
+         MVI   CONSID,0                CLEAR REQUESTED ID
+         LA    R2,COMMAND+4            POINT TO ID REQUESTED
+         CALL  CHARHEX,(TWO,(R2),CONSID)  CONVERT REQUEST TO BINARY
+         BAL   LINK,FINDCON            LOCATE THE CONSOLE BUFFER
+         B     CLEAN
+NOTCID   EQU   *
+         MVC   LASTCMD,CMDBUFF         SAVE THE COMMAND
+         LA    R1,CMD                  POINT TO COMMAND
+         LA    R0,0                    INDICATE MASTER CONSOLE
+         IC    R0,UCMID                MOVE IN CONSOLE ID
+         BAL   R14,MODESETS            SET TO SUPERVISOR STATE
+         SVC   34                      SEND THE COMMAND
+         BAL   R14,MODESETP            GET BACK TO PROBLEM STATE
+CLEAN    XC    CMDBUFF,CMDBUFF         SET CMDBUFF TO NULLS
+*
+ISSUEX   L     LINK,ISSUE@             RESTORE RETURN ADDRESS
+         BR    LINK                    RETURN
+*
+ISSUE@   DS    F
+*
+MODESETS EQU   *
+         STM   R0,R15,MODESET@
+         MODESET KEY=ZERO,MODE=SUP     GET AUTHORIZED
+         LM    R0,R15,MODESET@
+         BR    R14
+*
+MODESETP EQU   *
+         STM   R0,R15,MODESET@
+         MODESET KEY=NZERO,MODE=PROB   RELINQUISH AUTHORIZATION
+         LM    R0,R15,MODESET@
+         BR    R14
+MODESET@ DS    16F
+*
+*     EQUATES
+*
+ON       EQU   X'FF'
+OFF      EQU   X'00'
+ENTER    EQU   X'7D'
+SHORT    EQU   X'6E'
+PF1      EQU   X'F1'
+PF2      EQU   X'F2'
+PF3      EQU   X'F3'
+PF4      EQU   X'F4'
+PF5      EQU   X'F5'
+PF6      EQU   X'F6'
+PF7      EQU   X'F7'
+PF8      EQU   X'F8'
+PF9      EQU   X'F9'
+PF10     EQU   X'7A'
+PF11     EQU   X'7B'
+PF12     EQU   X'7C'
+PF13     EQU   X'C1'
+PF14     EQU   X'C2'
+PF15     EQU   X'C3'
+PF16     EQU   X'C4'
+PF17     EQU   X'C5'
+PF18     EQU   X'C6'
+PF19     EQU   X'C7'
+PF20     EQU   X'C8'
+PF21     EQU   X'C9'
+PF22     EQU   X'4A'
+PF23     EQU   X'4B'
+PF24     EQU   X'4C'
+*
+OK       EQU   X'FF'
+READBUFF EQU   X'FF'
+NORMBUFF EQU   X'00'
+FULLSIZE EQU   2688
+*
+*     CONSTANTS
+*
+         LTORG
+AUTHMSG  DC    C'YOU ARE NOT AUTHORIZED TO USE CONSOLE'
+FULLMSG  DC    C'FULL SCREEN MODE DISABLED'
+ERRMSG3  DC    C'COULD NOT LOCATE CONSOLE ADDRESS SPACE'
+CONSMSG  DC    C'COULD NOT LOCATE MASTER CONSOLE'
+FIXEDMSG DC    35C'-'
+PF7CMD   DC    C'V NET,TERM,SLU=--------,SCOPE=ALL,TYPE=FORCE'
+PF8CMD   DC    C'D NET,E,ID='
+PF9CMD   DC    C'V NET,ACT,ID='
+PF10CMD  DC    C'$DN,Q=XEQ'
+PF11CMD  DC    C'$DQ,Q=XEQ'
+PF12CMD  DC    C'E XXXXXXX,PERFORM=11'
+WAITIME  DC    F'200'
+MYASID   DS    H
+CONSASID DS    H
+ATTNFLAG DS    X
+OKSWTCH  DC    X'00'
+READTYPE DC    X'00'
+FLAG     DC    X'00'
+FULLSCRN EQU   X'80'
+CMD      DC    H'82',H'0'
+COMMAND  DC    CL78' '
+BLANKS   DC    CL78' '
+MOD      DC    C'F CNSLMON,'
+MODCMD   DC    CL78' '
+SAVECONS DC    CL24' '
+BLKTEST  DC    F'1'
+CPUID#   DS    CL4
+SCREENPT DS    F
+LASTBFPT DS    F
+BUFFADDR DS    F
+BLK#     DC    F'0'
+UCMID    DS    XL1                     CURRENT CONSOLE ID
+CONSID   DS    XL1                     DESIRED CONSOLE ID
+ONE      DC    F'1'
+TWO      DC    F'2'
+FOUR     DC    F'4'
+*
+TGETAREA DS    CL100
+MYBUFF   DC    X'C1'                   WCC
+         DC    X'114040'               SBA   (ROW 01, COL 01)
+TARGET   EQU   *
+         DC    28CL84' '               CONSOLE BUFFER GOES HERE
+LTARGET  EQU   *-TARGET
+         DC    X'11E340'               SBA (ROW 29 COL 01)
+         DC    X'1DE4'                 SF,AB(PROT,LOW)
+CONS     DC    C'---CONSOLE ID='
+CONSID2  DS    CL2
+         DC    C' UCB='
+UCBNAME  DS    CL3
+         DC    13C'-'
+ROLL     DS    CL4
+         DC    3C'-'
+MSGAREA  DS    CL35
+         DC    X'1DC8'                 SF,AB(INPUT,HIGH)
+CMDBUFF  DC    XL79'00'
+         DC    X'1DE8'                 SF,AB(PROT,HIGH)
+LASTCMD  DC    CL79' '
+         DC    X'1DE4'                 SF,AB(PROT,LOW)
+         DC    CL79'PF1=HELP, PF2=ROLL, PF3=END'
+         DC    X'11'                   SBA (ROW 21 COL 02)
+CURSOR   DC    X'E4D1'
+         DC    X'13'                   IC
+LBUFFER  EQU   *-MYBUFF
+CLEAR    DC    X'C1'                   WCC
+         DC    X'114040'               SBA   (ROW 01, COL 01)
+         DC    X'3C404000'             RA    REPEAT TO ADDRESS
+         DC    X'277F'                 MAGIC FROM ED
+LCLEAR   EQU   *-CLEAR
+HELPMSG  DC    X'C1'                   WCC
+         DC    X'114040'               SBA   (ROW 01, COL 01)
+         DC    X'3C404000'             RA    REPEAT TO ADDRESS
+         DC    X'114040'               SBA (ROW 01 COL 01)
+         DC    X'1DE4'                 SF,AB(PROT,LOW)
+         DC    CL80'-------- CONSOLE PF KEY DEFINITIONS --------'
+         DC    CL80' '
+         DC    CL80'PF1     - UNUSED'
+         DC    CL80'PF2     - UNUSED'
+         DC    CL80'PF3     - UNUSED'
+         DC    CL80'PF13    - DISPLAY PF KEY INFORMATION'
+         DC    CL80'PF14    - INITIATE ROLL MODE'
+         DC    CL80'PF15    - EXIT'
+         DC    CL80'PF5/17  - RECALL LAST COMMAND (NOT ISSUED UNLESS MO+
+               DIFIED)'
+         DC    CL80'PF6/18  - REISSUE LAST COMMAND'
+         DC    CL80'PF7/19  - "V NET,TERM,SLU=--------,SCOPE=ALL,TYPE=F+
+               ORCE'
+         DC    CL80'PF8/20  - "D NET,E,ID="'
+         DC    CL80'PF9/21  - "V NET,ACT,ID="'
+         DC    CL80'PF10/22 - "$DN,Q=XEQ"'
+         DC    CL80'PF11/23 - "$DQ,Q=XEQ"'
+         DC    CL80'PF12/24 - "E -------,PERFORM=11"'
+         DC    CL80'ENTER "CID XX" TO REDEFINE CONSOLE ID'
+         DC    X'115CF0'               SBA (ROW 24 COL 01)
+         DC    X'1DE4'                 SF,AB(PROT,LOW)
+         DC    C'HIT ENTER TO RETURN TO CONSOLE SCREEN'
+         DC    X'13'                   IC
+LHELPMSG EQU   *-HELPMSG
+OLDBUFR  EQU   *
+         DC    28CL84' '               CONSOLE BUFFER GOES HERE
+LOLDBUFR EQU   *-OLDBUFR
+         END   OMA

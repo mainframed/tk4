@@ -1,0 +1,1762 @@
+SMPKA    TITLE 'CPU AND PAGING PEAK PERIOD ANALYZER'
+***********************************************************************
+*                                                                     *
+* SMPKA  LOCATES PEAK PERIODS OF CPU UTILISATION AND PAGING RATE,     *
+*        PRODUCES A REPORT OF THESE AND OPTIONALLY INVOKES CMF        *
+*        ANALYZER USING THE PEAK CPU UTILISATION PERIOD THAT IT HAS   *
+*        DETERMINED.                                                  *
+*                                                                     *
+*        ALL THE TYPE 70 RECORDS ARE INSPECTED FOR THE DAYTIME (0800  *
+*        TO 1700) FOR ALL DAYS IN THE INPUT.  THE PEAK PERIOD FOR UP  *
+*        TO 2 SYSTEMS IS DEDUCED USING THE WAIT TIME.                 *
+*                                                                     *
+*        ALL THE TYPE 71 RECORDS ARE INSPECTED FOR THE DAYTIME (0800  *
+*        TO 1700) FOR ALL DAYS IN THE INPUT.  THE PEAK PERIOD FOR UP  *
+*        TO 2 SYSTEMS IS DEDUCED USING THE TOTAL OF ALL THE PAGE-IN   *
+*        AND PAGE-OUT COUNTS.                                         *
+*                                                                     *
+*        SORT IS INVOKED:                                             *
+*        AN E15 READS THE INPUT RECORDS AND CREATES INTERMEDIATE      *
+*        RECORDS.  THE TOTAL DAYTIME WAIT TIME AND PAGING I/O COUNT   *
+*        IS ACCUMULATED.                                              *
+*        THE INTERMEDIATE RECORDS ARE THEN SORTED.                    *
+*        AN E35 SUMMARISES THE INTERMEDIATE RECORDS IN AS MANY LAYERS *
+*        AS IS NECESSARY TO EVALUATE ALL THE PERIODS.  THE PERIOD FOR *
+*        EACH SYSTEM WITH THE LOWEST AGGREGATE WAIT TIME IS STORED.   *
+*        THE PERIOD WITH THE HIGHEST AGGREGATE PAGING I/O COUNT IS    *
+*        STORED                                                       *
+*                                                                     *
+*        INPUT IS A DATASET CONTAINING RMF OR CMF TYPE 70 AND 71      *
+*        RECORDS FOR THE PERIOD OF INTEREST.  THE DATA CAN BE         *
+*        UNSEQUENCED.                                                 *
+*                                                                     *
+*        IF THERE IS A SYSPRINT DD STATEMENT, A REPORT OF THE PEAK    *
+*        PERIODS, WITH THE CPU AND PAGING RATE, IS PRODUCED.          *
+*                                                                     *
+*        IF THERE IS A SYSIN DD STATEMENT, THEN ADDITIONAL CMF        *
+*        CONTROL STATEMENTS ARE CREATED AND THE CMF ANALYZER IS       *
+*        INVOKED FOR EACH SYSTEM.                                     *
+*                                                                     *
+*        WRITTEN BY     DAVE MILLS                                    *
+*                       EAST MIDLANDS ELECTRICITY                     *
+*                       398 COPPICE ROAD                              *
+*                       ARNOLD                                        *
+*                       NOTTINGHAM   NG5 7HX     (0602) 269711 X2007  *
+*        ALL RIGHTS RESERVED:   THIS PROGRAM IS PROVIDED FOR THE USE  *
+*        OF OTHER USER GROUP MEMBERS ON AN  AS IS  BASIS WITHOUT ANY  *
+*        WARRANTY.  NO RESPONSIBILITY IS IMPLIED FOR THE ACCURACY OF  *
+*        THE OUTPUT OF THE PROGRAM.                                   *
+*                                                                     *
+****************************** CONTINUED ******************************
+         EJECT
+***********************************************************************
+*                                                                     *
+*        MAPPING MACRO ERBSMFR IS USED, THEREFORE SYS1.RMFMAC01 MUST  *
+*        BE ADDED TO THE SYSLIB CONCATENATION FOR ASSEMBLY.           *
+*                                                                     *
+*        IN ADDITION TO STANDARD OS MACROS, THE FOLLOWING MACROS ARE  *
+*        USED AND ARE INCLUDED INLINE AFTER THIS DOCUMENTATION:       *
+*        ENTER    LEAVE    EDIT                                       *
+*                                                                     *
+*        UTDTC (EMEB SERVICE ROUTINE) IS USED FOR DATE CONVERSION.    *
+*        UTLOG (EMEB SERVICE ROUTINE) IS USED FOR MESSAGES.           *
+*        SORT IS INVOKED THROUGH LINK.                                *
+*        CMFANALYZ IS INVOKED THROUGH LINK.                           *
+*                                                                     *
+*        SUGGESTED JOB CONTROL FOR EXECUTION                          *
+*        -----------------------------------                          *
+*        //GO      EXEC PGM=SMPKA<,PARM= (AS FOR CMFANALYZ)>          *
+*        //SYSPRINT  DD SYSOUT=A                                      *
+*        //EXTDATA   DD DSN= (DATASET CONTAINING RMF/CMF RECORDS)     *
+*        // (DD STATEMENTS FOR CMFANALYZ)                             *
+*                                                                     *
+*              A SYSOUT DD STATEMENT MAY BE SUPPLIED TO DIRECT THE    *
+*              SORT MESSAGES, IF IT IS NOT SUPPLIED IT IS DYNAMICALLY *
+*              ALLOCATED TO THE MESSAGE CLASS.                        *
+*                                                                     *
+*        REGISTER USE                                                 *
+*        ------------                                                 *
+*        R0                                                           *
+*        R1   @ DCB WHEN NEEDED                                       *
+*        R2                                                           *
+*        R3   MESSAGE POINTER FOR GENERROR                            *
+*        R4   ACCUMULATOR SEGMENT POINTER  ) SYSTEM STORE             *
+*        R5                                )  POINTERS                *
+*        R6                                                           *
+*        R7                                                           *
+*        R8                                                           *
+*        R9                                                           *
+*        R10  BASE FOR GENERROR ROUTINE                               *
+*        R11  BASE FOR PROGRAM SECTIONS (1)                           *
+*        R12  BASE FOR PROGRAM SECTIONS (2)                           *
+*        R13  CURRENT SAVE AREA                                       *
+*        R14  RETURN FROM SUB-PROGRAMS                                *
+*        R15  LINK TO SUB-PROGRAMS                                    *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+*---------------------------------------------------------------------*
+*        STANDARD EMEB MACROS                                         *
+*---------------------------------------------------------------------*
+         PRINT OFF
+         MACRO
+&NAME    ENTER &LABEL,&REGS,&SAVE=,&BASE=12,&STORE=0
+.*
+.*  25/4/82  REGS,TEMP REMOVED, 14-12 SAVED                         MJH
+.*  20/2/84  TIDYING UP, USER MUST ENSURE R15 VALUE                 DEM
+.*
+         LCLA  &CHARS,&COUNT,&DISP,&DISPX,&BASENDX
+         LCLC  &SNAPID,&REG
+         LCLB  &NOSNAP,&INTSAVE,&DYNSAVE
+.*
+&NAME    DS    0F                                                FEB 84
+.* - - - - - - - - - - - - - - - - - -
+&INTSAVE SETB  ('&SAVE' EQ '')         1=INTERNAL SAVE AREA
+&DYNSAVE SETB  ('&SAVE' EQ 'DYN')      1=GETMAINED SAVE AREA
+.* - - - - - - - - - - - - - - - - - -
+         AIF   ('&SYSECT' EQ '').CHKLBL
+&SNAPID  SETC  '''&SYSECT'''
+.CHKLBL  ANOP
+         AIF   (T'&LABEL EQ 'O').CHKSNAP
+&SNAPID  SETC  '&LABEL'
+.CHKSNAP ANOP
+&NOSNAP  SETB  ('&SNAPID' EQ '')       1=SNAPID NOT WANTED
+         AIF   (&NOSNAP).SETDISP
+&CHARS   SETA  K'&SNAPID-2
+&COUNT   SETA  2
+.TSTCHAR ANOP
+         AIF   ('&SNAPID'(&COUNT,1) EQ '&&'(1,1)).DECR
+         AIF   ('&SNAPID'(&COUNT,1) NE '''').INCR
+.DECR    ANOP
+&CHARS   SETA  &CHARS-1
+&COUNT   SETA  &COUNT+1
+.INCR    ANOP
+&COUNT   SETA  &COUNT+1
+         AIF   (&COUNT LT K'&SNAPID).TSTCHAR
+&COUNT   SETA  (1+&CHARS+3)/4*4        (COUNT,SNAPID,DS-0F)
+.SETDISP ANOP
+         AIF   (&NOSNAP AND NOT &INTSAVE).STORE
+&DISP    SETA  &INTSAVE*72+&COUNT+4
+.*                           THIS MUST BE ON WORD-BOUNDARY
+         B     &DISP.(0,15)
+         AIF   (&NOSNAP).SETSAVE
+         DC    AL1(&CHARS),C&SNAPID
+         DS    0F
+.* - - - - - - - - - - - - - - - - - -
+         AIF   (NOT &INTSAVE).STORE
+.SETSAVE ANOP
+         DC    18A(0)
+.* - - - - - - - - - - - - - - - - - -
+.STORE   ANOP
+         AIF   ('&REGS' EQ '').SAVEALL
+         MNOTE 0,'REGISTER RANGE IGNORED, REGS 14,12 SAVED'
+.SAVEALL ANOP
+         STM   14,12,12(13)
+.* - - - - - - - - - - - - - - - - - -
+.SETBASE ANOP
+.*                           CHECK BASE REGISTERS ARE VALID
+&BASENDX SETA  1
+.BASELP0 ANOP
+&REG     SETC  '&BASE(&BASENDX)'
+         AIF   ('&REG'(1,1) NE 'R').NUMBASE
+&REG     SETC  '&REG'(2,K'&REG-1)
+.NUMBASE ANOP
+         AIF   ('&REG' EQ '13' OR '&REG' EQ '14').INVBASE
+         AIF   (NOT &DYNSAVE).NXTBASE
+         AIF   ('&REG' NE '0' AND '&REG' NE '1').NXTBASE
+.INVBASE ANOP
+         MNOTE 4,'BASE REGISTER &BASE(&BASENDX) COULD CAUSE ERRORS'
+.NXTBASE ANOP
+&BASENDX SETA  &BASENDX+1
+         AIF   (&BASENDX LE N'&BASE).BASELP0
+.*                          ENSURE BASE REG IS AT DOUBLE-WORD
+         CNOP  6,8
+&REG     SETC  '&BASE(1)'
+         BALR  &REG,0
+         USING *,&REG
+         AIF   (N'&BASE EQ 1).ONEBASE
+&BASENDX SETA  1
+&DISP    SETA  N'&BASE*4
+.BASELP1 ANOP
+&REG     SETC  '&BASE(&BASENDX+1)'
+         L     &REG,*+&DISP
+&DISPX   SETA  &BASENDX*4
+         USING *-&DISPX+4096*&BASENDX,&REG
+&BASENDX SETA  &BASENDX+1
+         AIF   (&BASENDX LT N'&BASE).BASELP1
+         B     *+&DISP
+&BASENDX SETA  1
+.BASELP2 ANOP
+         DC    A(*-&DISP+4096*&BASENDX)
+&DISP    SETA  &DISP+4
+&BASENDX SETA  &BASENDX+1
+         AIF   (&BASENDX LT N'&BASE).BASELP2
+.ONEBASE ANOP
+.* - - - - - - - - - - - - - - - - - -
+         LR    14,13
+         AIF   (&INTSAVE).INTSAVE
+         AIF   (&DYNSAVE).DYNSAVE
+         LA    13,&SAVE
+         AGO   .CHAIN
+.DYNSAVE ANOP
+         LA    0,72+&STORE
+*        GETMAIN R,LV=(0)
+         GETMAIN R,LV=(0)
+         LR    13,1
+         LM    0,1,20(14)
+         AGO   .CHAIN
+.INTSAVE ANOP
+&DISP    SETA  &COUNT+4
+         LA    13,&DISP.(0,15)
+.CHAIN   ANOP
+         ST    14,4(0,13)
+         ST    13,8(0,14)
+         MEND
+         SPACE
+         MACRO
+&NAME    LEAVE &REGS,&SAVE=,&STORE=0,&CODE=
+.*
+.*  25/4/82  REGS,TEMP REMOVED,0 AND 1 NOW PASSED UNCHANGED       M.J.H
+.*           RETURN CODE CORRECTED
+.*
+         LCLC  &REG
+.*
+         AIF   (T'&REGS EQ 'O').START
+         MNOTE 0,'REGISTER RANGE IGNORED, REGS 2-14 RESTORED'
+.START   ANOP
+&NAME    DS    0H
+         AIF   ('&CODE' EQ '').SETZERO
+         AIF   ('&CODE'(1,1) EQ '(').LOADREG
+         LA    15,&CODE                LOAD RETURN CODE
+         AGO   .CODEND
+.LOADREG ANOP
+&REG     SETC  '&CODE'(2,K'&CODE-2)
+         AIF   ('&REG' EQ '15').CODEND
+         LR    15,&REG                 LOAD RETURN CODE
+         AGO   .CODEND
+.SETZERO ANOP
+         SLR   15,15                   ZEROISE RETURN CODE
+.CODEND  ANOP
+         AIF   ('&SAVE' EQ 'DYN').DYNCODE
+         L     13,4(0,13)              LOAD ADDRESS OF CALLERS SAVEAREA
+         XC    8(4,13),8(13)           CLEAR LSA CHAIN
+         LM    2,12,28(13)             RESTORE REGISTERS 2-12
+         L     14,12(0,13)             LOAD RETURN ADDRESS
+         BR    14                      RETURN TO CALLER
+         MEXIT
+.DYNCODE ANOP
+         LR    2,13                    LOAD ADDRESS OF SAVE AREA
+         L     13,4(0,13)              LOAD ADDRESS OF CALLERS SAVEAREA
+         STM   15,1,16(13)             REGS 15,0,1 IN CALLERS SAVEAREA
+         XC    8(4,13),8(13)           CLEAR LSA CHAIN
+         LA    0,72+&STORE             LOAD COUNT OF DYNAMIC AREA
+*        FREEMAIN R,LV=(0),A=(2)       FREE DYNAMIC AREA
+         FREEMAIN R,LV=(0),A=(2)
+         LM    14,12,12(13)            RESTORE REGISTERS
+         BR    14                      RETURN TO CALLER
+         MEND
+         SPACE
+         MACRO
+&NAME    EDIT  &TO,&FROM,&EDWD
+         LCLA  &CNT1,&CNT2
+         LCLA  &D
+         LCLB  &EDMK
+         LCLC  &LTH
+         LCLC  &M(24)
+         LCLC  &EDCH
+         LCLC  &SD
+.*
+         AIF   (T'&EDWD NE 'O').A1      IS EDIT WORD OMITTED
+         MNOTE 4,'NO EDIT FORMAT GIVEN'
+         MEXIT
+.A1      AIF   ('&EDWD'(1,1) EQ '''').A2
+.A15     MNOTE 4,'EDIT FORMAT NOT WITHIN QUOTES'
+         MEXIT
+.A2      AIF   ('&EDWD'(K'&EDWD,1) NE '''').A15
+.*
+&CNT1    SETA  2         START POSITION IN &EDWD
+&CNT2    SETA  1         START POSITION IN &M
+         AIF   ('&EDWD'(2,1) EQ '*').A6
+&M(1) SETC  '40'    FILL CHAR IS BLANK
+&CNT2    SETA  &CNT2+1
+.*
+.A6      ANOP
+         AIF   ('&EDWD'(&CNT1,1) EQ '''').D1
+         AIF   ('&EDWD'(&CNT1,1) EQ 'X').A8
+         AIF   ('&EDWD'(&CNT1,1) EQ '0').A81
+         AIF   ('&EDWD'(&CNT1,1) EQ ',').A9
+         AIF   ('&EDWD'(&CNT1,1) EQ ':').B1
+         AIF   ('&EDWD'(&CNT1,1) EQ '.').B2
+         AIF   ('&EDWD'(&CNT1,1) EQ ' ').B3
+         AIF   ('&EDWD'(&CNT1,1) EQ 'C').B4
+         AIF   ('&EDWD'(&CNT1,1) EQ 'R').B5
+         AIF   ('&EDWD'(&CNT1,1) EQ '-').B6
+         AIF   ('&EDWD'(&CNT1,1) EQ '$').B7
+         AIF   ('&EDWD'(&CNT1,1) EQ '*').B8
+         AIF   ('&EDWD'(&CNT1,1) EQ '/').B9
+&EDCH    SETC  '&EDWD'(&CNT1,1)
+         MNOTE 4,'IMPROPER EDIT CHARACTER - &EDCH'
+         MEXIT
+.*
+.A8      AIF   ('&EDWD'(&CNT1+1,1) EQ 'X').A89   IS NEXT A 'X' ?
+         AIF   ('&EDWD'(&CNT1+1,1) EQ '0').A88    OR A '0' ?
+         AIF   ('&EDWD'(&CNT1+1,1) EQ '$').A88     OR A '$'    ?
+         AIF   ('&EDWD'(&CNT1+1,1) EQ '''').A89      OR THE END ?
+         AIF   ('&EDWD'(&CNT1+2,1) EQ '0').A88     IF NOT TEST NEXT
+         AGO   .A89                              ELSE USE DS
+.A81     AIF   (&CNT1 EQ 2).A88        '0' IN FIRST POSITION
+         AGO   .A89                    ELSE USE DIGIT SELECT
+.A88     ANOP
+&M(&CNT2)   SETC  '21'  START SIGNIFICANCE
+         AGO   .C9
+.A89      ANOP
+&M(&CNT2)   SETC  '20'  DIGIT SELECT
+         AGO   .C9
+.A9      ANOP
+&M(&CNT2)   SETC  '6B'  COMMA
+         AGO   .C9
+.B1      ANOP
+&M(&CNT2)   SETC  '7A'  COLON
+         AGO   .C9
+.B2      ANOP
+&M(&CNT2)   SETC  '4B'  PERIOD
+         AGO   .C9
+.B3      ANOP
+&M(&CNT2)   SETC  '40'  BLANK
+         AGO   .C9
+.B4      ANOP
+&M(&CNT2)   SETC  'C3'  C
+         AGO   .C9
+.B5      ANOP
+&M(&CNT2)   SETC  'D9'  R
+         AGO   .C9
+.B6      ANOP
+&M(&CNT2)   SETC  '60'  -
+         AGO   .C9
+.B7      ANOP
+&EDMK    SETB  1        $ - SET ON EDMK OPTION
+&D       SETA  &CNT2-1  SET DISP OF SIGNIF SELECT
+&SD      SETC  '&D'
+         AGO   .A81      AND TREAT AS IF '0'
+.B8      ANOP
+&M(&CNT2)   SETC  '5C'  *
+         AGO   .C9
+.B9      ANOP
+&M(&CNT2)   SETC  '61'  /
+.*
+.C9      ANOP
+&CNT1    SETA  &CNT1+1
+&CNT2    SETA  &CNT2+1
+         AIF   (&CNT2 LE 24).A6
+         MNOTE 4,'EDIT WORD TOO LARGE TO HANDLE'
+.*
+.D1      ANOP
+&CNT2    SETA  &CNT2-1
+&LTH     SETC  ''
+         AIF   ('&TO'(K'&TO,1) EQ ')').E2
+&LTH     SETC  '('.'&CNT2'.')'
+.E2      ANOP
+&NAME    MVC   &TO&LTH,=X'&M(1)&M(2)&M(3)&M(4)&M(5)&M(6)&M(7)&M(8)&M(9)X
+               &M(10)&M(11)&M(12)&M(13)&M(14)&M(15)&M(16)&M(17)&M(18)&MX
+               (19)&M(20)&M(21)&M(22)&M(23)&M(24)'
+         AIF   (&EDMK).F1
+         ED    &TO&LTH,&FROM
+         AGO   .E4
+.F1      LA    1,&TO+&SD
+         EDMK  &TO&LTH,&FROM
+         BCTR  1,0
+         MVI   0(1),C'$'
+.E4      ANOP
+         MEND
+         PRINT ON
+         EJECT
+*---------------------------------------------------------------------*
+*  DSECTS     DSECTS     DSECTS     DSECTS     DSECTS     DSECTS      *
+*---------------------------------------------------------------------*
+         SPACE
+         PRINT NOGEN
+         SPACE
+         DCBD  DSORG=PS,DEVD=DA
+         IEFZB4D0 ,                    DYNALLOC CONTROL BLOCKS
+         IEFZB4D2 ,                    DYNALLOC TU KEYS
+         SPACE
+         PRINT GEN
+         SPACE 2
+SMFREC   DSECT
+         ERBSMFR 70                    DEFINE SMF TYPE 70 RECORD
+         SPACE
+         ORG   SMFREC
+         ERBSMFR 71                    DEFINE SMF TYPE 71 RECORD
+         EJECT
+*=====================================================================*
+*                      PROGRAM ENTRY POINT                            *
+*=====================================================================*
+*  ESTABLISH A SAVE AREA AND OBTAIN ADDRESSIBILITY.  SET THE SYSTEM   *
+*     MASK SO THAT INTERRUPTS OCCUR TO AVOID CALCULATION ERRORS DUE   *
+*     TO OVERFLOWS ETC.                                               *
+*---------------------------------------------------------------------*
+SMPKA    CSECT
+         ENTER 'SMPKA',BASE=(11,12)
+         ST    R1,PARMADDR             SAVE PARM ADDRESS
+         SPACE
+         ICM   R1,B'1000',=B'00001110' ALLOW ALL INTERRUPTS
+         SPM   R1                   1   EXCEPT SIGNIFICANCE.
+         EJECT
+*---------------------------------------------------------------------*
+* -  ALLOCATE A SYSOUT DATASET FOR SORT IF NOT ALREADY ALLOCATED      *
+*---------------------------------------------------------------------*
+         XC    RBERROR(L'RBERROR+L'RBINFO),RBERROR  CLEAR ERROR AREA
+         MVI   RBVERB,S99VRBAL         VERB = ALLOCATE
+         LA    R1,TUALY                POINT AT ALLOCATION POINTERS
+         ST    R1,RBTUPTR              SET @ POINTERS
+         LA    R1,RBPTR                POINT AT RB POINTERS
+         DYNALLOC            ISSUE DYNALLOC TO ALLOCATE SYSOUT
+         CLC   RBERROR,=X'0410'        FILE IN USE ?
+         BE    SORTLINK                YES, IGNORE THE ERROR
+         BAL   R14,DYNCHECK            ELSE, CHECK COMPLETION
+         SPACE
+*---------------------------------------------------------------------*
+*  INVOKE SYNCSORT USING PARAMETERS THAT SPECIFY THE INLINE           *
+*     E15 AND E35 EXIT PROCESSORS.                                    *
+*---------------------------------------------------------------------*
+SORTLINK DS    0H
+         LA    R1,L'INTEREC            GET INTER RECORD LENGTH
+         CVD   R1,DWORD                IN DECIMAL
+         EDIT  DWORDE,DWORDL,'X0X'     IN CHARACTERS
+         MVC   SRECORDL,DWORDEX        PUT IT INTO RECORD PARAMETER
+         SPACE
+         LA    R1,SORTPARM
+         LINK  EP=SORT
+         SPACE
+         LTR   R15,R15                 SUCCESSFUL ?
+         BZ    SORTOK                  YES, CONTINUE
+         LA    R3,MSG1                 NO, REPORT IT
+         B     GENERROR                AND ABEND
+         EJECT
+*---------------------------------------------------------------------*
+* DEFINE THE PARAMETERS FOR THE SORT                                  *
+*---------------------------------------------------------------------*
+         SPACE
+SORTPARM DC    A(SORTDATA)           POINTER TO SORT PARM DATA
+         ORG   *-4
+         DC    X'80'
+         ORG
+         CNOP  2,4
+SORTDATA DC    AL2(SCOUNT)
+         DC    A(SSORT,SSORTE)       BEGINNING AND END OF SORT PARAM
+         DC    A(SRECORD,SRECORDE)   BEGINNING AND END OF RECORD PARAM
+         DC    A(SE15)               @ E15 PROCESSOR
+         DC    A(SE35)               @ E35 PROCESSOR
+SCOUNT   EQU   *-(SORTDATA+2)
+         SPACE
+SSORT    DC    C' SORT FIELDS=(1,12,BI,A),DYNALLOC=(SYSDA,1),FILSZ='
+         DC    C'E1000'      ALLOW PLENTY FOR A WEEKS DATA
+SSORTE   DC    C' '
+         SPACE
+SRECORD  DC    C' RECORD TYPE=F,LENGTH='
+SRECORDL DC    C'XX'         FOR RECORD LENGTH
+SRECORDE DC    C' '
+         EJECT
+*---------------------------------------------------------------------*
+*  SORT AND DATA ANALYSIS COMPLETED - TERMINATE THIS PHASE.           *
+*---------------------------------------------------------------------*
+SORTOK   DS    0H
+         CP    RECNUM,=P'0'            NUMBER OF RECORDS = ZERO ?
+         BNE   FINEDIT
+         LA    R3,MSG5                 NO RECORDS SELECTED MSG
+         BAL   R14,GENERROR            USE GENERROR TO LOG THE MESSAGE
+         LA    R15,16                  GIVE UP WITH BAD RETURN CODE
+         ST    R15,RETCODE
+         B     LEAVE
+         SPACE
+FINEDIT  DS    0H
+         EDIT  WDATC,FIRSD+1,'XXXXX'
+         MVC   MSG0F,WDAT              MOVE FROM DATE INTO MSG
+         EDIT  WDATC,LASTD+1,'XXXXX'
+         MVC   MSG0L,WDAT              MOVE LAST DATE INTO MSG
+         EDIT  MSG0C,RECNUM,'XXXX$'    EDIT SELECTED REC COUNT
+         MVI   0(R1),C' '              BLANK OUT THE $
+         LR    R2,R1                   MVCL SOURCE ADDRESS
+         LA    R3,MSG0+L'MSG0
+         SR    R3,R1                   MVCL SOURCE LENGTH
+         ICM   R3,B'1000',=C' '        FILL CHARACTER
+         LA    R0,MSG0C                MVCL RESULT ADDRESS
+         LA    R1,MSG0+L'MSG0-MSG0C    MVCL RESULT LENGTH
+         MVCL  R0,R2                   MOVE REC COUNT TO LEFT
+         LA    R3,MSG0                 FINAL MESSAGE TO LINE
+         BAL   R14,GENERROR            USE GENERROR TO LOG THE MESSAGE
+         SPACE
+*---------------------------------------------------------------------*
+* SWAP DATA FOR THE SYSTEMS SO THAT LOWEST IS DONE FIRST.             *
+*---------------------------------------------------------------------*
+         OC    S2SID,S2SID             IS THERE A SECOND SID ?
+         BZ    OKORDER                 NO, LEAVE AS IS
+         CLC   S1SID,S2SID             IS FIRST LOWER THAN SECOND ?
+         BL    OKORDER                 YES, CONTINUE
+         XC    S1DATA,S2DATA           SWAP FIRST
+         XC    S2DATA,S1DATA            SYSTEM
+         XC    S1DATA,S2DATA            WITH SECOND
+OKORDER  DS    0H
+         EJECT
+*=====================================================================*
+* PRODUCE REPORT FOR THE PEAK PERIODS FOUND                           *
+*=====================================================================*
+*   IF  SYSPRINT DD STATEMENT PRESENT                                 *
+*---------------------------------------------------------------------*
+         OPEN  (SYSPRINT,OUTPUT)       OPEN THE SYSPRINT DS
+         L     R1,=A(SYSPRINT)
+         USING IHADCB,R1
+         TM    DCBOFLGS,DCBOFOPN       OPENED ?
+         BO    DOREPT                  YES, CONTINUE
+         LA    R3,MSG11                INFORMATION MESSAGE
+         BAL   R14,GENERROR
+         B     CMFANAL                 AND BYPASS REPORT
+         DROP  R1
+         SPACE
+DOREPT   DS    0H
+         OC    FIRDTEST,FIRDTEST       HAVE WE GOT THE FIRST DATE ?
+         BZ    NODATES
+         LA    R1,UTDTCP1              )
+         L     R15,=V(UTDTC)           × CONVERT 00YYDDDF (PD+) TO
+         BALR  R14,R15                 × DD MMM YY (CHAR) AND PLACE
+         LA    R1,UTDTCP2              × INTO THE HEADING:  FIRST TO
+         L     R15,=V(UTDTC)           × HIF, LAST TO H1T
+         BALR  R14,R15                 )
+NODATES  DS    0H
+         B     REPORT
+         SPACE
+UTDTCP1  DC    A(DTCC,FIRSD,H1F,ZERO)  PARAMETERS FOR UTDTC
+         ORG   *-4
+         DC    X'80'                   VL BIT
+         ORG
+UTDTCP2  DC    A(DTCC,LASTD,H1T,ZERO)  PARAMETERS FOR UTDTC
+         ORG   *-4
+         DC    X'80'                   VL BIT
+         ORG
+UTDTCP3  DC    A(DTCC,0,D1D,ZERO)     PARAMETERS FOR UTDTC
+         ORG   *-4
+         DC    X'80'                   VL BIT
+         ORG
+DTCC     DC    C'D',C' ',C'J',C'F',C'    '  UTDTC COMMAND BLOCK
+ZERO     DC    F'0'                    DUMMY FOR UTDTC
+         EJECT
+REPORT   DS    0H
+         LA    R5,S1SID
+         USING PKSID,R5
+REPST    DS    0H
+         OC    PKSID,PKSID             VALID SYSTEM ID ?
+         BZ    REPEND                  NO, ALL DONE
+         MVI   LCC,C'-'                SET SPACING
+         BAL   R14,PUT                 ** PRINT BLANK LINE **
+         MVI   LCC,C'-'                SET SPACING
+         MVC   D1L1,=C'SYSTEM ID'      SETUP LINE
+         MVC   D1S,PKSID               MOVE SID TO REPORT DETAIL
+REPCPU   DS    0H
+         LA    R6,PKCPU                POINT AT CPU DATA
+         USING PKDAT,R6
+         MVC   D1L2,=C'CPU UTILISATION'
+         L     R1,PKINT                DURATION (MSECS)
+         S     R1,PKVAL                - CPU WAIT = UTILISATION
+         SLR   R0,R0
+         M     R0,=F'10000'            (PERCENT WITH 2 DEC)
+         D     R0,PKINT                / DURATION = %AGE
+         CVD   R1,DWORD                INTO DECIMAL
+         AP    DWORD,=P'5'             CAUSE ROUNDING
+         EDIT  D1PV,DWORDX,'XX0.X'     ONTO LINE
+         MVC   D1PQ,=C'%   '           MOVE QUALIFIER
+         L     R1,PKINTT               DURATION (MSECS)
+         S     R1,PKVALT               - TOTAL CPU WAIT = UTILISATION
+         SLR   R0,R0
+         M     R0,=F'10000'            (PERCENT WITH 2 DEC)
+         D     R0,PKINTT               / DURATION = %AGE
+         CVD   R1,DWORD                INTO DECIMAL
+         AP    DWORD,=P'5'             CAUSE ROUNDING
+         EDIT  D1TV,DWORDX,'XX0.X'     ONTO LINE
+         MVC   D1TQ,=C'%   '           MOVE QUALIFIER
+         BAL   R14,REPCOMM             FINISH THE LINE
+         SPACE
+REPPIO   DS    0H
+         MVI   LCC,C'-'                SET SPACING
+         LA    R6,PKPIO                POINT AT PAGING DATA
+         USING PKDAT,R6
+         MVC   D1L2,=C'    PAGING RATE'
+         L     R1,PKVAL                PAGING I/OS
+         SLR   R0,R0
+         M     R0,=F'100000'           (WITH 2 DEC)
+         D     R0,PKINT                / DURATION(MSEC) = RATE
+         CVD   R1,DWORD                INTO DECIMAL
+         AP    DWORD,=P'5'             CAUSE ROUNDING
+         EDIT  D1PV,DWORDX,'XX0.X'     ONTO LINE
+         MVC   D1PQ,=C'/SEC'           MOVE QUALIFIER
+         L     R1,PKVALT               TOTAL PAGING I/OS
+         SLR   R0,R0
+         M     R0,=F'100000'           (WITH 2 DEC)
+         D     R0,PKINTT               / DURATION(MSEC) = RATE
+         CVD   R1,DWORD                INTO DECIMAL
+         AP    DWORD,=P'5'             CAUSE ROUNDING
+         EDIT  D1TV,DWORDX,'XX0.X'     ONTO LINE
+         MVC   D1TQ,=C'/SEC'           MOVE QUALIFIER
+         SPACE
+         LA    R14,REPS2               SET RETURN
+         SPACE
+REPCOMM  DS    0H            DO COMMON EDITTING
+         ST    R14,REPCSAVE            PRESERVE LINK
+         MVC   D1L3,=C'PEAK:'
+         LA    R1,PKDAT                )
+         ST    R1,UTDTCP3+4            ×
+         LA    R1,UTDTCP3              × CONVERT 00YYDDDF (PD+) TO
+         L     R15,=V(UTDTC)           × DD MMM YY AND PLACE ON LINE
+         BALR  R14,R15                 )
+         L     R1,PKIST                PERIOD START TIME (MSECS)
+         BAL   R14,EDTIME              GOSUB TO EDIT TIME
+         EDIT  D1T,WISTX,'X0X:XX:XX'
+         MVC   D1L4,=C'DURATION'
+         L     R1,PKINT                PERIOD DURATION (MSECS)
+         BAL   R14,EDTIME              GOSUB TO EDIT TIME
+         EDIT  D1PR,WISTX,'X0X:XX:XX'
+         MVC   D1L5,=C'AVERAGE:'
+         MVC   D1L6,=C'DURATION'
+         L     R1,PKINTT               TOTAL DURATION (MSECS)
+         BAL   R14,EDTIME              GOSUB TO EDIT TIME
+         EDIT  D1TR,WISTX,'X0X:XX:XX'
+         BAL   R14,PUT                 ** PRINT LINE **
+         L     R14,REPCSAVE            RESTORE LINK
+         BR    R14                     RETURN
+         SPACE
+REPCSAVE DC    A(0)
+         SPACE
+REPS2    DS    0H
+         CLC   PKSID,S2SID             DONE SECOND SYSTEM ?
+         BE    REPEND                  YES, END THE REPORT
+         LA    R5,S2SID                REPEAT FOR SECOND SYSTEM
+         B     REPST
+         DROP  R5,R6
+         SPACE
+REPEND   DS    0H
+         MVC   LINEREC,E1              MOVE END LINE
+         BAL   R14,PUT                 ** PRINT LINE **
+         CLOSE SYSPRINT
+         B     CMFANAL
+         EJECT
+*---------------------------------------------------------------------*
+*   SUBROUTINE TO PRINT THE LINES OF THE REPORT                       *
+*---------------------------------------------------------------------*
+PUT      DS    0H
+         ST    R14,PUTSAVE
+         MVI   PUTC,X'0C'              PRESET ZERO LINES
+         TM    LCC,B'00001111'         IF CC NOT X0 (+)
+         BNZ   PUT2
+         MVZ   PUTC,LCC                FOR _ 0 - CONVERT TO
+         NI    PUTC,B'00111111'         NUMBER OF LINES USED
+         XI    PUTC,B'00010000'         (1 2 3)
+PUT2     DS    0H
+         L     R2,=A(SYSPRINT)         @ DCB FOR PUTS
+         CP    LINECT,PUTC             ENOUGH LINES ON CURRENT PAGE ?
+         BNL   PUT3                    YES, GO PUT IT
+         PUT   (2),H0                  PUT HEADING PREFIX
+         AP    PAGNUM,=P'1'            AUGMENT PAGE NUMBER
+         EDIT  H1P,PAGNUM,'XX0'        EDIT PAGE NUMBER
+         PUT   (2),H1                  PUT HEADING LINE 1
+         ZAP   LINECT,=P'57'           SET NEW LINE COUNT
+PUT3     DS    0H
+         PUT   (2),LINEREC             PUT THE LINE
+         SP    LINECT,PUTC             DECREMENT LINE COUNT
+         MVI   LCC,C' '                SET SINGLE SPACING
+         MVC   LINE,LCC                BLANK OUT THE LINE
+         L     R14,PUTSAVE
+         BR    R14
+         SPACE
+PUTSAVE  DC    A(0)          STORE FOR RETURN LINK
+PAGNUM   DC    PL2'0'        CURRENT PAGE NUMBER
+PUTC     DC    P'0'          NUMBER OF LINE USED THIS LINE
+         EJECT
+*=====================================================================*
+* OPTIONALLY INVOKE CMF ANALYZER FOR THE PEAK CPU PERIODS             *
+*   IF  SYSIN DD STATEMENT PRESENT                                    *
+*=====================================================================*
+CMFANAL  DS    0H
+         OPEN  (OSYSIN,INPUT)          OPEN THE REAL SYSIN DS
+         L     R1,=A(OSYSIN)
+         USING IHADCB,R1
+         TM    DCBOFLGS,DCBOFOPN       OPENED ?
+         BO    DOCMFA                  YES, CONTINUE
+         LA    R3,MSG12                INFORMATION MESSAGE
+         BAL   R14,GENERROR
+         B     LEAVE                   AND BYPASS CMF ANALYZER
+         DROP  R1
+         SPACE
+*---------------------------------------------------------------------*
+* CONSTRUCT PARAMETER DATASET FOR CMF ANALYZER                        *
+*---------------------------------------------------------------------*
+DOCMFA   DS    0H
+*---------------------------------------------------------------------*
+* -  ALLOCATE A NEW SYSIN DATASET (ASSIGNED DDNAME)                   *
+*---------------------------------------------------------------------*
+         XC    RBERROR(L'RBERROR+L'RBINFO),RBERROR  CLEAR ERROR AREA
+         MVI   RBVERB,S99VRBAL         VERB = ALLOCATE
+         LA    R1,TUALS                POINT AT ALLOCATION POINTERS
+         ST    R1,RBTUPTR              SET @ POINTERS
+         LA    R1,RBPTR                POINT AT RB POINTERS
+         DYNALLOC            ISSUE DYNALLOC TO ALLOCATE NEW SYSIN
+         BAL   R14,DYNCHECK            CHECK COMPLETION
+         MVC   TCCAD,TALSAD            MOVE DDNAME TO CONCATENATE TU
+         SPACE
+*---------------------------------------------------------------------*
+* -  COPY THE REAL SYSIN INTO THE NEW ONE                             *
+*---------------------------------------------------------------------*
+         L     R1,=A(SYSIN)            @ DCB
+         USING IHADCB,R1
+         MVC   DCBDDNAM,TALSAD         SET DDNAME
+         OPEN  (SYSIN,OUTPUT)
+         L     R1,=A(SYSIN)            @ DCB AGAIN
+         TM    DCBOFLGS,DCBOFOPN       OPENED ?
+         BO    COPYS2                  YES, CONTINUE
+         MVC   MSG7D,DCBDDNAM          NO, DDNAME TO MESSAGE
+         LA    R3,MSG7                 ERROR MESSAGE
+         B     GENERROR
+         DROP  R1
+         SPACE
+COPYS2   DS    0H
+         GET   OSYSIN                  READ REAL SYSIN
+         LR    R0,R1                   @ RECORD TO R0
+         PUT   SYSIN,(0)               WRITE NEW SYSIN
+         B     COPYS2                   UNTIL EOD
+         SPACE
+SYSINEOD DS    0H
+         CLOSE OSYSIN                  CLOSE REAL SYSIN DS
+         FREEPOOL OSYSIN               FREE THE BUFFERS
+         CLOSE (SYSIN,REREAD)          CLOSE NEW SYSIN DS
+         SPACE
+*---------------------------------------------------------------------*
+* -  UNALLOCATE THE REAL SYSIN DATASET                                *
+*---------------------------------------------------------------------*
+         MVI   RBVERB,S99VRBUN         VERB = UNALLOCATE
+         LA    R1,TUUN                 POINT AT UNALLOCATION POINTERS
+         ST    R1,RBTUPTR              SET @ POINTERS
+UASYSIN  DS    0H
+         LA    R1,RBPTR                POINT AT RB POINTERS
+         DYNALLOC            ISSUE DYNALLOC TO UNALLOCATE OLD SYSIN
+         CLC   RBERROR,=X'0438'        DDNAME NOT FOUND ?
+         BE    UASDONE                 YES, IGNORE THE ERROR
+         BAL   R14,DYNCHECK            CHECK COMPLETION
+         B     UASYSIN                 GO BACK IN CASE ANY MORE DDS
+         SPACE
+UASDONE  DS    0H
+         SPACE 2
+*---------------------------------------------------------------------*
+* -  ALLOCATE THE PREFIX DATASET (DDNAME SYSIN)                       *
+*---------------------------------------------------------------------*
+         MVI   RBVERB,S99VRBAL         VERB = ALLOCATE
+         LA    R1,TUALP                POINT AT ALLOCATION POINTERS
+         ST    R1,RBTUPTR              SET @ POINTERS
+         LA    R1,RBPTR                POINT AT RB POINTERS
+         DYNALLOC            ISSUE DYNALLOC TO ALLOCATE SYSIN PREFIX
+         BAL   R14,DYNCHECK            CHECK COMPLETION
+         SPACE
+*---------------------------------------------------------------------*
+* -  WRITE THE PREFIX CONTROL STATEMENTS INTO THE PREFIX DATASET      *
+*---------------------------------------------------------------------*
+         LA    R5,S1SID                POINT TO SYSTEM 1 DATA
+         USING PKSID,R5
+         SPACE
+WRPREFIX DS    0H
+         L     R1,=A(SYSIN)
+         USING IHADCB,R1
+         MVC   DCBDDNAM,=CL8'SYSIN'    SET DDNAME
+         OPEN  (SYSIN,OUTPUT)
+         L     R1,=A(SYSIN)
+         USING IHADCB,R1
+         TM    DCBOFLGS,DCBOFOPN       OPENED ?
+         BO    WSYSIN1                 YES, CONTINUE
+         MVC   MSG7D,DCBDDNAM          NO, DDNAME TO MESSAGE
+         LA    R3,MSG7                 ERROR MESSAGE
+         B     GENERROR
+         DROP  R1
+         SPACE
+WSYSIN1  DS    0H
+* PUT SYSTEM ID INTO CMF SYSTEM CARD.
+         MVC   CSSID,PKSID             SYSTEM ID
+         PUT   SYSIN,CMFSID            WRITE SYSTEM ID CARD
+         SPACE
+* PUT PEAK PERIOD DATE INTO CMF DATETIME CARD.
+         LA    R6,PKCPU                POINT TO CPU DATA
+         USING PKDAT,R6
+         EDIT  WDATC,PKDAT+1,'XXXXX'
+         MVC   CDDAT1,WDAT
+         MVC   CDDAT2,WDAT
+* PUT PEAK PERIOD TIMES INTO CMF DATETIME CARD.
+         L     R1,PKIST                INT START TIME (MSECS)
+         LA    R14,HIGHTIME            SET RETURN TO CONTINUE
+         SPACE
+*----CONVERT MSECS TO 0HHMMSSF
+EDTIME   DS    0H            ENTRY TO EDIT A TIME IN R1
+         SLR   R0,R0
+         D     R0,=F'1000'             INTO SECONDS
+         CVD   R1,WISTD                INTO DECIMAL
+         DP    WISTD,=P'60'            MINUTES AND SECONDS
+         DP    WISTQ1,=P'60'           HOURS AND MINUTES
+         MVO   WISTH(L'WISTH+1),WISTQ2 FORMAT HOURS
+         MVO   WISTM(L'WISTM+1),WISTR2 FORMAT MINUTES (REMAINDER)
+         MVO   WISTS(L'WISTS+1),WISTR1 FORMAT SECONDS (SAVED ABOVE)
+         MVO   WISTX,WISTX(L'WISTH+L'WISTM+L'WISTS)
+         EDIT  WHMSC,WISTX,'X0XXXXX'
+         BR    R14                     RETURN TO MOVE TIME TO CARD
+*-----------------------------
+         SPACE
+HIGHTIME DS    0H
+         MVC   CDHMS1,WHMS             PERIOD START TIME TO CARD
+         L     R1,PKIST                INT START TIME (MSECS)
+         DROP  R6
+         LA    R6,PERIODC              POINT TO CPU PERIOD DEF
+         USING PERDEF,R6
+         A     R1,MINPER               PLUS ONE PERIOD LENGTH
+         DROP  R6
+         BAL   R14,EDTIME              GO EDIT PERIOD END TIME
+         MVC   CDHMS2,WHMS             PERIOD END TIME TO CARD
+         PUT   SYSIN,CMFDAT            WRITE DATETIME CARD
+         CLOSE SYSIN                   CLOSE NEW SYSIN DATASET
+         FREEPOOL SYSIN                FREE THE BUFFERS
+         EJECT
+*---------------------------------------------------------------------*
+* -  CONCATENATE THE PREFIX WITH THE NEW SYSIN DATASET                *
+*---------------------------------------------------------------------*
+         MVI   RBVERB,S99VRBCC         VERB = CONCATENATE
+         LA    R1,TUCC                 POINT AT CONCATENATION POINTERS
+         ST    R1,RBTUPTR              SET @ POINTERS
+         LA    R1,RBPTR                POINT AT RB POINTERS
+         DYNALLOC            ISSUE DYNALLOC TO CONCATENATE SYSIN'S
+         BAL   R14,DYNCHECK            CHECK COMPLETION
+         SPACE
+*---------------------------------------------------------------------*
+* INVOKE CMF ANALYZER
+*---------------------------------------------------------------------*
+         SPACE
+         L     R1,PARMADDR             RESTORE PARM DATA POINTER
+         LINK  EP=CMFANLYZ
+         ST    R15,WWORD               GET RETURN CODE
+         SPACE
+***********************************************************************
+* ( REMOVE SPIE ENVIRONMENT LEFT BY CMF ANALYZER )                    *
+*---------------------------------------------------------------------*
+         SPIE
+         SPACE
+*---------------------------------------------------------------------*
+* ( DELETE LOAD MODULES LEFT BY CMF ANALYZER )                        *
+*---------------------------------------------------------------------*
+         LA    R2,L'DELENT             INCREMENT BY ONE ENTRY
+         LA    R3,DELFIN               @ LAST ENTRY IN LIST
+         LA    R4,DMSSLIST             @ DELETE NAME LIST
+DELAGN   DS    0H
+         DELETE EPLOC=(4)              DELETE LOAD MODULE
+         BXLE  R4,R2,DELAGN            GO DELETE NEXT NAME
+         B     DELDONE
+         SPACE
+DMSSLIST DS    0C            LIST OF DMSS MODULES TO BE DELETED
+DELENT   DS    0CL8                    ONE ENTRY (DEFINES LENGTH)
+         DC    CL(L'DELENT)'DM32DMSS'
+         DC    CL(L'DELENT)'DMSSINIT' (MINOR CDE)
+         DC    CL(L'DELENT)'SOSV0000'
+         DC    CL(L'DELENT)'SOSV0001'
+         DC    CL(L'DELENT)'SOSV0044'
+         DC    CL(L'DELENT)'SOSS0001'
+         DC    CL(L'DELENT)'SOSS0002'
+         DC    CL(L'DELENT)'SOSS0003'
+         DC    CL(L'DELENT)'SOSS0004'
+         DC    CL(L'DELENT)'SOSS0005'
+         DC    CL(L'DELENT)'SOSS0006'
+         DC    CL(L'DELENT)'SOSS0007'
+         DC    CL(L'DELENT)'SOSS0008'
+         DC    CL(L'DELENT)'SOSS0009'
+         DC    CL(L'DELENT)'SOSS0010'
+         DC    CL(L'DELENT)'SOSS0011'
+         DC    CL(L'DELENT)'SOSS0012'
+         DC    CL(L'DELENT)'SOSS0013'
+DELFIN   EQU   *-L'DELENT              LAST ENTRY
+         SPACE
+DELDONE  DS    0H
+***********************************************************************
+         SPACE
+         UNPK  WWRCX,WWORDX               CONVERT
+         MVZ   WWRC,WWRCZ                 RETURN CODE
+         TR    WWRC,=C'0123456789ABCDEF'  TO HEX CHARS
+         MVC   MSG3R,WWRC              PUT IT INTO MESSAGE
+         LA    R3,MSG3                 LOG THE MESSAGE
+         BAL   R14,GENERROR             THROUGH GENERROR
+         SPACE
+         C     R15,RETCODE             IS RETCODE HIGHEST ?
+         BNH   NHIGH                   NO, CONTINUE
+         ST    R15,RETCODE             YES, SAVE CMF'S RETURN CODE
+NHIGH    DS    0H
+         SPACE
+*---------------------------------------------------------------------*
+* -  DECONCATENATE THE PREFIX FROM THE NEW SYSIN DATASET              *
+*---------------------------------------------------------------------*
+         MVI   RBVERB,S99VRBDC         VERB = DECONCATENATE
+         LA    R1,TUDC                 POINT AT DECONCATENATN POINTERS
+         ST    R1,RBTUPTR              SET @ POINTERS
+         LA    R1,RBPTR                POINT AT RB POINTERS
+         DYNALLOC            ISSUE DYNALLOC TO CONCATENATE SYSIN'S
+         BAL   R14,DYNCHECK            CHECK COMPLETION
+         SPACE 2
+*---------------------------------------------------------------------*
+* NOW DO THE SAME FOR THE NEXT SYSTEM ID                              *
+*---------------------------------------------------------------------*
+         CLC   PKSID,S2SID             DONE 2ND SYSTEM ?
+         BE    LEAVE                   YES,THAT'S ALL
+         LA    R5,S2SID                NO, POINT AT SYSTEM 2 DATA
+         OC    PKSID,PKSID             GOT SYSTEM 2 SID ?
+         BNZ   WRPREFIX                YES, DO IT ALL AGAIN
+         DROP  R5                      DROP SYSTEM DATA POINTER
+         EJECT
+*=====================================================================*
+* IT'S ALL OVER NOW, CLOSE THE LOG AND RETURN TO OS.                  *
+*---------------------------------------------------------------------*
+LEAVE    DS    0H
+         MVI   RLGCMDCD,RLGCCLSE
+         L     R15,=V(UTLOG)
+         CALL  (15),(LOGCTAB)          CLOSE THE LOG
+         L     R15,RETCODE
+         LEAVE CODE=(15)               LEAVE WITH CMF'S RETURN CODE
+         SPACE 3
+*---------------------------------------------------------------------*
+* DEFINE THE CONTROL STATEMENTS FOR CMF                               *
+*---------------------------------------------------------------------*
+CMFSID   DC    CL80' '       DEFINE CMF SYSTEM CONTROL STATEMENT.
+         ORG   CMFSID
+         DC    C' SYSTEM ID='
+CSSID    DC    CL4' '        SYSTEM ID
+         ORG
+         SPACE 2
+CMFDAT   DC    CL80' '       DEFINE CMF DATETIME CONTROL STATEMENT.
+         ORG   CMFDAT
+         DC    C' DATETIME ('
+CDDAT1   DC    C'YYDDD'      START DATE
+         DC    C':'
+CDHMS1   DC    C'HHMMSS'     START TIME
+         DC    C','
+CDDAT2   DC    C'YYDDD'      END DATE (= START DATE)
+         DC    C':'
+CDHMS2   DC    C'HHMMSS'     END TIME (= START TIME + PERIOD)
+         DC    C') '
+         ORG
+         EJECT
+*=====================================================================*
+*     ERROR ROUTINE FOR DYNAMIC ALLOCATION.  THIS INVOKES THE         *
+*     DAIRFAIL SERVICE ROUTINE TO FORMAT THE FAILURE MESSAGES.        *
+*     THE PROGRAM WILL ABEND.                                         *
+*=====================================================================*
+DYNCHECK DS    0H            ENTRY TO CHECK DYNALLOC COMPLETION
+         LTR   R15,R15                 WAS DYNALLOC 100%
+         BNZ   DYNERR                  NO, GO DO DAIRFAIL
+         OC    RBERROR(L'RBERROR+L'RBINFO),RBERROR  ANY ERROR ?
+         BZR   R14                     NO, JUST RETURN TO CALLER
+         SPACE
+DYNERR   DS    0H
+         ST    R15,DRFLR15             SAVE RETCODE FOR DAIRFAIL
+         UNPK  DCRCX,DRFLR15X          GET RETURN CODE
+         MVZ   DCRC,DCRCZ
+         TR    DCRC,=C'0123456789ABCDEF'  IN HEX CHARS
+         MVC   MSG9R,DCRC              PUT IT INTO MESSAGE
+         UNPK  DCERX,RBERROR(L'RBERROR+1)  GET ERROR CODE
+         MVZ   DCER,DCERZ
+         TR    DCER,=C'0123456789ABCDEF'  IN HEX CHARACTERS
+         MVC   MSG9E,DCER              PUT IT IN MESSAGE
+         UNPK  DCERX,RBINFO(L'RBINFO+1)    GET INFORMATION CODE
+         MVZ   DCER,DCERZ
+         TR    DCER,=C'0123456789ABCDEF'  IN HEX CHARACTERS
+         MVC   MSG9I,DCER              PUT IT IN MESSAGE
+         SPACE
+         XC    DFPARMS(DFLEN),DFPARMS  CLEAR DAIRFAIL PARM LIST
+         LA    R15,RB                  GET ADDRESS OF ALLOCATION RB
+         ST    R15,DFS99RBP            SAVE IN DAIRFAIL PARM LIST
+         LA    R15,DRFLR15             GET ADDRESS OF SAVED R15
+         ST    R15,DFRCP               SAVE IN DAIRFAIL PARM LIST
+         LA    R15,FULL0               GET ADDRESS OF DUMMY F02
+         ST    R15,DFJEFF02            SAVE IN DAIRFAIL PARM LIST
+         LA    R15,DRFLID              GET ADDRESS OF CALLERS FLAGS
+         ST    R15,DFIDP               SAVE IN DAIRFAIL PARM LIST
+         LA    R15,DFBUFS              GET ADDRESS OF MSG BUFFERS
+         ST    R15,DFBUFP              SAVE IN DAIRFAIL PARM LIST
+         LINK  MF=(E,DFPARMS),SF=(E,LINKDRFL) LINK TO DAIRFAIL SERV RTN
+         LTR   R15,R15                 GOOD RETURN CODE ?
+         BZ    DRFLPRT                 YES, GO FORMAT THE MESSAGE
+         SPACE
+         LA    R3,MSG10                NO, SEND OH DEAR DEAR MESSAGE
+         BAL   R14,GENERROR                AND ABEND
+         B     DYNERRAB
+         SPACE
+DRFLPRT  DS    0H
+         SLR   R15,R15
+         ICM   R15,B'0011',DFBUFL1     GET MSG1 LENGTH (+ EXTRA 4)
+         BZ    DYNERRAB                SKIP IF NO 1ST MESSAGE
+         SH    R15,=H'5'               PREPARE FOR EXECUTE
+         CH    R15,=AL2(L'MSG9T-1)     TOO LONG ?
+         BNH   DYNERRP1                NO, CONTINUE
+         LA    R15,L'MSG9T-1           YES, TRUNCATE MESSAGE
+DYNERRP1 DS    0H
+         EX    R15,DYNERRM1            1ST MESSAGE TO MSG9A
+         LA    R3,MSG9B                SEND
+         BAL   R14,GENERROR             1ST MESSAGE
+         SLR   R15,R15
+         ICM   R15,B'0011',DFBUFL2     GET MSG2 LENGTH (+ EXTRA 4)
+         BZ    DYNERRAB                SKIP IF NO 2ND MESSAGE
+         SH    R15,=H'5'               PREPARE FOR EXECUTE
+         CH    R15,=AL2(L'MSG9T-1)     TOO LONG ?
+         BNH   DYNERRP2                NO, CONTINUE
+         LA    R15,L'MSG9T-1           YES, TRUNCATE MESSAGE
+DYNERRP2 DS    0H
+         EX    R15,DYNERRM2            2ND MESSAGE TO MSG9B
+         LA    R3,MSG9B                SEND
+         BAL   R14,GENERROR             2ND MESSAGE
+         SPACE
+DYNERRAB DS    0H
+         LA    R3,MSG9A                POINT AT MESSAGE
+         B     GENERROR                SEND MSG AND ABEND
+         SPACE
+DYNERRM1 MVC   MSG9T(0),DFBUFT1        MOVE 1ST DAIRFAIL TEXT TO MSG
+DYNERRM2 MVC   MSG9T(0),DFBUFT2        MOVE 2ND DAIRFAIL TEXT TO MSG
+         SPACE
+FULL0    DC    A(0)                    NULL IKJEFF02 ROUTINE
+DRFLR15  DC    A(0)                    SAVED RETURN CODE
+DRFLR15X EQU   DRFLR15+3,2              TO BE UNPACKED
+DRFLID   DC    AL1(DFBUFSW),AL1(DFSVC99) MSGS IN BUFS REQD×SVC 99
+         SPACE
+DCHARS   DC    4H'0'                   WORKAREA
+DCRC     EQU   DCHARS,2                 FOR RETURN CODE
+DCRCX    EQU   DCHARS,3                 (DITTO FOR UNPK)
+DCER     EQU   DCHARS,4                 FOR ERROR/INFO CODE
+DCERX    EQU   DCHARS,5                 (DITTO FOR UNPK)
+DCRCZ    EQU   FULL0,L'DCRC            ZEROS FOR RETURN CODE
+DCERZ    EQU   FULL0,L'DCER            ZEROS FOR ERROR/INFO CODE
+         SPACE
+LINKDRFL LINK  EP=IKJEFF18,SF=L LINK TO DAIRFAIL SERVICE ROUTINE
+         SPACE 2
+         DROP  R11,R12
+         EJECT
+*=====================================================================*
+*====================== E15 EXIT PROCESSOR ===========================*
+*=====================================================================*
+*  E15 EXIT PROCESSOR READS THE DATA AND PASSES SUBRECORDS TO SORT    *
+*---------------------------------------------------------------------*
+SE15     ENTER 'SE15',BASE=11
+         L     R1,=A(EXTDATA)          @ INPUT DCB
+         USING IHADCB,R1
+         TM    DCBOFLGS,DCBOFOPN       ALREADY OPENED ?
+         BO    E15READ                 YES, CONTINUE
+         OPEN  (EXTDATA,INPUT)         NO, ATTEMPT OPEN
+         L     R1,=A(EXTDATA)
+         TM    DCBOFLGS,DCBOFOPN       OPENED ?
+         BO    E15READ                 YES, CONTINUE
+         LA    R3,MSG6                 NO, ERROR MESSAGE
+         B     GENERROR
+         DROP  R1
+         EJECT
+*---------------------------------------------------------------------*
+*  READ THE SMF RECORDS, SELECTING THE REQUIRED RECORDS:              *
+*          RECORD TYPE = 70 OR 71                                     *
+*          TIME GE 0800                                               *
+*          TIME LT 1700                                               *
+*          DATE EQ WEEKDAY (UTDTC USED)                               *
+*---------------------------------------------------------------------*
+E15READ  DS    0H
+         L     R1,=A(EXTDATA)
+         GET   (1)                     READ A RECORD
+         LR    R10,R1                  @ RECORD
+         USING SMFREC,R10              TELL ASSEMBLER
+         CLI   SMF70RTY,70             IS IT TYPE 70 ?
+         BE    TESTTM                  YES, CARRY ON
+         CLI   SMF70RTY,71             IS IT TYPE 71 ?
+         BNE   E15READ                 NO, DONT WANT IT
+TESTTM   DS    0H
+         CLC   SMF70IST,=P'0080000'    CF INT START TIME V 0800
+         BL    E15READ                 LT, DON'T WANT IT
+         CLC   SMF70IST,=P'0170000'    CF INT START TIME V 1700
+         BNL   E15READ                 GE, DON'T WANT IT
+         SPACE
+* SINCE WE'RE ONLY EVALUATING DATA FOR TWO SYSTEMS, IGNORE ANY RECORDS
+* FOR ANY SYSTEM ID'S ABOVE THE FIRST TWO.
+         LA    R5,S1SID                SET POINTER TO S1 DATA
+         USING PKSID,R5
+         OC    PKSID,PKSID             GOT SYSTEM 1 ID ?
+         BZ    NEWSID                  NO, PUT THIS ONE IN
+         CLC   PKSID,SMF70SID          IS THIS REC FOR SYSTEM 1 ?
+         BE    GOTSID                  YES, GOT IT
+         LA    R5,S2SID                UPDATE POINTER TO S2 DATA
+         OC    PKSID,PKSID             GOT SYSTEM 2 SID ?
+         BZ    NEWSID                  NO, PUT THIS ONE IN
+         CLC   PKSID,SMF70SID          IS THIS REC FOR SYSTEM 2 ?
+         BNE   E15READ                 NO, IGNORE THE RECORD
+         B     GOTSID                  YES, GOT IT
+NEWSID   DS    0H
+         MVC   PKSID,SMF70SID          PUT THIS SID INTO STORE
+GOTSID   DS    0H
+* ENSURE THAT THIS DATE IS A WEEKDAY
+         CLC   DTDATE,SMF70DAT         SAME DATE AS LAST TIME ?
+         BE    TSTDOW                  YES, DOW AVAILABLE
+         MVC   DTDATE,SMF70DAT         NO, STORE NEW DATE
+         LA    R1,UTDTCP4              ) GET DAY OF WEEK
+         L     R15,=V(UTDTC)           ×  FOR THIS
+         BALR  R14,R15                 )  NEW DATE
+TSTDOW   DS    0H
+         CLI   DTDOW+1,6               IS THIS A WEEKDAY ?
+         BNL   E15READ                 NO, IGNORE THE RECORD
+         SPACE
+* STORE THE LOWEST AND HIGHEST DATES IN THE INPUT
+         OC    FIRDTEST,FIRDTEST       HAVE WE GOT THE FIRST DATE ?
+         BZ    ISFIRST                 NO, USE THIS
+         CLC   SMF70DAT,FIRSD          IT THIS LOWEST ?
+         BNL   NFIRST                  NO,
+ISFIRST  DS    0H
+         MVC   FIRSD,SMF70DAT          YES, SAVE THIS AS FIRST DATE
+NFIRST   DS    0H
+         CLC   SMF70DAT,LASTD          IT THIS HIGHEST?
+         BNH   NLAST                   NO,
+         MVC   LASTD,SMF70DAT          YES, SAVE THIS AS LAST DATE
+NLAST    DS    0H
+         SPACE
+* FORMAT AN INTERMEDIATE RECORD
+         MVC   IRTY,SMF70RTY           RECORD TYPE
+         MVC   ISID,SMF70SID           SYSTEM ID
+         MVC   IDAT,SMF70DAT           INTERVAL START DATE
+*----CONVERT 0HHMMSSF TO MSECS
+         MVO   WISTX,SMF70IST          INT START TIME (HHMMSSFF)
+         ZAP   WMINS,=P'0'
+         MVO   WMINS,WISTH             SEPARATE THE HOURS
+         MP    WMINS,=P'3600'          CONVERT HOURS TO SECS
+         ZAP   WISTD,WMINS             MOVE TO INT START TIME
+         MVO   WMINS,WISTM             SEPARATE THE MINUTES
+         MP    WMINS,=P'60'            CONVERT MINS TO SECS
+         AP    WISTD,WMINS             ADD INTO INT START TIME
+         MVO   WMINS,WISTS             SEPARATE THE SECONDS
+         AP    WISTD,WMINS             ADD INTO INT START TIME
+         MP    WISTD,=P'1000'          CONVERT SECS TO MSECS
+         CVB   R1,WISTD                INT START TIME IN BINARY
+*-----------------------------
+         ST    R1,IIST                 INT START TIME IN MSECS
+*----CONVERT 0MMSSTTTF TO MSECS
+         MVC   WINT,SMF70INT           INT DURATION (MMSSTTTF)
+         MVO   WMINS,WINTM             SEPARATE THE MINUTES
+         XC    WINTM,WINTM             EXCLUDE MINS
+         MP    WMINS,=P'60000'         CONVERT MINS TO MSECS
+         AP    WINT,WMINS              ADD BACK INTO INT DURATION
+         CVB   R1,WINTD                INT DURATION IN BINARY
+*------------------------------
+         ST    R1,IINT                 INTERVAL DURATION
+         SPACE
+         CLI   SMF70RTY,70             IS IT TYPE 70 ?
+         BNE   FTYPE71                 NO, MUST BE TYPE 71
+         AP    RECNUM,=P'1'            ADD 1 TO RECORDS READ (70 ONLY)
+*----CONVERT CLOCK UNITS TO MSECS
+         MVC   DWORD,SMF70WAT          WAIT IN BIN CLOCK UNITS (CPU1)
+         LM    R0,R1,DWORD
+         SRDA  R0,12                   IN MICROSECONDS
+         AH    R1,=H'500'              CAUSE ROUNDING
+         D     R0,=F'1000'             IN MILLISECONDS (R1)
+*--------------------------------
+         ST    R1,IVAL                 CPU WAIT TIME
+*              ACCUMULATE TOTAL CPU WAIT (MSECS) AND DURATION
+         LA    R6,PKCPU
+         USING PKDAT,R6
+         A     R1,PKVALT               + TOTAL
+         ST    R1,PKVALT               = NEW TOTAL
+         L     R1,IINT                 INTERVAL DURATION
+         A     R1,PKINTT               + TOTAL
+         ST    R1,PKINTT               = NEW TOTAL
+         B     E15INS
+         DROP  R6
+         SPACE
+FTYPE71  DS    0H            ACCUMULATE TOTAL PAGING I/OS
+         MVC   WWORD,SMF71PIN          NON-VIO, NON-SW PAGE-INS
+         L     R1,WWORD
+         MVC   WWORD,SMF71POT          NON-VIO, NON-SW PAGE-OUTS
+         A     R1,WWORD
+         MVC   WWORD,SMF71SIN          SWAP PAGE-INS
+         A     R1,WWORD
+         MVC   WWORD,SMF71SOT          SWAP PAGE-OUTS
+         A     R1,WWORD
+         MVC   WWORD,SMF71VIN          VIO PAGE-INS
+         A     R1,WWORD
+         MVC   WWORD,SMF71VOT          VIO PAGE-OUTS
+         A     R1,WWORD
+         ST    R1,IVAL                 STORE INTO INTER RECORD
+*              ACCUMULATE TOTAL PAGING I/OS AND DURATION
+         LA    R6,PKPIO
+         USING PKDAT,R6
+         A     R1,PKVALT               + TOTAL
+         ST    R1,PKVALT               = NEW TOTAL
+         L     R1,IINT                 INT DURATION
+         A     R1,PKINTT               + TOTAL
+         ST    R1,PKINTT               = NEW TOTAL
+         DROP  R5,R6
+         SPACE
+E15INS   DS    0H
+         LA    R1,INTEREC              TELL SORT WHERE THE RECORD IS
+         LA    R15,12                  TELL SORT TO INSERT THIS RECORD
+E15LEAVE LEAVE CODE=(15)
+         DROP  R10
+         SPACE 2
+*---------------------------------------------------------------------*
+*  END-OF-DATA ROUTINE FOR EXTDATA, THE INPUT DATA FILE               *
+*---------------------------------------------------------------------*
+E15EOD   DS    0H
+         CLOSE EXTDATA                 CLOSE INPUT DATASET
+         L     R1,=A(EXTDATA)
+         FREEPOOL (1)                  FREE THE BUFFERS
+         LA    R15,8                   TELL SORT TO NOT RETURN
+         B     E15LEAVE                GO BACK TO SORT
+         SPACE
+         DROP  R11
+         SPACE 2
+UTDTCP4  DC    A(DTWCC,DTDATE,DTDNM,DTDOW)  PARAMETERS FOR UTDTC
+UTDTCP4D EQU   UTDTCP4+4,4             @ DATE
+         ORG   *-4
+         DC    X'80'                   VL BIT
+         ORG
+DTDATE   DC    PL4'0'                  DATE TESTED
+DTDOW    DC    H'0'                    RETURNED DAY NUMBER (1=MON)
+DTDNM    DC    CL3' '                  RETURNED DAY NAME
+DTWCC    DC    C'W',C' ',C'J',C' ',C'    '  UTDTC COMMAND BLOCK
+         SPACE
+*=====================================================================*
+*====================  END OF E15 PROCESSOR  =========================*
+*=====================================================================*
+         EJECT
+*=====================================================================*
+*====================== E35 EXIT PROCESSOR ===========================*
+*=====================================================================*
+*  E35 EXIT PROCESSOR ANALYZES THE SORTED INTERMEDIATE RECORDS        *
+*     AND LOCATES THE PEAK PERIOD(S)                                  *
+*---------------------------------------------------------------------*
+SE35     ENTER 'SE35',BASE=11
+         L     R1,0(R1)                @ RECORD LEAVING PHASE 3
+         LTR   R1,R1                   END-OF-DATA ?
+         BZ    E35END                  YES, ALL DONE NOW
+         SPACE
+*---------------------------------------------------------------------*
+* PROCESS INTERMEDIATE RECORD                                         *
+*---------------------------------------------------------------------*
+         MVC   INTEREC,0(R1)           MOVE RECORD TO WORK AREA
+         SPACE
+*---------------------------------------------------------------------*
+* SEARCH THE ACCUMULATION AREA - FIRST START A NEW PERIOD             *
+*---------------------------------------------------------------------*
+ACCSRCH  DS    0H
+         LA    R4,ACCSEGM              @ FIRST SEGMENT
+         USING ACCSEGM,R4
+NSEARCH  DS    0H
+         CLI   ACCSID,X'FF'            END OF SEGMENTS ?
+         BNE   NCONTS                  NO, CONTINUE
+         LA    R3,MSG2                 YES, POINT AT ERROR MESSAGE
+         B     GENERROR                 AND GO TO ERROR ROUTINE
+         SPACE
+NCONTS   DS    0H
+         OC    ACCSID,ACCSID           EMPTY SEGMENT ?
+         BZ    SEGNEW                  YES, USE IT
+         LA    R4,ACCSEGL(,R4)         ELSE TRY NEXT SEGMENT
+         B     NSEARCH
+         SPACE
+SEGNEW   DS    0H
+         MVC   ACCSID,ISID             SAVE SYSTEM ID
+         MVC   ACCRTY,IRTY             SAVE TYPE
+         MVC   ACCDAT,IDAT             SAVE DATE
+         MVC   ACCIST,IIST             SAVE START TIME (MSECS)
+         SPACE
+         DROP  R4
+         SPACE
+*---------------------------------------------------------------------*
+* SEARCH THE ACCUMULATION AREA - SECOND UPDATE EXISTING PERIODS       *
+*---------------------------------------------------------------------*
+E35CHK   DS    0H
+         LA    R4,ACCSEGM              @ FIRST SEGMENT
+         USING ACCSEGM,R4
+SEARCH   DS    0H
+         CLI   ACCSID,X'FF'            END OF SEGMENTS ?
+         BE    E35DONE                 YES, DONE IT ALL
+         CLC   ACCSID,ISID             SAME SYSTEM ID (NOT EMPTY) ?
+         BNE   CONTS                   NO, ...
+         CLC   ACCRTY,IRTY             AND TYPE ?
+         BE    SEGCHK                  YES, GO CHECK THIS ONE
+CONTS    DS    0H
+         LA    R4,ACCSEGL(,R4)         ELSE TRY NEXT SEGMENT
+         B     SEARCH
+         SPACE
+SEGCHK   DS    0H
+         LA    R6,PERIODC              POINT AT PERIOD FOR CPU
+         CLI   ACCRTY,70               TYPE 70 (CPU) ?
+         BE    PERCHK                  YES, ...
+         LA    R6,PERIODP              NO, POINT AT PERIOD FOR PAGING
+         SPACE
+         USING PERDEF,R6
+PERCHK   DS    0H
+         CLC   ACCDAT,IDAT             SAME DATE ?
+         BNE   EVALTE                  NO, GO EVALUATE THIS SEGMENT
+         L     R0,ACCIST               CALCULATE TIME AT
+         A     R0,MAXPER                END OF MAX PERIOD
+         C     R0,IIST                 IS THIS WITHIN PERIOD ?
+         BL    EVALTE                  NO, GO EVALUATE THIS SEGMENT
+         L     R0,IINT
+         A     R0,ACCINT
+         ST    R0,ACCINT               UPDATE INTERVAL DURATION
+         L     R0,IVAL
+         A     R0,ACCVAL
+         ST    R0,ACCVAL               UPDATE TOTAL COUNT
+         CLC   ACCINT,MINPER           IS DUR APPROX ONE PERIOD ?
+         BL    CONTS                   NO, GO LOOK AT NEXT SEGMENT
+         SPACE
+EVALTE   DS    0H
+         CLC   ACCINT,MINPER           IS DUR APPROX ONE PERIOD ?
+         BL    SEGDEL                  NO, IGNORE
+         DROP  R6                      DROP PERIOD VALUE POINTER
+         LA    R5,S1SID                POINT AT FIRST SYSTEM STORE
+         USING PKSID,R5
+         CLC   ACCSID,PKSID            IS THIS FOR SYSTEM 1 ?
+         BE    EVSTYP                  YES, CHECK THIS FOR SYSTEM 1
+         LA    R5,S2SID                POINT AT SECOND SYSTEM STORE
+         CLC   ACCSID,PKSID            IS THIS FOR SYSTEM 2 ?
+         BE    EVSTYP                  YES, CHECK THIS FOR SYSTEM 2
+         LA    R3,MSG2                 NO, OOPS NASTY
+         B     GENERROR
+         SPACE
+EVSTYP   DS    0H
+         LA    R6,PKCPU                PRESET POINTER TO CPU PEAK
+         CLI   ACCRTY,70               TYPE = CPU ?
+         BE    EVSCOMM                 YES, ...
+         LA    R6,PKPIO                NO, POINT TO PIO PEAK
+         SPACE
+EVSCOMM  DS    0H
+         USING PKDAT,R6
+         OC    PKVAL,PKVAL             FOUND ONE YET ?
+         BZ    EVSUSE                  NO, USE THIS REGARDLESS
+         CLI   ACCRTY,70               CPU - MIN VAL REQUIRED
+         BNE   EVSMAX                  NO, MAX VAL REQUIRED
+         CLC   ACCVAL,PKVAL            IS THIS VALUE < FOUND SO FAR ?
+         BNL   SEGDEL                  NO, GO DELETE THE SEGMENT
+         B     EVSUSE
+         SPACE
+EVSMAX   DS    0H
+         CLC   ACCVAL,PKVAL            IS THIS VALUE > FOUND SO FAR ?
+         BNH   SEGDEL                  NO, GO DELETE THE SEGMENT
+         SPACE
+EVSUSE   DS    0H
+         MVC   PKDAT,ACCDAT            YES, REPLACE CURRENT PEAK PERIOD
+         MVC   PKIST,ACCIST                 ×
+         MVC   PKINT,ACCINT                 ×
+         MVC   PKVAL,ACCVAL                 ×
+         DROP  R5,R6
+         SPACE 2
+SEGDEL   DS    0H
+         MVI   ACCSEGM,X'00'           SET SEGMENT TO ZEROS
+         MVC   ACCSEGM+1(ACCSEGL-1),ACCSEGM
+         B     CONTS                   GO LOOK AT NEXT SEGMENT
+         SPACE
+         DROP  R4
+*---------------------------------------------------------------------*
+         SPACE 2
+E35DONE  DS    0H
+         LA    R15,4                   ALWAYS DELETE RECORD
+         B     E35LEAVE
+         SPACE
+E35END   DS    0H
+         LA    R15,8                   TELL SORT NOT TO COME BACK
+E35LEAVE LEAVE CODE=(15)               RETURN TO SORT
+         SPACE
+         DROP  R11
+*=====================================================================*
+*====================  END OF E35 PROCESSOR  =========================*
+*=====================================================================*
+         EJECT
+*---------------------------------------------------------------------*
+*  GENERAL ERROR ROUTINE ...                                          *
+*     PARAMETERS:                                                     *
+*     REG 3 => MESSAGE (ONE BYTE LENGTH, FOLLOWED BY ID AND TEXT)     *
+*     OPERATION:                                                      *
+*     THE MESSAGE IS PASSED TO UTLOG FOR LOGGING.                     *
+*     IF THE MESSAGE ID HAS A SEVERITY OF 'E' OR WORSE;               *
+*     AN ABEND CODE IS DEDUCED FROM THE MESSAGE IDENTIFIER,           *
+*     GENERAL REGISTERS ARE SAVED IN AN AREA IDENTIFIABLE IN A DUMP,  *
+*     AND ABEND IS INVOKED                                            *
+*---------------------------------------------------------------------*
+GENERROR DS    0H
+         BALR  R10,0                   GET NEW BASE FOR THIS RTN
+         USING *,R10
+         STM   R14,R1,GENSAVE          SAVE SYSTEM REGISTERS
+         SLR   R1,R1
+         IC    R1,0(,R3)               GET MSG LENGTH
+         BCTR  R1,0                    - 1
+         EX    R1,MOVEMSG              MESSAGE ONTO THE LINE
+         MVI   RLGCMDCD,RLGCLOG        SEND MESSAGE
+         L     R15,=V(UTLOG)            THROUGH UTLOG
+         LA    R1,GENPARM
+         CALL  (15)                     TO THE RUN LOG
+         CLI   9(R3),C'E'              ERROR ?
+         BE    GENAB                   YES, ABEND
+         CLI   9(R3),C'D'              DISASTER ?
+         BE    GENAB                   YES, ABEND
+         LM    R14,R1,GENSAVE           AND
+         BR    R14                      RETURN
+GENAB    DS    0H
+         PACK  GENDW,7(2,R3)           GET MESSAGE NUMBER
+         CVB   R1,GENDW                IN BINARY = ABEND CODE
+         ABEND (1),DUMP                *** ABEND ***
+         SPACE
+MOVEMSG  MVC   LOGL(0),1(R3)           MOVE MESSAGE ONTO THE LINE
+GENDW    DC    D'0'                    ABEND CODE (PACKED)
+         SPACE
+GENPARM  DC    A(LOGCTAB,LOGL)         PARAMETERS FOR UTLOG
+         SPACE
+         DC    C'  R14 R15 R0 R1 '     LOCATOR
+GENSAVE  DC    4A(0)                   SAVE AREA
+         DC    4C' '                   SEPARATOR
+         SPACE
+         DROP  R10
+         EJECT
+*---------------------------------------------------------------------*
+*     DATA STORAGE AND WORKING AREAS                                  *
+*---------------------------------------------------------------------*
+         SPACE
+         LTORG
+         SPACE
+PARMADDR DC    A(0)                    SAVED PARM DATA POINTER
+RETCODE  DC    A(0)                    HIGHEST RETURN CODE FOUND
+         SPACE
+* RECORD AREA FOR INTERMEDIATE RECORD ...
+IRECS    DS    0D            START OF INTER RECORD
+ISID     DC    CL4' '        SYSTEM ID
+IDAT     DC    PL4'0'        INTERVAL START DATE  00YYDDDF
+IIST     DC    PL4'0'        INTERVAL START TIME  MSECS
+IRTY     DC    B'0'          RECORD TYPE (70×71)
+         DC    XL3'0'        FILLER
+IINT     DC    PL4'0'        INTERVAL DURATION    MSECS
+IVAL     DC    BL4'0'        70 CPU WAIT TIME     MSECS
+*                            71 TOTAL PAGE I/OS
+INTEREC  EQU   IRECS,*-IRECS ALL OF INTER RECORD
+         SPACE
+*---------------------------------------------------------------------*
+PERDEF   DSECT ,             DEFINE PERIOD FOR ACCUMULATIONS
+MINPER   DS    F                MINIMUM PERIOD IN MSECS
+MAXPER   DS    F                MAXIMUM PERIOD IN MSECS
+SMPKA    CSECT
+PERIODC  DS    0F            DEFINE PERIOD FOR CPU UTILISATION
+         DC    A(59*60*1000)    MINIMUM PERIOD IN MSECS (59 MINS)
+         DC    A(1*60*60*1000)  MAXIMUM PERIOD IN MSECS (1 HOUR)
+PERIODP  DS    0F            DEFINE PERIOD FOR PAGING IO
+         DC    A(9*60*1000)     MINIMUM PERIOD IN MSECS (9 MINS)
+         DC    A(10*60*1000)    MAXIMUM PERIOD IN MSECS (10 MINS)
+         SPACE
+*---------------------------------------------------------------------*
+PKSTORE  DSECT ,             DEFINE STORE FOR SYSTEMS AND PEAK PERIODS
+PKSID    DS    CL4            SYSTEM ID
+PKCPU    DS    0F             CPU PEAK PERIOD
+PKDAT    DS    PL4             00YYDDDF  DATE
+PKIST    DS    F               MSECS     START TIME
+PKINT    DS    F               MSECS     INTERVAL LENGTH
+PKVAL    DS    F               MSECS×NUM VALUE
+PKINTT   DS    F               MSECS     TOTAL INTERVAL LENGTH
+PKVALT   DS    F               MSECS×NUM TOTAL VALUE
+PKPIO    DS    0F             PAGING I/O PEAK PERIOD
+SMPKA    CSECT
+         DS    0F
+S1SID    DC    CL4' '        FIRST SYSTEM  -  SYSTEM ID
+         ORG   S1SID
+         DC    (L'S1SID)X'00'          INITIAL VALUES
+         ORG
+         DC    PL4'0'                  CPU UTILISATION
+         DC    5F'0'
+         DC    PL4'0'                  PAGING I/O
+         DC    5F'0'
+S1DATA   EQU   S1SID,*-S1SID           ALL SYSTEM 1 DATA
+         SPACE
+S2SID    DC    CL4' '        SECOND SYSTEM   -  SYSTEM ID
+         ORG   S2SID
+         DC    (L'S2SID)X'00'          INITIAL VALUES
+         ORG
+         DC    PL4'0'                  CPU UTILISATION
+         DC    5F'0'
+S2DATP   DC    PL4'0'                  PAGING I/O
+         DC    5F'0'
+S2DATA   EQU   S2SID,*-S2SID           ALL SYSTEM 2 DATA
+*---------------------------------------------------------------------*
+         SPACE 2
+RECNUM   DC    PL3'0'        NUMBER OF RECORDS SELECTED
+FIRSD    DC    PL4'0'        00YYDDDF EARLIEST DATE SELECTED
+FIRDTEST EQU   FIRSD,2       XXXX      TO TEST FOR NO DATE
+LASTD    DC    PL4'0'        00YYDDDF LATEST DATE SELECTED
+         SPACE 2
+WINTD    DC    D'0'
+WINT     EQU   WINTD+4,4     MMSSTTTF  DURATION FROM RECORD
+WINTM    EQU   WINTD+4,1     MM        MINUTES
+         SPACE
+WISTD    DC    D'0'          0000000000000000  FOR REFORMATTING IST
+WIST     EQU   WISTD+4,4             0000000F  INT START TIME (MSECS)
+WISTQ1   EQU   WISTD+0,6     00000000000F      MINUTES FROM DIVIDE
+WISTQ2   EQU   WISTD+0,4     0000000F          HOURS FROM DIVIDE
+WISTR2   EQU   WISTD+4,2             000F      MINUTES FROM DIVIDE
+WISTR1   EQU   WISTD+6,2                 000F  SECONDS FROM DIVIDE
+         SPACE
+WISTX    DC    PL4'0'        HHMMSSFF  INTERVAL START TIME FROM RECORD
+WISTH    EQU   WISTX+0,1     HH        HOURS
+WISTM    EQU   WISTX+1,1       MM      MINUTES
+WISTS    EQU   WISTX+2,1         SS    SECONDS
+         SPACE
+WMINS    DC    PL5'0'        000000000F  FOR MM IN MSECS
+         SPACE
+WDATC    DC    CL6' '        _YYDDD    DATE IN CHARACTERS (EDIT)
+WDAT     EQU   WDATC+1,5      YYDDD    DATE IN CHARACTERS
+         SPACE
+WHMSC    DC    CL9' '        _0HHMMSS  TIME IN CHARACTERS (EDIT)
+WHMS     EQU   WHMSC+2,6       HHMMSS  TIME IN CHARACTERS
+         SPACE
+DWORD    DC    D'0'          000000000000000F  FOR CVD/CVB
+DWORDE   EQU   DWORD+0,4     _ 9 9 9            EDITTED 3-DIGITS
+DWORDEX  EQU   DWORDE+2,2        9 9                    2-DIGITS
+DWORDX   EQU   DWORD+5,2               0000     RATE RESULT
+DWORDL   EQU   DWORD+6,2                 000F   3-DIGITS
+         ORG   DWORD
+WWORD    DC    F'0'
+WWORDX   EQU   WWORD+3,2               TO UNPACK LAST BYTE
+WWRC     EQU   WWORD,2                  FOR RETURN CODE
+WWRCX    EQU   WWORD,3                  (DITTO FOR UNPK)
+WHALF    DC    H'0'
+         ORG
+WWRCZ    DC    XL(L'WWRC)'00'          ZEROS FOR RETURN CODE
+         EJECT
+*---------------------------------------------------------------------*
+*                                                                     *
+*     DEFINE THE LINES FOR THE REPORT                                 *
+*                                                                     *
+*---------------------------------------------------------------------*
+LINEREC  DC    CL133' '      REPORT RECORD AREA
+LCC      EQU   LINEREC,1       CONTROL CHARACTER (ASA)
+LINE     EQU   LINEREC+1,132   DATA LINE
+LINECT   DC    PL2'0'        LINES REMAINING ON THE PAGE
+         SPACE
+H0       DC    C'1'
+H0L      DC    CL(L'LINE)'E.O.(COMPUTER OPERATIONS)'
+         SPACE
+H1       DC    C'0'
+H1L      DC    C'SMPKA - PEAK PERIOD CPU AND PAGING ANALYSIS           X
+                                   DATES:  DD MMM YY  TO  DD MMM YY    X
+                             PAGE 999'
+H1F      EQU   H1L+82,9      DD MMM YY  FROM DATE
+H1T      EQU   H1L+97,9      DD MMM YY  TO DATE
+H1P      EQU   H1L+128,4     _999       PAGE NUMBER
+         SPACE
+E1       DC    C'-'
+E1L      DC    CL(L'LINE)'END OF REPORT'
+         SPACE
+*  DEFINE DATA LINE ...
+*     LINE+     ×          1         2         3         4         5  5
+*               ×0         0         0         0         0         0  3
+*     LINE+    5     6         7         8         9         0        0
+*              4     0         0         0         0         0        9
+*     LINE+    1         2         33×
+*              0         0         01×
+*               ×SYSTEM ID  XXXX  XXXXXXXXXXXXXXX PEAK: DD MMM YY__HH:M
+*              M:SS  DURATION__HH:MM:SS  _XXX.X%...   AVERAGE: DURATION
+*              __HH:MM:SS  _XXX.X%...×
+D1L1     EQU   LINE+00,9     SYSTEM_ID
+D1S      EQU   LINE+11,4     XXXX         SYSTEM ID
+D1L2     EQU   LINE+17,15                 IDENTIFYING LITERAL
+D1L3     EQU   LINE+33,5     PEAK:
+D1D      EQU   LINE+39,9     DD MMM YY    DATE
+D1T      EQU   LINE+48,10    __HH:MM:SS   TIME
+D1L4     EQU   LINE+60,8     DURATION
+D1PR     EQU   LINE+68,10    __HH:MM:SS   DURATION - PEAK
+D1PV     EQU   LINE+80,6     _XXX.X       VALUE
+D1PQ     EQU   LINE+86,4     XXXX         QUALIFIER (% × /SEC)
+D1L5     EQU   LINE+93,8     AVERAGE:
+D1L6     EQU   LINE+102,8    DURATION
+D1TR     EQU   LINE+110,10   __HH:MM:SS   DURATION - WHOLE
+D1TV     EQU   LINE+122,6    _XXX.X       VALUE
+D1TQ     EQU   LINE+128,4    XXXX         QUALIFIER (% × /SEC)
+         EJECT
+*---------------------------------------------------------------------*
+*                                                                     *
+*     DEFINE THE MESSAGES ISSUED                                      *
+*                                                                     *
+*---------------------------------------------------------------------*
+LOGCTAB  LOGCMD
+         SPACE
+LOGL     DC    CL131' '
+         SPACE
+MSG0     DC    C' SMPKA000I  PHASE 1 COMPLETED,_XXXXX CPU RECORDS SELECX
+               TED, FROM YYDDD TO YYDDD'
+         ORG   MSG0
+         DC    AL1(L'MSG0-1)
+         ORG
+MSG0C    EQU   MSG0+30,6     RECORD COUNT
+MSG0F    EQU   MSG0+64,5     FIRST DATE
+MSG0L    EQU   MSG0+73,5     LAST DATE
+         SPACE
+MSG1     DC    C' SMPKA001D  SORT FAILED, EXECUTION ABANDONED'
+         ORG   MSG1
+         DC    AL1(L'MSG1-1)
+         ORG
+MSG2     DC    C' SMPKA002D  SYSTEM ID PROGRAM LOGIC ERROR'
+         ORG   MSG2
+         DC    AL1(L'MSG2-1)
+         ORG
+MSG3     DC    C' SMPKA003I  CMF ANALYZER COMPLETED, RETURN CODE WAS XX*
+               '
+         ORG   MSG3
+         DC    AL1(L'MSG3-1)
+         ORG
+MSG3R    EQU   MSG3+52,2
+         SPACE
+MSG5     DC    C' SMPKA005I  END OF RUN, *NO* RECORDS SELECTED'
+         ORG   MSG5
+         DC    AL1(L'MSG5-1)
+         ORG
+MSG6     DC    C' SMPKA006D  UNABLE TO OPEN EXTDATA, RUN ABANDONED'
+         ORG   MSG6
+         DC    AL1(L'MSG6-1)
+         ORG
+MSG7     DC    C' SMPKA007D  UNABLE TO OPEN XXXXXXXX, RUN ABANDONED'
+         ORG   MSG7
+         DC    AL1(L'MSG7-1)
+         ORG
+MSG7D    EQU   MSG7+27,8               DDNAME
+         SPACE
+MSG9A    DC    C' SMPKA009E  DYNAMIC ALLOCATION FAILURE - XX XXXX XXXX'
+         ORG   MSG9A
+         DC    AL1(L'MSG9A-1)
+         ORG
+MSG9R    EQU   MSG9A+41,2              RETURN CODE
+MSG9E    EQU   MSG9A+44,4              ERROR CODE
+MSG9I    EQU   MSG9A+49,4              INFORMATION CODE
+         SPACE
+MSG9B    DC    CL121' '                MESSAGE TEXT
+         ORG   MSG9B
+         DC    AL1(L'MSG9B-1)
+         ORG
+MSG9T    EQU   MSG9B+1,L'MSG9B-1
+         SPACE
+MSG10    DC    C' SMPKA010I  DAIRFAIL HAS FAILED - UNABLE TO FORMAT ERRX
+               OR DETAIL MESSAGES'
+         ORG   MSG10
+         DC    AL1(L'MSG10-1)
+         ORG
+         SPACE
+MSG11    DC    C' SMPKA011I  UNABLE TO OPEN SYSPRINT, REPORT BYPASSED'
+         ORG   MSG11
+         DC    AL1(L'MSG11-1)
+         ORG
+         SPACE
+MSG12    DC    C' SMPKA012I  UNABLE TO OPEN SYSIN, CMF ANALYZER BYPASSEX
+               D'
+         ORG   MSG12
+         DC    AL1(L'MSG12-1)
+         ORG
+         SPACE
+         EJECT
+*---------------------------------------------------------------------*
+* DYNALLOC CONTROL BLOCKS                                             *
+*---------------------------------------------------------------------*
+         SPACE
+* DYNALLOC REQUEST BLOCK POINTER AND REQUEST BLOCK
+RBPTR    DC    A(RB)                   @ REQUEST BLOCK
+         ORG   *-4
+         DC    AL1(S99RBPND)           LAST PARM FLAG
+         ORG
+         SPACE
+RB       DS    0F            DYNALLOC REQUEST BLOCK
+RBLENGTH DC    AL1(S99RBEND-S99RB)     LENGTH OF REQUEST BLOCK
+RBVERB   DC    AL1(0)                  DYNALLOC VERB
+RBFLAGS  DC    H'0'                    FLAGS
+RBERROR  DC    H'0'                    DYNALLOC ERROR CODE
+RBINFO   DC    H'0'                    DYNALLOC INFORMATION CODE
+RBTUPTR  DC    A(0)                    @ TEXT UNIT POINTERS
+         DC    2A(0)
+         SPACE
+VL       EQU   X'80000000'             VL BIT FOR PARAMETER LISTS
+         SPACE
+* TEXT UNIT POINTERS AND TEXT UNITS TO ALLOCATE SYSOUT DS
+TUALY    DC    A(TALYA,TALYB+VL)
+TALYA    DC    AL2(DALDDNAM),AL2(1),AL2(8),CL8'SYSOUT'  DDNAME=SYSOUT
+TALYB    DC    AL2(DALSYSOU),AL2(0)                     SYSOUT=*
+         SPACE
+* TEXT UNIT POINTERS AND TEXT UNITS TO ALLOCATE NEW SYSIN
+TUALS    DC    A(TALSA,TALSB,TALSC,TALSD,TALSE,TALSF+VL)
+TALSA    DC    AL2(DALRTDDN),AL2(1),AL2(8) ...          DDNAME
+TALSAD   DC    CL8' '                                    RETURNED
+TALSB    DC    AL2(DALSTATS),AL2(1),AL2(1),X'04'        DISP=NEW
+TALSC    DC    AL2(DALNDISP),AL2(1),AL2(1),X'04'         ,DELETE
+TALSD    DC    AL2(DALTRK),AL2(0)                       SPACE=(TRK
+TALSE    DC    AL2(DALPRIME),AL2(1),AL2(3),AL3(1)        ,1)
+TALSF    DC    AL2(DALUNIT),AL2(1),AL2(3),C'VIO'        UNIT=VIO
+         SPACE
+* TEXT UNIT POINTERS AND TEXT UNITS TO FREE EXISTING SYSIN
+TUUN     DC    A(TUNA,TUNB+VL)
+TUNA     DC    AL2(DUNDDNAM),AL2(1),AL2(8),CL8'SYSIN'   DDNAME
+TUNB     DC    AL2(DUNUNALC),AL2(0)                     UNALLOC
+         SPACE
+* TEXT UNIT POINTERS AND TEXT UNITS TO ALLOCATE PREFIX DS
+TUALP    DC    A(TALPA,TALPB,TALPC,TALPD,TALPE,TALPF+VL)
+TALPA    DC    AL2(DALDDNAM),AL2(1),AL2(8),CL8'SYSIN'   DDNAME
+TALPB    DC    AL2(DALSTATS),AL2(1),AL2(1),X'04'        DISP=NEW
+TALPC    DC    AL2(DALNDISP),AL2(1),AL2(1),X'04'         ,DELETE
+TALPD    DC    AL2(DALTRK),AL2(0)                       SPACE=(TRK
+TALPE    DC    AL2(DALPRIME),AL2(1),AL2(3),AL3(1)        ,1)
+TALPF    DC    AL2(DALUNIT),AL2(1),AL2(3),C'VIO'        UNIT=VIO
+         SPACE
+* TEXT UNIT POINTERS AND TEXT UNITS TO CONCATENATE PREFIX+NEW SYSIN
+TUCC     DC    A(TCCA+VL)
+TCCA     DC    AL2(DCCDDNAM),AL2(2),AL2(8),CL8'SYSIN'   DDNAME
+         DC    AL2(8)
+TCCAD    DC    CL8' '                                   OLD DDNAME
+         SPACE
+* TEXT UNIT POINTERS AND TEXT UNITS TO DECONCATENATE PREFIX+NEW SYSIN
+TUDC     DC    A(TDCA+VL)
+TDCA     DC    AL2(DDCDDNAM),AL2(1),AL2(8),CL8'SYSIN'   DDNAME
+         EJECT
+*---------------------------------------------------------------------*
+*  PARAMETER LIST FOR DAIRFAIL  (MACRO IS IN SYS1.MACLIB)             *
+*---------------------------------------------------------------------*
+         IKJEFFDF
+         EJECT
+*---------------------------------------------------------------------*
+*     DEFINE THE DATA MANAGEMENT CONTROL BLOCKS                       *
+*---------------------------------------------------------------------*
+         SPACE
+MAXREC   EQU   32756         ABSOLUTE MAXIMUM SMF RECORD
+         SPACE
+         PRINT NOGEN
+         SPACE
+EXTDATA  DCB   DSORG=PS,MACRF=GL,DDNAME=EXTDATA,EODAD=E15EOD,          X
+               RECFM=VBS,BFTEK=A,LRECL=MAXREC
+         SPACE
+SYSPRINT DCB   DSORG=PS,MACRF=PM,DDNAME=SYSPRINT,                      X
+               RECFM=FBA,BLKSIZE=133,LRECL=133,BUFNO=1
+         SPACE
+OSYSIN   DCB   DSORG=PS,MACRF=GL,DDNAME=SYSIN,EODAD=SYSINEOD
+         SPACE
+SYSIN    DCB   DSORG=PS,MACRF=PM,DDNAME=SYS000,                        X
+               RECFM=F,LRECL=80,BLKSIZE=80
+         SPACE 2
+         REGEQU
+         SPACE 2
+*---------------------------------------------------------------------*
+*  DEFINE A TABLE FOR ACCUMULATING THE DATA FROM THE INTER RECORDS    *
+*  EACH SEGMENT RECORDS PART OF A PERIOD THAT IS BEING CONSIDERED.    *
+*                                                                     *
+*        NOTE: THE MAXIMUM VALUE IN A WORD IS +4,294,967,295          *
+*---------------------------------------------------------------------*
+         SPACE
+ACCAREA  DS    0F
+         SPACE
+ACCSEGM  DS    0F
+ACCSID   DC    CL4' '        SYSTEM ID
+ACCRTY   DC    B'0'          TYPE (70×71)
+         DC    BL3'0'        FILLER
+ACCDAT   DC    PL4'0'        DATE
+ACCIST   DC    F'0'          FIRST INTERVAL START TIME IN MSECS
+ACCINT   DC    F'0'          DURATION OF INTERVAL IN MSECS
+ACCVAL   DC    F'0'          70 TOTAL WAIT TIME IN MSECS
+*                            71 TOTAL PAGING I/O COUNT
+ACCSEGL  EQU   *-ACCSEGM     LENGTH OF SEGMENT
+         SPACE
+         ORG   ACCAREA
+         DC    (60*ACCSEGL)X'00' SPACE FOR 60 SEGMENTS
+         DC    X'FFFF'       ACCUMULATOR END MARKER
+         SPACE 2
+         END

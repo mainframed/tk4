@@ -1,0 +1,712 @@
+         TITLE 'TRIM COMMAND - DOCUMENTATION'
+**********************************************************************
+* NAME                             TRIM                              *
+*                                                                    *
+* FUNCTION                         TO RELEASE UNUSED DATASET SPACE.  *
+*                                  SPACE IS RELEASED SO THAT THE     *
+*                                  TRACKS ALLOCATED EQUAL THE TRACKS *
+*                                  USED. FOR PARTITIONED DATASETS,   *
+*                                  A COMPRESS IS NECESSARY FOR THE   *
+*                                  COMMAND TO BE EFFECTIVE.          *
+*                                                                    *
+* RESTRICTIONS                     DATASET MUST:                     *
+*                                                                    *
+*                                  BE TSO USER OWNED                 *
+*                                  BE CATALOGED                      *
+*                                  HAVE NO EXPIRATION DATE           *
+*                                  RESIDE ON A SINGLE ONLINE VOLUME  *
+*                                  HAVE NO OS PASSWORD PROTECTION    *
+*                                  BE PS OR PO ORGANIZATION          *
+*                                                                    *
+* SYNTAX                                                             *
+*                                  TRIM 'DSNAME'                     *
+*                                                                    *
+*                                        ISSUE 'HELP TRIM' FOR MORE  *
+*                                              INFORMATION           *
+* FUTURE ENHANCEMENTS                                                *
+*                                  THRESHOLD CONSIDERATIONS          *
+*                                  PARTIAL RELEASE                   *
+*                                  SECONDARY EXTENT CHECKING         *
+*                                  PATTERN MASK SUPPORT              *
+*                                  ALLOCATION TYPE CHANGES           *
+*                                  AUTO-COMPRESS PO BEFORE RELEASE   *
+*                                                                    *
+*                                                                    *
+* LOGIC                                                              *
+*                                  1. PARSE OPERAND                  *
+*                                  2. ISSUE LOCATE TO FIND DATASET   *
+*                                  3. CHECK EXPDT,DSORG,PASSWORD     *
+*                                  4. DYNALLOC DSN (MOD WITH RLSE)   *
+*                                  5. OPEN DSN OUTPUT                *
+*                                  6. CLOSE DSN                      *
+*                                  7. REPORT (STACK DSINFO COMMAND)  *
+*                                                                    *
+* REGISTER ASSIGNMENTS             R0,R1             = SVC PARMS     *
+*                                  R15               = RETURN CODES  *
+*                                  R14               = RETURN TO TMP *
+*                                  R12               = BASE          *
+*                                  R13               = SAVE AREA     *
+*                                  R2,R3,R5,R6,R7    = WORK REGS     *
+*                                  R8,R9,R10                         *
+*                                  R4                = A(WORK AREA)  *
+*                                                                    *
+* INPUT                            R1->CPPL                          *
+*                                                                    *
+* OUTPUT                           DSINFO DSN('DSNAME')              *
+*                                                                    *
+* EXITS                            IKJPARS - PARSE SERVICE ROUTINE   *
+*                                  IKJSTCK - STACK SERVICE ROUTINE   *
+*                                                                    *
+* TABLES                           NONE                              *
+*                                                                    *
+* SYSTEM                           MVS 3.8 AND MVS/SE2               *
+*                                                                    *
+* ATTRIB                           RE-ENTRANT, REFRESHABLE           *
+*                                                                    *
+* ERRORS                           SEE "TRIM - ERROR MESSAGES"       *
+*                                                                    *
+*                                                                    *
+* MACROS                           FULLSAVE - ENTRANCE CONVENTIONS   *
+*                                  GETMAIN  - OBTAIN VIRT. MEMORY    *
+*                                  FREEMAIN - RELEASE VIRT. MEMORY   *
+*                                  CALLTSSR - INVOKE TSO SERVICE     *
+*                                  LOCATE   - READ CATALOG BLOCK     *
+*                                  OBTAIN   - READ A DSCB            *
+*                                  DYNALLOC - DYNAMIC ALLOCATION     *
+*                                  TIME     - GET TIME AND DATE      *
+*                                  OPEN     - OPEN DCB               *
+*                                  CLOSE    - CLOSE DCB              *
+*                                  FULLRTRN - RETURN CONVENTIONS     *
+*                                  TPUT     - TERMINAL OUTPUT        *
+*                                  STACK    - STACK TMP INPUT        *
+*                                  IKJRLSA  - RELEASE PARSE PDL      *
+*                                  IKJPARM  - START PCL              *
+*                                  IKJENDP  - END PCL                *
+*                                  IKJPOSIT - POSITIONAL PARAMETER   *
+*                                                                    *
+* DSECTS                           CB        DSECT                   *
+*                                  ---       -----                   *
+*                                  PPL   -   IKJPPL                  *
+*                                  CPPL  -   IKJCPPL                 *
+*                                  DSCB1 -   IECSDSL1 (1)            *
+*                                  DCB   -   DCBD                    *
+*                                  RBP   -   S99RBP                  *
+*                                  RB    -   S99RB                   *
+*                                  LSD   -   IKJLSD                  *
+*                                  ISL   -   INLIST                  *
+*                                  VOLLST-   VOLLST                  *
+*                                  CVT   -   CVT DSECT=YES,PREFIX=NO *
+*                                  PSCB  -   IKJPSCB                 *
+*                                  WORK  -   WORK                    *
+*                                                                    *
+* AUTHOR                           CLIFFORD LYONS                    *
+*                                                                    *
+* DATE                             MAY 1, 1980                       *
+*                                                                    *
+* PRIVILEGES                       NONAUTHORIZED,V=V,PROBLEM STATE   *
+*                                                                    *
+* NOTE                             'SYSDA' HAS BEEN USED AS THE      *
+*                                  DEFAULT UNIT NAME FOR DATASET     *
+*                                  ALLOCATION UNLESS PSCBGPNM IS     *
+*                                  NON-BLANK. IF THIS DEFAULT IS     *
+*                                  NOT APPLICABLE, CHANGE &UNIT.     *
+*                                                                    *
+*                                                                    *
+* INSTALL                          CHANGE &UNIT CONSTANT (SEE SOURCE)*
+*                                  ASSEMBLE TRIM                     *
+*                                  LINK TRIM RENT REUS REFR          *
+*                                  ASSEMBLE DSINFO                   *
+*                                  LINK DSINFO                       *
+*                                  PLACE TRIM IN LINKLIST OR PLPA    *
+*                                  PLACE DSINFO IN LINKLIST LIBRARY  *
+**********************************************************************
+         TITLE 'TRIM INITIALIZATION SECTION'
+TRIM     CSECT
+*
+*  INITIALIZATION
+*
+         LCLC  &UNIT
+         LCLA  &UNITCNT
+&UNIT    SETC  'SYSDA'                 ***DEFAULT UNIT NAME***
+&UNITCNT SETA  K'&UNIT
+         REGS  R
+         FULLSAVE RENT=YES
+         LR    R3,R1                   SAVE A(CPPL)
+         USING CPPL,R3
+         GETMAIN R,LV=WORKLEN          GET WORK AREA
+         LR    R4,R1                   SAVE ADDR
+         USING WORK,R4                 *** R4 POINTS TO WORK AREA ***
+         ST    R3,CPPLADDR             SAVE CPPL ADDRESS
+         TITLE 'TRIM - INVOKE IKJPARS TO DECIPHER OPERAND'
+*
+*  PARSE OPERAND
+*
+         XC    PARSE(PARSELEN),PARSE   CLEAR PARSE WORK AREA
+         LA    R5,PARSPARM             POINT TO PPL
+         USING PPL,R5                  INITIALIZE PPL:
+         MVC   PPLUPT,CPPLUPT                         A(UPT)
+         MVC   PPLECT,CPPLECT                         A(ECT)
+         MVC   PPLCBUF,CPPLCBUF                       A(CIB)
+         DROP  R3
+         LA    R1,ECB
+         ST    R1,PPLECB                              A(ECB)
+         L     R1,=A(PCL)
+         ST    R1,PPLPCL                              A(PCL)
+         LA    R1,ANSWER
+         ST    R1,PPLANS                              A(ANS)
+         CALLTSSR EP=IKJPARS,MF=(E,(R5))
+         DROP  R5
+         L     R3,ANSWER               PDL POINTER
+         LA    R9,PARSERR              ERROR TABLE INDEX
+         LTR   R3,R3
+         BP    GOODPARS
+         BAL   R10,PUTRTN              EXIT, IF PARSE ERROR
+         B     EXIT1
+         TITLE 'TRIM - CHECK DSNAME OPERAND'
+*
+*  VALIDITY CHECK OPERANDS
+*
+GOODPARS EQU   *                       PARSE OK
+         USING PDL,R3
+         TM    PASSFLG,PASFOUND        PASSWORD SPECIFIED?
+         BZ    NOPASS
+         LA    R9,PASSERR
+         BAL   R10,PUTRTN              YES, EXIT
+         B     EXIT1
+NOPASS   EQU   *
+         TM    MEMFLG,MEMFOUND         MEMBER SPECIFIED?
+         BZ    NOMEM
+         LA    R9,MEMERR
+         BAL   R10,PUTRTN              YES, EXIT
+         B     EXIT1
+NOMEM    EQU   *
+         TM    DSNFLGS,DSNFOUND        DSN PRESENT?
+         BO    DSNOK
+         LA    R9,DSNERR
+         BAL   R10,PUTRTN              NO, EXIT
+         B     EXIT1
+DSNOK    EQU   *
+         TM    DSNFLGS,DSNQUOTE        DSN ENCLOSED IN QUOTES?
+         BZ    NOQUOTE
+         LA    R9,QUOTERR              YES, THEN ERROR
+         BAL   R10,PUTRTN
+         B     EXIT1
+NOQUOTE  MVI   DSN,C' '
+         MVC   DSN+1(L'DSN-1),DSN
+         L     R1,DSNPTR               DSN POINTER
+         LH    R2,DSNLEN               L'DSN
+         STH   R2,DSNTU+4              SAVE IN DSN TEXT UNIT
+         BCTR  R2,0
+         EX    R2,*+4                  SAVE DATASET NAME
+         MVC   DSN(*-*),0(R1)
+         DROP  R3
+         TITLE 'TRIM - GET CATALOG ENTRY FOR DATASET'
+*
+*  LOCATE THE DATASET
+*
+LOCCODE  EQU   X'44'                   INDICATE LOCATE BY NAME
+         XC    LOCPARM(LOCLEN),LOCPARM BUILD LOCATE CAMLST
+         MVI   LOCOPT,LOCCODE          OPTION=LOCATE
+         LA    R1,DSN
+         ST    R1,LOCDSN               A(DSN)
+         LA    R1,RETURN
+         ST    R1,LOCWORK              A(RETURN AREA)
+         LA    R1,LOCPARM
+         LOCATE (1)                    ISSUE LOCATE SVC
+         LA    R9,LOCERR
+         BXLE  R15,R15,LOCOK           EXIT IF DSN NOT CATALOGED
+         BAL   R10,PUTRTN
+         B     EXIT1
+LOCOK    LA    R7,RETURN               POINT TO VOLUME LIST
+         USING VOLLST,R7
+         LH    R5,VOLNUM               GET # VOLUMES
+         LA    R6,1
+         CR    R5,R6                   GT 1 = ERROR
+         LA    R9,MULTERR
+         BE    SINGVOL
+         BAL   R10,PUTRTN
+         B     EXIT1
+SINGVOL  TM    VOLDEVCD+2,X'20'        DASD DATASET?
+         LA    R9,DASDERR
+         BO    DASD                    NO, ERROR
+         BAL   R10,PUTRTN
+         B     EXIT1
+DASD     MVC   VOLSER,VSERIAL          SAVE VOLSER OF DATASET
+         DROP  R7
+VOLLST   DSECT                         DESCRIBES VOLUME LIST
+*                                      UP TO 20 ENTRIES (12 BYTES EACH)
+VOLNUM   DS    H                       # VOLS
+VOLDEVCD DS    CL4                     DEVICE CODE
+VSERIAL  DS    CL6                     VOLSER
+VOLSEQ   DS    CL2                     SEQUENCE #
+TRIM     CSECT                         CONTINUE TRIM
+         TITLE 'TRIM - GET FMT1 DSCB FOR DATASET'
+*
+*  CHECK EXPDT, DSORG, PASSWORD
+*
+OBTCODE  EQU   X'C1'                   INDICATES OBTAIN
+         XC    OBTPARM(OBTLEN),OBTPARM
+         MVI   OBTOPT,OBTCODE          OPTION=OBTAIN
+         LA    R1,DSN
+         ST    R1,OBTDSN               A(DSN)
+         LA    R1,VOLSER
+         ST    R1,OBTVOL               A(VOLSER)
+         LA    R1,RETURN
+         ST    R1,OBTWORK              A(RETURN AREA)
+         LA    R1,OBTPARM
+         OBTAIN (1)                    ISSUE OBTAIN SVC
+         BXLE  R15,R15,CHKEXPDT
+         LA    R9,OBTERR               EXIT IF ERROR
+         BAL   R10,PUTRTN
+         B     EXIT1
+CHKEXPDT EQU   *
+         LA    R5,RETURN               POINT TO FMT1 DSCB
+         USING DS1FMTID,R5
+         CLC   DS1EXPDT,=XL3'0'        EXPIRATION DATE?
+         BE    NOEXPDT                 NO, CONTINUE
+         XC    EXPDT(EXPDTLEN),EXPDT   CLEAR CONVERSION AREA
+         MVC   DECDDDC,=PL2'0'
+         TIME  ,                       YES, CHECK IF EXPIRED!
+         ST    R1,YYDDDC
+         ZAP   PACKWORK,DECDDDC        CONVERT DATE TO BINARY
+         CVB   R1,PACKWORK
+         STH   R1,BINDD
+         MVO   PACKWORK,DECYY
+         CVB   R1,PACKWORK
+         STC   R1,BINY
+         CLC   DS1EXPDT,TODAY          DATE EXPIRED?
+         BL    NOEXPDT
+         LA    R9,EXPDTER              NO, THEN ERROR
+         BAL   R10,PUTRTN
+         B     EXIT1
+NOEXPDT  EQU   *                       PASSED EXPDT CHECK
+         TM    DS1DSIND,DS1IND10       PASSWORD PROTECTED?
+         BZ    NOPSWD
+         LA    R9,PSWDERR              YES, THEN ERROR
+         BAL   R10,PUTRTN
+         B     EXIT1
+NOPSWD   TM    DS1DSORG,X'02'          PS OR PO?
+         BO    GOODSN
+         TM    DS1DSORG,X'40'
+         BO    GOODSN
+         DROP  R5
+         LA    R9,DSORGERR             NO, THEN ERROR
+         BAL   R10,PUTRTN
+         B     EXIT1
+         TITLE 'TRIM - INVOKE DYNALLOC FOR ALLOCATE (MOD AND RLSE)'
+GOODSN   EQU   *                       BUILD SVC 99 CONTROL BLOCKS
+*
+*  BUILD REQUEST BLOCK POINTER
+*
+         LA    R5,DYNALRBP
+         USING S99RBP,R5
+         LA    R1,DYNALRB
+         ST    R1,S99RBPTR             REQUEST BLOCK POINTER
+         MVI   S99RBPTR,S99RBPND
+*
+*  BUILD REQUEST BLOCK
+*
+         LA    R5,DYNALRB
+         USING S99RB,R5                SVC 99 REQUEST BLOCK
+         MVC   S99RBLN(1),=AL1(20)     RB LENGTH
+         MVI   S99VERB,S99VRBAL        VERB=DSNAME ALLOCATION
+         XC    S99FLAG1,S99FLAG1       FLAG 1
+         XC    S99ERROR,S99ERROR       ERROR CODE
+         XC    S99INFO,S99INFO         INFORMATION CODE
+         XC    S99FLAG2,S99FLAG2       FLAG 2
+         LA    R1,DYNALTUP
+         ST    R1,S99TXTPP             TEXT UNIT POINTER
+         XC    S99RSV01,S99RSV01       RESERVED FIELD
+         DROP  R5
+*
+*  BUILD TEXT UNIT POINTER LIST
+*
+         LA    R1,DSNTU
+         ST    R1,DSNPOINT             DSNAME TEXT UNIT
+         LA    R1,STATU
+         ST    R1,STAPTR               STATUS TEXT UNIT
+         LA    R1,NORTU
+         ST    R1,NORPTR               NORMAL DISP. TEXT UNIT
+         LA    R1,CONTU
+         ST    R1,CONTPTR              COND. DISP. TEXT UNIT
+         LA    R1,RLSTU
+         ST    R1,RLSPTR               RELEASE TEXT UNIT
+         LA    R1,VOLTU
+         ST    R1,VOLPTR               VOLUME TEXT UNIT
+         LA    R1,UNITU
+         ST    R1,UNITPTR              UNIT TEXT UNIT
+         LA    R1,CLOTU
+         ST    R1,CLOPTR               CLOSE TEXT UNIT
+         LA    R1,DDNTU
+         ST    R1,DDNPTR               DDNAME TEXT UNIT
+         MVI   DDNPTR,X'80'
+*
+*  BUILD TEXT UNITS
+*
+         MVC   DSNTU(2),=X'0002'       DSNAME
+         MVC   DSNTU+2(2),=X'0001'     1 PARAMETER
+         MVC   DSNTU+6(44),DSN         DATASET NAME
+*
+         MVC   STATU(2),=X'0004'       STATUS
+         MVC   STATU+2(2),=X'0001'
+         MVC   STATU+4(2),=X'0001'
+         MVI   STATU+6,X'02'           MOD STATUS
+*
+         MVC   NORTU(2),=X'0005'       NORMAL DISPOSITION
+         MVC   NORTU+2(2),=X'0001'
+         MVC   NORTU+4(2),=X'0001'
+         MVI   NORTU+6,X'08'           KEEP
+*
+         MVC   CONTU(2),=X'0006'       CONDITIONAL DISPOSITION
+         MVC   CONTU+2(2),=X'0001'
+         MVC   CONTU+4(2),=X'0001'
+         MVI   CONTU+6,X'08'           KEEP
+*
+         MVC   RLSTU(2),=X'000D'       RELEASE SPACE
+         XC    RLSTU+2(2),RLSTU+2
+*
+         MVC   VOLTU(2),=X'0010'       VOLUME
+         MVC   VOLTU+2(2),=X'0001'
+         MVC   VOLTU+4(2),=AL2(6)      LENGTH
+         MVC   VOLTU+6(6),VOLSER       VOLSER
+*
+         MVC   UNITU(2),=X'0015'       UNIT
+         MVC   UNITU+2(2),=X'0001'
+         L     R3,CPPLADDR
+         USING CPPL,R3                 BUILD UNIT NAME FROM PSCB
+         L     R3,CPPLPSCB
+         USING PSCB,R3
+         CLI   PSCBGPNM,C' '           ANY UNIT FOR USER?
+         BNE   FINDUNIT
+*
+*        IF NO UNIT SPECIFIED IN UADS, USE &UNIT DEFAULT
+*
+         MVC   UNITU+6(&UNITCNT),=C'&UNIT' NO, DEFAULT TO &UNIT
+         MVC   UNITU+4(2),=AL2(&UNITCNT)
+         B     SETCLSE
+FINDUNIT LA    R2,8
+         LA    R5,PSCBGPNM             CALCULATE EXACT LENGTH
+         LR    R6,R5
+CHKBLANK CLI   0(R6),C' '
+         BE    SAVUNIT
+         LA    R6,1(0,R6)
+         BCT   R2,CHKBLANK
+SAVUNIT  SR    R6,R5
+         STH   R6,UNITU+4              SAVE LENGTH IN TEXT UNIT
+         BCTR  R6,0
+         EX    R6,*+4
+         MVC   UNITU+6(*-*),0(R5)      SAVE UNIT NAME IN TEXT UNIT
+         DROP  R3
+*
+SETCLSE  MVC   CLOTU(2),=X'001C'       DEALLOCATE AT CLOSE
+         MVC   CLOTU+2(2),=X'0000'
+*
+         MVC   DDNTU(2),=X'0055'       RETURN DDNAME
+         MVC   DDNTU+2(2),=X'0001'
+         MVC   DDNTU+4(2),=X'0008'     LENGTH
+         MVC   DDNTU+6(8),=CL8' '      CLEAR FIELD
+*
+*  ISSUE SVC 99
+*
+         LA    R1,DYNALRBP             R1->REQUEST BLOCK POINTER
+         DYNALLOC
+         BXLE  R15,R15,GOODAL
+         LA    R9,DYNALERR             EXIT IF ERROR
+         BAL   R10,PUTRTN
+         B     EXIT1
+         TITLE 'TRIM - OPEN DATASET (OUTPUT) THEN CLOSE'
+*
+*  OPEN DATASET (OUTPUT)
+*
+GOODAL   MVC   OPNPARM(OPNLEN),OPNLST  MOVE OPEN PARMS
+         MVC   DCBCOPY(DCBLEN),PSDCB   MOVE DCB
+         LA    R5,DCBCOPY
+         USING IHADCB,R5
+         MVC   DCBDDNAM,DDNTU+6        MOVE DDNAME FROM DYNALLOC
+         LA    R6,OPNPARM
+         OPEN  ((R5),(OUTPUT)),MF=(E,(R6))
+         TM    DCBOFLGS,DCBOFOPN       OPEN SUCCESSFUL?
+         DROP  R5
+         BO    OPENOK                  NO, THEN ERROR
+         LA    R9,OPENERR
+         BAL   R10,PUTRTN
+*
+*  IF OPEN FAILS, THEN DEALLOCATE THE DATASET
+*
+         LA    R5,DYNALRB
+         USING S99RB,R5
+         MVI   S99VERB,S99VRBUN       CHANGE RB TO INDICATE DEALLOC
+         DROP  R5
+         MVI   DSNPOINT,X'80'         ABBREVIATE TEXT UNIT POINTERS
+         LA    R1,DYNALRBP
+         DYNALLOC                     FREE DATASET
+         BXLE  R15,R15,EXIT1
+         LA    R9,DEALERR
+         BAL   R10,PUTRTN             IF CAN'T FREE, TELL USER
+         B     EXIT1
+*
+*  CLOSE DATASET (DEALLOCATE AT CLOSE AND RELEASE SPACE)
+*
+OPENOK   LA     R5,DCBCOPY            POINT TO DCB
+         MVC    CLOSEPRM(CLOSELEN),CLSELST
+         LA     R1,CLOSEPRM
+         CLOSE  ((R5)),MF=(E,(1))     CLOSE DATASET
+         TITLE 'TRIM -REPORT TO TERMINAL USER, (STACK DSINFO COMMAND)'
+REPORT   EQU   *
+         L     R6,CPPLADDR             GET CPPL ADDRESS
+         USING CPPL,R6
+         L     R7,CPPLUPT              R7->USER PROFILE TABLE
+         L     R8,CPPLECT              R8->ENVIRONMENT CONTROL TABLE
+         DROP  R6
+*
+*  GET SP 78 STORAGE FOR LIST SOURCE DESCRIPTOR AND IN-STORAGE LIST
+*
+         XC    GETANS(8),GETANS        CLEAR RETURN AREA
+         LA    R1,16
+         ST    R1,REQUEST              SIZE OF LSD
+         LA    R1,58
+         ST    R1,REQUEST+4            SIZE OF ISL
+         MVI   REQUEST+4,X'80'
+         LA    R2,REQUEST              POINT TO GETMAIN REQUEST
+         LA    R3,GETANS               POINT TO RETURN AREA
+         LA    R5,GETPARM              POINT TO GETMAIN PARMS
+         XC    GETPARM(GETLEN),GETPARM
+         GETMAIN LU,LA=(R2),A=(R3),SP=78,MF=(E,(R5))
+*
+*  COMPLETE THE LIST SOURCE DESCRIPTOR (LSD)
+*
+         L     R6,GETANS               R6->LSD
+         XC    0(16,R6),0(R6)          CLEAR LSD
+         USING LSD,R6
+         L     R10,GETANS+4
+         ST    R10,LSDADATA            A(ISL)
+         MVC   LSDRCLEN,=H'58'         RECORD LENGTH OF ISL
+         MVC   LSDTOTLN,=H'58'         TOTAL LENGTH OF ISL
+         ST    R10,LSDANEXT            NEXT RECORD POINTER
+         DROP  R6
+*
+*  COMPLETE THE IN-STORAGE LIST
+*
+         USING INLIST,R10
+         MVI   COMMAND,C' '
+         MVC   COMMAND+1(L'COMMAND-1),COMMAND
+         MVC   CMD,=CL7'DSINFO'
+         MVC   KEYWD,=CL3'DSN'         DSINFO DSN('DSNAME')
+         MVI   LEFT,C'('
+         MVI   QUOTE,C''''
+         L     R3,ANSWER
+         USING PDL,R3
+         L     R9,DSNPTR               GET POINTER TO DSN
+         LH    R2,DSNLEN               GET L'DSN
+         BCTR  R2,0
+         EX    R2,*+4                  SAVE DSN IN DSINFO COMMAND
+         MVC   QUOTE+1(*-*),0(R9)
+         LA    R9,QUOTE+2(R2)          POINT PAST DSN
+         MVI   0(R9),C''''
+         MVI   1(R9),C')'              FINISH DSINFO COMMAND
+         DROP  R3,R10
+*
+*  STACK DSINFO COMMAND
+*
+         XC    STPB(STACKLEN),STPB     CLEAR STPB
+         LA    R2,STPB                 STACK PARAMETER BLOCK
+         LA    R3,STACKECB             STACK ECB
+         XC    STACKECB,STACKECB
+         L     R5,GETANS               LIST SOURCE DESCRIPTOR
+         LA    R1,IOPLADS              I/O PARAMETER LIST
+         STACK PARM=(R2),UPT=(R7),ECT=(R8),ECB=(R3),                   $
+               STORAGE=((R5),PROCN),MF=(E,(1))
+         BXLE  R15,R15,EXIT1
+         LA    R9,STACKERR             IF ERROR THEN EXIT WITH MSG
+         BAL   R10,PUTRTN
+         TITLE 'TRIM - EXIT SECTION'
+EXIT1    IKJRLSA ANSWER                FREE PARSE SCRATCH PAD
+         FREEMAIN R,LV=WORKLEN,A=(R4)  FREE WORK AREA
+         FULLRTRN RENT=YES             EXIT
+         TITLE 'TRIM - ERROR MESSAGE ROUTINE'
+PUTRTN   LA    R1,DYNALERR
+         CR    R9,R1                   IF DYNALLOC ERROR THEN
+         BNE   PUTIT                             CHECK FURTHER
+         LA    R1,DYNALRB
+         USING S99RB,R1
+         CLC   S99ERROR,=X'0210'       DATASET PREVIOUSLY ALLOCATED?
+         BNE   PUTIT
+         DROP  R1
+         LA    R9,ENQERR               YES, SAY SO EXPLICITLY!
+PUTIT    TPUT  (R9),60
+         BR    R10
+         TITLE 'PARSE PARAMETER CONTROL LIST'
+PCL      IKJPARM DSECT=PDL
+DSNAME   IKJPOSIT DSNAME,PROMPT='DATA SET NAME',USID
+         IKJENDP
+         TITLE 'OPEN/CLOSE PARAMETERS, SKELETON DCB'
+PSDCB    DCB   DSORG=PS,MACRF=W,DEVD=DA,DDNAME=X
+DCBLEN   EQU   *-PSDCB
+OPNLST   OPEN  (PSDCB,(OUTPUT)),MF=L
+OPNLEN   EQU   *-OPNLST
+CLSELST  CLOSE (PSDCB),MF=L
+CLSELEN  EQU   *-CLSELST
+         TITLE 'TRIM - ERROR MESSAGES'
+PARSERR  DC    CL60'TRIM TERMINATED - PARSE ERROR'
+MEMERR   DC    CL60'TRIM TERMINATED - INVALID DSN, MEMBER PRESENT'
+DSNERR   DC    CL60'TRIM TERMINATED - DSNAME NOT PRESENT'
+QUOTERR  DC    CL60'TRIM TERMINATED - DSNAME IN QUOTES'
+LOCERR   DC    CL60'TRIM TERMINATED - DATASET NOT CATALOGED'
+MULTERR  DC    CL60'TRIM TERMINATED - MULTIPLE VOLUME DATASET'
+DASDERR  DC    CL60'TRIM TERMINATED - TAPE DATASET NOT SUPPORTED'
+OBTERR   DC    CL60'TRIM TERMINATED - DATASET NOT FOUND'
+EXPDTER  DC    CL60'TRIM TERMINATED - DSN HAS EXPDT'
+PASSERR  DC    CL60'TRIM TERMINATED - PASSWORD SPECIFIED'
+PSWDERR  DC    CL60'TRIM TERMINATED - DSN PASSWORD PROTECTED'
+DSORGERR DC    CL60'TRIM TERMINATED - DATASET NOT PS OR PO'
+DYNALERR DC    CL60'TRIM TERMINATED - DYNAMIC ALLOCATION FAILURE'
+OPENERR  DC    CL60'TRIM TERMINATED - OPEN FAILURE'
+STACKERR DC    CL60'TRIM TERMINATED - STACK SERVICE ERROR'
+ENQERR   DC    CL60'TRIM TERMINATED - DATASET PREVIOUSLY ALLOCATED'
+DEALERR  DC    CL60'DEALLOCATION FAILED, CHECK USER DATASET'
+         TITLE 'TRIM - LITERALS'
+         LTORG
+         TITLE 'PARSE DESCRIPTOR ENTRIES'
+PDL      DSECT
+         ORG   DSNAME
+DSNPTR   DS    F                       A(DSN)
+DSNLEN   DS    H                       L'DSN
+DSNFLGS  DS    X                       FLAGS
+DSNFOUND EQU   X'80'                   DSN PRESENT
+DSNQUOTE EQU   X'40'                   DSN ENCLOSED WITHIN QUOTES
+DSNRES   DS    X                       RESERVED
+MEMPTR   DS    F                       A(MEMBER)
+MEMLEN   DS    H                       L'MEMBER
+MEMFLG   DS    X                       FLAGS
+MEMFOUND EQU   X'80'                   MEMBER NAME PRESENT
+MEMRES   DS    X                       RESERVED
+PASSPTR  DS    F                       A(PASSWORD)
+PASSLEN  DS    H                       L'PASSWORD
+PASSFLG  DS    X                       FLAGS
+PASFOUND EQU   X'80'                   PASSWORD PRESENT
+         TITLE 'PARSE PARAMETER LIST'
+         IKJPPL
+         TITLE 'SVC 99 REQUEST BLOCK'
+         IEFZB4D0                      SVC 99 PARAMETER LIST
+         TITLE 'COMMAND PROCESSOR PARAMETER LIST'
+         IKJCPPL                       CPPL
+         TITLE 'DATA CONTROL BLOCK'
+         DCBD   DSORG=PS,DEVD=DA       DCB
+         TITLE 'COMMUNICATIONS VECTOR TABLE'
+         CVT   DSECT=YES,PREFIX=NO
+         TITLE 'TSO PROTECTED STEP CONTROL BLOCK'
+         IKJPSCB
+         TITLE 'FORMAT 1 DSCB'
+         IECSDSL1 (1)                  FMT1 DSCB
+         TITLE 'LIST SOURCE DESCRIPTOR'
+         IKJLSD
+         TITLE 'IN-STORAGE LIST'
+INLIST   DSECT                         DSINFO COMMAND SKELETON
+COMMAND  DS    0CL58
+CMD      DS    CL7                     DSINFO
+KEYWD    DS    CL3                     DSN
+LEFT     DS    CL1                     (
+QUOTE    DS    CL1                     '
+         TITLE 'WORK AREA FOR TRIM COMMAND'
+WORK     DSECT                         WORK AREA
+*
+*  PARSE SECTION
+*
+PARSE    EQU   *
+PARSPARM DS    7A                      PPL
+ECB      DS    F                       ECB
+ANSWER   DS    F                       A(PDL)
+PARSELEN EQU   *-PARSE
+*
+*  LOCATE SECTION
+*
+LOCATE   EQU   *
+LOCPARM  CAMLST NAME,DSN,,RETURN       LOCATE CAMLST
+LOCOPT   EQU   LOCPARM                 OPTION BYTE
+LOCDSN   EQU   LOCPARM+4               DSN POINTER
+LOCWORK  EQU   LOCPARM+12              RETURN AREA POINTER
+LOCLEN   EQU   *-LOCATE
+*
+*  OBTAIN SECTION
+*
+OBTAIN   EQU   *
+OBTPARM  CAMLST SEARCH,DSN,VOLSER,RETURN
+OBTOPT   EQU   OBTPARM                 OPTION BYTE
+OBTDSN   EQU   OBTPARM+4               DSN POINTER
+OBTVOL   EQU   OBTPARM+8               VOLSER POINTER
+OBTWORK  EQU   OBTPARM+12              RETURN AREA POINTER
+OBTLEN   EQU   *-OBTAIN
+*
+*  DYNALLOC SECTION
+*
+DYNAL    EQU   *
+DYNALRBP DS    F                       REQUEST BLOCK POINTER
+DYNALRB  DS    5F                      REQUEST BLOCK
+DYNALTUP DS    9F                      TEXT UNIT POINTER LIST
+         ORG   DYNALTUP
+DSNPOINT DS    F                       DSNAME
+STAPTR   DS    F                       STATUS
+NORPTR   DS    F                       NORMAL DISP.
+CONTPTR  DS    F                       COND. DISP.
+RLSPTR   DS    F                       RELEASE
+VOLPTR   DS    F                       VOLUME
+UNITPTR  DS    F                       UNIT
+CLOPTR   DS    F                       DEALLOCATE AT CLOSE
+DDNPTR   DS    F                       RETURN DDNAME
+         ORG
+         DS    0H                      TEXT UNITS
+DSNTU    DS    CL50                    DSNAME
+         DS    0H
+STATU    DS    CL7                     STATUS
+         DS    0H
+NORTU    DS    CL7                     NORMAL DISPOSITION
+         DS    0H
+CONTU    DS    CL7                     CONDITIONAL DISPOSITION
+         DS    0H
+RLSTU    DS    CL4                     RELEASE
+         DS    0H
+VOLTU    DS    CL12                    VOLUME
+         DS    0H
+UNITU    DS    CL14                    UNIT
+         DS    0H
+CLOTU    DS    CL4                     DEALLOCATE AT CLOSE
+         DS    0H
+DDNTU    DS    CL14                    RETURN DDNAME
+*
+*  OPEN/CLOSE SECTION
+*
+OPNPARM  OPEN  (DCBCOPY,(OUTPUT)),MF=L
+DCBCOPY  DCB   DSORG=PS,MACRF=W,DEVD=DA,DDNAME=X
+CLOSEPRM CLOSE (DCBCOPY),MF=L
+CLOSELEN EQU   *-CLOSEPRM
+*
+*  MISCELLANEOUS
+*
+CPPLADDR DS    F                       HOLDS ADDRESS OF CPPL
+VOLSER   DS    CL6                     HOLDS VOLSER
+RETURN   DS    40D                     WORK AREA FOR LOCATE AND OBTAIN
+DSN      DS    CL44                    DATASET NAME FROM COMMAND
+EXPDT    EQU   *                       EXPDT CONVERSION WORK AREA
+PACKWORK DS    D                       WORK AREA
+YYDDDC   DS    0F
+         DS    X
+DECYY    DS    X                       DECIMAL YY
+DECDDDC  DS    PL2                     DECIMAL DDD
+FILLER   DS    X                       FORCE BINDD TO HALFWORD
+TODAY    DS    0XL3                    TODAY'S DATE
+BINY     DS    X                       BINARY Y
+BINDD    DS    H                       BINARY DD
+EXPDTLEN EQU   *-EXPDT                 LENGTH OF CONVERSION AREA
+*
+*  STACK WORK AREA
+*
+REQUEST  DS    2F                      REQUESTS FOR LSD AND ISL
+GETANS   DS    2F                      RETURN ADDRESSES
+IOPLADS  DS    4F                      IOPL FOR STACK SERVICE
+STACKECB DS    F                       ECB FOR STACK SERVICE
+STPB     STACK MF=L                    STACK PARAMETER BLOCK
+STACKLEN EQU   *-STPB
+GETPARM  GETMAIN LU,LA=REQUEST,A=ANSWER,SP=78,MF=L
+GETLEN   EQU   *-GETPARM
+WORKLEN  EQU   *-WORK                  LENGTH OF ENTIRE WORK AREA
+         END

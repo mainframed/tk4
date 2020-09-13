@@ -1,0 +1,965 @@
+         TITLE 'TEC012 - UNLOAD, RELOAD COMPRESSION PROGRAM'
+***********************************************************************
+*                                                                     *
+*  TTTTTTTT  EEEEEEEE  CCCCCCCC   000000      11       22222          *
+*     TT     EE        CC        00     0    111           22         *
+*     TT     EE        CC        0 0    0   1 11           2          *
+*     TT     EEEE      CC        0  0   0     11          2           *
+*     TT     EE        CC        0   0  0     11        22            *
+*     TT     EE        CC        0    0 0     11       22             *
+*     TT     EEEEEEEE  CCCCCCCC   000000   111111111  2222222         *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+* THIS PROGRAM WAS WRITTEN SPECIFICALLY TO HANDLE THE SHARE MVS       *
+* MODIFICATION TAPE.  IT WILL UNLOAD A SEQUENTIAL FILE OR A PDS       *
+* WITH FIXED OR VARIABLE LENGTH RECORDS (LRECL <= 255) TO A           *
+* COMPRESSED SEQUENTIAL FILE (USUALLY TAPE).  IT ALSO RELOAD FROM     *
+* THE COMPRESSED FILE TO A SEQUENTIAL FILE OR A PDS.                  *
+*                                                                     *
+* IF A PARM FIELD IS SUPPLIED, IT WILL PERFORM AN UNLOAD FUNCTION,    *
+* IF NO PARM FIELD, A LOAD FUNCTION WILL BE PERFORMED.  IN EITHER     *
+* CASE, SYSUT1 WILL BE COPIED TO SYSUT2                               *
+*                                                                     *
+* RECFM, DSORG, LRECL, AND BLKSIZE MUST BE SPECIFIED EXTERNALLY TO    *
+* THE PROGRAM FOR SYSUT1 AND SYSUT2                                   *
+* FOR TAPE AND NEW DATASETS IT MUST BE ON THE DDCARD                  *
+*                                                                     *
+* UNLOAD FUNCTION                                                     *
+*   INPUT CAN BE A PDS OR SEQUENTIAL FILE.                            *
+*   OUTPUT WILL BE A SEQUENTIAL FILE OF COMPRESSED DATA.              *
+*   THE INPUT FILE IS CHECKED FOR ALREADY COMPRESSED FORMAT, IF SO    *
+*     A SIMPLE COPY IS DONE.                                          *
+*                                                                     *
+* LOAD FUNCTION                                                       *
+*   INPUT MUST BE COMPRESSED FILE PRODUCED BY UNLOAD FUNCTION         *
+*   OUTPUT WILL BE A SEQUENTIAL OR PDS WITH THE SAME LRECL AS THE     *
+*     ORIGINAL FILE.   IF BLKSIZE IS NOT SUPPLIED ON THE OUTPUT DD    *
+*     CARD, ONE WILL BE CALCULATED BASED ON DEVICE TYPE.              *
+*                                                                     *
+***********************************************************************
+         EJECT
+TEC012   CSECT
+         SPACE 2
+*******  REGISTERS ********
+         SPACE 2
+R0       EQU   0                    WORK REG
+R1       EQU   1                    WORK REG
+R2       EQU   2                    WORK REG
+R3       EQU   3                    WORK REG
+R4       EQU   4                    NOT USED
+R5       EQU   5                    RECORD LENGTH
+R6       EQU   6                    INTERNAL BAL
+R7       EQU   7                    -> END OF BLOCK
+R8       EQU   8                    -> TABLE ENTRY/OUTPUT BUFFER
+R9       EQU   9                    RECORD COUNTER
+R10      EQU   10                   POINT TO INPUT RECORD / OR JFCB
+R11      EQU   11                   BASE REGISTER
+R12      EQU   12                   R11 + 4096
+R13      EQU   13                   SAVE AREA
+R14      EQU   14                   RETURN ADDRESS
+R15      EQU   15                   RETURN CODE
+         SPACE 2
+         IEZBITS
+         EJECT
+         SAVE  (14,12),,TEC012_&SYSDATE_&SYSTIME
+         LR    R11,R15             ESTABLISH ADDRESSABILITY
+         LA    R12,4095(,R11)
+         LA    R12,1(,R12)
+         USING TEC012,11,12
+         LA    R2,SAVEAREA
+         ST    R13,4(,R2)          SAVE CALLER'S SAVE AREA ADDR
+         ST    R2,8(,R13)          SAVE MY SAVE AREA ADDRESS
+         XC    16(4,R13),16(R13)   ZERO RETURN CODE
+         LR    R13,R2              POINT TO SAVE AREA
+         SPACE 1
+         L     R1,0(,R1)                -> PARM FIELD
+         LH    R1,0(,R1)                LENGTH OF FIELD
+         LTR   R1,R1                    CHECK FOR EXISTENCE OF FIELD
+         BNZ   SETUP100                 GOT IT, MUST BE UNLOAD FUNCTION
+         OI    EXECFLAG,LOAD            NONE, INDICATE LOAD FUNCTION
+         EJECT
+SETUP100 DS    0H
+         LA    R10,JFCBAREA
+         USING JFCB,R10
+*
+* ANALYZE SYSUT1
+*
+         RDJFCB MF=(E,JFCBOPEN)     SEE IF THE DDCARD IS THERE
+         LTR   R15,R15              THEN OPEN AND CLOSE TO RESOLVE
+         BNZ   ERROR01              REAL DCB INFORMATION
+         CLC   JFCBFLSQ,=H'0'       WILL BE NON-ZERO FOR TAPE
+         BNE   SETUP105              DCB MUST BE ON DD CARD FOR TAPE
+         OPEN  MF=(E,JFCBOPEN)
+         CLOSE MF=(E,JFCBOPEN)
+         RDJFCB MF=(E,JFCBOPEN)     JFCB WILL NOW HAVE INFO FROM DS
+         LTR   R15,R15
+         BNZ   ERROR01
+*
+         MVC   UT1DSORG,JFCDSRG1
+SETUP105 DS    0H
+         MVC   UT1DSN,JFCBDSNM      SAVE INFORMATION ABOUT THIS FILE
+         MVC   UT1RECFM,JFCRECFM
+         MVC   UT1BLKSI,JFCBLKSI
+         MVC   UT1LRECL,JFCLRECL
+*
+         LH    R2,UT1REC            CALCULATE LENGTH OF RECORD
+         LA    R1,UT1REC-1          BY DELETING TRAILING BLANKS
+SETUP110 LA    R3,0(R1,R2)
+         CLI   0(R3),C' '
+         BNE   SETUP115
+         BCT   R2,SETUP110
+SETUP115 DS    0H
+         STH   R2,UT1REC
+         EJECT
+*
+* CHECK SYSUT2
+*
+SETUP120 MVC   JFCBDCB+DCBDDNAM-IHADCB(8),UT2PS+DCBDDNAM-IHADCB
+         RDJFCB MF=(E,JFCBOPEN)     SEE IF THE DDCARD IS THERE
+         LTR   R15,R15              THEN OPEN AND CLOSE TO RESOLVE
+         BNZ   ERROR02              REAL DCB INFORMATION
+         TM    JFCBIND2,JFCNEW      BYPASS OPEN FOR NEW DATASETS
+         BO    SETUP125
+         OPEN  MF=(E,JFCBOPEN)
+         CLOSE MF=(E,JFCBOPEN)
+         RDJFCB MF=(E,JFCBOPEN)     JFCB WILL NOW HAVE INFO FROM DS
+         LTR   R15,R15
+         BNZ   ERROR02
+*
+SETUP125 DS    0H
+         MVC   UT2DSORG,JFCDSRG1
+         MVC   UT2DSN,JFCBDSNM      SAVE INFORMATION ABOUT THIS FILE
+         MVC   UT2RECFM,JFCRECFM
+         MVC   UT2BLKSI,JFCBLKSI
+         MVC   UT2LRECL,JFCLRECL
+*
+         DROP  R10
+         SPACE 2
+*
+* DONE WITH JFCBAREA, SET UP TRANSLATE TABLES
+*
+*    NUMERIC  - USED TO LOOK CHECK FOR NUMERIC STRING (X'F0'-X'F9')
+*    TRTABLE2 - USED TO CHECK FOR ANY CHARACTERS LESS THAN X'40'
+*    TRTABLE3 - USED TO LOOK FOR SPECIAL CHARACTERS TO COMPRESS
+*    TRTABLE4 - REBUILT ON FLY, LOOK FOR OTHER THAN SINGLE SPECIAL CHAR
+*
+SETUP130 MVI   NUMERIC,X'FF'
+         MVC   NUMERIC+1(255),NUMERIC
+         XC    TRTABLE2(256),TRTABLE2
+         XC    TRTABLE3(256),TRTABLE3
+         XC    NUMERIC+C'0'(10),NUMERIC+X'F0'
+         MVC   TRTABLE2(64),NUMERIC
+         MVI   TRTABLE3+C' ',C' '   LOOK FOR BLANK
+         MVI   TRTABLE3+C'*',C'*'    AND STAR
+         MVI   TRTABLE3+C'-',C'-'    AND DASH
+         MVI   TRTABLE3+C'.',C'.'    AND PERIOD
+         MVI   TRTABLE3+C'_',C'_'    AND UNDERSCORE
+         EJECT
+*
+* DETERMINE WHICH ROUTINE TO USE
+*
+SETUP140 TM    EXECFLAG,LOAD        DETERMINE WHICH ROUTINE TO USE
+         BO    SETUP200             LOAD OR UNLOAD
+*
+* MUST BE UNLOAD
+*
+SETUP150 TM    UT2DSORG,JFCORGPS    SYSUT2 MUST BE DSORG=PS
+         BZ    ERROR10
+         TM    UT1DSORG,JFCORGPS    CHECK FOR SYSUT1 DSORG=PS
+         BO    UNLOADPS             YES, FUNCTION=UNLOAD PS
+         TM    UT1DSORG,JFCORGPO    CHECK FOR SYSUT1 DSORG=PO
+         BO    UNLOADPO             YES, FUNCTION = UNLOAD PO
+         B     ERROR11
+         SPACE 2
+*
+* CHECK FOR LOAD FUNCTIONS
+*
+SETUP200 TM    UT1DSORG,JFCORGPS    SYSUT1 MUST BE DSORG=PS
+         BZ    ERROR12
+         TM    UT2DSORG,JFCORGPS    CHECK FOR SYSUT2 DSORG=PS
+         BO    LOADPS               YES, FUNCTION = LOAD PS
+         TM    UT2DSORG,JFCORGPO    CHECK FOR SYSUT2 DSORG=PO
+         BO    LOADPO               YES, FUNCTION = LOAD PO
+         B     ERROR13
+         EJECT
+***********************************************************************
+*                                                                     *
+* UNLOAD PS - UNLOAD A PS FILE TO A COMPRESSED FORMAT                 *
+*                                                                     *
+***********************************************************************
+UNLOADPS DS    0H
+         CLC   UT1LRECL,=H'255'     LRECL MUST BE <= 255
+         BH    ERROR01
+         LA    R1,UNLDSEOD          SET END OF FILE ROUTINE ADDRESS
+         STCM  R1,7,UT1PS+DCBEODA-IHADCB
+         OPEN  MF=(E,O1PS2PS)
+         TM    UT1PS+DCBOFLGS-IHADCB,DCBOFOPN
+         BNO   ERROR01
+         TM    UT2PS+DCBOFLGS-IHADCB,DCBOFOPN
+         BNO   ERROR02
+         SLR   R9,R9                ZERO RECORD COUNTER
+         OI    EXECFLAG,FIRST
+UNLDS000 DS    0H
+         GET   UT1PS
+         LR    R10,R1               POINT TO INPUT RECORD
+         TM    EXECFLAG,FIRST       CHECK FOR FIRST RECORD
+         BZ    UNLDS100             NO GO DO IT
+         BAL   R6,CHECKSEQ          CHECK FOR SEQUENCED DATA
+         PUT   UT2PS,UT1REC
+         NI    EXECFLAG,255-FIRST   INDICATE BEEN HERE BEFORE
+UNLDS100 DS    0H
+         LA    R9,1(,R9)            RECORD COUNTER
+         BAL   R6,COMPRESS
+         PUT   UT2PS,RECORD
+         B     UNLDS000
+UNLDSEOD DS    0H
+         CLOSE MF=(E,O1PS2PS)
+         B     RETURN0
+         EJECT
+***********************************************************************
+*                                                                     *
+* UNLOAD PO - UNLOAD A PO FILE TO A COMPRESSED FORMAT                 *
+*                                                                     *
+***********************************************************************
+UNLOADPO DS    0H
+         CLC   UT1LRECL,=H'255'     LRECL MUST BE <= 255
+         BH    ERROR01
+*
+* SET UP UT1PS DCB TO READ THE DIRECTORY
+*
+         LA    R1,UNLDO150          SET END OF FILE ROUTINE ADDRESS
+         STCM  R1,7,UT1PS+DCBEODA-IHADCB
+         MVC   UT1PS+DCBLRECL-IHADCB(2),=H'256'
+         MVC   UT1PS+DCBPRECL-IHADCB(2),=H'256'
+         MVC   UT1PS+DCBBLKSI-IHADCB(2),=H'256'
+         OI    UT1PS+DCBRECFM-IHADCB,DCBRECF
+*
+* GET SOME STORAGE TO HANDLE ENTRIES (MAX IS ABOUT 5400)
+*
+         GETMAIN RU,LV=65536,BNDRY=PAGE,SP=12
+         OI    EXECFLAG,GETMAIN
+         ST    R1,BLDLLIST
+         LR    R8,R1
+*
+* OPEN SYSUT1 AS A SEQUENTIAL FILE
+*
+         OPEN  MF=(E,O1PS)
+         TM    UT1PS+DCBOFLGS-IHADCB,DCBOFOPN
+         BNO   ERROR01
+         EJECT
+*
+* READ EACH DIRECTORY BLOCK FOR MEMBER NAMES AND TTR, PUT IN TABLE
+*
+*    R8  -> CURRENT TABLE ENTRY
+*    R10 -> CURRENT PLACE IN INPUT RECORD
+*
+UNLDO100 DS    0H
+         GET   UT1PS
+         LR    R10,R1               REMEMBER WHERE IT IS
+         LH    R2,0(,R10)           LENGTH OF GOOD DATA
+         ALR   R2,R10               POINT TO NO GOOD DATA
+         LA    R10,2(,R10)          POINT TO FIRST MEMBER
+UNLDO110 DS    0H
+         MVC   0(11,R8),0(R10)      SAVE MEMBER NAME AND TTR
+         CLC   0(8,R10),HIVALUES    AT END OF LIST
+         BE    UNLDO160
+         LA    R8,12(,R8)           -> NEXT ENTRY IN TABLE
+         LA    R10,11(,R10)         -> PAST MEMBER NAME AND TTR
+         CLR   R10,R2               ARE WE AT END OF BLOCK
+         BNL   UNLDO100             YES, GO GET NEXT BLOCK
+         TM    0(R10),BIT0          WE HAVE TO CHECK FOR LAST ENTRY
+         BZ    UNLDO120              BEING AN ALIAS IN THIS WAY
+         SH    R8,=H'12'             BECAUSE OF PROBLEM WITH LAST ENTRY
+UNLDO120 DS    0H
+         NI    0(R10),X'1F'         TURN OF ALIAS IND, USER TTRN
+         SLR   R1,R1
+         IC    R1,0(R10)            GET NUMBER OF HALF WORDS
+         SLL   R1,1                 TURN INTO BYTE COUNT
+         LA    R10,1(R1,R10)        POINT TO NEXT ENTRY
+         CLR   R10,R2               CHECK FOR END OF BLOCK
+         BNL   UNLDO100             YES, GO GET NEXT BLOCK
+         B     UNLDO110             NO, PROCESS NEXT MEMBER
+*
+* AT END OF DIRECTORY
+*
+UNLDO150 DS    0H                   GOT HERE BY PHYSICAL EOF ON INPUT
+         MVC   0(8,R8),HIVALUES     INDICATE LAST MEMBER
+UNLDO160 DS    0H
+         ST    R8,BLDLEND           SAVE AS REDUNDANT CHECK
+         L     R8,BLDLLIST          POINT TO BEGINNING AGAIN
+         CLOSE MF=(E,O1PS)
+         PRINT NOGEN
+         FREEPOOL UT1PS
+         PRINT GEN
+         EJECT
+*
+* USING TABLE, PROCESS EACH MEMBER OF PDS
+*
+         LA    R1,UNLDOEOD          SET END OF FILE ROUTINE ADDRESS
+         STCM  R1,7,UT1PO+DCBEODA-IHADCB
+         OPEN  MF=(E,O1PO2PS)
+         TM    UT1PO+DCBOFLGS-IHADCB,DCBOFOPN
+         BNO   ERROR01
+         TM    UT2PS+DCBOFLGS-IHADCB,DCBOFOPN
+         BNO   ERROR02
+         LH    R0,UT1BLKSI          GET A BUFFER AREA
+         GETMAIN RU,LV=(0),SP=12
+         OI    EXECFLAG,GETMAIN     INDICATE GETMAIN ISSUED
+         ST    R1,BUFFER            SAVE A POINTER TO THE AREA
+         SLR   R9,R9                RECORD COUNTER
+*
+*  BEGIN PROCESSING A NEW MEMBER
+*
+UNLDO200 DS    0H
+         CLC   0(8,R8),HIVALUES     IS THIS LAST MEMBER
+         BE    UNLDO500               YES, GO FINISH UP
+         LA    R0,8(,R8)            -> THIS TTR ENTRY
+         POINT UT1PO,(0)            -> MEMBER TO PROCESS
+         OI    EXECFLAG,FIRST
+         EJECT
+*
+*  BEGIN PROCESSING A NEW BLOCK OF INPUT DATA
+*
+         PRINT NOGEN
+UNLDO210 DS    0H
+         L     R10,BUFFER
+         READ  UNLDDECB,SF,UT1PO,(10)
+         CHECK UNLDDECB
+         TM    UT1RECFM,JFCFIX      CALCULATE BYTES READ
+         BO    UNLDO220             FIX, BRANCH; VARIABLE, FALL THROUGH
+         LH    R7,0(,R10)           GET LENGTH DATA
+         ALR   R7,R10               POINT TO END OF BLOCK
+         LA    R10,4(,R10)          POINT PAST BLOCK LLZZ
+         B     UNLDO300
+         PRINT GEN
+*
+UNLDO220 DS    0H                   *FIXED LENGTH
+         LH    R7,UT1BLKSI          GET BLKSIZE
+         L     R1,UNLDDECB+16       -> IOB
+         SH    R7,14(,R1)           SUBTRACT CSW RESIDUAL COUNT
+         ALR   R7,R10               POINT TO END OF BLOCK
+UNLDO300 DS    0H                   PRODUCE THE RECORDS
+         TM    EXECFLAG,FIRST
+         BZ    UNLDO320
+         NI    EXECFLAG,255-FIRST
+         C     R8,BLDLLIST          FIRST MEMBER?
+         BNE   UNLDO310             NO, BYPASS
+         PUT   UT2PS,UT1REC
+UNLDO310 DS    0H
+         BAL   R6,CHECKSEQ
+         LA    R1,13                FILL IN LLZZ FIELD
+         SLL   R1,16
+         ST    R1,RECORD
+         MVC   RECFLAG,UT1FLAG
+         OI    RECFLAG,RECMBR       INDICATE MEMBER NAME RECORD
+         MVC   RECDATA(8),0(R8)     FILL IN MEMBER NAME
+         PUT   UT2PS,RECORD
+         EJECT
+*
+*  PROCESS ALL LOGICAL RECORDS IN THIS PHYSICAL RECORD
+*
+UNLDO320 DS    0H
+         LA    R9,1(,R9)            COUNT THIS RECORD
+         BAL   R6,COMPRESS
+         PUT   UT2PS,RECORD
+         TM    UT1RECFM,JFCFIX      FIXED LENGTH RECORDS
+         BO    UNLDO340              YES, BRANCH
+         AH    R10,0(,R10)          ADD THIS RECORD LENGTH
+         B     UNLDO360
+UNLDO340 DS    0H
+         AH    R10,UT1LRECL         FIXED, ADD CONSTANT LENGTH
+UNLDO360 DS    0H
+         CLR   R10,R7               AT END OF BUFFER
+         BL    UNLDO320             AND OUTPUT IT
+         B     UNLDO210             GO READ NEXT BUFFER
+UNLDOEOD DS    0H                   REACHED END OF THIS MEMBER
+         LA    R8,12(,R8)           POINT TO NEXT MEMBER/TTR ENTRY
+         C     R8,BLDLEND
+         BL    UNLDO200             AND GO PROCESS IT
+UNLDO500 DS    0H                   FINISH UP
+         CLOSE MF=(E,O1PO2PS)
+         B     RETURN0
+         EJECT
+***********************************************************************
+*                                                                     *
+* LOAD PS - RELOAD A COMPRESSED FILE TO A PS DATA SET                 *
+*                                                                     *
+***********************************************************************
+LOADPS   DS    0H
+         CLC   UT2LRECL,=H'255'     LRECL MUST BE <= 255
+         BH    ERROR02
+         LA    R1,LOADSEOD          SET END OF FILE ROUTINE ADDRESS
+         STCM  R1,7,UT1PS+DCBEODA-IHADCB
+         OPEN  MF=(E,O1PS2PS)
+         TM    UT1PS+DCBOFLGS-IHADCB,DCBOFOPN
+         BNO   ERROR01
+         TM    UT2PS+DCBOFLGS-IHADCB,DCBOFOPN
+         BNO   ERROR02
+         SLR   R9,R9                ZERO RECORD COUNTER
+         OI    EXECFLAG,FIRST
+LOADS000 DS    0H
+         GET   UT1PS
+         LR    R10,R1               POINT TO INPUT RECORD
+         TM    EXECFLAG,FIRST       CHECK FOR FIRST RECORD
+         BZ    LOADS100             NO GO DO IT
+         USING CTLREC,R10
+         CLC   CTLDSORG,UT2DSORG    CHECK FOR SYSUT2 ATTRIBUTES
+         BNE   ERROR14              MATCHING WHAT WAS EXPECTED FROM
+         CLC   CTLRECFM,UT2RECFM    UNLOADED FILE
+         BNE   ERROR14
+         CLC   CTLLRECL,UT2LRECL
+         BNE   ERROR14
+         NI    EXECFLAG,255-FIRST
+         MVC   UT2FLAG,CTLFLAG
+         DROP  R10
+         B     LOADS000             GO PROCESS THE REST OF THE RECORDS
+LOADS100 DS    0H
+         LA    R9,1(,R9)            RECORD COUNTER
+         BAL   R6,EXPAND
+         PUT   UT2PS,RECORD
+         B     LOADS000
+LOADSEOD DS    0H
+         CLOSE MF=(E,O1PS2PS)
+         B     RETURN0
+         EJECT
+***********************************************************************
+*                                                                     *
+* LOAD PO - RELOAD A COMPRESSED FILE TO A PARTITIONED DATA SET        *
+*                                                                     *
+***********************************************************************
+LOADPO   DS    0H
+         CLC   UT2LRECL,=H'255'     LRECL MUST BE <= 255
+         BH    ERROR02                ELSE ERROR
+         LA    R1,LOADOEOD          SET END OF FILE ROUTINE ADDRESS
+         STCM  R1,7,UT1PS+DCBEODA-IHADCB
+         OPEN  MF=(E,O1PS2PO)
+         TM    UT1PS+DCBOFLGS-IHADCB,DCBOFOPN
+         BNO   ERROR01
+         TM    UT2PO+DCBOFLGS-IHADCB,DCBOFOPN
+         BNO   ERROR02
+         SLR   R9,R9                ZERO RECORD COUNTER
+         GET   UT1PS                GET CONTROL RECORD
+         LR    R10,R1               POINT TO INPUT RECORD
+         USING CTLREC,R10
+         CLC   CTLDSORG,UT2DSORG    CHECK FOR SYSUT2 ATTRIBUTES
+         BNE   ERROR14              MATCHING WHAT WAS EXPECTED FROM
+         CLC   CTLRECFM,UT2RECFM    UNLOADED FILE
+         BNE   ERROR14
+         CLC   CTLLRECL,UT2LRECL
+         BNE   ERROR14
+         DROP  R10
+         LH    R0,UT2BLKSI          GET A BUFFER AREA
+         GETMAIN RU,LV=(0),SP=12
+         ST    R1,BUFFER            SAVE POINTER TO IT
+         LR    R8,R1                  IN TWO PLACES
+         LR    R7,R1                CALCULATE END OF BUFFER
+         AH    R7,UT2BLKSI
+         OI    EXECFLAG,GETMAIN+FIRST
+         TM    UT2RECFM,JFCFIX      IF RECFM=V THEN SAVE ROOM FOR
+         BO    LOADO000             LLZZ OF BLOCK
+         LA    R8,4(,R8)
+         EJECT
+*
+* PROCESS SYSUT1 FILE
+*
+*   R7 -> BYTE PAST END OF BUFFER
+*   R8 -> NEXT SPOT IN OUTPUT BUFFER
+*
+LOADO000 DS    0H
+         GET   UT1PS                GET NEXT RECORD
+         LR    R10,R1               AND REMEMBER WHERE IT IS
+         LA    R9,1(,R9)            RECORD COUNTER
+         TM    4(R10),RECMBR        IS THIS A NEW MEMBER
+         BZ    LOADO300             NO, GO PROCESS RECORD
+         B     LOADO050             YES, DO A STOW ON OLD ONE
+*
+* END OF FILE ENCOUNTERED
+*
+LOADOEOD DS    0H
+         OI    EXECFLAG,ENDOFILE    INDICATE END OF FILE
+*
+* NEW MEMBER ENCOUNTERED, STOW OLD MEMBER IF THERE IS ONE
+*
+LOADO050 DS    0H
+         TM    EXECFLAG,FIRST       IS THIS FIRST MEMBER
+         BO    LOADO200             YES, NOTHING TO STOW
+         TM    EXECFLAG,BUFUSE      IS ANYTHING IN CURRENT BUFFER
+         BZ    LOADO100             NO, BYPASS WRITE
+         BAL   R6,LOADO500
+LOADO100 DS    0H
+         XC    TTRC,TTRC            CLEAR TTRC FIELD
+         CLI   MEMBER,C' '          IF NO MEMBER NAME, THEN BYPASS STOW
+         BE    LOADO200               THIS HAPPENS WHEN SYSUT1 IS EMPTY
+         STOW  UT2PO,MEMBER,A       ADD MEMBER
+         LTR   R15,R15              WAS STOW SUCCESSFUL??
+         BNZ   ERROR15
+LOADO200 DS    0H
+         MVC   UT2FLAG,4(R10)       SAVE FLAG BYTE
+         MVC   MEMBER,5(R10)          AND MEMBER NAME
+         NI    EXECFLAG,255-FIRST
+         TM    EXECFLAG,ENDOFILE    AT END OF FILE
+         BZ    LOADO000             NO, GO PROCESS SOME MORE
+         CLOSE MF=(E,O1PS2PO)
+         B     RETURN0
+         EJECT
+*
+* EXPAND RECORD
+* WRITE OLD BUFFER IF REQUIRED
+* MOVE NEW RECORD INTO BUFFER
+*
+LOADO300 DS    0H
+         BAL   R6,EXPAND
+         TM    UT2RECFM,JFCFIX      FIXED OR VARIABLE
+         BO    LOADO350               FIXED, BRANCH
+* GET LENGTH OF RECORD INTO R5
+         LH    R5,RECLL             LENGTH OF VARIABLE RECORD
+         B     LOADO400
+*
+LOADO350 DS    0H
+         LH    R5,UT2LRECL          LENGTH OF FIXED RECORD
+*
+LOADO400 DS    0H
+         LR    R3,R7                CALCULATE ROOM LEFT IN BUFFER
+         SLR   R3,R8
+         CLR   R3,R5                CAN WE FIT THIS RECORD
+         BNL   LOADO420             YES, BYPASS WRITE
+         BAL   R6,LOADO500          NO, WRITE CURRENT BUFFER
+LOADO420 DS    0H
+         BCTR  R5,0                 ADJUST FOR EXECUTE
+         EX    R5,LOADOMVC          MOVE INTO BUFFER
+         LA    R8,1(R5,R8)          POINT TO NEXT POSITION
+         OI    EXECFLAG,BUFUSE      INDICATE BUFFER HAS DATA IN IT
+         B     LOADO000             AND GO GET NEXT RECORD
+         SPACE 1
+LOADOMVC MVC   0(0,R8),RECORD
+         EJECT
+*
+* WRITE A BUFFER AND RESET POINTERS
+*
+LOADO500 DS    0H
+         L     R3,BUFFER            -> BUFFER
+         SLR   R8,R3                CALCULATE LENGTH OF DATA
+         TM    UT2RECFM,JFCFIX      FIXED LENGTH?
+         BO    LOADO520             YES, GO FILL BLKSIZE IN DCB
+*
+         SLL   R8,16                MAKE INTO LLZZ FIELD
+         ST    R8,0(,R3)            STORE INTO BUFFER
+         B     LOADO550
+*
+LOADO520 DS    0H
+         STH   R8,UT2PO+DCBBLKSI-IHADCB
+LOADO550 DS    0H
+         WRITE OUTDECB,SF,UT2PO,(R3)
+         CHECK OUTDECB
+         L     R8,BUFFER            POINT TO BEGINNING OF OUTPUT BUFFER
+         NI    EXECFLAG,255-BUFUSE  BUFFER NOW EMPTY
+         TM    UT2RECFM,JFCFIX      IF RECFM=F THE RETURN
+         BOR   R6
+         LA    R8,4(,R8)            ELSE RECFM=V, THEN LEAVE ROOM
+         BR    R6                     FOR LLZZ IN OUTPUT BLOCK
+         EJECT
+***********************************************************************
+*                                                                     *
+* CHECKSEQ - CHECK FOR SEQUENCE RECORDS IN THE DATA                   *
+*   THIS ROUTINE IS ENTERED FOR THE FIRST RECORD IN A FILE TO CHECK   *
+*   FOR THE EXISTENCE OF SEQUENCE NUMBERS.  FOR FIXED LENGTH RECORDS  *
+*   THE LAST EIGHT BYTES ARE CHECKED, FOR VARIABLE LENGTH RECORDS     *
+*   THE FIRST EIGHT BYTES.  IF THE FIRST RECORD HAS VALID SEQUENCE    *
+*   NUMBERS, THE COMPLETE FILE IS ASSUMED TO BE SEQUENCED.  THIS IS   *
+*   HOW SPF DOES IT.  WHEN PROCESSING A PDS, EACH MEMBER IS CHECKED   *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+CHECKSEQ DS    0H
+         NI    UT1FLAG,255-NUMBERED
+         TM    UT1RECFM,JFCFIX      FIXED LENGTH RECORDS
+         BO    CHK100               YES, GO CHECK
+         TRT   4(8,R10),NUMERIC     NO, VARIABLE, CHECK FIRST 8 BYTES
+         BNZR  R6                   NON-NUMERIC FOUND, RETURN
+         OI    UT1FLAG,NUMBERED     INDICATE VB SEQUENCED
+         BR    R6
+         SPACE 1
+CHK100   DS    0H
+         LH    R1,UT1LRECL          GET RECORD LENGTH
+         SH    R1,=H'8'             LESS EIGHT BYTES
+         LA    R2,0(R1,R10)         POINT TO LAST EIGHT BYTES
+         TRT   0(8,R2),NUMERIC      CHECK FOR FB NUMERIC
+         BNZR  R6
+         OI    UT1FLAG,NUMBERED     INDICATE FB SEQUENCED DATA
+         BR    R6
+         EJECT
+***********************************************************************
+*                                                                     *
+* COMPRESS - COMPRESS DATA POINTED TO AT R10 INTO FIELD AT RECORD     *
+*                                                                     *
+*    R3 -> CURRENT PLACE IN SOURCE (INPUT RECORD)                     *
+*    R4 -> CURRENT PLACE IN DESTINATION                               *
+*    R5 =  LENGTH LEFT IN SOURCE                                      *
+*                                                                     *
+* THIS ROUTINE COMPRESSES ALL OCCURRANCES OF SPECIAL CHARACTERS AS    *
+* DEFINED IN THE SPECIAL TABLE.  THE CHARACTER MUST REPEAT AT LEAST   *
+* THREE TIMES.  THE REPEATED STRING IS COMPRESSED TO TWO BYTES, THE   *
+* FIRST IS THE NUMBER OF TIMES THE CHARACTER IS REPEATED MINUS ONE,   *
+* THE SECOND IS THE CHARACTER REPEATED.  THE COUNT (FIRST BYTE) WILL  *
+* ALWAYS BE LESS THE X'3F'.  THEREFORE, NO INPUT RECORDS THAT HAVE    *
+* A CHARACTER OF LESS THAN X'3F' WILL BE COMPRESSED.                  *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+COMPRESS DS    0H
+         XC    RECFLAG,RECFLAG      CLEAR RECORD FLAG
+         LA    R4,RECDATA           POINT TO DESTINATION FIELD
+         TM    UT1RECFM,JFCFIX      IS INPUT FIXED LENGTH
+         BO    COMP010              YES, BRANCH
+* SET UP POINTERS FOR VARIABLE LENGTH RECORDS
+         LH    R5,0(,R10)           GET RECORD LENGTH
+         LA    R3,4(,R10)           POINT TO DATA
+         SH    R5,=H'4'             ADJUST RECORD LENGTH FOR EXECUTE
+         TM    UT1FLAG,NUMBERED     DO WE ADJUST FOR NUMBERED DATA
+         BZ    COMP020              NO, BRANCH
+         LA    R3,8(,R3)            YES, ADJUST POINTER
+         SH    R5,=H'8'             AND ADJUST SOURCE LENGTH
+         BP    COMP020              MUST HAVE SOME DATA LEFT
+COMP005  ABEND 1,DUMP               CAN'T HANDLE SEQUENCE NUMBER ONLY
+* SET UP POINTERS FOR FIXED LENGTH RECORDS
+COMP010  DS    0H
+         LR    R3,R10               POINT TO DATA
+         LH    R5,UT1LRECL          GET RECORD LENGTH
+         TM    UT1FLAG,NUMBERED     DO WE ADJUST FOR NUMBERED DATA
+         BZ    COMP020              NO, BRANCH
+         SH    R5,=H'8'             YES, ADJUST SOURCE LENGTH
+         BNP   COMP005              MUST HAVE SOME DATA LEFT
+         EJECT
+* CHECK FOR NON-COMPRESSIBLE STRING
+COMP020  DS    0H
+         BCTR  R5,0                 LENGTH WILL ALWAYS BE LESS ONE
+         EX    R5,COMPTRT1          LOOK FOR ANY CHAR < X'40'
+         BNZ   COMP500              IF FOUND, DON'T COMPRESS STRING
+* SETUP POINTERS NEAR END OF SOURCE FOR USE LATER
+         LA    R1,0(R3,R5)          POINT TO LAST BYTE OF SOURCE
+         ST    R1,LASTBYTE          SAVE POINTER
+         BCTR  R1,0                 ADJUST BY TWO
+         BCTR  R1,0
+         ST    R1,LASTLES2          -> TO LAST COMPRESSABLE BYTE
+         SPACE 1
+* LOOK FOR SPECIAL CHARACTERS TO COMPRESS OUT
+*  THIS IS THE BEGINNING OF THE LOOP THROUGH THE STRING
+COMP100  DS    0H
+         CH    R5,=H'2'             LESS THAN THREE CHARACTERS LEFT?
+         BNH   COMP500              YES, GO MOVE RESET OF STRING
+         EX    R5,COMPTRT2          FIND SPECIAL CHAR
+         BC    8+2,COMP500           BR, NOT FOUND OR FOUND LAST
+         C     R1,LASTLES2          IF FOUND IN LAST TWO BYTES
+         BH    COMP500              WE STILL WON'T COMPRESS
+         CLC   0(2,R1),1(R1)        MUST BE THREE CHARS IN A ROW
+         BE    COMP150
+         MVC   0(1,R4),0(R3)        MOVE OVER THIS BYTE
+         LA    R3,1(,R3)            BUMP SOURCE
+         LA    R4,1(,R4)              AND DEST POINTERS
+         BCTR  R5,0                 AND ADJUST SOURCE LENGTH
+         B     COMP100
+         EJECT
+* WE ARE GOING TO COMPRESS SOME DATA
+* MOVE DATA UP TO THIS POINT FROM SOURCE TO DEST FIELDS
+COMP150  DS    0H
+         OI    RECFLAG,RECCOMP      INDICATE COMPRESSED DATA
+         CLR   R1,R3                IF COMPRESSING FIRST BYTE IN SOURCE
+         BE    COMP200                NOTHING TO MOVE
+         LR    R2,R1                CALCULATE LENGTH TO MOVE
+         SLR   R2,R3                LENGTH TO MOVE
+         SLR   R5,R2                ADJUST LENGTH OF SOURCE
+         BCTR  R2,0                 ADJUST FOR EXECUTE
+         EX    R2,COMPMVC1
+         LA    R3,1(R2,R3)          INCREMENT POINTERS
+         LA    R4,1(R2,R4)
+* FOUND OUT HOW MANY BYTES TO COMPRESS
+COMP200  DS    0H
+         SLR   R2,R2                CLEAR REG
+         IC    R2,0(R3)             GET CHARACTER WERE COMPRESSING
+         MVI   TRTABLE4,X'FF'
+         MVC   TRTABLE4+1(255),TRTABLE4
+         LA    R2,TRTABLE4(R2)      CLEAR BYTE WERE LOOKING FOR
+         XC    0(1,R2),0(R2)
+         LR    R0,R5                SAVE LENGTH OF FIELD
+         CH    R5,=H'64'            MORE THAN 65 BYTES LEFT
+         BNH   COMP210
+         LA    R5,64                ONLY LOOK AT NEXT 65 BYTES
+COMP210  DS    0H
+         EX    R5,COMPTRT3          LOOK FOR NEXT NON-SPECIAL CHAR
+         BZ    COMP250              NON FOUND, COMPRESS REST
+         LR    R5,R0                RESTORE ORIGINAL LENGTH
+         LR    R2,R1                CALCULATE LENGTH OF COMPRESSED DATA
+         SLR   R2,R3
+         SLR   R5,R2                REDUCE LENGTH
+         BCTR  R2,0                 ADJUST LENGTH OF COMPRESSED DATA
+         BCTR  R2,0                 TWICE (ZERO IS TWO BYTES OF DATA)
+         STC   R2,0(R4)             SAVE IN DEST
+         MVC   1(1,R4),0(R3)        SAVE CHARACTER COMPRESSED
+         LA    R4,2(,R4)            BUMP OVER COMPRESS INFO IN DEST
+         LR    R3,R1                POINT TO NEXT CHARACTER
+         B     COMP100
+         EJECT
+* REST OF RECORD OR 64 CHARACTERS ALL SAME
+COMP250  DS    0H
+         BCTR  R5,0                 ADJUST TO LENGTH MINUS TWO
+         STC   R5,0(R4)             SAVE COUNT OF COMPRESSED BYTES
+         MVC   1(1,R4),0(R3)        SAVE CHARACTER COMPRESSED
+         LA    R4,2(,R4)            BUMP OVER COMPRESS INFO IN DEST
+         LA    R5,1(,R5)            READJUST TO LENGTH MINUS ONE
+         CLR   R0,R5                DID WE SEARCH ALL OF RECORD
+         BE    COMP900              YES, ALL DONE, GO FINISH UP
+         LR    R5,R0
+         SH    R5,=H'65'            REDUCE LENGTH OF SOURCE
+         LA    R3,65(,R3)           BUMP OVER COMPRESSED CHARACTERS
+         B     COMP100
+         SPACE 1
+* EXITS FROM LOOP
+         SPACE 1
+* NOTHING MORE TO COMPRESS, MOVE REST OF STRING
+COMP500  DS    0H
+         EX    R5,COMPMVC1
+         LA    R4,1(R5,R4)          POINT PAST MOVED DATA
+* CALCULATE LENGTH OF DEST STRING
+COMP900  DS    0H
+         LA    R1,RECORD            BEGINNING OF RECORD
+         SLR   R4,R1                GET LENGTH
+         SLL   R4,16                MOVE INTO LEFT OF REG FOR LLZZ
+         ST    R4,RECORD
+* RETURN TO SENDER
+         BR    R6
+         SPACE 1
+COMPTRT1 TRT   0(0,R3),TRTABLE2     EXECUTED INSTRUCTIONS
+COMPTRT2 TRT   0(0,R3),TRTABLE3
+COMPTRT3 TRT   0(0,R3),TRTABLE4
+COMPMVC1 MVC   0(0,R4),0(R3)
+         EJECT
+***********************************************************************
+*                                                                     *
+* EXPAND - EXPAND THE DATA POINTED TO AT R10 INTO FIELD AT RECORD     *
+*    R3 -> NEXT BYTE IN INPUT RECORD (SOURCE)                         *
+*    R4 -> NEXT BYTE IN DESTINATION FIELD (RECOUT)                   *
+*    R5 =  NUMBER OF BYTES LEFT IN SOURCE (MINUS ONE)                 *
+*                                                                     *
+***********************************************************************
+         SPACE 1
+EXPAND   DS    0H
+* COMMON STUFF FIRST
+         LA    R4,RECOUT            POINT TO DESTINATION FIELD
+         LH    R5,0(,R10)           GET COMPRESSED RECORD LENGTH
+         LA    R3,5(,R10)           POINT TO DATA
+         SH    R5,=H'6'             ADJUST FOR EXECUTE
+         SPACE 1
+         TM    UT2RECFM,JFCFIX      IS INPUT FIXED LENGTH
+         BO    EXPND010             YES, BRANCH
+         TM    UT2FLAG,NUMBERED     IF NUMBERED
+         BZ    EXPND010
+         LA    R4,8(,R4)            POINT PAST AREA TO PUT NUMBER
+EXPND010 DS    0H
+         TM    4(R10),RECCOMP       IS RECORD COMPRESSED
+         BZ    EXPND500             NO, GO MOVE RECORD
+* LOOP THROUGH LOOKING FOR COMPRESSED BYTE
+EXPND100 DS    0H
+         EX    R5,EXPNDTR1          LOOK FOR ANY CHAR <= X'3F'
+         BC    8+2,EXPND500         IF NOT FOUND (8) OR LAST (2) BR
+         LR    R2,R1                POINT TO BYTE FOUND
+         SR    R2,R3                LENGTH OF NOT COMPRESSED DATA
+         BZ    EXPND300             BYPASS MOVE
+* MOVE NON-COMPRESSED DATA
+         SLR   R5,R2                ADJUST LENGTH OF SOURCE
+         BCTR  R2,0                 ADJUST FOR EXECUTE
+         EX    R2,EXPNDMV1          MOVE NON-COMPRESSED DATA
+         LA    R3,1(R2,R3)          POINT PAST MOVED DATA
+         LA    R4,1(R2,R4)          IN DEST ALSO
+EXPND300 DS    0H
+         SLR   R2,R2
+         IC    R2,0(,R3)            BYTES OF COMPRESSED DATA
+         MVC   0(1,R4),1(R3)        MOVE BYTE COMPRESSED
+         EX    R2,EXPNDMV2          FILL IN NECESSARY NUMBER
+         LA    R4,2(R2,R4)          BUMP PAST EXPANDED DATA
+         LA    R3,2(,R3)            AND COMPRESSED DATA
+         SH    R5,=H'2'             ADJUST LENGTH
+         BP    EXPND100             AND GO DO IT AGAIN
+         BM    EXPND510
+         EJECT
+EXPND500 DS    0H                   * FIXED LENGTH RECORDS
+         EX    R5,EXPNDMV1          MOVE REST OF RECORD
+         LA    R4,1(R5,R4)          POINT PAST LAST BYTE IN DEST
+EXPND510 DS    0H
+         TM    UT2RECFM,JFCFIX      DO WE NEED TO CALCULATE LLZZ
+         BO    EXPND550             NO, BYPASS
+* CLEAN UP FOR VARIABLE LENGTH
+         LA    R1,RECORD
+         SLR   R4,R1                GET LENGTH
+         SLL   R4,16                ADJUST FOR LLZZ
+         ST    R4,RECORD
+         TM    UT2FLAG,NUMBERED
+         BZR   R6
+         LA    R4,RECOUT            POINT TO WHERE TO PUT SEQ NUMBER
+         B     EXPND575
+* CLEAN UP FOR FIXED LENGTH RECORD
+EXPND550 DS    0H
+         LH    R5,UT2LRECL          LEFT ADJUST INTO RECORD FIELD
+         BCTR  R5,0
+         EX    R5,EXPNDMV3
+         TM    UT2FLAG,NUMBERED
+         BZR   R6
+         SH    R4,=H'4'             ADJUST END POINTER
+* INSERT SEQUENCE NUMBER
+EXPND575 DS    0H
+         CVD   R9,WORKAREA
+         OI    WORKAREA+7,X'0F'
+         UNPK  0(7,R4),WORKAREA+4(4)
+         MVI   7(R4),C'0'
+         BR    R6
+         SPACE 1
+EXPNDMV1 MVC   0(0,R4),0(R3)         EXECUTED INSTRUCTION
+EXPNDMV2 MVC   1(0,R4),0(R4)
+EXPNDMV3 MVC   RECORD(0),RECOUT
+EXPNDTR1 TRT   0(0,R3),TRTABLE2
+         EJECT
+***********************************************************************
+*                                                                     *
+* RETURN                                                              *
+*                                                                     *
+***********************************************************************
+         PRINT NOGEN
+ERROR01  DS    0H
+         WTO   'TEC012- 01 - ERROR ENCOUNTERED ON SYSUT1',             X
+               ROUTCDE=11
+         B     RETURN8
+ERROR02  DS    0H
+         WTO   'TEC012- 02 - ERROR ENCOUNTERED ON SYSUT2',             X
+               ROUTCDE=11
+         B     RETURN8
+ERROR10  WTO   'TEC012- 10 - SYSUT2 MUST BE DSORG=PS FOR UNLOAD',      X
+               ROUTCDE=11
+         B     RETURN8
+ERROR11  WTO   'TEC012- 11 - SYSUT1 MUST BE DSORG=PS OR PO FOR UNLOAD',X
+               ROUTCDE=11
+         B     RETURN8
+ERROR12  WTO   'TEC012- 12 - SYSUT2 MUST BE DSORG=PS FOR LOAD',        X
+               ROUTCDE=11
+         B     RETURN8
+ERROR13  WTO   'TEC012- 13 - SYSUT2 MUST BE DSORG=PS OR PO FOR LOAD',  X
+               ROUTCDE=11
+         B     RETURN8
+ERROR14  WTO   'TEC012- 14 - SYSUT2 DOESN''T MATCH COMPRESSED FILE ATTRX
+               IBUTES',ROUTCDE=11
+         B     RETURN8
+ERROR15  WTO   'TEC012- 15 - PROBLEM ON STOW',ROUTCDE=11
+         B     RETURN8
+*
+RETURN8  DS    0H
+         BAL   R6,FREEMAIN
+         L     R13,4(,R13)
+         MVI   19(R13),X'08'        SET RETURN CODE = 8
+         B     RETURN
+RETURN0  DS    0H
+         BAL   R6,FREEMAIN
+         L     R13,4(,R13)
+RETURN   DS    0H
+         RETURN (14,12)
+         SPACE 2
+FREEMAIN DS    0H
+         TM    EXECFLAG,GETMAIN
+         BZR   R6
+         FREEMAIN RU,SP=12
+         BR    R6
+         EJECT
+***********************************************************************
+*                                                                     *
+* CONSTANTS AND ALL THAT STUFF                                        *
+*                                                                     *
+***********************************************************************
+WORKAREA DS    D'0'
+SAVEAREA DS    18F                 SAVE AREA FOR REGISTERS ON ENTRY
+         SPACE 1
+HIVALUES DC    2F'-1'
+BLDLLIST DC    A(0)
+BLDLEND  DC    A(0)
+BUFFER   DC    A(0)
+LASTBYTE DC    A(0)
+LASTLES2 DC    A(0)
+         SPACE 1
+UT1REC   DC    0H'0',AL2(UT1LEN,0)  FIRST RECORD OF COMPRESSED FILE
+UT1DSORG DC    X'40'                ASSUME DSORG=PS
+UT1RECFM DC    X'00'
+UT1LRECL DC    X'0000'
+UT1BLKSI DC    X'0000'
+UT1FLAG  DC    X'00'                SAME BIT USAGE AS RECFLAG
+UT1DSN   DC    CL44' '
+UT1LEN   EQU   *-UT1REC
+         SPACE 1
+UT2REC   DC    0H'0',AL2(UT2LEN,0)  FIRST RECORD OF COMPRESSED FILE
+UT2DSORG DC    X'00'
+UT2RECFM DC    X'00'
+UT2LRECL DC    X'0000'
+UT2BLKSI DC    X'0000'
+UT2FLAG  DC    X'00'                SAME BIT USAGE AS RECFLAG
+UT2DSN   DC    CL44' '
+UT2LEN   EQU   *-UT2REC
+         SPACE 1
+RECORD   DS    0F
+RECLL    DC    H'0'
+RECZZ    DC    H'0'
+RECOUT   EQU   *
+RECFLAG  DC    X'0'                 SAME BIT USAGE AS UT1FLAG/UT2FLAG
+NUMBERED EQU   BIT0                 FILE (OR MEMBER) HAS SEQ NUMBER
+RECCOMP  EQU   BIT1                 RECORD IS IN COMPRESSED FORMAT
+RECMBR   EQU   BIT2                 THIS RECORD IS PDS MEMBER NAME
+RECDATA  DS    CL255
+         SPACE 1
+EXECFLAG DC    X'00'
+LOAD     EQU   BIT0                 0-LOAD FUNCTION 1-UNLOAD FUNCTION
+FIRST    EQU   BIT1                 1ST RECORD PROCESSING MUST BE DONE
+GETMAIN  EQU   BIT2                 GETMAIN HAS BEEN ISSUED
+ENDOFILE EQU   BIT3                 END OF FILE ENCOUNTERED
+BUFUSE   EQU   BIT4                 OUTPUT BUFFER CONTAINS DATA
+         SPACE 1
+         DS    0H'0'                STOW REQUIRES HALFWORD ALIGNMENT
+MEMBER   DC    CL8' '               MEMBER FOR STOW
+TTRC     DC    XL4'0'               TTRC FIELD FOR STOW
+         EJECT
+         LTORG
+O1PS     OPEN  (UT1PS,(INPUT)),MF=L
+O1PS2PS  OPEN  (UT1PS,(INPUT),UT2PS,(OUTPUT)),MF=L
+O1PO2PS  OPEN  (UT1PO,(INPUT),UT2PS,(OUTPUT)),MF=L
+O1PS2PO  OPEN  (UT1PS,(INPUT),UT2PO,(OUTPUT)),MF=L
+         SPACE 2
+UT1PS    DCB   DDNAME=SYSUT1,DSORG=PS,MACRF=GL
+UT1PO    DCB   DDNAME=SYSUT1,DSORG=PO,MACRF=R
+UT2PS    DCB   DDNAME=SYSUT2,DSORG=PS,MACRF=PM
+UT2PO    DCB   DDNAME=SYSUT2,DSORG=PO,MACRF=W
+         SPACE 1
+*
+*  WARNING!! DATA BEYOND THIS POINT IS OVERLAID WITH TRT TABLES
+*
+         SPACE 1
+JFCBDCB  DCB   DDNAME=SYSUT1,DSORG=PS,MACRF=R,EXLST=EXLST
+JFCBOPEN OPEN  (JFCBDCB,(INPUT)),MF=L
+EXLST    DS    0F
+         DC    X'07'
+         DC    AL3(JFCBAREA)
+JFCBAREA DC    176X'00'
+         ORG   JFCBDCB
+NUMERIC  DS    XL256
+TRTABLE2 DS    XL256
+TRTABLE3 DS    XL256
+TRTABLE4 DS    XL256
+         SPACE 1
+CTLDATA  DSECT
+CTLREC   DC    AL2(CTLLEN)          FIRST RECORD OF COMPRESSED FILE
+         DC    H'0'
+CTLDSORG DC    X'00'
+CTLRECFM DC    X'00'
+CTLLRECL DC    X'0000'
+CTLBLKSI DC    X'0000'
+CTLFLAG  DC    X'00'
+CTLDSN   DC    CL44' '
+CTLLEN   EQU   *-CTLREC
+         SPACE 1
+JFCB     DSECT
+         IEFJFCBN
+         IHADCB DSORG=(PS,PO),DEVD=(DA,TA)
+         END

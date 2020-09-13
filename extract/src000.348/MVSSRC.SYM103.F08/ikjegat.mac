@@ -1,0 +1,2245 @@
+AT       TITLE 'IKJEGAT - AT SUBCOMMAND OF TSO/TEST'
+         COPY  IKJEGSIO
+IKJEGAT  CSECT
+         EJECT
+*****************************  PROLOGUE  ******************************
+*                                                                     *
+* STATUS                                                              *
+*    CHANGE LEVEL 00, RELEASE NUMBER 02, VS2    03/02/73              *
+*                                                                     *
+* FUNCTION/OPERATION                                                  *
+*    THIS MODULE CONTAINS LOGIC FOR THE AT SUBCOMMAND OF THE 'TEST'   *
+*    PACKAGE FOR THE TIME SHARING OPTION (TSO) FOR AOS/2.  IT         *
+*    HAS TWO FUNCTIONS-                                               *
+*    1.  DETERMINE IF AT WAS ISSUED FOR A DEFER REQUEST OR TO MAKE    *
+*    ACTIVE BREAKPOINTS.  IF THE REQUEST IS TO ALTER THE DEFER        *
+*    QUEUE, THIS MODULE XCTL'S TO THE SECOND LOAD OF AT.              *
+*    2.  INSERT BREAKPOINTS AT SPECIFIED LOCATIONS IN THE PROBLEM     *
+*    PROGRAM AND SAVE ANY ASSOCIATED SUBCOMMAND CHAIN FOR THE         *
+*    ADDRESSES SPECIFIED.                                             *
+*                                                                     *
+* ENTRY POINTS                                                        *
+*         IKJEGAT - DETERMINES WHETHER THE MODULE WAS ENTERED         *
+*    BECAUSE OF A USER REQUEST OR BECAUSE A NEW LOAD MODULE           *
+*    HAS BEEN BROUGHT INTO CORE AND IT IS NECESSARY TO SEARCH         *
+*    THE DEFER QUEUE FOR REQUESTS AGAINST THAT MODULE.                *
+*                                                                     *
+* INPUT                                                               *
+*    A FLAG (TSTFLGS1) IN THE COMMUNICATIONS TABLE INDICATES          *
+*    THE TYPE OF ENTRANCE.  WHEN THE AT ROUTINE IS ENTERED BECAUSE    *
+*    A NEW MODULE HAS BEEN BROUGHT INTO CORE, THE FIRST TWO WORDS     *
+*    IN AT'S WORK AREA WILL CONTAIN THE NAME OF THE MODULE.           *
+*                                                                     *
+* OUTPUT                                                              *
+*    OUTPUT CONSISTS OF-                                              *
+*    1.  DIAGNOSTIC MESSAGES.                                         *
+*    2.  A BREAK ELEMENT QUEUE POINTED TO BY BREAKTAB IN TCOMTAB IN   *
+*    THE FORMAT DESCRIBED BY THE BRKELEM DSECT.                       *
+*    3.  RETURN CODES AS LISTED BELOW-                                *
+*                                                                     *
+*    0 - MAINLINE MAY REISSUE TEST MODE MESSAGE TO GET ANOTHER        *
+*    SUBCOMMAND. TSTFLUSH IN TCOMTAB IS ON IF ERROR OCCURRED.         *
+*    4 - RESUME PROBLEM PROGRAM - USED ONLY WHEN ACTIVATING DEFERRED  *
+*    BREAKPOINTS. TSTFLUSH IN TCOMTAB IS ON IF ERROR OCCURRED.        *
+*    16 - ATTENTION HAS BEEN SCHEDULED                                *
+*    20 - INDICATE RETURN FROM RETRY ROUTINE                          *
+*    24 - INDICATES AN ESTAE MACRO FAILURE                            *
+*                                                                     *
+* EXTERNAL REFERENCES                                                 *
+*         1.  IKJPARS - TO SCAN THE INPUT BUFFER FOR SYNTAX CHECKING  *
+*    OF ADDRESSES AND KEYWORDS IF SPECIFIED AND TO PROMPT THE         *
+*    USER FOR VALID INPUT WHEN NECESSARY.  AT ENTRY TO IKJPARS        *
+*    REGISTER ONE POINTS TO A PARAMETER LIST WITH THE                 *
+*    FOLLOWING FORMAT-                                                *
+*                                                                     *
+*         0 - POINTER TO UPT                                          *
+*         4 - POINTER TO ECT                                          *
+*         8 - POINTER TO CP ECB                                       *
+*         12 - POINTER TO PARAMETER DESCRIPTOR CONTROL LIST           *
+*         16 - POINTER TO ANSWER PLACE                                *
+*         20 - POINTER TO COMMAND BUFFER                              *
+*         24 - POINTER TO USER WORK AREA (AT'S SAVE AREA)             *
+*                                                                     *
+*         2.  IKJEGCVT - CONVERTS AN ABSOLUTE ADDRESS, AN EXPRESSION, *
+*    AN INDIRECT ADDRESS, OR A FULLY QUALIFIED ADDRESS TO             *
+*    BINARY.  AT ENTRY, REGISTER ONE CONTAINS THE COMPLEMENT          *
+*    OF THE PDE ADDRESS TO INDICATE AN ADDRESS CONVERSION             *
+*    AND REGISTER ZERO IS SET TO ZERO TO INDICATE A CONVERT           *
+*    TO BINARY. IN MOST CASES A SWITCH MUST BE SET IN TCOMTAB         *
+*    TO TELL CONVERT THAT A RANGE IS POSSIBLE.  FOR A VALUE           *
+*    CONVERSION TO BINARY REGISTER 1 CONTAINS A POINTER TO THE        *
+*    COUNT PDE AND REGISTER 0 CONTAINS ZERO.                          *
+*                                                                     *
+* EXITS, NORMAL                                                       *
+*    IF IT IS DETERMINED THAT AT WAS ISSUED TO PUT A DEFER BREAK      *
+*    ELEMENT ON THE QUEUE, THIS MODULE XCTL'S TO THE SECOND LOAD      *
+*    MODULE OF AT, IKJEGATD.  OTHERWISE, RETURN IS VIA REGISTER       *
+*    14 TO THE CALLER.                                                *
+*                                                                     *
+* EXITS, ERROR                                                        *
+*    RETURN VIA REGISTER 14 TO THE CALLER.                            *
+*                                                                     *
+* TABLES/WORK AREAS                                                   *
+*    THIS MODULE USES WORK AREAS AS DESCRIBED BY THE FOLLOWING DSECTS *
+*    1.  TCOMTAB - TEST'S COMMUNICATION WORK AREA                     *
+*    2.  WORKSP - AT'S WORK AREA, A PART OF TEST'S WORK AREA DEFINED  *
+*    BY THE TSTCWORK DSECT AS CWORKCMD                                *
+*    3.  IKJPARMD - INFORMATION FROM IKJPARS                          *
+*    4.  CONPLACE - INFORMATION FROM IKJEGCVT                         *
+*                                                                     *
+* ATTRIBUTES                                                          *
+*    REENTRANT, REFRESHABLE.                                          *
+*                                                                     *
+* CHARACTER CODE DEPENDENCY                                           *
+*    THE OPERATION OF THIS MODULE DEPENDS UPON AN INTERNAL REPRESEN-  *
+*    TATION OF THE EXTERNAL CHARACTER SET WHICH IS EQUIVALENT TO THE  *
+*    ONE USED AT ASSEMBLY TIME.  THE CODING HAS BEEN ARRANGED SO THAT *
+*    REDEFINITION OF 'CHARACTER' CONSTANTS, BY REASSEMBLY, WILL RESULT*
+*    IN A CORRECT MODULE FOR THE NEW DEFINITIONS.                     *
+*                                                                     *
+* NOTES                                                               *
+*    NONE.                                                            *
+*                                                                     *
+***********************************************************************
+         EJECT
+***********************************************************************
+*                                                                     *
+*                   EQUATES                                           *
+*                                                                     *
+***********************************************************************
+         SPACE
+R0       EQU   0                        REGISTER 0 - PARM REG
+R1       EQU   1                        REGISTER 1 - WORKREG
+R2       EQU   2                        REGISTER 2 - WORKREG
+R3       EQU   3                        REGISTER 3 - RESERVED FOR
+*                                       MAINTENANCE
+R4       EQU   4                        REGISTER 4 - WORKREG
+R5       EQU   5                        REGISTER 5 - WORKREG - USED
+*                                       FOR BALS TO INTERNAL RTNS
+R6       EQU   6                        REGISTER 6 - WORKREG
+R7       EQU   7                        REGISTER 7 - WORKREG
+R8       EQU   8                        REGISTER 8 - WORKREG - IN ADDR
+*                                       EXITS, SAVES ADDRESS OF WORD
+*                                       TO SEND 2ND LVL MSGS TO PARSE
+R9       EQU   9                        REGISTER 9 - BASE FOR TCOMTAB
+R10      EQU   10                       REGISTER 10 - BASE FOR COMMON
+*                                       WORKAREA
+R11      EQU   11                       REGISTER 11 - BASE FOR ADDRESS
+*                                       PDE
+R12      EQU   12                       REGISTER 12 - AT'S BASE
+*                                       REGISTER
+R13      EQU   13                       REGISTER 13 - SAVE AREA PTR
+R14      EQU   14                       REGISTER 14 - FOR EXTERNAL
+*                                       BALRS
+R15      EQU   15                       REGISTER 15 - WORKREG, RETURN
+*                                       CODE REG
+         SPACE
+ZERO     EQU   0                        NUMBER 0
+ONE      EQU   1                        NUMBER 1
+TWO      EQU   2                        NUMBER 2
+THREE    EQU   3                        NUMBER 3
+FOUR     EQU   4                        NUMBER 4
+EIGHT    EQU   8                        NUMBER 8
+TWELVE   EQU   12                       NUMBER 12
+SIXTEEN  EQU   16                       NUMBER 16
+TWENTY   EQU   20                       NUMBER 20
+TWENTY4  EQU   24                       NUMBER 24
+TWENTY6  EQU   26                       NUMBER 26
+TWENTY8  EQU   28                       NUMBER 28
+THIRTY   EQU   30                       NUMBER 30
+FORTY3   EQU   43                       NUMBER 43
+FORTY6   EQU   46                       NUMBER 46
+FORTY7   EQU   47                       NUMBER 47
+         SPACE
+L1       EQU   1                        LENGTH OF 1
+L2       EQU   2                        LENGTH OF 2
+L3       EQU   3                        LENGTH OF 3
+L4       EQU   4                        LENGTH OF 4
+L5       EQU   5                        LENGTH OF 5
+L6       EQU   6                        LENGTH OF 6
+L25      EQU   25                       LENGTH OF 25
+L30      EQU   30                       LENGTH OF 30
+L34      EQU   34                       LENGTH OF 34
+L46      EQU   46                       LENGTH OF 46
+L69      EQU   69                       LENGTH OF 69
+L98      EQU   98                       LENGTH OF 98
+         SPACE
+D0       EQU   0                        DISPLACEMENT OF 0
+D1       EQU   1                        DISPLACEMENT OF 1
+D2       EQU   2                        DISPLACEMENT OF 2
+D3       EQU   3                        DISPLACEMENT OF 3
+D4       EQU   4                        DISPLACEMENT OF 4
+D6       EQU   6                        DISPLACEMENT OF 6
+D7       EQU   7                        DISPLACEMENT OF 7
+D8       EQU   8                        DISPLACEMENT OF 8
+         SPACE
+FACTOR   EQU   8                        DISPLACEMENT FOR MESSAGE
+*                                       POINTERS
+BAL      EQU   X'45'                    BAL OP CODE.
+BALR     EQU   X'05'                    BALR OP CODE.
+LENBITS  EQU   X'C0'                    LENGTH BITS OF OP CODE.
+HEX00    EQU   X'00'                    BYTE OF ZEROS
+HEXB2    EQU   X'B2'                    USED IN 370 OP CODE CHECK
+HEXFF    EQU   X'FF'                    END FLAG FOR PARSE'S PARM LIST
+FF       EQU   X'FF'                    TEST MASK FOR KEYWORDS
+BADBOUND EQU   X'01'                    SETTING TO TEST FOR ADDRESS ON
+*                                       HALFWORD BOUNDARY
+BLANK    EQU   C' '                     BLANK
+PLUS     EQU   C'+'                     CHARACTER PLUS SIGN
+FCODE    EQU   X'10'                    FULLWORD DECIMAL TYPE CODE
+CZERO    EQU   C'0'                     CHARACTER ZERO
+F0       EQU   X'F0'                    ZERO
+TESTSVC  EQU   97                       TEST'S SVC NUMBER
+MAXLEN   EQU   255                      MAXIMUM LENGTH OF
+*                                       SUBCOMMAND CHAIN
+OVLYBIT  EQU   X'20'                    FLAG TO INDICATE OVERLAY
+TWOHIGH  EQU   X'13'                    MAXIMUM VALUE OF SECOND
+*                                       BYTE OF VALID TWO-BYTE OP CODE
+SVC10NO  EQU   10            SVC 10 NUMBER-GETMAIN
+SVC120NO EQU   120           SVC 120 NUMBER-FREEMAIN
+RC24     EQU   24            RETURN CODE 24
+         EJECT
+***********************************************************************
+*                                                                     *
+*                  AT PROCESSING STARTS HERE                          *
+*                                                                     *
+***********************************************************************
+         USING TCOMTAB,R9               ESTABLISH ADDRESSABILITY TO
+*                                       COMMUNICATION WORK AREA
+         USING TSTCWORK,R10             R10 IS USED AS A BASE FOR
+*                                       COMMON WORKAREA
+         SPACE
+         SAVE (14,12),,IKJEGAT          SAVE CALLER'S REGISTERS
+         LR    R12,R15                  ESTABLISH ADDRESSABILITY
+         USING IKJEGAT,R12              FOR THIS CSECT
+         L     R5,REGSAVE2              R5=ADDR OF AT'S SAVE AREA
+         ST    R13,SAVELAST-SAVEAREA(R5)  STORE BACKWARD CHAIN PTR
+         ST    R5,SAVENEXT-SAVEAREA(R13)  STORE FORWARD POINTER
+         LR    R13,R5                   R13=ADDRESS OF AT'S SAVE AREA
+         L     R10,WORKAREA             R10=ADDRESS OF COMMON WORKAREA
+         SPACE
+***********************************************************************
+*        SET UP AND ISSUE ESTAE FOR ABENDS                            *
+***********************************************************************
+         XC    STAEL,STAEL   CLEAR ESTAE PARM LIST
+         L     R15,TSTSTAE   R15=ADDR OF ESTAE EXIT ROUTINE
+         ESTAE (R15),CT,PARAM=ATSPL,XCTL=NO,RECORD=YES,                *
+               MF=(E,STAEL) ESTABLISH ESTAE EXIT
+         LTR   R15,R15                  WAS STAE SUCCESSFUL
+SMTSTAE  BZ    CONTINUE                 YES. CONTINUE.
+         STC   R15,TSTESTRC  SAVE RETURN CODE FROM ESTAE
+         LA    R15,RC24      SET RETURN CODE TO 24
+         OI    TSTFLGS4,TSTFLUSH TELL MAINLINE TO FLUSH STACK
+         B     RETMAIN       RETURN TO IKJEGMNL
+         SPACE
+***********************************************************************
+*        ESTAE OK. IF AT IS TO ACTIVATE DEFERRED BREAKPOINTS,         *
+*        GO HANDLE THEM.                                              *
+***********************************************************************
+CONTINUE DS    0H                       PROCESSING AFTER ISSUING STAE
+         TM    TSTFLGS1,TSTBUILD        IS AT LOGIC RECEIVING CONTROL
+*                                       TO CREATE ACTIVE BREAK
+*                                       ELEMENTS FROM THE DEFER
+*                                       QUEUE FOR A NEWLY LOADED
+*                                       MODULE
+         BO    FROMDEFR                 YES, HANDLE DEFER QUEUE
+         SPACE
+***********************************************************************
+*        AT WAS ISSUED FROM TERMINAL.                                 *
+* CREATE THE PARAMETER LIST REQUIRED AND LINK TO IKJPARS TO SCAN THE  *
+* SUBCOMMAND AND VALIDITY CHECK THE INPUT.                            *
+***********************************************************************
+         LM    R4,R6,PARMLIST           PICK UP POINTERS TO UPT, ECT,
+*                                       AND CP ECB
+         ST    R4,PARMS+PPLUPT-PPL      SAVE PTR TO UPT
+         ST    R5,PARMS+PPLECT-PPL      SAVE PTR TO ECT
+         ST    R6,PARMS+PPLECB-PPL      SAVE PTR TO CP'S ECB
+         L     R2,PCLISTA               R2=ADDRESS OF PCL
+         LA    R5,TSTANSPL              R5=POINTER TO ANSWER PLACE
+         L     R4,INBUF                 R4=ADDRESS OF SUBCOMMAND BUFFER
+         ST    R2,PARMS+PPLPCL-PPL      SAVE PTR TO PCL
+         ST    R5,PARMS+PPLANS-PPL      SAVE PTR TO ANSWER PLACE
+         ST    R4,PARMS+PPLCBUF-PPL     SAVE PTR TO BUFFER
+         ST    R13,PARMS+PPLUWA-PPL     SAVE PTR TO AT'S WORK AREA
+         LA    R1,PARMS                 R1=ADDRESS OF PARAMETER LIST
+         LINK  EP=IKJPARS,ERRET=PARSERR  GO TO PARSE ROUTINE
+SMTPARS  DS    0H                       FOR SMT TEST CASES.
+BLOW5    DS    0H                       RESUME ADDRESS IN CASE LINK
+*                                       FAILS
+         SPACE
+***********************************************************************
+*        CHECK PARSE RETURN CODE. IF NONZERO, GO PROCESS              *
+*        IT. PUT PDE ADDRESS IN R11. IF DEFER WAS SPECIFIED IN        *
+*        COMMAND, GO XCTL TO SECOND LOAD OF AT, IKJEGATD.             *
+***********************************************************************
+         LTR   R15,R15                  WAS PARSE SUCCESSFUL
+         BNZ   CHKCODE(R15)             NO, FIND OUT WHY
+         L     R1,TSTANSPL              R1=POINTER TO PDL
+         USING IKJPARMD,R1              SET UP ADDRESSABILITY TO PDL
+         LA    R11,ADDR                 R11=ADDRESS OF ADDRESS PDE
+         USING IKJPARMA,R11             SET UP ADDRESSABILITY TO
+*                                       ADDRESS PDE
+         LA    R2,TWO                   R2=TWO
+         CH    R2,DEFER                 WAS DEFER SPECIFIED ?
+         BE    TRANSFER                 YES, XCTL TO SECOND LOAD OF AT
+         DROP  R1
+         SPACE
+***********************************************************************
+*        AT WAS ISSUED TO MAKE ACTIVE BREAKPOINTS. CONVERT ALL        *
+*        ADDRESSES IN THE ADDRESS PDES TO BINARY.                     *
+***********************************************************************
+         SPACE
+         XR    R6,R6                    INITIALIZE INDICATOR FOR
+*                                       CONVERTED PDE'S
+WASITCVD DS    0H                       MAKE SURE ALL PDE'S ARE
+*                                       CONVERTED
+         TM    PDEUSER,PDECONVD         HAS PDE BEEN CONVERTED
+         BZ    CONVPDE                  NO, CONVERT PDE
+         LA    R6,D1(R6)                SET INDICATOR FOR PDE
+*                                       CONVERTED
+         SPACE
+MOREPDES DS    0H                       ARE THERE MORE PDE'S
+         L     R11,PDE2CHAI             R11=PDE CHAIN CONTENTS
+         LA    R11,D0(R11)              CLEAR HIGH ORDER BYTE
+         LTR   R11,R11                  IS CHAIN FIELD EMPTY
+         BNZ   WASITCVD                 NO, CHECK FOR PDE CONVERTED
+         SPACE
+***********************************************************************
+*        IF NO ADDRESSES WERE CONVERTED SUCCESSFULLY, RETURN          *
+*        TO MAINLINE.                                                 *
+***********************************************************************
+         LTR   R6,R6                    WAS AT LEAST ONE PDE
+*                                       CONVERTED
+         BNZ   BLDBREAK      YES,CONTINUE
+         SR    R15,R15       SET RETURN CODE TO ZERO
+         B     RETMAIN       RETURN TO IKJEGMNL
+         SPACE
+***********************************************************************
+*        BUILD ACTIVE BREAK ELEMENTS VIA BREAKRTN ROUTINE.            *
+***********************************************************************
+BLDBREAK DS    0H                       PREPARE TO GO TO SUBROUTINE TO
+*                                       BUILD BREAK ELEMENTS
+         L     R1,TSTANSPL              R1=ADDRESS OF PDL
+         BAL   R14,BREAKRTN             BRANCH TO BUILD BREAK ELEMENT
+         LTR   R15,R15                  WAS BREAK REQUEST HANDLED OK
+         BNZ   NOBREAK                  NO, CHECK FOR ATTN
+         SPACE
+***********************************************************************
+*        IF SUCCESSFUL, RETURN TO MAINLINE WITH CODE 0.               *
+***********************************************************************
+CODE0    DS    0H                       SET RETURN CODE TO ZERO
+         XR    R15,R15                  ZERO REGISTER
+         B     RETMAIN                  PREPARE TO RETURN TO MAINLINE
+         SPACE
+***********************************************************************
+*        IF UNSUCCESSFUL,SEND RC 16,20,OR 24 TO MAINLINE IF ONE OF THEM
+*        OCCURRED AND TO ZERO OTHERWISE.
+*        RETURN TO MAINLINE.
+***********************************************************************
+NOBREAK  DS    0H                       SUBROUTINE WAS UNABLE TO
+*                                       ESTABLISH BREAKPOINT
+         C     R15,ATTNCODE  IS RETURN CODE 16,20 OR 24?
+         BNL   RETMAIN       YES,SEND RC TO MAINLINE
+         B     CODE0         SEND RC=0 TO MAINLINE
+         SPACE
+***********************************************************************
+*        THIS SECTION OF CODE CONVERTS THE ADDRESSES IN AN ADDRESS    *
+*        PDE TO BINARY VIA THE IKJEGCVT MODULE. UPON ENTRY            *
+*        TO THIS CODE, R11 POINTS TO THE ADDRESS PDE TO BE            *
+*        CONVERTED. IF THE ADDRESSES IN THE PDE ARE INVALID, A        *
+*        MESSAGE IS SENT TO THE TERMINAL, AND THE NEXT PDE IS         *
+*        PROCESSED. IF THE ADDRESSES ARE VALID, THE ADDRESSES ARE     *
+*        PUT IN THE PDEUSER AND PDE2USER FIELDS OF THE ADDRESS PDE,   *
+*        AND THE NEXT PDE IS PROCESSED.                               *
+***********************************************************************
+CONVPDE  DS    0H                       ADDRESS PDE MUST BE SENT TO
+*                                       CONVERT TO ESTABLISH A
+*                                       BINARY ADDRESS
+         LCR   R1,R11                   R1=COMPLEMENT OF ADDRESS OF PDE
+*                                       TO INDICATE ADDRESS CONVERT
+         XR    R0,R0                    R0=ZERO TO INDICATE CONVERT TO
+*                                       BINARY
+         L     R15,TSTCONVT             R15=ADDRESS OF CONVERT ROUTINE
+         OI    TSTFLGS1,RANGESW         TELL CONVERT A RANGE IS
+*                                       POSSIBLE
+         BALR  R14,R15                  GO TO CONVERT
+         LTR   R15,R15                  WAS CONVERT SUCCESSFUL
+         BNZ   WHYNOT                   NO, FIND OUT WHY NOT
+         SPACE
+***********************************************************************
+*        CONVERSION SUCCESSFUL. BE SURE CONVERTED ADDRESSES ARE       *
+*        WRITABLE AND ARE IN PDEUSER FIELD(S).                        *
+***********************************************************************
+         TM    PDEFLG5,PDEWRITE         IS FIRST ADDRESS WRITABLE ?
+         BZ    BADADDR                  NO - GO WRITE ERROR MSG
+         TM    PDEUSER,PDESIB           IS ADDRESS IN USERWORD
+         BZ    TRYRANGE                 YES, CHECK FOR RANGE
+         L     R2,PDEUSER               R2=POINTER TO SI BLOCK
+         MVC   PDEUSER,D0(R2)           MOVE BINARY ADDRESS TO USERWORD
+         SPACE
+TRYRANGE DS    0H                       MAKE CERTAIN BINARY ADDRESS IN
+*                                       SECOND HALF OF PDE IF RANGE
+*                                       SPECIFIED
+         OC    PDE2USER,PDE2USER        WAS RANGE GIVEN
+         BZ    TESTBND                  NO, CHECK BOUNDARY
+         TM    PDE2FLG5,PDEWRITE        IS SECOND ADDRESS WRITABLE ?
+         BZ    BADRNGE                  NO - GO WRITE ERROR MSG
+         TM    PDE2USER,PDESIB          DOES USERWORD POINT TO A BINARY
+*                                       ADDRESS
+         BZ    CHKORDER                 NO, TEST FOR FIRST ADDRESS
+*                                       LESS THAN SECOND
+         L     R2,PDE2USER              R2=POINTER TO SI BLOCK
+         MVC   PDE2USER,D0(R2)          MOVE BINARY ADDRESS TO USERWORD
+         SPACE
+***********************************************************************
+*        A RANGE WAS GIVEN. CHECK FOR FIRST ADDRESS LESS THAN         *
+*        SECOND AND FIRST ADDRESS ON HALFWORD BOUNDARY. IF ERROR,     *
+*        WRITE ERROR MESSAGE AND GET NEXT PDE. IF OK, GO FLAG         *
+*        PDE AS CONVERTED AND GET NEXT PDE.                           *
+***********************************************************************
+CHKORDER DS    0H                       CHECK FOR FIRST ADDRESS OF
+*                                       RANGE LESS THAN SECOND
+         CLC   PDEUSER+D1(L3),PDE2USER+D1 IS FIRST ADDRESS LOW
+         BH    BADORDER                 NO, PUT OUT MESSAGE
+         TM    PDEUSER+D3,BADBOUND      IS FIRST ADDRESS FOR HALFWORD
+*                                       BOUNDARY
+         BNO   FLAGOK                   YES, FLAG PDE CONVERTED
+         LA    R1,MSG1       R1=ADDR OF MESSAGE NUMBERS
+         SPACE
+OFFBOUND DS    0H                       SET UP MESSAGE FOR ADDRESS NOT
+*                                       ON HALFWORD BOUNDARY
+         BAL   R5,IOTYPE2    PUT OUT MESSAGE
+         BAL   R5,IORC1      TEST IO RC'S
+         MVI   PDEUSER,HEX00 TURN OFF ALL PDEUSER FLAGS
+         B     MOREPDES      CHECK FOR MORE PDES
+         SPACE
+BADADDR  DS    0H                       PDE HAS AN ADDRESS WHICH IS
+*                                       NOT WRITABLE. ISSUE APPROP.
+*                                       ERROR MSG
+         OC    PDE2USER,PDE2USER        AN ADDRESS RANGE ?
+         BNZ   BADRNGE                  YES - ISSUE BAD RANGE MSG
+         LA    R1,MSG2       R1=ADDR OF MESSAGE NUMBERS
+         B     FIXSTRNG                 ADD ADDRESS STRING TO MESSAGE
+         SPACE
+BADRNGE  DS    0H                       ADDRESS RANGE IS NOT WRITABLE
+*                                       ISSUE APPROP. ERROR MSG
+         LA    R1,MSG3       R1=ADDR OF MESSAGE NUMBERS
+         B     FIXSTRNG                 ADD ADDRESS STRING TO MESSAGE
+         SPACE
+BADORDER DS    0H                       SET UP MESSAGE FOR FIRST
+*                                       ADDRESS OF RANGE MUST BE
+*                                       LESS THAN SECOND
+         LA    R1,MSG4       R1=ADDR OF MESSAGE NUMBERS
+         SPACE
+FIXSTRNG DS    0H                       ADD ADDRESS STRING TO MESSAGE
+         BAL   R5,IOTYPE3    PUT OUT MESSAGE
+         BAL   R5,IORC1      TEST IO RC'S
+         MVI   PDEUSER,HEX00            TURN OFF ALL PDEUSER FLAGS
+         B     MOREPDES                 CHECK FOR MORE PDES
+         SPACE
+***********************************************************************
+*        PDE OK. FLAG IT AS OK, AND GO GET NEXT PDE.                  *
+***********************************************************************
+FLAGOK   DS    0H                       FLAG PDE CONVERTED
+         MVI   PDEUSER,PDECONVD         SET FLAG
+         LA    R6,D1(R6)                SET INDICATOR FOR PDE CONVERTED
+         B     MOREPDES                 CHECK FOR MORE PDES
+         SPACE
+***********************************************************************
+*        ONLY ONE ADDRESS. CHECK IT FOR HALFWORD BOUNDARY.            *
+*        IF OK, GO FLAG PDE CONVERTED AND GET NEXT PDE. IF ERROR,     *
+*        ISSUE ERROR MESSAGE AND GO GET NEXT PDE.                     *
+***********************************************************************
+TESTBND  DS    0H                       IS SINGLE ADDRESS ON HALFWORD
+*                                       BOUNDARY
+         TM    PDEUSER+D3,BADBOUND      IS BOUNDARY OK
+         BNO   FLAGOK                   YES, FLAG PDE CONVERTED
+         LA    R1,MSG5       R1=ADDR OF MESSAGE NUMBERS
+         B     OFFBOUND      GO ISSUE ERROR MESSAGE
+         SPACE
+***********************************************************************
+*        ADDRESS CONVERSION FAILED. IF AN ATTENTION OCCURRED,         *
+*        SET RETURN CODE TO 16 AND RETURN TO MAINLINE.                *
+*        IF AN ABEND OCCURRED, SET RETURN CODE TO 20 AND RETURN TO    *
+*        MAINLINE. OTHERWISE, TURN OFF CONVERTED FLAG IN PDE AND      *
+*        GET NEXT PDE.                                                *
+***********************************************************************
+WHYNOT   DS    0H                       FIND OUT WHY CONVERT FAILED
+         C     R15,ATTNCODE  IS RETURN CODE=16,20 OR 24?
+         BNL   RETMAIN       YES, SEND IT TO IKJEGMNL
+         OI    TSTFLGS4,TSTFLUSH        TURN TSTFLUSH ON SO MNL WILL
+*                                       FLUSH INPUT STACK
+         MVI   PDEUSER,HEX00            TURN OFF ALL PDEUSER FLAGS
+         B     MOREPDES                 IKJEGSYM WILL HAVE PUT OUT A
+*                                       MESSAGE IF IT WERE UNABLE
+*                                       TO RESOLVE THE ADDRESS -
+*                                       CHECK FOR MORE PDE'S
+         EJECT
+***********************************************************************
+*        USER DID NOT ENTER AT COMMAND FROM TERMINAL. A NEW           *
+*        MODULE HAS BEEN BROUGHT INTO CORE. CHECK FOR ENTRIES         *
+*        ON DEFER QUEUE FOR THIS NEW MODULE. THE NAME OF THE NEWLY    *
+*        LOADED MODULE IS IN THE FIRST EIGHT BYTES OF AT'S            *
+*        WORKAREA. THE FIRST BYTE AFTER THE LOAD MODULE NAME IS       *
+*        A FLAG BYTE. IT IS X'20' IF THE MODULE IS AN OVERLAY,        *
+*        AND, IN THIS CASE, A SWITCH IS SET TO TELL SYM NOT TO        *
+*        ISSUE MESSAGES.                                              *
+***********************************************************************
+FROMDEFR DS    0H                       THIS ROUTINE IS ENTERED TO MAKE
+*                                       ACTIVE BREAKPOINTS FOR A
+*                                       LOAD MODULE BROUGHT INTO
+*                                       CORE
+         TM    LOADATTR,OVLYBIT         IS LOAD MODULE IN OVERLAY
+         BO    FIXSYMSW                 YES, TELL SYM NOT TO PRINT MSGS
+         SPACE
+***********************************************************************
+*        IF THE DEFER QUEUE IS EMPTY, RETURN TO MAINLINE              *
+*        WITH A RETURN CODE OF 4. OTHERWISE, GET ADDRESS OF FIRST     *
+*        DME ON DEFERRED QUEUE.                                       *
+***********************************************************************
+HANDLED  DS    0H                       HANDLE DEFER BREAKPOINTS
+         OC    DEFERTAB,DEFERTAB        IS THE DEFER QUEUE EMPTY
+         BZ    CODE4                    YES, RETURN TO MAINLINE WITH A
+*                                       CODE OF FOUR
+         L     R8,DEFERTAB              R8=POINTER TO FIRST DME
+         USING DME,R8                   R8 IS BASE FOR DME
+         SPACE
+***********************************************************************
+*        IF LOADNAME IN DME NOT THE SAME AS NEWLY LOADED MODULE,      *
+*        GO CHECK FOR MORE DMES ON QUEUE. IF SAME, GET ADDRESS OF     *
+*        FIRST DBE QUEUED FROM DME. NOTE - R8 IS BASE FOR BOTH        *
+*        DME'S AND DBE'S.                                             *
+***********************************************************************
+CHKMATCH DS    0H                       COMPARE LOADNAMES
+         CLC   LOADNAME,DMELOAD         DOES THE DME LOADNAME
+*                                       EQUAL THE INPUT LOADNAME
+         BNE   MOREDMES                 NO, CHECK FOR MORE DME'S
+         L     R8,DMEDBE                R8=POINTER TO FIRST DBE
+         DROP  R8                       R8 WILL BE USED FOR DBE
+*                                       ADDRESSABILITY
+         USING DBE,R8                   R8 IS BASE FOR DBE
+         SPACE
+***********************************************************************
+*        GET ADDRESS OF PDL FROM DBE, AND SET UP TO CONVERT ALL       *
+*        ADDRESS PDES IN PDL.                                         *
+***********************************************************************
+ACCESS   DS    0H                       GET ADDR OF FIRST ADDR PDE
+         L     R1,DBEPDL                R1=POINTER TO PDL
+         USING IKJPARMD,R1              ESTABLISH ADDRESSABILITY TO PDL
+         LA    R11,ADDR                 R11=ADDRESS OF ADDRESS PDE
+         DROP  R1
+         XR    R6,R6                    INITIALIZE INDICATOR FOR
+*                                       CONVERTED PDES
+         SPACE
+***********************************************************************
+*        CHECK PDE TO SEE IF OFF HAS TURNED THE PDEYECH FLAG ON.      *
+*        IF SO, SKIP THE PDE AND TRY THE NEXT ONE. (THE PDEYECH FLAG  *
+*        IS OFF'S WAY OF REMOVING DEFERRED BREAKPOINTS.) OTHERWISE,   *
+*        GO TO IKJEGCVT TO CONVERT PDE ADDRESSES TO BINARY.           *
+***********************************************************************
+CONVDEFR DS    0H                       CONVERT PDE'S ON DEFER QUEUE
+*                                       FOR ONE DBE
+         TM    PDEUSER,PDEYECH          HAS BRKPT BEEN OFF'D ?
+         BO    ANOTHER                  YES, GO TRY THE NEXT PDE
+         OI    TSTFLGS1,RANGESW         TELL CONVERT A RANGE IS
+*                                       POSSIBLE
+         LCR   R1,R11                   LOAD COMPLEMENT OF ADDRESS OF
+*                                       PDE FOR ADDRESS CONVERT
+         XR    R0,R0                    INDICATE BINARY CONVERT
+         L     R15,TSTCONVT             R15=ADDRESS OF CONVERT ROUTINE
+         BALR  R14,R15                  CONVERT PDE
+         LTR   R15,R15                  WAS CONVERSION OK
+         BNZ   SETUSER                  NO, INSURE CONVERTED FLAG IS
+*                                       OFF
+         TM    PDEFLG5,PDEWRITE         IS FIRST ADDRESS WRITABLE ?
+         BZ    DEFBADAD                 NO - GO WRITE ERROR MSG
+         TM    PDEUSER,PDESIB           IS BINARY ADDR IN USERWORD
+         BZ    ASKRANGE                 YES, CHECK FOR ADDR RANGE
+         L     R4,PDEUSER               R4=POINTER TO SI BLOCK
+         MVC   PDEUSER,D0(R4)           MOVE BINARY ADDRESS TO USERWORD
+         SPACE
+***********************************************************************
+*        IF A RANGE WAS GIVEN, BE SURE SECOND ADDRESS IS IN PDE.      *
+***********************************************************************
+ASKRANGE DS    0H                       SEE IF SECOND USERWORD CONTAINS
+*                                       A BINARY ADDRESS
+         OC    PDE2USER,PDE2USER        WAS RANGE GIVEN
+         BZ    BNDTEST                  NO, CHECK BOUNDARY
+         TM    PDE2USER,PDEWRITE        IS SECOND ADDRESS WRITABLE ?
+         BZ    DEFBADRG                 NO - GO WRITE ERROR MSG
+         TM    PDE2USER,PDESIB          DOES USERWORD POINT TO SI BLOCK
+         BZ    TSTORDER                 NO, TEST FOR FIRST ADDRESS
+*                                       LESS THAN SECOND
+         L     R4,PDE2USER              R4=POINTER TO SI BLOCK
+         MVC   PDE2USER,D0(R4)          MOVE BINARY ADDRESS TO USERWORD
+         SPACE
+***********************************************************************
+*        A RANGE WAS GIVEN. CHECK FOR FIRST ADDRESS LESS THAN         *
+*        SECOND AND FIRST ADDRESS ON HALFWORD BOUNDARY. IF ERROR,     *
+*        WRITE ERROR MESSAGE AND GET NEXT PDE. IF OK, GO FLAG PDE     *
+*        CONVERTED AND GET NEXT PDE.                                  *
+***********************************************************************
+TSTORDER DS    0H                       CHECK FOR FIRST ADDRESS OF
+*                                       RANGE LESS THAN SECOND
+         CLC   PDEUSER+D1(L3),PDE2USER+D1  IS FIRST ADDRESS LOW
+         BH    ORDERBAD                 NO, PUT OUT MESSAGE
+         TM    PDEUSER+D3,BADBOUND      IS FIRST ADDRESS FOR HALF-WORD
+*                                       BOUNDARY
+         BNO   FLAGPDE                  YES, FLAG PDE CONVERTED
+         LA    R1,MSG1       R1=ADDR OF MESSAGE NUMBERS
+OFFBND   DS    0H
+         BAL   R5,IOTYPE2    PUT OUT MESSAGE
+         BAL   R5,IORC1      TEST IO RC'S
+         MVI   PDEUSER,HEX00 TURN OFF ALL PDEUSER FLAGS
+         B     ANOTHER       CHECK FOR MORE PDES
+         SPACE
+FIXMSG   DS    0H                       ADD ADDRESS STRING TO MESSAGE
+         BAL   R5,IOTYPE3    PUT OUT MESSAGE
+         BAL   R5,IORC1      TEST IO RC'S
+         MVI   PDEUSER,HEX00            TURN OFF ALL FLAGS IN PDEUSER
+         B     ANOTHER                  CHECK FOR MORE PDES
+         SPACE
+DEFBADAD DS    0H                       PDE HAS AN ADDRESS WHICH IS
+*                                       NOT WRITABLE. ISSUE APPROP.
+*                                       ERROR MSG.
+         OC    PDE2USER,PDE2USER        ADDRESS RANGE ?
+         BNZ   DEFBADRG                 YES - ISSUE BAD RANGE MSG
+         LA    R1,MSG2       R1=ADDR OF MESSAGE NUMBERS
+         B     FIXMSG                   ADD ADDRESS STRING TO MESSAGE
+         SPACE
+DEFBADRG DS    0H                       ADDRESS RANGE IS NOT WRITABLE
+*                                       ISSUE APPROP. ERROR MSG
+         LA    R1,MSG3       R1=ADDR OF MESSAGE NUMBERS
+         B     FIXMSG                   ADD ADDRESS STRING TO MESSAGE
+         SPACE
+ORDERBAD DS    0H                       SET UP MESSAGE FOR FIRST
+*                                       ADDRESS OF RANGE MUST BE
+*                                       LESS THAN SECOND
+         LA    R1,MSG4       R1=ADDR OF MESSAGE NUMBERS
+         B     FIXMSG                   ADD ADDRESS STRING TO MESSAGE
+         SPACE
+***********************************************************************
+*        MODULE AN OVERLAY. TURN ON SWITCH TO TELL SYM NOT TO         *
+*        ISSUE MESSAGES.                                              *
+***********************************************************************
+FIXSYMSW DS    0H                       TELL SYM NOT TO PRINT MSGS
+         OI    TSTFLGS3,SYMMESG         SET SWITCH IN TCOMTAB
+         B     HANDLED                  SET DEFER BREAKPOINTS
+         SPACE
+***********************************************************************
+*        ONLY ONE ADDRESS GIVEN, CHECK FOR HALFWORD BOUNDARY.         *
+*        IF NOT HALFWORD, ISSUE MESSAGE AND GET NEXT PDE.             *
+***********************************************************************
+BNDTEST  DS    0H                       IS SINGLE ADDRESS ON HALF-WORD
+*                                       BOUNDARY
+         TM    PDEUSER+D3,BADBOUND      IS BOUNDARY OK
+         BNO   FLAGPDE                  YES, FLAG PDE CONVERTED
+         LA    R1,MSG5       R1=ADDR OF MESSAGE NUMBERS
+         B     OFFBND        GO ISSUE MESSAGE
+         SPACE
+***********************************************************************
+*        ADDRESS IS OK. FLAG PDE AS CONVERTED. INCREMENT COUNTER      *
+*        FOR CONVERTED PDES..                                         *
+***********************************************************************
+FLAGPDE  DS    0H                       FLAG PDE CONVERTED
+         MVI   PDEUSER,PDECONVD         SET FLAG
+         LA    R6,D1(R6)                SET INDICATOR FOR PDE CONVERTED
+         SPACE
+***********************************************************************
+*        IF MORE PDES, GO CONVERT THEM. IF NO PDES WERE CONVERTED,    *
+*        GO CHECK FOR MORE DBES. OTHERWISE, BUILD ACTIVE BREAK        *
+*        ELEMENTS VIA THE BREAKRTN ROUTINE FOR THE PDL.               *
+***********************************************************************
+ANOTHER  DS    0H                       CHECK FOR MORE PDE'S
+         L     R11,PDE2CHAI             R11=PDE CHAIN CONTENTS
+         LA    R11,D0(R11)              CLEAR HIGH ORDER BYTE
+         LTR   R11,R11                  IS CHAIN EMPTY
+         BNZ   CONVDEFR                 NO, CONVERT NEXT PDE
+         LTR   R6,R6                    IS AT LEAST ONE PDE CONVERTED
+         BZ    DBELINK                  NO, CHECK FOR MORE DBE'S
+         L     R1,DBEPDL                R1=POINTER TO PDL
+         BAL   R14,BREAKRTN             BRANCH TO BUILD BREAK ELEMENTS
+         LTR   R15,R15                  IS BREAKRTN RC ZERO ?
+         BZ    DBELINK                  YES - CHECK FOR MORE DBES
+         C     R15,ATTNCODE  WAS RETURN CODE 16?
+         BE    RETMAIN       YES,SEND RC=16 TO MAINLINE
+         BL    DBELINK       RC LESS THAN 16 GET NEXT DBE
+         OI    TSTFLGS4,TSTFLUSH        ABEND OCCURRED, TURN TSTFLUSH
+*                                       ON SO MNL WILL FLUSH INPUT
+         B     CODE4                    RETURN TO MNL WITH RC 4
+         SPACE
+***********************************************************************
+*        IF THERE ARE MORE DBES ON THE QUEUE, PROCESS THEM. IF NOT,   *
+*        RETURN TO MAINLINE WITH RETURN CODE FOUR.                    *
+***********************************************************************
+DBELINK  DS    0H                       CHECK FOR MORE DBE'S
+         OC    DBEDBE,DBEDBE            IS DBE LINK FIELD ZERO
+         BZ    CODE4                    YES, RETURN TO MAINLINE WITH
+*                                       CODE OF FOUR
+         L     R8,DBEDBE                R8=POINTER TO NEXT DBE
+         B     ACCESS                   ACCESS FIRST ADDRESS PDE
+         DROP  R8                       R8 NO LONGER USED FOR
+*                                       DBE ADDRESSABILITY
+         SPACE
+***********************************************************************
+*        THE PDE WAS NOT CONVERTED. SET PDEUSER FLAGS TO ZERO.        *
+*        IF RETURN CODE WAS 16, ATTN WAS ENTERRED - RETURN TO MNL     *
+*        WITH RETURN CODE OF 16. IF AN ABEND OCCURRED, RETURN TO      *
+*        MNL WITH RETURN CODE 20. OTHERWISE, CHECK FOR MORE PDES.     *
+***********************************************************************
+SETUSER  DS    0H                       INSURE FLAG FOR PDE CONVERTED
+*                                       IS NOT ON
+         OI    TSTFLGS4,TSTFLUSH        TURN TSTFLUSH ON SO MNL WILL
+*                                       FLUSH INPUT STACK
+         MVI   PDEUSER,ZERO             INSURE X'FF' MADE ZERO
+         C     R15,ATTNCODE  IS RETURN CODE=16,20 OR 24?
+         BNL   RETMAIN       YES, SEND IT TO IKJEGMNL
+         B     ANOTHER       NO, CHECK FOR MORE PDE'S
+         SPACE
+***********************************************************************
+*        THE LOADNAME IN THE DME WAS NOT THE SAME AS THAT OF          *
+*        THE NEWLY LOADED MODULE. IF THERE ARE NO MORE DMES ON        *
+*        QUEUE, RETURN TO MAINLINE WITH RETURN CODE FOUR.             *
+*        OTHERWISE, GET ADDRESS OF NEXT DME AND GO PROCESS IT.        *
+*        NOTE THAT R8 WILL POINT TO DME.                              *
+***********************************************************************
+MOREDMES DS    0H                       TEST FOR MORE DME'S
+         USING DME,R8                   R8 IS DME BASE
+         OC    DMEDME,DMEDME            IS LINK FIELD EMPTY
+         BZ    CODE4                    YES, RETURN WITH CODE OF FOUR
+         L     R8,DMEDME                R8=ADDRESS OF NEXT DME
+         B     CHKMATCH                 BRANCH TO COMPARE DME LOADNAME
+*                                       WITH INPUT
+         DROP  R8                       R8 NO LONGER USED FOR
+*                                       DME ADDRESSABILITY
+         SPACE
+***********************************************************************
+*        TURN OFF SYM SWITCH AND TSTBUILD SWITCH.                     *
+*        SET RETURN CODE TO FOUR FOR RETURN TO MAINLINE FROM          *
+*        ACTIVATING DEFERRED BREAKPOINTS.                             *
+***********************************************************************
+CODE4    DS    0H                       SET RETURN CODE TO FOUR FOR
+*                                       THE PROBLEM PROGRAM TO
+*                                       BE CONTINUED
+         NI    TSTFLGS3,HEXFF-SYMMESG   TURN OFF SYM MSG SWITCH
+         NI    TSTFLGS1,HEXFF-TSTBUILD  TURN OFF TSTBUILD FLAG
+         LA    R15,FOUR                 SET CODE TO FOUR
+         B     RETMAIN                  RETURN TO MAINLINE
+         EJECT
+***********************************************************************
+*        THE DEFER KEYWORD WAS SPECIFIED. PUT ADDRESS OF FIRST        *
+*        ADDRESS PDE IN PARM WORD OF WORKAREA. PUT ADDRESS            *
+*        OF TCOMTAB IN R1 AS PARAMETER FOR IKJEGATD. TURN ON XCTL     *
+*        FLAG IN TSTFLGS2 FIELD OF TCOMTAB, AND XCTL TO IKJEGATD.     *
+***********************************************************************
+TRANSFER DS    0H
+         MVC   XCTLL(XCTLEN),XLIST      MOVE LIST FORM OF XCTL TO WORK
+*                                       AREA
+         ST    R11,PDEADDR              SAVE ADDRESS OF FIRST ADDR PDE
+         LA    R1,TCOMTAB               R1=ADDRESS OF TCOMTAB
+         LA    R15,XCTLL                R15=ADDRESS OF LIST FORM OF
+*                                       MACRO
+         L     R13,SAVELAST-SAVEAREA(R13)  RESTORE R13
+         L     R14,RETURNPT-SAVEAREA(R13)  RESTORE R14
+         OI    TSTFLGS2,TSTXCTL         SET BIT FOR AT XCTL'S
+         XCTL  (2,12),EP=IKJEGATD,MF=(E,(1)),SF=(E,(15))
+SMTXCTL2 DS    0X                       FOR SMT TEST CASES.
+         EJECT
+***********************************************************************
+*                                                                     *
+*        THE FOLLOWING INSTRUCTIONS CONSTITUTE A CLOSED SUBROUTINE    *
+*        FOR CREATING ACTIVE BREAKPOINTS FROM PDL'S PASSED TO IT.     *
+*        PDL'S MUST CONTAIN ADDRESS PDE'S WHICH CONTAIN THE ACTUAL    *
+*        BINARY ADDRESSES IN THE USER WORDS OF THE PDE. INPUT WILL    *
+*        CONSIST OF THE PDL ADDRESS IN REGISTER 1, TCOMTAB ADDRESS    *
+*        IN REGISTER 9, THE ADDRESS OF AT'S WORK AREA IN REGISTER 10, *
+*        PROGRAM BASE IN REGISTER 12, A RETURN ADDRESS IN REGISTER 14 *
+*        AND A SAVE AREA ADDRESS IN REGISTER 13.                      *
+*                                                                     *
+***********************************************************************
+BREAKRTN DS    0H                       BEGINNING OF SUBROUTINE
+         SAVE  (14,12)                  SAVE CALLER'S REGISTERS.
+         LA    R4,BRKSAVE               GET ADDRESS OF BREAKRTN'S
+*                                       SAVEAREA
+         ST    R4,SAVENEXT-SAVEAREA(R13)  STORE FORWARD POINTER.
+         ST    R13,SAVELAST-SAVEAREA(R4)  STORE BACKWARD POINTER.
+         LR    R13,R4                   R13=NEW SAVE AREA ADDR.
+         SPACE
+***********************************************************************
+*        SAVE PDL ADDRESS IN WORKAREA, AND GET ADDRESS OF             *
+*        FIRST ADDRESS PDE.                                           *
+***********************************************************************
+         USING IKJPARMD,R1              PDL ADDRESSABILITY.
+         ST    R1,PDLADDR               SAVE ADDRESS OF PDL FOR
+*                                       LATER USE
+         LA    R11,ADDR                 R11=ADDRESS PDE ADDR.
+         DROP  R1
+         SPACE
+***********************************************************************
+*        IF PDE HAS BEEN CONVERTED, GO PROCESS IT IN SUPRLOOP.        *
+*        IF NOT, CHECK FOR MORE PDES. IF MORE, GO CHECK THEM.         *
+*        IF NO MORE, RETURN TO CALLER.                                *
+***********************************************************************
+TESTCONV DS    0H                       CHECK FOR CONVERTED PDE
+         TM    PDEUSER,PDECONVD         HAS PDE BEEN CONVERTED
+         BO    SUPRLOOP                 YES, BUILD BRKELEM(S) FOR PDE
+         L     R11,PDE2CHAI             R11=CHAIN POINTER FOR ADDR LIST
+         LA    R11,D0(R11)              CLEAR HIGH ORDER BYTE
+         LTR   R11,R11                  Q.IS A LIST POINTER PRESENT
+         BZ    ROUTRTN                  NO, RETURN
+         B     TESTCONV                 CHECK FOR THIS PDE CONVERTED
+         SPACE
+***********************************************************************
+*        THE PDE HAS BEEN CONVERTED. CALCULATE NUMBER OF BYTES        *
+*        REQUIRED FOR BREAK ELEMENT AND ASSOCIATED DATA.              *
+***********************************************************************
+SUPRLOOP DS    0H
+         SR    R1,R1                    CLEAR ACCUMULATOR.
+         SPACE
+***********************************************************************
+*        GET LENGTH OF LOADNAME.CSECT.                                *
+***********************************************************************
+         AH    R1,PDELEN2               R1=CSECT NAME LENGTH.
+         BZ    ADDRCHK                  NO LOAD OR CSECT NAME.
+         LA    R1,D1(R1)                BUMP FOR PRECEDING PERIOD.
+         AH    R1,PDELEN1               ADD IN LOAD NAME LENGTH.
+         TM    PDEFLG3,AFLG             Q.ANY ADDRESS.
+         BZ    CHNCALC                  NO,  COMPUTE CHAIN LENGTH.
+         LA    R1,D1(R1)                YES, BUMP FOR TRAILING PERIOD.
+         SPACE
+***********************************************************************
+*        IF REGISTER-TYPE ADDRESS, ADD ONE FOR LETTER.                *
+***********************************************************************
+ADDRCHK  DS    0H                       DETERMINE ADDRESS TYPE
+         TM    PDEFLG4,SYMADDR          IS ADDRESS SYMBOLIC ?
+         BO    ADDADDR                  YES, SKIP BUMP FOR PUNCTUATION
+*                                       OR LETTER
+         LA    R1,D1(R1)                BUMP FOR PUNCTUATION OR LETTER
+*                                       FOR ABSOLUTE, RELATIVE OR
+*                                       REGISTER TYPE ADDRESS
+         SPACE
+***********************************************************************
+*        CALCULATE AMOUNT OF CORE NEEDED FOR ADDRESS STRING.          *
+***********************************************************************
+ADDADDR  DS    0H                       CALCULATE CORE NEEDED
+*                                       FOR ADDR STRING
+         AH    R1,PDELEN3               ADD ADDRESS STRING LENGTH.
+         L     R7,PDEEXPTR              R7=ADDRESS OF 1ST EXPRESSION.
+         AH    R1,PDEINDCT              R1=(BRK+ADDR+IND.COUNT).
+         SPACE
+CALCLOOP DS    0H                       ADD IN CORE FOR EXPRESSION
+         LA    R7,D0(R7)                CLEAR HIGH ORDER BYTE
+         LTR   R7,R7                    Q.ANY EXPRESSION.
+         BZ    CHNCALC                  NO, CHECK ON CHAIN.
+         USING EXPRPDE,R7               R7 IS BASE FOR EXPRESSION PDE
+         AH    R1,EXPRLNH               R1=(BRK+ADDR+EXP LEN).
+         AH    R1,EXPRINDC              R1=(BRK+ADDR+EXP+IND.COUNT).
+         LA    R1,D1(R1)                R1=(BRK+ADDR+EXP+IND+SIGN LEN).
+         TM    EXPRFLGS,EXPRDEC         IS EXPRESSION DECIMAL VALUE
+         BZ    KEEPON                   NO, CONTINUE
+         LA    R1,D1(R1)                R1=(BRK+ADDR+EXP+IND+SIGN LEN).
+         SPACE
+KEEPON   DS    0H                       CHECK FOR ANOTHER
+*                                       EXPRESSION PDE
+         L     R7,EXPRCHAI              R7=NEXT EXPRESSION ADDRESS.
+         B     CALCLOOP                 GET 'EM ALL.
+         DROP  R7                       R7 NO LONGER USED FOR
+*                                       EXPRESSION PDE ADDRESSABILITY
+         SPACE
+CHNCALC DS    0H
+         LA    R1,BRKLEN(R1)            ADD BREAK ELEMENT LENGTH.
+         CH    R1,MAXLEN2               IS ACCUMULATED LENGTH FOR
+*                                       STRING GREATER THAN 100
+         BH    CHGREG                   YES, LIMIT THE LENGTH
+         SPACE
+***********************************************************************
+*        CALCULATE AMOUNT OF CORE NEEDED FOR SUBCOMMAND CHAIN.        *
+***********************************************************************
+CHNCALC2 DS    0H
+         L     R7,PDLADDR               R7=PDL ADDRESS
+         USING IKJPARMD,R7              R7 USED FOR PDL ADDRESSABILITY
+         LA    R1,D2(R1)                ADD IN ADDR SAVE LENGTH
+*                                       FIELD - 2 BYTES.
+         TM    PDEUSER,PDEADLST         Q.IS THIS A LIST
+*                                       PDE (NOT THE 1ST)
+         BO    GETBRK                   YES, GO GET CORE
+         LA    R1,D7(R1)                NO, ROUND R1 UP TO DBL BOUND.
+         N     R1,DBLBND
+         LH    R0,SBCMDCHN+EXPRLNH-EXPRPDE  GET THE CHAIN LENGTH.
+         LTR   R0,R0                    Q. IS THERE A CHAIN.
+         BZ    GETBRK                   NO, GO GET CORE
+         ALR   R1,R0                    R1=(BRK+ADDR SAVE+CHAIN LEN).
+         LA    R1,D3(R1)                ADD IN CHAIN SAVE LENGTH
+*                                       FIELD 3 BYTES
+         B     GETBRK                   GO GET CORE
+         SPACE
+CHGREG   DS    0H                       LIMIT ADDRESS STRING
+*                                       LENGTH TO 100
+         LH    R1,MAXLEN2               R1=MAXIMUM LENGTH FOR BREAK
+*                                       ELEMENT AND ADDRESS STRING
+         B     CHNCALC2                 CALCULATE NEEDS FOR
+*                                       SUBCOMMAND CHAIN
+         DROP  R7                       R7 NOT USED FOR PDL
+*                                       ADDRESSABILITY FROM NOW ON
+         SPACE
+***********************************************************************
+*        ADDRESS CHECK AND GETMAIN FOR BRKELEM CORE                   *
+***********************************************************************
+GETBRK   DS    0H
+         L     R7,PDEUSER               GET ADDRESS OF BREAKPOINT
+TSTLNH1  DS    0H                       NEXT INSTRUCTION MAY ABEND
+         TM    D0(R7),LENBITS           HOW LONG IS INSTRUCTION ?
+TSTLNH2  DS    0H                       PRECEDING INSTRUCTION MAY ABEND
+         BO    CHEKSIX                  GO CHECK SIX BYTES
+         BM    CHEKFOUR                 GO CHECK FOUR BYTES
+CHEKTWO  DS    0H                       NEXT INSTRUCTION MAY ABEND
+         OC    D0(L2,R7),D0(R7)         TRY FOR PROTECTION CHECK
+BLOWTWO  DS    0H                       FOR PROTECTION CHECK STAE ENTRY
+         B     GETELEM                  GO GET CORE FOR BRKELEM
+         SPACE
+CHEKSIX  DS    0H                       INSTRUCTION IS SIX BYTES
+         OC    D0(L6,R7),D0(R7)         TRY FOR PROTECTION CHECK
+BLOWSIX  DS    0H                       FOR PROTECTION CHECK STAE ENTRY
+         B     GETELEM                  GO GET CORE FOR BRKELEM
+         SPACE
+CHEKFOUR DS    0H                       INSTRUCTION IS FOUR BYTES
+         OC    D0(L4,R7),D0(R7)         TRY FOR PROTECTION CHECK
+BLOWFOUR DS    0H                       FOR PROTECTION CHECK STAE ENTRY
+         SPACE
+GETELEM  DS    0H                       CORE IS NOT WRITE-PROTECTED
+         LR    R0,R1                    R1=NUMBER BYTES REQUIRED
+         ST    R0,BYTENUMB              SAVE IN WORKAREA
+         GETMAIN RC,LV=(0),SP=1        GET STORAGE REQUIRED
+*                                       FOR BRK ELEMENT.
+SMTGET01 DS    0H                       FOR SMT TEST CASES.
+         SPACE
+***********************************************************************
+*        ZERO ENTIRE BREAK ELEMENT.                                   *
+***********************************************************************
+BLOW2    DS    0H                       HERE'S THE RESUME ADDR
+*                                       IF THE GETMAIN BLOWS
+*                                       FOR LACK OF STORAGE.
+         LTR   R15,R15       WAS GETMAIN SUCCESSFUL?
+         BZ    BLOW2C        YES, CONTINUE
+         LA    R1,SVC10NO    R1=SVC 10 NUMBER
+* ISSUE 'GETMAIN SVC ERROR' MESSAGE
+         BAL   R5,GETFREIO   PUT OUT MESSAGE
+         C     R15,ATTNCODE  IS RETURN CODE=16,20,24?
+         BNL   RETURNRC      YES, SEND IT TO CALLER
+         LA    R15,TWENTY    SET RETURN CODE TO 20 TO LOOK LIKE ABEND
+         B     RETURNRC      SEND IT TO CALLER
+BLOW2C   EQU   *
+         LR    R2,R1                    R2=BREAK ELEMENT ADDR.
+         USING BRKELEM,R2               BREAK ELEMENT ADDRESSABILITY.
+         XC    BRKELEM(BRKLEN),BRKELEM  ZERO BREAK ELEMENT
+         LA    R4,BRKLEN(R2)            R4=ADDR STRING SAVE ADDR.
+         ST    R4,STRNGADR              SAVE ADDRESS OF ADDRESS
+*                                       STRING FOR LATER USE
+         SPACE
+***********************************************************************
+*        THE FOLLOWING INSTRUCTIONS BUILD THE ADDRESS STRING          *
+*        AS ENTERED BY THE USER INTO THE ADDRESS STRING SAVE AREA     *
+*        FOR THIS BREAKPOINT.                                         *
+***********************************************************************
+         LA    R1,D2(R4)                R1=SAVE AREA POINTER FOR BUILD.
+         LR    R0,R11                   R0=ADDRESS OF ADDRESS PDE
+         L     R15,TSTADDR              R15=ADDRESS OF ADDRESS
+*                                       STRING BUILD ROUTINE
+         BALR  R14,R15                  GO TO BUILD ROUTINE
+         STH   R0,D0(R4)                SAVE LENGTH OF STRING
+         SPACE
+***********************************************************************
+*        IF THIS PDE IS PART OF A LIST, GO BUILD THE BREAK            *
+*        ELEMENT FOR IT. IF NOT, MOVE THE SUBCOMMAND CHAIN FOR        *
+*        IT TO THE GETMAIN AREA AND SAVE A POINTER TO IT IN           *
+*        CHNADDR FIELD OF WORKAREA.                                   *
+***********************************************************************
+CHNSAVE  DS    0H
+         TM    PDEUSER,PDEADLST         Q.IS PDE FLAGGED AS A LIST PDE.
+         BO    GOBUILD                  YES, DON'T CHECK FOR CHAIN
+         LA    R5,D7(R1)                SET CHAIN SAVE ADDRESS REGISTER
+         N     R5,DBLBND                ROUND UP TO DOUBLE
+*                                       WORD FOR FREEMAIN
+         ST    R5,CHNADDR               SAVE IN WORK AREA
+         L     R1,PDLADDR               R1=PDL POINTER
+         USING IKJPARMD,R1              R1 IS BASE FOR PDL
+         L     R7,SBCMDCHN+EXPRPTR-EXPRPDE  R7=CHAIN STRING ADDRESS.
+         LA    R7,D0(R7)                CLEAR HIGH ORDER BYTE
+         LTR   R7,R7                    Q.IS A CHAIN SPECIFIED.
+         BZ    NOCHAIN                  NO, BUILD THE BREAK ELEMENT.
+         LH    R6,SBCMDCHN+EXPRLNH-EXPRPDE  R6=LENGTH OF COMMAND CHAIN
+         STH   R6,D0(R5)                PLACE CHAIN LNH IN SAVE AREA
+         BCTR  R6,ZERO                  DECREMENT R6 FOR EXECUTE
+         EX    R6,CHNMVC                MOVE CHAIN TO SAVE AREA
+         LA    R6,D3(R6)                R6=LENGTH OF COMMAND
+*                                       CHAIN+LENGTH FIELD
+         ALR   R6,R5                    R6=POINTER TO LAST BYTE
+*                                       OF CHAIN SAVE AREA
+         XC    D0(L1,R6),D0(R6)         ZERO LAST BYTE
+         B     GOBUILD                  BUILD BREAK ELEMENT
+         SPACE
+CHNMVC   MVC   D2(L1,R5),D0(R7)         EXECUTE MVC FOR COMMAND CHAINS.
+         SPACE
+NOCHAIN  DS    0H                       NO CHAIN SAVE ADDRESS
+         SR    R5,R5                    ZERO REGISTER
+         ST    R5,CHNADDR               SAVE IN WORK AREA
+         SPACE
+***********************************************************************
+*                                                                     *
+*        THIS SERIES OF INSTRUCTIONS BUILDS A BREAK ELEMENT AND       *
+*        SETS A BREAK SVC INTO THE PROBLEM PROGRAM.  IF THE PDE       *
+*        PASSED IS ONE OF A RANGE, ALL BREAK ELEMENTS ARE BUILT FOR   *
+*        THE RANGE AND ALL SVC'S INSERTED IN THE PROBLEM PROGRAM.     *
+*                                                                     *
+***********************************************************************
+GOBUILD  DS    0H
+         L     R5,PDEUSER               GET ADDRESS OF BREAKPOINT
+*                                       INSERTION
+         LA    R5,D0(R5)                CLEAR HIGH ORDER BYTE OF ADDR
+         LA    R6,BREAKTAB              R6=HEAD OF BREAK ELEMENT CHAIN.
+         L     R7,BREAKTAB              R7=1ST ELEMENT ON CHAIN.
+         SPACE
+***********************************************************************
+*        BREAK ELEMENT QUEUE IS ARRANGED IN ASCENDING ORDER OF        *
+*        BREAKPOINT ADDRESSES. FIND APPROPRIATE PLACE IN QUEUE        *
+*        FOR THIS ENTRY AND GO PLACE IT IN QUEUE.                     *
+***********************************************************************
+SEQLOOP  DS    0H                       EXAMINE CURRENT CHAIN
+         LTR   R7,R7                    Q.ANY MORE ELEMENTS ON CHAIN.
+         BZ    ADDL                     NO, ADD CURRENT ELEMENT
+*                                       TO CHAIN
+         L     R8,BRKADDR-BRKELEM(R7)   R8=BRK ADDR OF EXISTING BRKPT
+         CR    R8,R5                    Q.ADDRESS FOR NEW BREAKPOINT
+*                                       HIGH ?
+         BE    DUPLICAT                 DUPLICATE BREAK ADDR FOUND
+         BH    ADDL                     HIGH, ADD NEW BREAK ELEM HERE.
+         SPACE
+CONTCHK  DS    0H                       CONTINUE SEARCHING QUEUE
+         LA    R6,BRKLINK-BRKELEM(R7)   R6=NEW LINK FIELD ADDR.
+         L     R7,BRKLINK-BRKELEM(R7)   R7=NEXT BREAK ELEMENT ADDR.
+         B     SEQLOOP                  TRY AGAIN.
+         SPACE
+***********************************************************************
+*        ADD BREAK ELEMENT TO CHAIN. SAVE ADDRESS OF PREVIOUS         *
+*        LINK FIELD FOR ERROR RECOVERY. PUT REQUIRED DATA  IN         *
+*        BREAK ELEMENT.                                               *
+***********************************************************************
+ADDL     DS    0H                       ADJUST POINTERS FOR
+*                                       NEW ELEMENTS
+         ST    R6,SAVEPTR               SAVE LINK FIELD POINTER
+         ST    R2,D0(R6)                PLACE NEW BRK ELEM ADDR
+*                                       IN CHAIN
+         ST    R7,BRKLINK               HOOK CHAIN TO NEW BRK
+*                                       LINK FIELD
+         ST    R5,BRKADDR               PLACE INSTR ADDR IN BRK ELEM.
+         MVC   BRKNAME,STRNGADR         PLACE ADDR SAVE AREA
+*                                       ADDR IN BRKELEM
+         MVC   BRKCHAIN,CHNADDR         PLACE CHAIN SAVE AREA
+*                                       ADDR IN BRK ELEM
+         L     R1,PDLADDR               R1=ADDR OF PDL
+         TM    COUNT+D1,FF              Q.IS COUNT SPECIFIED.
+         BZ    SKIPCT                   NO, LEAVE COUNT FIELD ZERO.
+         L     R1,CONAREA               R1=IKJEGCVT OUTPUT AREA ADDR.
+         MVC   BRKCOUNT(L2),CONCOUNT-CONBYTE+D2(R1)  SET COUNT FIELD.
+         MVC   BRKCOUNT+D2(L2),BRKCOUNT
+         SPACE
+SKIPCT   DS    0H                       SAVE BREAK INSTRUCTION
+         MVC   BRKINST+D2(L6),INITCON   INITIALIZE INSTR. SAVE FIELD.
+         TM    BRKFLGS,BRKRANGE         IS THIS BREAK ELEMENT
+*                                       PART OF A RANGE ?
+         BZ    SETFLAGS                 NO - DISPLACEMENT OF ZERO IS
+*                                       OK, SO GO SET PARAMETER FLAGS
+         L     R6,PDEUSER               R6=BINARY ADDR FROM PDE.
+         LA    R6,D0(R6)                ZERO HIGH BYTE.
+         SR    R5,R6                    R5=DISP FROM BEGINNING OF
+*                                       RANGE(IF RANGE)
+         STH   R5,BRKDISP               PLACE DISPLACEMENT IN BRK ELEM.
+         L     R5,BRKADDR               RESET R5
+SETFLAGS DS    0H
+         L     R1,PDLADDR               R1=ADDRESS OF PDL.
+         TM    NONOT+D1,TWO             Q.NONOTIFY SPECIFIED.
+         BZ    NOTIFY                   NO, DON'T SET SWITCH.
+         OI    BRKFLGS,BRKNONOT         YES, SET SWITCH.
+         SPACE
+NOTIFY   DS    0H                       CHECK FOR ADDRESS IN A LIST
+         TM    PDEUSER,PDEADLST         Q.IS BREAK ONE OF A LIST.
+         BZ    NOLIST                   NO, DON'T SET SWITCH.
+         OI    BRKFLGS,BRKLIST          YES, DO.
+         SPACE
+***********************************************************************
+*        BAL, AND BALR INSTRUCTIONS ARE HANDLED IN A                  *
+*        SPECIAL WAY. IF THE INSTRUCTION AT THE BREAKPOINT IS A       *
+*        BAL OR BALR, SET THE CORRESPONDING FLAG                      *
+*        IN THE BRKFLGS FIELD TO INDICATE THIS.                       *
+***********************************************************************
+NOLIST   DS    0H                       CHECK FOR BAL OR BALR INSTR.
+         CLI   D0(R5),BAL               Q.IS IT BAL INSTR.
+         BE    BALI                     YES, SET BALSW BIT IN BRK ELEM.
+         CLI   D0(R5),BALR              Q.IS IT BALR INSTR.
+         BNE   LENGTH                   NEITHER, GO CHECK LENGTH
+         SPACE
+BALI     DS    0H                       SET ELEMENT TO INDICATE BAL
+*                                       OR BALR INSTRUCTION
+         OI    BRKFLGS,BALSW            TURN ON BIT.
+         SPACE
+***********************************************************************
+*        FIND LENGTH OF INSTRUCTION AT BREAKPOINT AND MOVE IT         *
+*        INTO THE BREAK ELEMENT. TOP TWO BITS IN OP CODE TELL         *
+*        LENGTH OF INSTRUCTION. '00' = 2 BYTES, '01'='10' =           *
+*        4 BYTES, '11' = 6 BYTES.                                     *
+***********************************************************************
+LENGTH   DS    0H                       DETERMINE INSTRUCTION LENGTH
+         TM    D0(R5),LENBITS           Q.HOW LONG IS INSTRUCTION.
+         BO    SIXBYTE                  SIX BYTES.
+         BM    FOURBYTE                 FOUR BYTES.
+         MVC   BRKINST(L2),D0(R5)       SAVE INSTRUCTION.
+         LA    R5,D2(R5)                BUMP INSTR ADDR REGISTER.
+         B     CHECKMOR                 CHECK FOR MORE IN RANGE.
+         SPACE
+FOURBYTE DS    0H                       INSTRUCTION LENGTH=4
+         MVC   BRKINST(L4),D0(R5)       SAVE INSTRUCTION.
+         LA    R5,D4(R5)                BUMP INSTR ADDR REGISTER.
+         B     CHECKMOR                 CHECK FOR MORE IN RANGE.
+         SPACE
+SIXBYTE  DS    0H                       INSTRUCTION LENGTH=6
+         MVC   BRKINST(L6),D0(R5)       SAVE INSTRUCTION.
+         LA    R5,D6(R5)                BUMP INSTR ADDR REGISTER.
+         SPACE
+***********************************************************************
+*        CHECK TO BE SURE INSTRUCTION AT BREAKPOINT ADDRESS IS        *
+*        VALID. IF NOT, GO PUT OUT MESSAGE.                           *
+***********************************************************************
+CHECKMOR DS    0H                       DOES INSTR. HAVE VALID OP CODE
+         L     R1,BRKADDR               R1=POINTER TO BREAK INSTR.
+         L     R8,OPCODTAB              R8=POINTER TO TABLE OF OP CODES
+         LR    R4,R1                    PUT ADDRESS OF FIRST BYTE
+*                                       OF OP CODE IN R4
+         LA    R6,L5                    PUT LENGTH OF ONE BYTE OP CODE
+*                                       TABLE ENTRY IN R6
+CKCODE   DS    0H                       CODE LOOP
+         XR    R7,R7                    ZERO R7
+         IC    R7,D0(R4)                R7=OP CODE OF INSTRUCTION
+         MR    R6,R6                    GET INDEX FOR OP CODE TABLE
+         LA    R8,D0(R7,R8)             R8=ADDRESS FOR OP CODE TEST
+         TM    D0(R8),FF                WAS OP CODE VALID
+         BNZ   OPCODEOK                 BRANCH IF VALID OP CODE
+         SPACE
+         CR    R1,R4                    WAS SECOND BYTE OF OPCODE
+*                                       CHECKED ?
+         BNE   BADOPCD                  YES, OP CODE NO GOOD
+         CLI   D0(R1),HEXB2             ELSE CHECK FOR 2 BYTE OP CODE
+         BNE   BADOPCD                  BRANCH IF INVALID OP CODE
+         LA    R4,D1(R1)                PUT ADDRESS OF SECOND BYTE
+*                                       OF 2-BYTE OP CODE IN R4
+         CLI   D0(R4),TWOHIGH           CHECK TO SEE IF SECOND BYTE
+*                                       IS WITHIN RANGE
+         BH    BADOPCD                  NO, BAD OP CODE
+         LA    R6,L6                    PUT LENGTH OF 2-BYTE OP CODE
+*                                       TABLE ENTRY IN R6
+         L     R8,TSTOPCD2              POINT TO TABLE OF 2-BYTE OP
+*                                       CODES
+         B     CKCODE                   GO CHECK SECOND BYTE
+         SPACE
+***********************************************************************
+*        MOVE SVC97 OP CODE TO REPLACE INSTRUCTION AT BREAKPOINT.     *
+*        IF NO RANGE, OR END OF RANGE, GO CHECK FOR MORE PDES.        *
+*        IF RANGE, SET RANGE FLAG IN BREAKELEMENT, GET CORE           *
+*        FOR ANOTHER BREAK ELEMENT, RESET LINK POINTERS, AND GO       *
+*        PROCESS NEXT INSTRUCTION IN RANGE.                           *
+***********************************************************************
+OPCODEOK DS    0H                       OP CODE IS VALID
+         MVC   D0(L2,R1),RSVC           SET BREAKPOINT SVC IN INSTR.
+         L     R6,PDE2USER              R6=END OF RANGE(IF RANGE).
+         LA    R6,D0(R6)                CLEAR HIGH ORDER BYTE
+         CR    R5,R6                    Q. IS NEXT INSTRUCTION HIGH
+         BH    NEXTCHAI                 YES, GET NEXT PDE
+         TM    D0(R5),LENBITS           HOW MANY BYTES IN INSTRUCTION ?
+         BO    TRYSIX                   SIX BYTE INSTRUCTION
+         BM    TRYFOUR                  FOUR BYTE INSTRUCTION
+         OC    D0(L2,R5),D0(R5)         TRY FOR PROTECTION CHECK
+BLOW12   DS    0H                       RESUME ADDRESS FOR PROT. CK
+         B     RANGFLAG                 TURN ON RANGE FLAG
+         SPACE
+TRYSIX   DS    0H                       SIX BYTE INSTRUCTION
+         OC    D0(L6,R5),D0(R5)         TRY FOR PROTECTION CHECK
+BLOW16   DS    0H                       RESUME ADDRESS FOR PROT. CK.
+         B     RANGFLAG                 TURN ON RANGE FLAG
+         SPACE
+TRYFOUR  DS    0H                       FOUR BYTE INSTRUCTION
+         OC    D0(L4,R5),D0(R5)         TRY FOR PROTECTION CHECK
+BLOW14   DS    0H                       RESUME ADDRESS FOR PROT. CK.
+         SPACE
+RANGFLAG DS    0H                       TURN ON RANGE FLAG
+         OI    BRKFLGS,BRKRANGE         WE'RE IN A VALID RANGE.
+         LA    R0,BRKLEN                R0=LENGTH FOR GETMAIN
+         ST    R0,BYTENUMB              SAVE IN WORKAREA
+         GETMAIN RC,LV=(0),SP=1
+SMTGET02 DS    0H                       FOR SMT TEST CASES.
+BLOW4    DS    0H                       RESUME ADDRESS IN CASE
+*                                       OF GETMAIN FAILURE
+         LTR   R15,R15       WAS GETMAIN SUCCESSFUL?
+         BZ    BLOW4C        YES, BRANCH TO CONTINUE
+         LA    R1,SVC10NO    R1=SVC 10 NUMBER
+* ISSUE 'GETMAIN SVC ERROR' MESSAGE
+         BAL   R5,GETFREIO   PUT OUT MESSAGE
+         C     R15,ATTNCODE  IS RETURN CODE 16,20 OR 24?
+         BNL   RETURNRC      YES, SEND IT TO CALLER
+         LA    R15,TWENTY    SET RETURN TO ABEND TYPE
+         B     RETURNRC      SEND IT TO CALLER
+BLOW4C   EQU   *
+         XC    D0(BRKLEN,R1),D0(R1)     CLEAR NEW BREAK ELEMENT
+         OI    BRKFLGS-BRKELEM(R1),BRKRANGE TURN ON RANGE SWITCH.
+         LA    R6,BRKLINK               R6=LINK FIELD ADDR IN
+*                                       PREVIOUS BRK ELEM.
+         L     R7,BRKLINK               R7=CONTENTS OF THAT LINK FIELD.
+         LR    R2,R1                    R2=ADDR OF NEW BRK ELEM.
+         B     SEQLOOP                  GO BUILD IT.
+         SPACE
+***********************************************************************
+*        OP CODE WAS BAD. BUILD MESSAGE IN OUTPUT BUFFER AND SEND     *
+*        TO TERMINAL.                                                 *
+***********************************************************************
+BADOPCD  DS    0H                       A BAD OP CODE HAS BEEN FOUND
+         OI    TSTFLGS4,TSTFLUSH TURN ON TSTFLUSH SO MNL WILL
+*                                FLUSH INPUT STACK
+         L     R6,SAVEPTR    R6=PTR TO PREVIOUS LINK FIELD
+         MVC   D0(L4,R6),BRKLINK RESET PREVIOUS LINK FIELD
+         LH    R7,BRKDISP    R7=BREAKPOINT DISPLACEMENT
+         L     R0,BYTENUMB   R0=NUMBER OF BYTES LAST GOTTEN
+         FREEMAIN RC,LV=(R0),A=(R2),SP=1 FREEMAIN CORE LAST GOTTEN
+         LTR   R15,R15       WAS FREEMAIN SUCCESSFUL?
+         BZ    BOC1          YES, BRANCH TO CONTINUE
+         LA    R1,SVC120NO   R1=SVC 120 NUMBER
+* ISSUE 'FREEMAIN SVC ERROR' MESSAGE
+         BAL   R5,GETFREIO   PUT OUT MESSAGE
+         BAL   R5,IORC2      TEST IO RETURN CODES AND CONTINUE
+BOC1     EQU   *
+         OC    PDE2USER+D1(L3),PDE2USER+D1 IS ADDRESS IN RANGE
+         BNZ   RANGMSG       YES,OUTPUT RANGE MESSAGE
+         LA    R1,MSG10      R1=ADDR OF MESSAGE NUMBERS
+         BAL   R5,IOTYPE3    PUT OUT MESSAGE
+         BAL   R5,IORC2      TEST IO RC'S
+         B     NEXTCHAI      CHECK FOR MORE BRKELEMS TO BE BUILT
+RANGMSG  DS    0H
+         XC    TSTIOPRM(L'TSTIOPRM),TSTIOPRM CLEAR IO PARM LIST
+* ISSUE 'NO BREAKPOINTS ESTABLISHED FROM OFFSET OF RANGE BEGINNING'
+* ISSUE 'INVALID OP CODE' MESSAGE
+         IKJEGSIO MSG,FIRST=M0037,INST11=(REG,(R7)),ID=AT004,          *
+               INST12=(APDE,(R11)),SECOND=M0244,MF=(E,TSTIOPRM)
+         BAL   R5,IORC2      TEST IO RC'S
+         B     NEXTCHAI      CHECK FOR MORE BRKELEMS TO BE BUILT
+         SPACE
+***********************************************************************
+*        NORMAL RETURN TO CALLER FROM BREAKRTN. RC = 0.               *
+***********************************************************************
+ROUTRTN  DS    0H                       NORMAL RETURN TO CALLER.
+         SR    R15,R15                  INDICATE NORMAL RETURN.
+         SPACE
+***********************************************************************
+*        RETURN TO CALLER FROM BREAKRTN. LEAVE RETURN CODE IN R15.    *
+***********************************************************************
+RETURNRC DS    0H                       ABNORMAL RETURN TO CALLER.
+         L     R13,SAVELAST-SAVEAREA(R13)  RESET R13 TO RESTORE
+*                                       CALLER'S REGISTERS
+         RETURN (14,12),RC=(15)         RETURN TO CALLER.
+         SPACE
+***********************************************************************
+*        BREAKPOINT ADDRESS IS A DUPLICATE OF AN EXISTING BREAKPOINT  *
+*        REMOVE EXISTING BREAK ELEMENT AND GO ADD THIS ONE TO         *
+*        THE QUEUE.                                                   *
+***********************************************************************
+DUPLICAT DS    0H                       DUPLICATE BREAK ADDR FOUND
+         LA    R1,SRHPARMS              R1=ADDRESS OF SRH PARM LIST
+         XC    SRHPARMS(SRHPRMLH),SRHPARMS       ZERO SRH PARM LIST
+         ST    R5,SRHADDR1              PUT BREAKPOINT ADDRESS
+*                                       IN SRH PARM LIST
+         L     R15,TSTSRHRT             GET ADDRESS OF BRKELEM
+*                                       REMOVAL ROUTINE
+         BALR  R14,R15                  BRANCH TO BRKELEM REMOVAL RTN
+         L     R7,D0(R6)                R6 POINTS TO PREVIOUS LINK
+*                                       FIELD - PUT ADDRESS OF NEXT
+*                                       BRKELEM IN R7
+         C     R15,ATTNCODE  IS RETURN CODE LESS THAN 16?
+         BNL   RETURNRC      NO,SEND RETURN CODE TO MAIN ROUTINE
+         B     ADDL          GO BUILD A NEW BRKELEM
+         SPACE
+***********************************************************************
+*        IF NO MORE CONVERTED PDES, RETURN TO CALLER WITH RC = 0.     *
+*        IF MORE PDES, FLAG THEM AS PART OF A LIST AND GO             *
+*        PROCESS THEM.                                                *
+***********************************************************************
+NEXTCHAI DS    0H                       EXAMINE CHAIN FIELD
+         L     R11,PDE2CHAI             R11=CHAIN POINTER FOR
+*                                       ADDR LIST
+         LA    R11,D0(R11)              CLEAR HIGH ORDER BYTE.
+         LTR   R11,R11                  Q.IS A LIST POINTER PRESENT.
+         BZ    ROUTRTN                  NO, ALL DONE, RETURN.
+         TM    PDEUSER,PDECONVD         Q.WAS PDE CONVERTED
+         BZ    NEXTCHAI                 NO, ARE MORE PDE'S CHAINED
+         OI    PDEUSER,PDEADLST         FLAG THE PDE AS A
+*                                       MEMBER OF A LIST
+         B     SUPRLOOP                 CALCULATE SIZE,
+*                                       BUILD BREAK ELEMENT
+         SPACE
+***********************************************************************
+*        PARSE RETURNED A NONZERO RETURN CODE. USE THIS BRANCH        *
+*        TABLE TO PROCESS.                                            *
+***********************************************************************
+         ORG   *-4                      REUSE SPACE FOR IMPOSSIBLE
+*                                       ZERO RETURN CODE
+CHKCODE  DS    0H                       THIS CODE IS ENTERED TO
+*                                       DETERMINE WHY PARSE WAS
+*                                       UNSUCCESSFUL
+         ORG
+         B     EXITOK1                  USER SPECIFIED NO PROMPT
+         B     SET16                    ATTENTION INTERRUPT
+         B     INVPARM                  AN INVALID PARAMETER WAS USED
+*                                       IN PARSE
+         B     NOCORE                   INSUFFICIENT CORE
+         B     PICKUP                   GET RETURN CODE FROM WORK AREA
+         SPACE
+***********************************************************************
+*        PARSE RETURN CODE 4 - USER ENTERED INCOMPLETE/INCORRECT      *
+*        DATA, BUT PROFILE WAS FOR NOPROMPT. SET FLAG IN TCOMTAB      *
+*        TO TELL MAINLINE TO FLUSH INPUT STACK. RETURN TO MAINLINE    *
+*        WITH RC = 0.                                                 *
+***********************************************************************
+EXITOK1  DS    0H
+         OI    TSTFLGS4,TSTFLUSH        INDICATE FLUSH OF STACK.
+         SR    R15,R15       ZERO RETURN CODE
+         B     RETMAIN       RETURN TO IKJEGMNL
+         SPACE
+***********************************************************************
+*        PARSE RETURN CODE 20 - VALIDITY CHECK ERROR. GET RETURN      *
+*        CODE SAVED BY VALIDITY CHECK ROUTINE AND RETURN TO           *
+*        MAINLINE WITH THAT AS A RETURN CODE.                         *
+***********************************************************************
+PICKUP   DS    0H                       PICK UP RETURN CODE AND RETURN
+         L     R15,PARSECD              GET RETURN CODE
+         B     RETMAIN                  RETURN TO MAINLINE
+         SPACE
+***********************************************************************
+*        PARSE RETURN CODE 16 - NOT ENOUGH CORE. ISSUE MESSAGE,       *
+*        AND RETURN TO MAINLINE WITH RC = 0.                          *
+***********************************************************************
+NOCORE   DS    0H                       PUT OUT MSG. FOR INSUFFICIENT
+*                                       STORAGE
+         BAL   R5,IOTYPE1    PUT OUT MESSAGE
+         BAL   R5,IORC1      TEST IO RC'S
+         B     CODE0                    SET RETURN CODE TO ZERO AND
+*                                       RETURN TO MAINLINE
+         SPACE
+***********************************************************************
+*        PARSE RETURN CODE 12 - AN INVALID PARAMETER WAS PASSED       *
+*        TO PARSE. ISSUE MESSAGE AND RETURN TO MAINLINE WITH RC = 0.  *
+***********************************************************************
+INVPARM  DS    0H                       SET UP MESSAGE FOR UNABLE
+*                                       TO PARSE
+         XC    TSTIOPRM(L'TSTIOPRM),TSTIOPRM CLEAR IO PARM LIST
+* ISSUE 'AT FAILED,COMMAND SYSTEM ERROR' MESSAGE
+* ISSUE 'PARSE ERROR CODE 12' MESSAGE
+         IKJEGSIO MSG,FIRST=M0104,INST11=(NUM,I0013),SECOND=M0277,     *
+               ID=AT004,MF=(E,TSTIOPRM)
+         BAL   R5,IORC1      TEST IO RC'S
+         B     CODE0         RETURN TO MNL WITH RC=0
+         SPACE
+***********************************************************************
+*        PARSE RETURN CODE 8 - AN ATTENTION WAS ENTERRED. SET         *
+*        RC = 16 AND RETURN TO MAINLINE.                              *
+***********************************************************************
+SET16    DS    0H                       SET RETURN CODE TO 16 FOR
+         LA    R15,SIXTEEN              ATTENTION SCHEDULED
+         B     RETMAIN                  RETURN TO MAINLINE
+         EJECT
+***********************************************************************
+*                                                                     *
+*               ESTAE EXIT ROUTINE                                    *
+*                                                                     *
+***********************************************************************
+RETRY    DS    0H                       AT'S RETRY ROUTINE IN CASE OF
+*                                       AN ABEND
+***********************************************************************
+*        GET ADDRESS OF TCOMTAB                                       *
+***********************************************************************
+         L     R5,CVTPTR                R5=ADDRESS OF CVT
+         USING CVT,R5                   ESTABLISH ADDRESSABILITY
+*                                       TO CVT
+         L     R5,CVTTCBP               R5=POINTER TO DOUBLE WORD
+*                                       OF POINTERS TO NEXT-TO-BE
+*                                       DISPATCHED TCB AND CURRENT
+*                                       TCB
+         DROP  R5
+         L     R5,D4(R5)                R5=POINTER TO CURRENT TCB
+*                                       (TEST'S TCB)
+         USING TCB,R5                   ESTABLISH ADDRESSABILITY TO
+*                                       TEST'S TCB
+         L     R9,TCBTRN                R9=ADDRESS OF TCOMTAB
+         DROP  R5
+         SPACE
+***********************************************************************
+*        RESTORE AT'S REGISTERS 13 AND 12(BASE).                      *
+***********************************************************************
+         L     R13,REGSAVE2             R13=ADDRESS OF AT'S SAVE AREA
+         L     R12,GR12-SAVEAREA(R13)   RESTORE BASE REGISTER
+***********************************************************************
+*        IF AT WAS ENTERED TO ACTIVATE DEFERED BREAK ELEMENTS,        *
+*        SET RETURN CODE TO 4 AND RETURN TO MAINLINE. OTHERWISE,      *
+*        SET RETURN CODE TO 20 AND RETURN TO MAINLINE.                *
+***********************************************************************
+         TM    TSTFLGS1,TSTBUILD        WAS THIS MODULE ENTERED TO
+*                                       BUILD ACTIVE BREAKPOINTS
+*                                       FROM THE DEFER QUEUE
+         BO    CODE4                    YES, SET CODE TO 4
+         LA    R15,TWENTY               R15=20 - INDICATES RETURN FROM
+*                                       RETRY ROUTINE
+         B     RETMAIN                  RETURN TO MAINLINE
+         EJECT
+*      ERRET FOR LINK TO IKJPARS
+PARSERR  EQU   *
+         XC    TSTIOPRM(L'TSTIOPRM),TSTIOPRM CLEAR IO PARM LIST
+         LR    R0,R1         LOAD ABEND CODE INTO R0
+* ISSUE 'LINK TO IKJPARS SVC ERROR' MESSAGE
+         IKJEGSIO SVCERR,SVC=6,ABENDRG=(R0),RC=(R15),                  *
+               INST11=(NUM,I0040),ID=AT004,MF=(E,TSTIOPRM)
+         C     R15,ATTNCODE  IS RETURN CODE 16,20 OR 24?
+         BNL   RETMAIN       YES SEND IT TO IKJEGMNL
+         LA    R15,TWENTY    MAKE RETURN CODE LOOK LIKE ABEND
+         B     RETMAIN       SEND IT TO MAINLINE
+         EJECT
+***********************************************************************
+* THIS SECTION RECEIVES CONTROL FROM IKJPARS ONCE IKJPARS HAS SCANNED *
+* AN ADDRESS AND HAS DETERMINED THAT IT IS SYNTACTICALLY CORRECT.     *
+* FURTHER VALIDITY CHECKING OF THE ADDRESS IS PERFORMED TO ENSURE     *
+* THAT THE ADDRESS IS AN ACCEPTABLE TYPE FOR THE AT SUBCOMMAND.  IF   *
+* AN ADDRESS IS FOUND TO BE UNACCEPTABLE, A MESSAGE IS ISSUED TO THE  *
+* USER BEFORE CONTROL IS RETURNED TO IKJPARS.                         *
+***********************************************************************
+         SPACE
+AT1ADDVC DS    0H                       VALIDITY CHECK FOR ADDRESS
+         SAVE  (14,12),,AT1ADDVC        SAVE REGISTERS FROM PARSE
+         L     R5,D4(R1)                R5=ADDR OF AT'S SAVE AREA
+         L     R12,GR12-SAVEAREA(R5)    GET ADDRESSABILITY WITH MAIN
+*                                       SECTIONS
+         L     R9,GR9-SAVEAREA(R5)      R9=ADDR OF TCOMTAB
+         L     R6,REGSAVE3              R6=ADDR OF EXIT ROUTINE'S
+*                                       SAVE AREA
+         ST    R13,SAVELAST-SAVEAREA(R6)   SAVE ADDR OF PARSE'S
+*                                       SAVE AREA
+         ST    R6,SAVENEXT-SAVEAREA(R13)  SAVE ADDR OF EXIT'S SAVE AREA
+*                                       IN PARSE'S SAVE AREA
+         LR    R13,R6                   R13=ADDR OF THIS ROUTINE'S SAVE
+*                                       AREA
+         L     R10,WORKAREA             R10=ADDRESS OF COMMON WORKAREA
+         LA    R8,D8(R1)                R8=ADDR OF LAST WORD OF
+*                                       PARSE'S PARM LIST
+         SPACE
+         L     R11,D0(R1)               R11=ADDRESS OF PDE
+         USING IKJPARMA,R11             ESTABLISH ADDRESSABILITY TO PDE
+         OI    TSTFLGS4,TSTVALCK TURN ON VALIDITY CHECK BIT
+         L     R4,OUTBUF     R4=ADDR OF OUTBUF
+         XC    D0(L4,R4),D0(R4) ZERO FIRST WORD OF OUTBUF
+         SPACE
+***********************************************************************
+*        CHECK FOR INVALID ADDRESS TYPE. IF INVALID, GO PUT           *
+*        OUT MESSAGE.                                                 *
+***********************************************************************
+         XR    R4,R4                    CLEAR REGISTER FOR TESTS
+         CH    R4,PDEINDCT              IS ADDRESS INDIRECT
+         BNE   CHKRANGE                 YES, WAS A RANGE GIVEN
+         TM    PDEFLG4,GENR+LFPR+SFPR   IS ADDRESS REGISTER TYPE ?
+         BM    STORMSG                  YES, PUT OUT ERROR MESSAGE
+         SPACE
+***********************************************************************
+*        IF A RANGE WAS ENTERED, GO CHECK IT.                         *
+***********************************************************************
+CHKRANGE DS    0H                       WAS A RANGE SPECIFIED
+         TM    PDE2FLG2,CTNAMFLG        ENTRYNAME GIVEN IN SECOND PDE
+         BO    RANGE                    YES, CHECK FOR VALID ADDRESS
+         TM    PDE2FLG3,AFLG            STRING GIVEN
+         BO    RANGE                    YES, CHECK FOR VALID ADDRESS
+         SPACE
+***********************************************************************
+*        RANGE NOT GIVEN. IF LOADNAME AND ADDRESS STRING ARE          *
+*        GIVEN, GO CHECK FOR VALID SYMBOL.                            *
+***********************************************************************
+NORANGE  DS    0H                       RANGE NOT GIVEN - TEST FOR
+*                                       FULLY QUALIFIED NAME
+         TM    PDEFLG1,LDNAMFLG         LOADNAME GIVEN
+         BZ    EXITCONV                 NO, CONVERT ADDRESS
+         TM    PDEFLG3,AFLG             STRING GIVEN
+         BNZ   TESTSYM                  INSURE ADDRESS STRING IS NOT
+*                                       SYMBOL WITH LENGTH GREATER
+*                                       THAN EIGHT
+         SPACE
+***********************************************************************
+*        NEITHER LOADNAME NOR ADDRESS STRING WERE GIVEN. CONVERT      *
+*        ADDRESS TO BINARY, BE SURE ADDRESS IS WRITABLE,              *
+*        AND BE SURE CONVERTED ADDRESS IS IN PDEUSER FIELD.           *
+***********************************************************************
+EXITCONV DS    0H                       SET UP FOR GOING TO CONVERT
+*                                       ROUTINE
+         LCR   R1,R11                   R1=COMPLEMENT OF ADDRESS OF PDE
+*                                       TO INDICATE ADDRESS CONVERT
+         XR    R0,R0                    R0=ZERO TO INDICATE CONVERT TO
+*                                       BINARY
+         OI    TSTFLGS1,RANGESW         TELL CONVERT TO EXPECT A RANGE
+         L     R15,TSTCONVT             R15=ADDRESS OF CONVERT ROUTINE
+         BALR  R14,R15                  GET ADDRESS CONVERTED
+         LTR   R15,R15                  WAS CONVERT SUCCESSFUL
+         BNZ   NOTCONV(R15)             NO, SEE IF PDE USELESS
+         TM    PDEFLG5,PDEWRITE         IS ADDRESS WRITABLE ?
+         BZ    ADDRPROT                 NO, CAN'T PUT A BRKPT THERE
+         TM    PDEUSER,PDESIB           IS ADDRESS IN USERWORD
+         BZ    INWORD                   YES, CHECK BOUNDARY
+         L     R6,PDEUSER               R6=ADDRESS OF SI BLOCK
+         MVC   PDEUSER(L4),D0(R6)       MOVE ADDRESS INTO USERWORD
+         SPACE
+***********************************************************************
+*        IF ADDRESS NOT ON HALFWORD BOUNDARY, GO ISSUE ERROR          *
+*        MESSAGE. OTHERWISE, FLAG PDE AS CONVERTED, SET RETURN C      *
+*        CODE TO 0                                         *
+***********************************************************************
+INWORD   DS    0H                       ADDRESS IS IN USERWORD
+         TM    PDEUSER+D3,BADBOUND      IS ADDRESS FOR HALF-WORD
+*                                       BOUNDARY
+         BO    BOUNDMSG                 NO, PUT OUT MESSAGE
+         MVI   PDEUSER,PDECONVD         SET FLAG FOR PDE CONTAINING
+*                                       BINARY ADDRESS
+         SPACE
+EXITOK   DS    0H                       SET RETURN CODE TO ZERO
+         XR    R15,R15                  ZERO REGISTER
+         SPACE
+***********************************************************************
+*              RETURN                                                 *
+***********************************************************************
+RETPARSE DS    0H                       RETURN FOR PARSE
+         L     R13,SAVELAST-SAVEAREA(R13) RESTORE R13
+         NI    TSTFLGS4,HEXFF-TSTVALCK TURN OFF VALIDITY CHECK BIT
+         SR    R0,R0         R0=0
+         L     R2,OUTBUF     R2=ADDR OF OUTBUF
+         C     R0,D0(R2)     IS THERE A SECOND LEVEL MESSAGE TO PASS?
+         BE    RETPARS1      NO, JUST GO BACK TO PARSE
+         L     R1,GR1-SAVEAREA(R13) R1=ADDR OF PARSE PARAMETER LIST
+         MVC   D8(L4,R1),OUTBUF PUT ADDRESS OF SECOND LEVEL MESSAGE
+*                               INTO PARSE PARAMETER LIST
+RETPARS1 EQU   *
+         RETURN (14,12),RC=(15) RETURN
+RETMAIN  DS    0H                       RETURN FOR MAINLINE
+         TM    TSTFLGS1,TSTBUILD ARE WE ACTIVATING DEFERED BRKPTS?
+         BO    CODE4         YES, GO GENERATE THE RIGHT RETURN CODE
+         LR    R2,R15        SAVE RETURN CODE
+         ESTAE 0             REMOVE ESTAE
+         LR    R15,R2        RESET RETURN CODE
+         NI    TSTFLGS4,HEXFF-TSTRERTN TURN OFF RETRY BIT
+         L     R13,SAVELAST-SAVEAREA(R13)  RESTORE R13
+         RETURN (14,12),,RC=(15)        RETURN
+         SPACE
+***********************************************************************
+*        CVT RETURNED A NONZERO RETURN CODE. USE THE FOLLOWING        *
+*        BRANCH TABLE TO PROCESS IT.                                  *
+***********************************************************************
+         ORG   *-4                      REUSE SPACE FOR ZERO COND. CODE
+NOTCONV  DS    0H
+         ORG
+         B     EXIT8                    RETURN CODE 4
+         B     EXIT8                    RETURN CODE 8
+         B     EXIT8                    RETURN CODE 12
+         B     EXIT12                   RETURN CODE 16
+         B     EXIT12                   RETURN CODE 20
+         B     EXIT12        RETURN CODE 24
+         SPACE
+***********************************************************************
+*        CVT RETURN CODE 16,20,24 EITHER AN ATTENTION WAS ENTERED     *
+*        OR SYM OR CVT BLEW. SAVE RETURN CODE IN WORKAREA, SET        *
+*        RETURN CODE TO 20, AND RETURN TO PARSE.                      *
+***********************************************************************
+EXIT12   DS    0H                       SET RETURN TO PARSE TO 12 SO
+*                                       THAT IT WILL RETURN TO AT
+         ST    R15,PARSECD              SAVE RETURN CODE IN WORK AREA
+         LA    R15,TWELVE               SET RETURN CODE TO 12
+         B     RETPARSE                 RETURN TO PARSE
+         SPACE
+***********************************************************************
+*        ADDRESS IN PDE IS IN WRITE-PROTECTED CORE. ISSUE             *
+*        APPROPRIATE ERROR MESSAGE, SET RETURN CODE TO 8,             *
+*        AND RETURN TO PARSE.                                         *
+***********************************************************************
+ADDRPROT DS    0H                       WRITE PROTECTED ADDRESS
+         LA    R1,MSG2       R1=ADDR OF MESSAGE NUMBERS
+         B     SETADDR                  ADD STRING TO MESSAGE
+         SPACE
+***********************************************************************
+*        INVALID ADDRESS TYPE. ISSUE MESSAGE, SET RETURN CODE         *
+*        TO 8 AND RETURN TO PARSE.                                    *
+***********************************************************************
+STORMSG  DS    0H                       PUT OUT MESSAGE FOR INVALID
+*                                       ADDRESS - REGISTER SPECIFI-
+*                                       CATION NOT ALLOWED
+         TM    PDE2FLG2,CTNAMFLG        WAS ENTRYNAME OF RANGE GIVEN
+         BO    STMSG2                   YES, PREPARE RANGE MESSAGE
+         TM    PDE2FLG3,AFLG            WAS STRING GIVEN
+         BO    STMSG2                   YES, PREPARE RANGE MESSAGE
+         LA    R1,MSG6       R1=ADDR OF MESSAGE NUMBERS
+         SPACE
+SETADDR  DS    0H                       ADD ADDRESS STRING TO MSG
+         BAL   R5,IOTYPE3    PUT OUT MESSAGE
+         BAL   R5,IORC3      TEST IO RC'S
+         B     EXIT8A        RETURN TO PARSE
+         SPACE
+***********************************************************************
+*        CVT RETURN CODE = 4, 8, OR 12. SET RETURN CODE TO 8, RETURN TO
+*        PARSE
+***********************************************************************
+EXIT8    DS    0H                       SET RETURN CODE TO PARSE TO
+*                                       HAVE PARSE ISSUE 'REENTER'
+EXIT8A   DS    0H                       SET RETURN CODE TO 8
+         LA    R15,EIGHT                SET CODE TO EIGHT
+         B     RETPARSE                 RETURN TO PARSE
+         SPACE
+***********************************************************************
+*        LOADNAME AND ADDRESS STRING GIVEN. TEST FOR VALID SYMBOL.    *
+*        IF INVALID, ISSUE MESSAGE AND RETURN TO PARSE WITH RC = 8.   *
+***********************************************************************
+TESTSYM  DS    0H                       IS STRING A SYMBOL WITH
+*                                       LENGTH GREATER THAN 8
+         CLC   PDELEN3,SYMBLLNH         IS LENGTH GREATER THAN 8
+         BNH   EXITOK                   NO, RETURN TO PARSE WITHOUT
+*                                       CONVERTING ADDR AS DEFER
+*                                       MIGHT BE SPECIFIED
+         TM    PDEFLG4,SYMADDR          IS STRING A SYMBOL
+         BNO   EXITOK                   NO, RETURN TO PARSE
+         LA    R1,MSG7       R1=ADDR OF MESSAGE NUMBERS
+         B     SETADDR                  ADD ADDRESS STRING TO MSG
+         SPACE
+STMSG2   DS    0H                       SET UP FOR RANGE MESSAGE -
+*                                       INVALID REGISTER NOTATION
+         LA    R1,MSG8       R1=ADDR OF MESSAGE NUMBERS
+         B     SETADDR                  ADD STRING TO MESSAGE
+         SPACE
+***********************************************************************
+*        ADDRESS NOT ON HALFWORD BOUNDARY. ISSUE MESSAGE,             *
+*        SET RC = 8 AND RETURN TO PARSE.                              *
+***********************************************************************
+BOUNDMSG DS    0H                       PREPARE MESSAGE FOR ADDRESS NOT
+*                                       ON HALF-WORD BOUNDARY
+         LA    R1,MSG5       R1=ADDR OF MESSAGE NUMBERS
+         SPACE
+BNDMSG1  DS    0H
+         BAL   R5,IOTYPE2    PUT OUT MESSAGE
+         BAL   R5,IORC3      TEST IO RC'S
+         B     EXIT8A        RETURN TO PARSE
+***********************************************************************
+*        A RANGE WAS GIVEN. IF SECOND ADDRESS IN RANGE IS INVALID     *
+*        REGISTER TYPE ADDRESS, GO ISSUE MESSAGE, SET RC = 8, AND     *
+*        RETURN TO PARSE.                                             *
+***********************************************************************
+RANGE    DS    0H                       AN ADDRESS RANGE WAS GIVEN
+         CH    R4,PDE2INDC              IS SECOND ADDRESS INDIRECT
+         BNE   ISITFULL                 YES, IS FIRST FULLY QUALIFIED
+         TM    PDE2FLG4,GENR+LFPR+SFPR  IS REGISTER SPECIFIED
+         BM    STMSG2                   BUILD MESSAGE FOR ADDRESS
+*                                       REQUIRED TO BE STORAGE
+         SPACE
+***********************************************************************
+*        CHECK TYPES OF ADDRESSES IN PDE AND GO TO CORRECT            *
+*        PROCESSING CODE.                                             *
+***********************************************************************
+ISITFULL DS    0H                       CHECK FOR FIRST ADDRESS FULLY
+*                                         QUALIFIED
+         TM    PDEFLG1,LDNAMFLG         LOADNAME GIVEN
+         BZ    GOTOCONV                 NO, CONVERT ADDRESSES
+         TM    PDEFLG3,AFLG             STRING GIVEN
+         BZ    GOTOCONV                 NO, CONVERT ADDRESSES
+         SPACE
+***********************************************************************
+* FIRST ARGUMENT OF THE RANGE IS A FULLY QUALIFIED ADDRESS.  CHECK    *
+* THE SECOND ARGUMENT.                                                *
+***********************************************************************
+         SPACE
+         TM    PDE2FLG1,LDNAMFLG        LOADNAME GIVEN
+         BZ    GOTOCONV                 NO, CONVERT ADDRESSES
+         TM    PDE2FLG3,AFLG            STRING GIVEN
+         BZ    GOTOCONV                 NO, CONVERT ADDRESSES
+         SPACE
+***********************************************************************
+*        BOTH ADDRESSES FULLY QUALIFIED. MAY BE A DEFERRED AT.        *
+*        CHECK FOR VALID ADDRESS STRING. IF INVALID, ISSUE MESSAGE    *
+*        SET RC = 8, AND RETURN TO PARSE. OTHERWISE, SET RC = 0 AND   *
+*        RETURN TO PARSE.                                             *
+***********************************************************************
+         CLC   PDELEN3,SYMBLLNH         IS LENGTH OF STRING GREATER
+*                                       THAN 8
+         BNH   CHKPDE2                  NO, CHECK SECOND HALF PDE
+         TM    PDEFLG4,SYMADDR          IS STRING A SYMBOL
+         BNO   CHKPDE2                  NO, CHECK SECOND HALF PDE
+         SPACE
+SYMMSG2  DS    0H                       PUT OUT MSG FOR RANGE CONTAINS
+*                                       SYMBOL WITH LENGTH GREATER
+*                                       THAN 8
+         LA    R1,MSG9       R1=ADDR OF MESSAGE NUMBERS
+         B     SETADDR                  ADD STRING TO MESSAGE
+         SPACE
+CHKPDE2  DS    0H                       CHECK LAST PART OF RANGE FOR
+*                                       SYMBOL WITH LENGTH GREATER
+*                                       THAN 8
+         CLC   PDE2LEN3,SYMBLLNH        IS LENGTH GREATER THAN 8
+         BNH   EXITOK                   NO, RETURN WITHOUT CONVERTING
+*                                       REQUEST MAY BE DEFER
+         TM    PDE2FLG4,SYMADDR         IS STRING A SYMBOL
+         BNO   EXITOK                   NO, RETURN TO PARSE
+         B     SYMMSG2                  YES, PUT OUT MESSAGE
+         SPACE
+***********************************************************************
+*        BOTH ADDRESSES ARE NOT FULLY QUALIFIED. MUST BE ACTIVE       *
+*        BREAKPOINT. CONVERT BOTH ADDRESSES TO BINARY. FIRST          *
+*        ADDRESS MUST BE LESS THAN OR EQUAL TO SECOND, AND MUST       *
+*        BE ON A HALFWORD BOUNDARY. IF BOTH CONDITIONS ARE NOT MET,   *
+*        ISSUE MESSAGE, SET RC = 8, AND RETURN TO PARSE. IF OK,       *
+*        SET RC = 0 AND RETURN TO PARSE.                              *
+***********************************************************************
+GOTOCONV DS    0H
+         OI    TSTFLGS1,RANGESW         TELL CONVERT TO EXPECT A RANGE
+         LCR   R1,R11                   R1=COMPLEMENT OF ADDRESS OF PDE
+*                                       TO INDICATE ADDRESS CONVERT
+         XR    R0,R0                    R0=ZERO TO INDICATE CONVERT
+*                                       TO BINARY
+         L     R15,TSTCONVT             R15=ADDRESS OF CONVERT ROUTINE
+         BALR  R14,R15                  GO TO CONVERT
+         LTR   R15,R15                  WAS CONVERT SUCCESSFUL
+         BNZ   NOTCONV(R15)             NO, SEE IF PDE USELESS
+         SPACE
+***********************************************************************
+* CONVERT WAS SUCCESSFUL.  THIS ROUTINE MAKES SURE THE BINARY         *
+* ADDRESSES ARE WRITABLE, AND THE CONVERTED ADDRESSES ARE IN          *
+* THE PDEUSER FIELDS.                                                 *
+***********************************************************************
+         SPACE
+         TM    PDEFLG5,PDEWRITE         IS FIRST ADDR WRITABLE ?
+         BZ    RANGPROT                 NO, CAN'T PUT A BRKPT THERE
+         TM    PDEUSER,PDESIB           IS FIRST ADDRESS IN USERWORD
+         BO    MOVEADR                  NO, PUT IT THERE
+         SPACE
+CHKUSER2 DS    0H                       LOOK AT SECOND PDE OF RANGE
+         TM    PDE2FLG5,PDEWRITE        IS SECOND ADDR WRITABLE ?
+         BZ    RANGPROT                 NO, CAN'T PUT A BRKPT THERE
+         TM    PDE2USER,PDESIB          IS SECOND ADDRESS IN USERWORD
+         BO    MOVADDR2                 NO, PUT IT THERE
+         SPACE
+COMPUSER DS    0H                       COMPARE ADDRESSES
+         CLC   PDEUSER+D1(L3),PDE2USER+D1  IS FIRST ADDRESS GREATER
+*                                       THAN SECOND
+         BH    FIRSTHI                  YES, PUT OUT ERROR MESSAGE
+         TM    PDEUSER+D3,BADBOUND      IS FIRST ADDRESS FOR HALF-WORD
+*                                       BOUNDARY
+         BO    BNDMSG2                  NO, PUT OUT MESSAGE
+         MVI   PDEUSER,PDECONVD         FLAG PDE AS CONVERTED
+         B     EXITOK                   RETURN TO PARSE
+         SPACE
+MOVEADR  DS    0H                       FIRST CONVERTED ADDRESS IN
+*                                       SI BLOCK
+         L     R5,PDEUSER               R5=ADDRESS OF SI BLOCK
+         L     R5,D0(R5)                R5=CONVERTED ADDRESS
+         ST    R5,PDEUSER               STORE IN FIRST USERWORD
+         B     CHKUSER2                 CHECK FOR CONVERTED ADDRESS IN
+*                                       SECOND USERWORD
+         SPACE
+***********************************************************************
+*        ONE OF THE ADDRESSES IN A RANGE IS IN WRITE-PROTECTED CORE.  *
+*        ISSUE MESSAGE, SET RETURN CODE TO 8, AND RETURN TO PARSE.    *
+***********************************************************************
+RANGPROT DS    0H                       WRITE PROTECTED RANGE
+         LA    R1,MSG3       R1=ADDR OF MESSAGE NUMBERS
+         B     SETADDR                  ADD STRING TO MESSAGE
+         SPACE
+***********************************************************************
+*        FIRST ADDRESS OF RANGE NOT ON HALFWORD BOUNDARY. ISSUE       *
+*        MESSAGE, SET RC = 8, AND RETURN.                             *
+***********************************************************************
+BNDMSG2  DS    0H                       FIRST ADDRESS OF RANGE NOT
+*                                       ON HALF-WORD BOUNDARY
+         LA    R1,MSG1       R1=ADDR OF MESSAGE NUMBERS
+         B     BNDMSG1       GO OUTPUT MESSAGES
+         SPACE
+***********************************************************************
+*        MOVE SECOND ADDRESS OF RANGE INTO PDE2USER FIELD.            *
+***********************************************************************
+MOVADDR2 DS    0H                       SECOND CONVERTED ADDRESS IN
+*                                       SI BLOCK
+         L     R5,PDE2USER              R5=ADDRESS OF SI BLOCK
+         L     R5,D0(R5)                R5=CONVERTED ADDRESS
+         ST    R5,PDE2USER              STORE IN SECOND USERWORD
+         B     COMPUSER                 COMPARE ADDRESSES
+         SPACE
+***********************************************************************
+*        FIRST ADDRESS IN RANGE IS HIGHER THAN SECOND ADDRESS.        *
+*        ISSUE MESSAGE, SET RC = 8, AND RETURN TO PARSE.              *
+***********************************************************************
+FIRSTHI  DS    0H                       PREPARE TO WRITE MESSAGE FOR
+*                                       FIRST ADDRESS EXCEEDS SECOND
+         LA    R1,MSG4       R1=ADDR OF MESSAGE NUMBERS
+         B     SETADDR                  ADD ADDRESS STRING TO MSG
+         EJECT
+***********************************************************************
+* THIS SECTION RECEIVES CONTROL FROM IKJPARS ONCE IKJPARS HAS SCANNED *
+* A PARENTHESIZED STRING (KNOWN AS THE SUB-COMMAND CHAIN) AND HAS     *
+* DETERMINED THAT IT IS SYNTACTICALLY CORRECT.  FURTHER VALIDITY      *
+* CHECKING OF THE SUB-COMMAND CHAIN IS PERFORMED.  IF THE SUB-COMMAND *
+* CHAIN IS FOUND TO BE UNACCEPTABLE, A MESSAGE IS ISSUED TO THE USER  *
+* BEFORE CONTROL IS RETURNED TO IKJPARS.                              *
+***********************************************************************
+AT1SUBVC DS    0H                       SUB-COMMAND VALIDITY CHECK
+         SAVE (14,12),,AT1SUBVC         SAVE IKJPARS' REGISTERS
+         L     R5,D4(R1)                R5=ADDR OF AT'S SAVE AREA
+         LA    R7,D8(R1)                R7=POINTER TO PARSE'S PARM
+*                                       FOR SECOND LEVEL MSG
+         L     R12,GR12-SAVEAREA(R5)    ESTABLISH ADDRESSABILITY WITH
+*                                       MAINLINE OF AT
+         L     R9,GR9-SAVEAREA(R5)      R9=ADDR OF TCOMTAB
+         L     R6,REGSAVE3              R6=ADDR OF EXIT'S SAVE AREA
+         ST    R13,SAVELAST-SAVEAREA(R6)  SAVE ADDRESS OF PARSE'S SAVE
+*                                       AREA
+         ST    R6,SAVENEXT-SAVEAREA(R13)  SAVE ADDRESS OF EXIT'S SAVE
+*                                       AREA IN PARSE'S SAVE AREA
+         LR    R13,R6                   R13=ADDR OF EXIT'S SAVE AREA
+         L     R10,WORKAREA             R10=ADDRESS OF COMMON WORKAREA
+         OI    TSTFLGS4,TSTVALCK TURN ON VALIDITY CHECK BIT
+         L     R4,OUTBUF     R4=ADDR OF OUTBUF
+         XC    D0(L4,R4),D0(R4) ZERO FIRST WORD OF OUTBUF
+         SPACE
+***********************************************************************
+* THIS EXIT CHECKS THE LENGTH OF THE SUBCOMMAND STRING FOR A MAXIMUM  *
+* OF 255.  IF IT IS GREATER A MESSAGE IS ISSUED.                      *
+***********************************************************************
+         SPACE
+         L     R6,D0(R1)                R6=ADDR OF SUB-COMMAND PDE
+         LA    R4,MAXLEN                R4=255
+         CH    R4,EXPRLNH-EXPRPDE(R6)   IS LENGTH GREATER THAN 255
+         BL    TOOLONG                  YES, PUT OUT ERROR MESSAGE
+         B     EXITOK                   LENGTH OK, RETURN TO IKJPARS
+         SPACE
+***********************************************************************
+*        SUBCOMMAND CHAIN TOO LONG. ISSUE MESSAGE, SET RC = 8, AND    *
+*        RETURN TO PARSE.                                             *
+***********************************************************************
+TOOLONG  DS    0H                       PREPARE TO PUT OUT MESSAGE FOR
+*                                       SUB-COMMAND CHAIN LENGTH
+*                                       EXCEEDS 255
+         XC    TSTIOPRM(L'TSTIOPRM),TSTIOPRM CLEAR IO PARM LIST
+* ISSUE 'COMMAND CHAIN TO LONG' MESSAGE
+* ISSUE 'COMMAND CHAIN LENGTH MAY NOT EXCEED 255 BYTES' MESSAGE
+         IKJEGSIO MSG,FIRST=M0035,SECOND=M0243,ID=AT004,MF=(E,TSTIOPRM)
+         BAL   R5,IORC3      TEST IO RC'S
+         B     EXIT8A        RETURN TO PARSE
+         EJECT
+***********************************************************************
+* THIS SECTION RECEIVES CONTROL FROM IKJPARS ONCE IKJPARS HAS SCANNED *
+* THE KEYWORD COUNT AND ITS SUBFIELD INTEGER AND HAS DETERMINED THAT  *
+* IT IS SYNTACTICALLY CORRECT.  FURTHER VALIDITY CHECKING OF THE      *
+* INTEGER IS PERFORMED.  IF THE INTEGER IS FOUND TO BE UNACCEPTABLE,  *
+* A MESSAGE IS ISSUED TO THE USER BEFORE CONTROL IS RETURNED TO PARSE.*
+***********************************************************************
+AT1CTVC  DS    0H                       VALIDITY CHECK FOR COUNT
+         SAVE  (14,12),,AT1CTVC         SAVE IKJPARS' REGISTERS
+         L     R5,D4(R1)                R5=ADDR OF AT'S SAVE AREA
+         L     R12,GR12-SAVEAREA(R5)    ESTABLISH ADDRESSABILITY WITH
+*                                       MAINLINE OF AT
+         L     R9,GR9-SAVEAREA(R5)      R5=ADDR OF TCOMTAB
+         L     R6,REGSAVE3              R6=ADDR OF EXIT'S SAVE AREA
+         ST    R13,SAVELAST-SAVEAREA(R6)  SAVE ADDRESS OF PARSE'S SAVE
+*                                       AREA
+         ST    R6,SAVENEXT-SAVEAREA(R13)  SAVE ADDRESS OF EXIT'S SAVE
+*                                       AREA IN PARSE'S SAVE AREA
+         LR    R13,R6                   R13=ADDR OF EXIT'S SAVE AREA
+         L     R10,WORKAREA             R10=ADDRESS OF COMMON WORKAREA
+         LA    R7,D8(R1)                R7=POINTER TO PARSE'S PARM
+*                                       FOR SECOND LEVEL MSG
+         OI    TSTFLGS4,TSTVALCK TURN ON VALIDITY CHECK BIT
+         L     R4,OUTBUF     R4=ADDR OF OUTBUF
+         XC    D0(L4,R4),D0(R4) ZERO FIRST WORD OF OUTBUF
+         SPACE
+***********************************************************************
+*        USE IKJEGCVT TO CONVERT COUNT TO BINARY.                     *
+***********************************************************************
+         L     R1,D0(R1)                R1=ADDR OF COUNT PDE
+         LR    R11,R1        SAVE ADDRESS OF PDE
+         SR    R0,R0                    ZERO REGISTER - CONVERT TO
+*                                       BINARY
+         MVI   IDENTCVT-IDENTPDE(R1),FCODE  MOVE IN TYPE CODE FOR
+*                                       IKJEGCVT
+         L     R15,TSTCONVT             R15=EP OF IKJEGCVT
+         BALR  R14,R15                  CONVERT COUNT TO BINARY
+         LTR   R15,R15                  WAS CONVERT SUCCESSFUL
+         BNZ   NOTCONV(R15)             NO, ATTENTION SCHEDULED
+         SPACE
+***********************************************************************
+*        INSURE THAT COUNT IS LESS THAN OR EQUAL TO MAXIMUM. IF NOT,  *
+*        ISSUE MESSAGE, SET RC = 8, AND RETURN TO PARSE. IF IT        *
+*        IS OK, SET COUNT TO ZERO IF THE COUNT IS ZERO,               *
+*        OR TO ONE LESS THAN THE COUNT IF IT IS GREATER THAN ONE,     *
+*        SET RETURN CODE TO 0 AND RETURN.                             *
+***********************************************************************
+         L     R4,CONAREA               R4=ADDRESS OF PLACE WHERE
+*                                       CONVERT RETURNS NUMBER
+         USING CONBYTE,R4               GET ADDRESSABILITY TO CONAREA
+         L     R5,COUNTMAX              R5=MAXIMUM COUNT
+         L     R6,CONCOUNT              R6=COUNT GIVEN
+         LTR   R6,R6                    IS COUNT = ZERO
+         BZ    EXITOK                   YES, RETURN TO PARSE
+         CLR   R6,R5                    IS COUNT GREATER THAN 65535
+         BH    BADCOUNT                 YES, PUT OUT ERROR MESSAGE
+         BCTR  R6,ZERO                  DECREMENT BY ONE
+         ST    R6,CONCOUNT              STORE BACK IN COUNT AREA
+         B     EXITOK                   COUNT OK - RETURN TO PARSE
+         SPACE
+BADCOUNT DS    0H                       PUT OUT MESSAGE FOR COUNT
+*                                       EXCEEDS MAXIMUM
+         XC    TSTIOPRM(L'TSTIOPRM),TSTIOPRM CLEAR IO PARM LIST
+* ISSUE 'INVALID COUNT NNNNNN' MESSAGE
+* ISSUE 'COUNT MUST BE BETWEEN 0 AND 65535' MESSAGE
+         IKJEGSIO MSG,FIRST=M0036,INST11=(VPDE,(R11)),SECOND=M0299,    *
+               ID=AT004,MF=(E,TSTIOPRM)
+         BAL   R5,IORC3      TEST IO RC'S
+         B     EXIT8A        RETURN TO PARSE
+         DROP  R4
+         EJECT
+*********************************************************************
+*  COMMON IO MACRO FORMS
+*********************************************************************
+IOTYPE1  DS    0H
+         XC    TSTIOPRM(L'TSTIOPRM),TSTIOPRM CLEAR IO PARM LIST
+         IKJEGSIO MSG,FIRST=M0103,ID=AT004,MF=(E,TSTIOPRM)
+         BR    R5            RETURN TO CALLER
+IOTYPE2  DS    0H
+         STM   R2,R3,SAVE2345 SAVE R2-3 FOR REUSE
+         LM    R2,R3,D0(R1)  LOAD R2-3 WITH MESSAGE NUMBERS
+         XC    TSTIOPRM(L'TSTIOPRM),TSTIOPRM CLEAR IO APRM LIST
+         IKJEGSIO MSG,FIRST=(R2),INST11=(APDE,(R11)),SECOND=(R3),      *
+               INST21=(NUM,I0002),ID=AT004,MF=(E,TSTIOPRM)
+         LM    R2,R3,SAVE2345 RESET R2-3
+         BR    R5            RETURN TO CALLER
+IOTYPE3  DS    0H
+         STM   R2,R3,SAVE2345 SAVE R2-3 FOR REUSE
+         LM    R2,R3,D0(R1)  LOAD R2-3 WITH MESSAGE NUMBERS
+         XC    TSTIOPRM(L'TSTIOPRM),TSTIOPRM CLEAR IO PARM LIST
+         IKJEGSIO MSG,FIRST=(R2),INST11=(APDE,(R11)),SECOND=(R3),      *
+               ID=AT004,MF=(E,TSTIOPRM)
+         LM    R2,R3,SAVE2345 RESET R2-3
+         BR    R5            RETURN TO CALLER
+GETFREIO EQU   *
+         ST    R2,SAVE2345   SAVE R2 FOR REUSE
+         LR    R2,R1         R2=SVC NUMBER
+         XC    TSTIOPRM(L'TSTIOPRM),TSTIOPRM CLEAR IO PARM LIST
+         IKJEGSIO SVCERR,SVC=(R2),RC=(R15),ID=AT004,MF=(E,TSTIOPRM)
+         L     R2,SAVE2345   RESET R2
+         BR    R5            RETURN TO CALLER
+*********************************************************************
+*  COMMON IO RETURN CODE CHECKS
+*********************************************************************
+IORC1    DS    0H
+         OI    TSTFLGS4,TSTFLUSH HAVE MNL FLUSH INPUT STACK
+         C     R15,ATTNCODE  IS RETURN CODE=16,20,OR 24?
+         BNL   RETMAIN       SEND IT TO MAINLINE
+         XR    R15,R15       CLEAR RETURN CODE AND CONTINUE
+         BR    R5            RETURN TO CALLER
+IORC2    DS    0H
+         C     R15,ATTNCODE  IS RETURN CODE 16,20 OR 24?
+         BNL   RETURNRC      YES, GO RETURN THE CODE
+         XR    R15,R15       CLEAR RETURN CODE AND CONTINUE
+         BR    R5            RETURN TO CALLER
+IORC3    DS    0H
+         LTR   R15,R15       TEST FOR ZERO RETURN CODE
+         BZ    D0(R5)        ZERO, RETURN TO CALLER
+         C     R15,ATTNCODE  IS RETURN CODE 16
+         BE    EXIT12        YES,GO END PARSE
+         OI    TSTFLGS4,TSTFLUSH HAVE MAINLINE FLUSH INPUT STACK
+         C     R15,ATTNCODE  IS RETURN CODE 20 OR 24?
+         BH    EXIT12        YES, END PARSE
+         XR    R15,R15       ZERO RETURN CODE
+         B     EXIT12        END PARSE
+         EJECT
+***********************************************************************
+*                                                                     *
+*        CONSTANTS USED IN THE CODE                                   *
+*                                                                     *
+***********************************************************************
+         SPACE 2
+***********************************************************************
+*        LIST FORMS OF XCTL MACRO USED.                               *
+***********************************************************************
+XLIST    DS    0F                       LIST FORM OF XCTL MACRO
+         XCTL  EP=IKJEGATD,SF=L         LIST FORM
+XCTLEN   EQU  *-XLIST                   LENGTH OF LIST FORM OF MACRO
+         SPACE
+***********************************************************************
+*        INITIALIZATION CONSTANTS FOR BRKINSTR FIELD                  *
+*        OF BRKELEM                                                   *
+***********************************************************************
+INITCON  DS    0H
+         NOPR  R1                       PADDING NOP.
+         NOPR  R1                       PADDING NOP.
+RSVC     SVC   TESTSVC                  BREAKPOINT SVC.
+         SPACE
+**********************************************************************
+*  MESSAGE NUMBER CONSTANTS
+*       EACH MESSAGE NUMBER AREA HAS THE FOLLOWING FORMAT
+*        WORD1-NUMBER OF FIRST LEVEL MESSAGE
+*        WORD2-NUMBER OF SECOND LEVEL MESSAGE(ZERO OF NO MESSAGE)
+**********************************************************************
+MSG1     DC    F'73'         INVALID ADDRESS RANGE
+         DC    F'280'        HALF WORD BOUNDARY REQUIRED
+MSG2     DC    F'101'        INVALID ADDRESS
+         DC    F'279'        ADDRESS WRITE PROTECTED
+MSG3     DC    F'73'         INVALID ADDRESS RANGE
+         DC    F'242'        PART OF RANGE WRITE PROTECTED
+MSG4     DC    F'73'         INVALID ADDRESS RANGE
+         DC    F'207'        FIRST ADDR MUST NOT BE HIGHER THAN LAST
+MSG5     DC    F'101'        INVALID ADDRESS
+         DC    F'280'        HALF WORD BOUNDARY REQUIRED
+MSG6     DC    F'101'        INVALID ADDRESS
+         DC    F'274'        REG. NOTATION MUST BE INDIR.GEN.REG.
+MSG7     DC    F'101'        INVALID ADDRESS
+         DC    F'281'        SYMBOL LENGTH EXCEEDS 8 CHARS.
+MSG8     DC    F'73'         INVALID ADDRESS RANGE
+         DC    F'274'        REG. NOTATION MUST BE INDIR.GEN.REG.
+MSG9     DC    F'73'         INVALID ADDRESS RANGE
+         DC    F'281'        SYMBOL LENGTH EXCEEDS 8 CHARS.
+MSG10    DC    F'38'         NO BRKPT ESTABLISHED AT
+         DC    F'244'        BAD OP CODE
+         SPACE
+***********************************************************************
+*        MISCELLANEOUS CONSTANTS                                      *
+***********************************************************************
+MAXLEN2  DC    AL2(BRKLEN+100)          MAXIMUM LENGTH FOR BREAK ELE-
+*                                       MENT AND ADDRESS STRING
+SYMBLLNH DC    H'8'                     MAXIMUM LENGTH OF A
+*                                       VALID SYMBOL
+         DS    0F                       ALIGN SP1 AND DBLBND TO WORD
+DBLBND   DC    X'FFFFFFF8'              MASK FOR ROUNDING TO DBL BOUND
+RETRYA   DC    A(RETRY)                 ADDRESS OF RETRY ROUTINE
+RETRYA1  EQU   RETRYA+1                 SECOND BYTE OF RETRYA
+PCLISTA  DC    V(IKJEGAPL)              ADDRESS OF PCL
+ATTNCODE DC    F'16'         RETURN CODE=ATTENTION IN PROCESS
+COUNTMAX DC    X'0000FFFF'              MAXIMUM COUNT INTEGER - 65535
+TABLE    DC    C'0123456789ABCDEF'      TRANSLATE TABLE
+ATSPL    IKJEGSPL RTRY=RETRY,ABNTB=ABENDTAB,MODNM=IKJEGAT,TNM=AT
+ABENDTAB DS    0F                       TABLE FOR ABEND MESSAGES
+*                                       FULLWORD ALIGNMENT
+         DC    AL1(97)                  CODE FOR PROTECTION CHECK
+         DC    AL3(BLOW12)              RESUME ADDRESS FOLLOWING
+*                                       PROTECTION CHECK
+         DC    AL1(97)                  CODE FOR PROTECTION CHECK
+         DC    AL3(BLOW14)              RESUME ADDRESS FOLLOWING
+*                                       PROTECTION CHECK
+         DC    AL1(97)                  CODE FOR PROTECTION CHECK
+         DC    AL3(BLOW16)              RESUME ADDRESS FOLLOWING
+*                                       PROTECTION CHECK
+         DC    AL1(97)                  CODE FOR PROTECTION CHECK
+         DC    AL3(BLOWTWO)             RESUME ADDRESS FOLLOWING
+*                                       PROTECTION CHECK
+         DC    AL1(97)                  CODE FOR PROTECTION CHECK
+         DC    AL3(BLOWFOUR)            RESUME ADDRESS FOLLOWING
+*                                       PROTECTION CHECK
+         DC    AL1(97)                  CODE FOR PROTECTION CHECK
+         DC    AL3(BLOWSIX)             RESUME ADDRESS FOLLOWING
+*                                       PROTECTION CHECK
+         DC    AL1(92)                  CODE FOR INSUFFICIENT STORAGE
+         DC    AL3(BLOW2)               RESUME ADDRESS FOLLOWING
+*                                       INITIAL GETMAIN
+         DC    AL1(92)                  CODE FOR INSUFFICIENT STORAGE
+         DC    AL3(BLOW4)               RESUME ADDRESS FOLLOWING
+*                                       ADDITIONAL BREAK ELEMENT
+*                                       GETMAIN
+         DC    AL1(99)                  CODE FOR LINK FAILED
+         DC    AL3(BLOW5)               RESUME ADDRESS FOLLOWING LINK
+*                                       TO IKJPARS
+         DC    AL1(97)                  CODE FOR PROTECTION CHECK
+         DC    AL3(TSTLNH1)             ADDRESS PRECEDING INSTRUCTION
+*                                       LENGTH CHECK
+         DC    AL1(97)                  CODE FOR PROTECTION CHECK
+         DC    AL3(TSTLNH2)             ADDRESS FOLLOWING INSTRUCTION
+*                                       LENGTH CHECK
+         DC    AL1(97)                  CODE FOR PROTECTION CHECK
+         DC    AL3(CHEKTWO)             ADDRESS PRECEDING CHECK
+*                                       FOR TWO BYTE INSTRUCTION
+         DC    AL1(97)                  CODE FOR PROTECTION CHECK
+         DC    AL3(CHEKSIX)             ADDRESS PRECEDING CHECK
+*                                       FOR SIX BYTE INSTRUCTION
+         DC    AL1(97)                  CODE FOR PROTECTION CHECK
+         DC    AL3(CHEKFOUR)            ADDRESS PRECEDING CHECK
+*                                       FOR FOUR BYTE INSTRUCTION
+         DC    X'FF'                    END OF TABLE
+         EJECT
+***********************************************************************
+*        PARSE MACROS DESCRIBING COMMAND INPUT                        *
+***********************************************************************
+IKJEGAPL IKJPARM DSECT=IKJPARMD
+ADDR     IKJPOSIT ADDRESS,LIST,RANGE,                                  *
+               PROMPT='ADDRESS POSITIONAL PARAMETER',VALIDCK=AT1ADDVC
+SBCMDCHN IKJPOSIT PSTRING,VALIDCK=AT1SUBVC
+COUNT    IKJKEYWD
+         IKJNAME 'COUNT',SUBFLD=INTEGER
+NONOT    IKJKEYWD DEFAULT='NOTIFY'
+         IKJNAME 'NOTIFY'
+         IKJNAME 'NONOTIFY'
+DEFER    IKJKEYWD DEFAULT='NODEFER'
+         IKJNAME 'NODEFER'
+         IKJNAME 'DEFER'
+INTEGER  IKJSUBF
+NUMBER   IKJIDENT 'INTEGER',FIRST=NUMERIC,OTHER=NUMERIC,MAXLNTH=5,     *
+               PROMPT='INTEGER',VALIDCK=AT1CTVC
+         IKJENDP
+         EJECT
+         IKJPPL
+PPLEND   EQU   *                        END OF PPL
+         EJECT
+TCB      IKJTCB                         TCB EXPANSION
+         EJECT
+CVT      DSECT
+         CVT
+         EJECT
+         IKJPARMA                       ADDRESS PDE DSECT
+         EJECT
+***********************************************************************
+*                                                                     *
+*        MAPPING DSECT FOR PDES FOR IDENT-TYPE DATA                   *
+*                                                                     *
+***********************************************************************
+IDENTPDE DSECT
+IDENTPTR DS    F -                      POINTER TO CHARACTER STIRNG,
+*                                       OR ZERO IF NOT PRESENT
+IDENTLNH DS    H -                      LENGTH OF CHARACTER STRING
+IDENTFLG DS    XL1 -                    FLAGS
+IDENTBIT EQU   B'10000000' -            BIT ON MEANS STRING PRESENT
+IDENTCVT DS    XL1 -                    RESERVED
+IDENTPDL EQU   *-IDENTPDE -             LENGTH OF IDENT PDE
+***********************************************************************
+*                                                                     *
+*        MAPPING DSECT FOR PDES FOR EXPRESSIONS                       *
+*                                                                     *
+***********************************************************************
+EXPRPDE  DSECT
+EXPRPTR  DS    F -                      POINTER TO CHARACTER STRING,
+*                                       OR ZERO IF NOT PRESENT
+EXPRLNH  DS    H -                      LENGTH OF CHARACTER STRING
+         DS    H -                      RESERVED
+EXPRFLGS DS    XL1 -                    FLAGS
+EXPRDEC  EQU   X'04' -                  DECIMAL EXPRESSION FLAG
+EXPRHEX  EQU   X'02' -                  HEX EXPRESSION FLAG
+EXPRSIGN DS    CL1 -                    ARITHMETIC SIGN OR ZERO
+EXPRINDC DS    H -                      INDIRECT COUNT
+EXPRCHAI DS    F -                      POINTER TO NEXT EXPRESSION
+*                                       PDE OR ZERO
+EXPRPDL  EQU   *-EXPRPDE -              LENGTH OF EXPRESSION PDE
+         EJECT
+         BRKELEM                        BREAK ELEMENT DSECT.
+         EJECT
+         IKJEGDME                       DEFERED MODULE ELEMENT DSECT
+         SPACE 2
+         IKJEGDBE                       DEFERED BREAK ELEMENT DSECT
+         EJECT
+SAVEAREA DSECT
+SAVEUSER DS    F                        UNUSED
+SAVELAST DS    F                        PTR TO LAST SAVEAREA (CALLER'S)
+SAVENEXT DS    F                        PTR TO NEXT SAVEAREA (SUBRTN)
+RETURNPT DS    F                        PTR TO CALLER'S RESUME ADDRESS
+ENTRYPT  DS    F                        PTR TO MY ENTRY POINT
+GR0      DS    F                        GENERAL REGISTER 0
+GR1      DS    F                        GENERAL REGISTER 1
+GR2      DS    F                        GENERAL REGISTER 2
+GR3      DS    F                        GENERAL REGISTER 3
+GR4      DS    F                        GENERAL REGISTER 4
+GR5      DS    F                        GENERAL REGISTER 5
+GR6      DS    F                        GENERAL REGISTER 6
+GR7      DS    F                        GENERAL REGISTER 7
+GR8      DS    F                        GENERAL REGISTER 8
+GR9      DS    F                        GENERAL REGISTER 9
+GR10     DS    F                        GENERAL REGISTER 10
+GR11     DS    F                        GENERAL REGISTER 11
+GR12     DS    F                        GENERAL REGISTER 12
+LSAVE    EQU   *-SAVEAREA               LENGTH OF SAVEAREA
+         EJECT
+         TCOMTAB                        COMMUNICATIONS TABLE DSECT
+         EJECT
+         TSTCWORK                       DSECT FOR WORKAREA
+         ORG   CWORKCMD                 GO BACK TO COMMAND WORKAREA
+         SPACE
+WORKSP   DS    0H
+         SPACE
+***********************************************************************
+*                                                                     *
+*        THIS IS A MAPPING OF THE AREA CALLED CWORKCMD IN TSTCWORK.   *
+*        WHEN AT IS ENTERED TO ACTIVATE DEFERED BREAKPOINTS, THE      *
+*        FIRST 8 CHARACTERS OF THE WORK AREA CONTAIN THE NAME OF THE  *
+*        NEWLY LOADED MODULE. THE NINTH BYTE CONTAINS A FLAG WHICH    *
+*        INDICATES WHETHER OR NOT THE MODULE IS IN OVERLAY. THE       *
+*        LAST 64 BYTES OF THE WORK AREA ARE RESERVED FOR A REGISTER   *
+*        SAVE AREA FOR IKJEGLDF IN THIS CASE.                         *
+*        IF ANY CHANGES ARE MADE TO THE WORK AREA, MAKE THE           *
+*        SAME CHANGES TO IKJEGATD. BOTH MODULES USE THE SAME FORMAT   *
+*        OF WORK AREA.                                                *
+***********************************************************************
+PDLADDR  DS    A -                      ADDRESS OF PDL BEING
+*                                       PROCESSED BY AT WHEN
+*                                       ACTIVATING DEFERED BREAKPOINTS
+PARSECD  EQU   PDLADDR -                NONZERO SERVICE ROUTINE
+*                                       RETURN CODES SENT TO VALIDITY
+*                                       CHECK ROUTINES ARE STORED HERE
+BYTENUMB DS    F -                      SAVE AREA FOR NUMBER OF BYTES
+*                                       LAST GOTTEN
+SAVEPTR  DS    A -                      POINTER TO PREVIOUS BREAK
+*                                       ELEMENT LINK FIELD
+CHNADDR  DS    A -                      ADDRESS OF SUBCOMMAND CHAIN
+*                                       FOR BREAKPOINT(S) BEING BUILT
+STAEL    DS    CL16                     ESTAE PARM LIST AREA
+STRNGADR DS    A -                      ADDRESS OF ADDRESS STRING
+*                                       FOR RANGE BEING PROCESSED
+         DS    0F
+PARMS    DS    (PPLEND-PPL)X -          PPL IS BUILT HERE
+         ORG   PARMS
+BRKSAVE  DS    18F -                    SAVE AREA FOR BREAKRTN
+SAVE2345 DS    4F            SAVE AREA FOR R2-5 USED DURING IO
+         ORG   STRNGADR
+PDEADDR  DS    A -                      ADDRESS OF FIRST ADDRESS PDE
+*                                       IN PDL - PASSED AS PARM
+         ORG   WORKSP
+LOADNAME DS    CL8 -                    LOAD NAME OF NEWLY LOADED MOD.
+*                                       FOR WHICH DEFERED BREAK-
+*                                       POINTS MAY BE ACTIVATED, OR
+*                                       LOAD NAME FOR WHICH DEFERED
+*                                       BREAKPOINTS ARE TO BE BUILT
+LOADATTR EQU   * -                      ONE BYTE FLAG INDICATING
+*                                       OVERLAY STATUS FOR NEWLY
+*                                       LOADED MODULE
+GETCORE  GETMAIN   EC,SP=1,MF=L -       LIST FORM OF GETMAIN
+ADDRCORE EQU   GETCORE+4 -              SECOND WORD OF LIST FORM
+*                                       CONTAINS ADDRESS OF CORE
+         ORG   WORKSP
+XCTLL    XCTL  EP=IKJEGATD,SF=L -       LIST FORM OF XCTL
+         ORG   STAEL                    OVERLAY STAE CONTROL BLOCK
+SRHPARMS DS    0H                       BRKELEM REMOVAL ROUTINE'S
+*                                       PARM LIST
+SRHFLAGS DC    F'0'                     FLAGS - 0 TO REMOVE BRKELEM
+SRHADDR1 DS    A                        ADDRESS OF BRKPOINT FOR
+*                                       BRKELEM TO BE REMOVED
+SRHADDR2 DS    A                        SECOND ADDRESS OF RANGE OR 0
+SRHPRMLH EQU   *-SRHPARMS               LENGTH OF SRH PARM LIST
+         EJECT
+***********************************************************************
+*        THIS WEIRD DSECT DESCRIBES THE CONAREA WHERE CVT RETURNS     *
+*        THE BINARY VALUE TRANSLATED FROM THE IDENT PDE FOR THE       *
+*        COUNT. THE FIRST BYTE CONTAINS THE LENGTH OF THE BINARY      *
+*        VALUE - IN THIS CASE IT ALWAYS CONTAINS A FOUR - AND THE     *
+*        NEXT FOUR BYTES, WHICH ARE ALIGNED ON A WORD BOUNDARY,       *
+*        CONTAIN THE BINARY VALUE.                                    *
+***********************************************************************
+CONPLACE DSECT                          DSECT FOR CONAREA
+         DS    D                        ALIGNMENT
+         ORG   *-ONE                    BACK UP ONE
+CONBYTE  DS    X                        LENGTH OF COUNT (FOUR)
+CONCOUNT DS    F                        BINARY COUNT
+         SPACE
+         EJECT
+IKJEGAT  CSECT
+         DS    0F            FORCE FULLWORD ALIGNMENT
+ATPATCH  DC    50C'Z'        PATCH AREA
+         END

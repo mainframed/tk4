@@ -1,0 +1,1171 @@
+SD82     TITLE 'IASXSD82 - ACCESS SYSOUT DATA SETS FROM HASP'
+***********************************************************************
+*                                                                     *
+*STATUS CHANGE LEVEL 000                                              *
+*                                                                     *
+*FUNCTION OF THIS MODULE:                                             *
+*                                                                     *
+*    1. PREPARE TO PUT OUT A DATA SET.                                *
+*    2. ISSUE IEFSSREQ TO OBTAIN A DATA SET FROM HASP.                *
+*    3. DYNAMICALLY ALLOCATE THE DATA SET RECEIVED FROM HASP.         *
+*    4. PUT OUT MESSAGES TO THE OPERATOR INDICATING PAUSE BETWEEN     *
+*       DATA SETS OR FORMS CHANGE.                                    *
+*    5. WRITE TYPE 6 SMF RECORD PER JOB OR FORM WITHIN JOB.           *
+*    6. ATTACH IEFSD087 OR USER WRITTEN WRITER.                       *
+*    7. WAIT FOR WORK IF HASP HAS NO DATA SETS ELGIBLE FOR WRITER.    *
+*                                                                     *
+*OPERATION OF THIS MODULE:                                            *
+*    ENTRY POINT:                                                     *
+*       IASXSD82 - FROM IASXSD81                                      *
+*                                                                     *
+*    EXIT POINT 1 - ATTACH IEFSD087 OR USER WRITER                    *
+*    EXIT POINT 2 - RETURN TO VS WHEN STOP COMMAND RECEIVED           *
+*    EXIT POINT 3 - TO IASXSD81 TO PROCESS A MODIFY COMMAND           *
+*                                                                     *
+*EXTERNAL ROUTINES:                                                   *
+*                                                                     *
+*    IEFSD087 - STANDARD OUTPUT WRITER OR USER WRITER                 *
+*    IEFSSREQ - INTERFACE TO HASP TO OBTAIN WORK                      *
+*                                                                     *
+*ATTRIBUTES - REENTRANT, REUSABLE, KEY1, SUPERVISOR STATE             *
+*                                                                     *
+*                                                                     *
+*REGISTER USAGE:                                                      *
+*                                                                     *
+*    R1-R4- WORK REGISTERS                                            *
+*    R5   - OUTPUT AND INPUT DCB ADDRESSABILITY                       *
+*    R6   - ADDRESS OF PARLIST                                        *
+*    R7   - SSOB ADDRESSABILTTY                                       *
+*    R8   - DYNAMIC ALLOCATION RB ADDRESSABILITY                      *
+*    R9   - BASE REGISTER                                             *
+*    R10  - ERROR MESSAGES ADDRESSABILITY                             *
+*    R14  - RETURN REGISTER                                           *
+*                                                                     *
+*CORE USAGE:                                                          *
+*                                                                     *
+*    ONE GETMAIN IS ISSUED FOR THE FOLLOWING AREAS                    *
+*                                                                     *
+*        1.  WORKLST                                                  *
+*        2.  SAVE AREA FOR EXTERNAL WRITER                            *
+*        3.  INPUT DCB, OPEN AND CLOSE LISTS                          *
+*        4.  ECBLIST, ATACHLIST,ETC.                                  *
+*        5.  FOUR BYTES FOR READ JFCB L-FORM DATA                     *
+*        6.  JFCB FOR INPUT DCB                                       *
+*        7.  VALID WRITER NAME TABLE                                  *
+*        8.  SMF RECORD AREA                                          *
+*        9.  ALLOC PARAMETER LIST                                     *
+*                                                                     *
+***********************************************************************
+         EJECT
+IASXSD82 CSECT
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+VARSP    EQU   X'48'               VARIABLE  SPANNED RECFM
+SUBPOOL  EQU   245                 SUBPOOL FOR CSCB
+CSCBSIZ  EQU   64                  CSCB SIZE
+MODFCM   EQU   X'08'               MODIFY COMMAND BIT
+STOPCM   EQU   X'10'               STOP COMMAND BIT
+NOENTRYS EQU   8                   NO. OF ENTRIES IN TABLE
+ENTRYSIZ EQU   8                   SIZE OF EACH ENTRY
+TBLESIZ  EQU   NOENTRYS*ENTRYSIZ   SIZE OF VALID NAMES TABLE
+SAVEAREA EQU   72
+WAITAND  EQU   X'7F'               CLEAR WAIT FLAG
+SIZPRG   EQU   12                  SIZE OF PURGE PARAMETER LIST
+PRGDEB   EQU   0                   ADDRESS OF DEB IN PURGE LIST
+PRGOPT   EQU   0                   OTION BYTE IN PURGE LIST
+PRGTCB   EQU   4                   ADDRESS OF TCB IN PURGE LIST
+PRGUSR   EQU   8                   ADDRESS OF PURGE LINK FIELD
+PURGOPT  EQU   X'E4'               PURGE RQE'S FOR DEB ONLY,
+*                                   POST PURGED REQUESTS, HALT I/O OPTS
+PRGOPT2  EQU   X'84'               PURGE BY DEV, POST, & QUIESCE OPTION
+DEBTCBAD EQU   0                   ADDR. OF TCB IN DEB
+DEBUSRPG EQU   16                  USER PURGE CHAIN
+ENTRY82  EQU   X'FF'               INDICATOR FOR IEFSD094 THAT
+*                                   ENTRY IS FROM IASXSD82
+TTETYPE  EQU   X'09'               3211 UNIT TYPE
+UCBFDF   EQU   X'80'               UCB FCB ID IS DEFAULT ID
+UCBUDF   EQU   X'80'               UCB UCS ID IS DEFAULT ID
+ZERO     EQU   0
+         EJECT
+         BALR  R9,0                SET UP BASE REGISTER
+         USING *,R9
+         LR    R6,R1               SAVE PARM REG
+         USING PARLIST,R6
+         XC    PARXXX(8),PARXXX    INDICATE NO SPANNING MODULE
+         OI    PARDUM,PARWAIT      INDICATE WRITER IS TO WRITE WAIT MSG
+         L     R10,MSGADDR         GET MESSAGE ADDRESS
+         USING IASXS82M,R10
+         L     R5,PARDCB           ADDRESS OF OUTPUT DCB
+         USING IHADCB,R5
+         TM    DCBRECFM,VARSP      IF NOT VS, DON'T LOAD XXX
+         BNO   SD82WKT
+***                                                                 ***
+*   LOAD VARIABLE SPANNING MODULE AND GET WORK AREA FOR IT            *
+***                                                                 ***
+         LOAD  EP=IEFSDXXX         LOAD THE VARIABLE SPANNING MODULE
+         ST    R0,PARXXX           SAVE THE ADDRESS OF THE MODULE
+         LA    R0,WORKFEND-WORKFXXX     GET CORE FOR SPANNING WORK AREA
+         GETMAIN R,LV=(0)
+         ST    R1,PARXXA           SAVE ADDRESS OF WKX
+SD82WKT  LA    R0,SD82CORE         GET SIZE OF CORE NEEDED FOR IEFSD082
+         GETMAIN R,LV=(0)          GET CORE FOR INPUT DCB WKT, ETC.
+         ST    R1,PARWKLST         SAVE ADDRESS OF CORE           .
+         USING WORKLST,R1
+         LA    R2,WORKT(R1)        ADDRESS OF SAVE AREA
+         ST    R13,4(R2)           SAVE CONTENT OF SAVE REGISTER
+         LR    R13,R2              NEW SAVE AREA ADDRESS
+         LA    R2,SAVEAREA(R2)     INCREMENT TO DCB ADDRESS
+         ST    R2,DCBIN            SAVE DCB ADDRESS
+         LA    R3,IDCB(R2)         ADDRESS OF ECB AND ATTACH LISTS
+         ST    R3,VARAR            STORE LISTS ADDR IN WORKLST
+         LA    R2,ATCHADDR+ATCHLST+4(R3)  ADDRESS OF INPUT DCB JFCB
+         ST    R2,WJFCB            SAVE ADDR OF INPUT DCB JFCB
+         LA    R2,JFCBLGTH(R2)     ADDRESS OF VALID WRITER NAMES TABLE
+         MVI   0(R2),X'00'         CLEAR WRITER NAME TABLE
+         MVC   1(TBLESIZ-1,R2),0(R2)    CLEAR WRITER NAME TABLE
+         ST    R2,PARNAMES         SAVE ADDR. OF NAME TABLE
+         LA    R2,TBLESIZ(R2)      ADDRESS OF SMF RECORD
+         ST    R2,PARSMF           SAVE ADDRESS OF SMF RECORD
+         LA    R2,SMF6(R2)         ADDRESS OF DYNAMIC ALLOCATE PARM LST
+         ST    R2,PARALLOC         STORE ADDRESS OF ALLOC AREA
+         XC    PARSMB,PARSMB       ZERO PARSMB
+***                                                                 ***
+*   INITIALIZE WORKLST                                                *
+***                                                                 ***
+         ST    R13,WOSAP           USE SAME SAVE REGISTER
+         ST    R6,WOSPS            ADDRESS OF PARLIST
+         MVC   DCBOT(4),PARDCB     ADDRESS OF OUTPUT DCB
+         MVC   WOXXX(8),PARXXX     ADDRESS OF SPANNING MODULE AND WORK
+         L     R3,16               GET TCB ADDR.
+         L     R3,0(R3)
+         L     R3,4(R3)            NOW HAVE TCB ADDR.
+         USING TCB,R3              TCB ADDRESSABILITY
+         MVC   WOTIO(4),TCBTIO     GET TIOT PTR. FOR WORKLST
+         L     R2,TCBJSCB          ADDRESS OF JSCB
+         USING IEZJSCB,R2          JSCB ADDRESSABILITY
+         L     R2,JSCBSSIB         ADDRESS OF SSIB
+         USING SSIB,R2             USE SSIB TO GET SUBSYSTEM NAME
+         TM    PARSWCH,PARDUMMY    IS THIS A DUMMY DATA SET
+         BZ    NODUMMY             NO
+         OI    VARBA,UNRWR         TURN ON UNIT RECORD SWITCH
+         B     SD82NDWK            BRANCH OUT
+NODUMMY  L     R4,PARUCB           GET ADDR OF OUTPUT UCB
+         USING UCBOB,R4
+         TM    UCBTBYT3,UCB3UREC   TEST FOR UNIT RECORD
+         BZ    SD82TFPT            NO
+         OI    VARBA,UNRWR         TURN ON UNIT RECORD SWITCH
+         CLI   UCBTBYT4,X'0C'      CHECK FOR 3525 PUNCH
+         BE    PCHTYP              YES
+         TM    UCBTBYT4,X'F8'      TEST FOR NO-PUNCH
+         BNE   SD82NDWK            BRANCH OUT IF SO
+PCHTYP   OI    VARBA,PUNSH         TURN ON PUNCH SWITCH
+         CLI   UCBTBYT4,X'03'      TEST FOR 1442
+         BNE   SD82NDWK            BRANCH OUT
+         OI    VARBA,FTFTW         TURN ON 1442 SWITCH
+         B     SD82NDWK            BRANCH OUT
+SD82TFPT TM    PARSWCH,PARPUN      TEST FOR PUNCH TYPE
+         BZ    SD82NDWK            BRANCH OUT
+         OI    VARBA,PUNSH         TURN ON PUNCH SWITCH
+         DROP  R1,R4
+SD82NDWK EQU   *
+***                                                                 ***
+*        INITIALIZE DYNAMIC ALLOCATION PARAMETER AREA                 *
+***                                                                 ***
+         L     R8,PARALLOC
+         LR    R1,R8                 ADDRESS OF PARALLOC
+         LA    R8,4(R8)            INCREMENT TO DAL REQUEST BLOCK
+         ST    R8,0(R1)            SET UP RB PTR ADDR.
+         OI    0(R1),S99RBPND
+         USING S99RB,R8
+         XC    S99RB(DYNRBSIZ),S99RB
+         MVI   S99RBLN,DYNRBSIZ    SIZE OF RB
+         LA    R3,DYNRBSIZ(R8)     INCREMENT TO FIRST TEXT POINTER
+         USING DYNTXTPT,R3
+         LA    R4,TXTPTSIZ(R3)     INCREMENT TO TEXT UNITS
+         USING S99TUNIT,R4
+         ST    R4,DSNTXTPT         SET UP ADDR OF FIRST TEXT UNIT
+         XC    S99TUKEY(DYNEND-DYNTXTND),S99TUKEY ZERO TEXT UNITS
+         MVI   S99TUKEY+1,DALDSNAM DSNAME IS SUPPLIED TO SVC99
+         MVI   S99TUNUM+1,X'01'    NUMBER OF ENTRIES
+         MVI   S99TULNG+1,44       SIZE OF DSNAME
+         LA    R4,L'DSNTXTUT(R4)   INCREMENT TO SSREQ TEXT UNIT
+         ST    R4,SSRTXTPT         ADDRESS OF SSREQ TEXT UNIT
+         MVI   S99TUKEY+1,DALSSREQ THIS IS A REQUEST FOR SUBSYSTEM
+         MVI   S99TULNG+1,4        LENGTH OF PARM FIELD
+         MVC   S99TUPAR(4),SSIBSSNM PRIMARY SUBSYSTEM NAME
+         DROP  R2                  UNUSE SSIB
+         MVI   S99TUNUM+1,X'01'    NUMBER OF REQUESTS
+         LA    R4,L'SSRTXTUT(R4)   INCREMENT TO DDN TEXT UNIT
+         ST    R4,DDNTXTPT         ADDR OF DDNAME RETURNED TEXT UNIT
+         MVI   DDNTXTPT,S99TUPLN   LAST TEXT UNIT PTR. IN LIST
+         MVI   S99TUKEY+1,DALRTDDN RETURN DDNAME TO ME
+         MVI   S99TUNUM+1,X'01'    NUMBER OF ENTRIES
+         MVI   S99TULNG+1,8        LENGTH OF PARM FIELD
+         MVC   S99TUPAR(8),BLANKS  INITIALIZE TO BLANKS
+         LA    R4,L'DDNTXTUT(R4)   INCREMENT TO DDNAME UNALLOC TEXT
+         ST    R4,UDNTXTPT         SAVE UNALLOC TEXT ADDRESS
+         MVI   S99TUKEY+1,DUNDDNAM USE DDNAME TO UNALLOCATE
+         MVI   S99TUNUM+1,X'01'    NUMBER OF ENTRIES
+         MVI   S99TULNG+1,8        LENGTH OF PARM FIELD
+         LA    R4,L'UDNTXTUT(R4)   INCREMENT TO OVERRIDE TEXT
+         ST    R4,UORTXTPT         SAVE ADDRESS OF OVERRIDE TEXT
+         MVI   UORTXTPT,S99TUPLN   LAST TEXT UNIT PTR. IN LIST
+         MVI   S99TUKEY+1,DUNOVDSP OVERRIDE DISPOSITION KEY
+         MVI   S99TULNG+1,1        LENGTH OF PARM FIELD
+         MVI   S99TUNUM+1,X'01'    NUMBER OF ENTRIES
+         DROP  R4
+         DROP  R3
+***                                                                 ***
+*        INITIALIZE FIRST TYPE 6 RECORD                               *
+***                                                                 ***
+         L     R3,PARSMF
+         USING SMFREC,R3
+         XC    SMFREC(SMF6),SMFREC ZERO SMF RECORD
+         MVI   SMFLEN1+1,SMFEND-SMFLEN1 LENGTH OF SECTION
+         MVI   SMFRECTP,X'06'      RECORD TYPE
+         MVI   SMFLLBB+1,(SMFENDFM-SMFLLBB)+(SMFEND-SMFRSV1) SIZE OF 6
+         TIME  BIN
+         STM   R0,R1,SMFWORKA      SAVE START TIME AND DATE
+         MVC   SMFSTTM(8),SMFWORKA PUT TIME AND DATE IN SMF RECORD
+         DROP  R3
+***                                                                 ***
+*   SET UP SSOB TO ISSUE IEFSSREQ TO ACCESS A DATA SET                *
+***                                                                 ***
+SD82SSOB EQU   *
+         L     R1,PARWORK          GET ADDRESS OF CORE FOR SSOB
+         LA    R7,4(R1)            INCREMENT TO SSOB ITSELF
+         USING SSOB,R7
+         ST    R7,0(R1)            SET UP ADDR OF ADDR OF SSOB IN R1
+         OI    0(R1),X'80'
+         XC    SSOBEGIN(SSOBHSIZ),SSOBEGIN   CLEAR SSOB HEADER
+         LA    R2,SSOBGN           INITIALIZE SSOB
+         XC    0(SSSOSIZE,R2),0(R2)     CLEAR SYSOUT EXTENSION
+         MVC   SSOB(WTRSOSIZ),WTRSSOB   INITIALIZE HEADER
+         ST    R2,SSOBINDV         ADDRESS OF SYSOUT EXTENSION
+         LA    R4,SSSOSIZE         SYSOUT EXTENSION SIZE
+         STH   R4,0(R2)            SET UP SIZE OF SYSOUT EXTENSION
+         MVC   SSSOPGMN,BLANKS     INITIALIZE WRITER NAME TO BLANKS
+         OI    SSSOFLG1,SSSODST    DEFAULT DESTINATION IS LOCAL
+         MVC   SSSODEST(8),=C'LOCAL   ' SET DEFAULT DESTINATION
+         TM    PARDUM,PARMOD       IS WRITER TO WAIT FOR MODIFY COMND?
+         BO    SD82WAIT            YES, GO WAIT
+         OI    SSSOFLG1,SSSOSCLS   INDICATE USE CLASS LIST
+SD82CLSL MVC   SSSOCLSL,PARGCLN    SET UP CLASS LIST IN SSOB
+SD82HASP EQU *
+         IEFSSREQ                  ASK HASP FOR WORK
+         LTR   R15,R15             TEST RETURN CODE
+         BZ    SD82RTRN            NORMAL RETURN
+         LA    R11,SD82M1          SET UP ADDRESS OF ERR MSG
+         STH   R15,PARSMB+2        SAVE RETURN FROM SUBSYSTEM   OZ02411
+         B     SD82STOP
+SD82RTRN EQU   *
+         C     R15,SSOBRETN
+         BE    SD82NEXT            NORMAL RETURN
+         LA    R2,4                COMPARE RETURN TO 4
+         C     R2,SSOBRETN         ARE THERE ANY MORE DATA SETS.
+         BE    SD82WAIT            NO, WAIT FOR WORK
+         OI    PARDUM,PARMOD+PARWAIT    WRITE MSG. AND WAIT ON ONE ECB
+         L     R14,PARWKLST        ADDRESS WORK LIST
+         USING WORKLST,R14         ADDRESS WORK LIST
+         L     R1,WJFCB            WORK AREA FOR WTO SKELETON
+         DROP  R14
+         LA    R11,M82KEYBD        INVALID JOBID/DEST MSG
+         MVC   0(SIZINVAL,R1),0(R11)    MOVE IN MSG. SKELETON
+         MVC   WTRNAM(3,R1),PARWTRNM  PUT IDENT. OF WTR IN MSG.
+         NI    SSSOFLG2,255-SSSOCTRL    TURN CONTROL BIT OFF
+         CLI   SSOBRETN+3,SSSOIDST WAS THERE A DEST. ERROR
+         BNE   SD82SSJB            NO, GO TEST FOR JOBID ERROR
+         LA    R2,SSSODEST         ADDRESS OF DEST IN SSOB
+         MVC   DESTDISP(5,R1),=C'DEST '      MOVE DEST INTO MSG.
+         B     WRITDJ              GO WRITE MSG.
+SD82SSJB CLI   SSOBRETN+3,SSSOINVA IS RETURN INVALID SEARCH ARGUMENTS
+         BNE   SD82SSER            NO, GO PRINT SS ERR.
+         TM    SSSOFLG1,SSSOSJBI   DO I SELECT BY JOBID?
+         BZ    SD82SSER            NO, THEN IT IS LOGIC ERROR
+         LA    R2,SSSOJOBI         ADDRESS OF JOBID IN SSOB
+WRITDJ   MVC   DISPPARM(8,R1),0(R2)     MOVE SSOB FIELD INTO MSG.
+         WTO   MF=(E,(1))          WRITE MSG.
+         B     SD82WAIT            GO WAIT FOR NEW COMMAND
+SD82SSER EQU   *
+         LA    R11,SD82M1          ADDR. OF ERROR MSG.
+         MVC   PARSMB+2(2),SSOBRETN+2        SAVE RETURN CODE
+         MVI   PARSMB,X'FF'        INDICATE MSG. IS SSOBRETN
+         B     SD82STOP
+SD82NEXT EQU   *
+***                                                                 ***
+*  DETERMINE IF WRITER NAME IS VALID OR IF OPERATOR MUST BE QUESTIONED*
+***                                                                 ***
+         OI    PARDUM,PARWAIT      PRINT WAIT MSG. NEXT TIME
+         L     R2,PARWKLST         ADDRESS WORK LIST
+         USING WORKLST,R2
+         MVC   WOWRN(8),OSWTR      SET UP STD. NAME AS DEFAULT
+         CLC   SSSOPGMN,BLANKS     WAS THERE A SPECIAL WTR NAME?
+         BE    SD82DAL             NO
+         CLC   SSSOPGMN,OSWTR      IS EXTERNAL WRITER NAME = IBM NAME?
+         BE    SD82DAL             YES
+         LA    R1,NOENTRYS         ENTRIES IN NAME TABLE
+         L     R3,PARNAMES         ADDR. OF VALID WRITER NAMES
+TESTNAME CLC   SSSOPGMN,0(R3)      IS NAME IN TABLE
+         BE    SD82USE             YES
+         CLI   0(R3),X'00'         IS THIS END OF TABLE
+         BE    ASKOPER             YES, OPERATOR MUST VALIDATE NAME
+         LA    R3,ENTRYSIZ(R3)     INCREMENT TO NEXT ENTRY
+         BCT   R1,TESTNAME         TRY AGAIN
+         L     R3,PARNAMES         POINT TO BEGINNING OF TABLE
+         MVC   0(TBLESIZ-ENTRYSIZ,R3),ENTRYSIZ(R3) WIPE OUT FIRST ENTRY
+         LA    R3,TBLESIZ-ENTRYSIZ(R3)  POINT TO LAST ENTRY IN TABLE
+ASKOPER  L     R4,WJFCB            GET ADDR. OF MSG AREA
+         LA    R11,SD82M6          ADDR. OF MSG.
+         SLR   R1,R1               ZERO REGISTER
+         ST    R1,0(,R4)           ZERO ECB
+         STH   R1,4(,R4)           ZERO REPLY AREA
+         MVC   6(8,R4),BLANKS      BLANK OUT REPLY AREA
+         ST    R4,OECBL(R4)        STORE ADDR. OF ECB IN WTOR
+         LA    R1,OREPLY(R4)       INCREMENT TO REPLY AREA
+         ST    R1,OREPLL(R4)       STORE ADDR. OF REPLY AREA IN WTOR
+         MVI   OREPLL(R4),10       PUT IN LENGTH 10 FOR REPLY
+         MVC   OWTORH(LENVALID,R4),0(R11)    MOVE MSG. SKELETON
+         MVC   OFSETO(3,R4),PARWTRNM    PUT IN WRITER IDENT.
+         MVC   MSGNAME(8,R4),SSSOPGMN   NAME OF WRITER TO BE VALIDATED
+         MVC   JOBIDSP(8,R4),SSSOJOBI   PRINT JOBID
+         LA    R1,OREPLL(,R4)      WTOR LOCATION
+         WTOR  MF=(E,(1))          WRITE TO OPERATOR
+         LR    R1,R4               ECB ADDR.
+         WAIT  ECB=(1)             WAIT FOR REPLY
+         CLI   OREPLY(R4),C'U'     USE THE NAME?
+         BNE   SD82NO              NO, CONTINUE TESTING
+         MVC   0(8,R3),SSSOPGMN    PUT VALID WTR NAME IN TABLE
+SD82USE  MVC   WOWRN(8),SSSOPGMN   USE WRITER NAME
+         B     SD82DAL             GO ALLOCATE DATA SET
+SD82NO   CLI   OREPLY(R4),C'N'     DON'T WRITE DATA SET?
+         BNE   SD82DAL             NO, USE DEFAULT
+         CLI   OREPLY+1(R4),C','   IS ANOTHER NAME TO BE SUBSTITUTED?
+         BNE   SD82ALUN            BO, BYPASS THIS DATA SET
+         MVC   WOWRN(8),OREPLY+2(R4)    USE NAME SUPPLIED BY OPERATOR
+SD82DAL  EQU   *                   DYNAMICALLY ALLOCATE DATA SET
+***                                                                 ***
+*    SET UP TO DYNAMICALLY ALLOCATE DATA SET                          *
+***                                                                 ***
+         MVI   S99VERB,S99VRBAL    ALLOCATION VERB
+         LA    R3,DISPDSN(R8)      ADDR. DSNAME TEXT UNIT
+         ST    R3,S99TXTPP         STORE ADDR OF TEXT UNIT PTRS
+         L     R4,0(,R3)           ADDR OF FIRST TEXT UNIT
+         MVC   6(44,R4),SSSODSN    GET DATA SET NAME FROM SSOB
+         BAL   R11,DYNAL           DYNAMICALLY ALLOCATE DATA SET
+***                                                                 ***
+         MVC   DCBLRECL(2),PARLRECL     RESET OUTPUT DCB LRECL
+         L     R2,PARWKLST         GET WORKLST ADDRESSABILITY
+         USING WORKLST,R2
+         L     R3,PARSMF
+         USING SMFREC,R3           ADDRESS SMF RECORD
+         CLC   SSSOJOBN,SMFJOBNM   DID JOB NAME CHANGE
+         BE    SD82SAME            NO
+         CLI   SMFCLASS,0          IS THIS THE FIRST JOB
+         BNE   CHSEP               NO, CONTINUE WITH SEPARATOR TEST
+         BAL   R4,CRE8NEW          GO INITIALIZE SMF RECORD
+CHSEP    EQU   *
+***                                                                 ***
+*   CALL JOB SEPARATOR ROUTINE, IF APPLICABLE                         *
+***                                                                 ***
+         L     R4,PARJBSEP         ADDRESS OF SEPARATOR ROUTINE
+         CLC   0(8,R4),BLANKS      IS THERE A JOB SEPARATOR ROUTINE
+         BE    SD82SAME            NO JOB SEPARATOR ROUTINE
+         TM    PARSWCH,PARDUMMY    IS OUTPUT DUMMY DATA SET
+         BO    SD82SEP             YES
+         L     R1,PARUCB           NO, GET ADDRESS OF OUTPUT DCB
+         USING UCBOB,R1            ADDRESS UCB
+         TM    UCBTBYT3,UCB3UREC   IS DEVICE CLASS UNIT RECORS
+         BNO   SD82SEP             NO, CONTINUE
+         TM    UCBTBYT4,TTETYPE    IS UNIT TYPE A 3211 PRINTER
+         BNO   SD82SEP             NO
+* CHECK OUTPUT UCB FOR DEFAULT LOADS IN UCS/FCB BUFFERS
+         L     R1,UCBXTADR         SHIFT TO UCB/UCS EXTENSION
+         USING UCBUCS,R1
+         TM    UCBUCSOP,UCBUDF     IS DEFAULT VALID
+         BO    CHKFCB              CONTINUE
+         CLI   PARUCSID,ZERO       DO I HAVE A UCSID
+         BNE   TTENT               YES
+CHKFCB   TM    UCBFCBOP,UCBFDF     IS PRESENT FCB IMAGE DEFAULT?
+         BO    SD82SEP             YES, NORMAL OPERATION
+         CLI   PARFCBID,ZERO       WAS FCB LOADED?
+         BE    SD82SEP             NO
+TTENT    OI    PARSWCH,PARTTE1     TURN ON TTE ENTRY SW
+         ST    R13,PARSAP          SET UP SAVE AREA ADDRESS FOR TTE
+         LA    R13,PARSAV          SAVE AREA FOR TTE
+         DROP  R1
+         LR    R1,R8               ADDRESS OF PARLIST IN R1
+         L     R7,PARWKLST         ADDRESS OF WORKLST FOR TTE
+* LINK TO THE 3211 SUPPORT MODULE                                     *
+         LINK  EP=IEFSDTTE,MF=(E,(1))   LINK TO 3211 PROCESSOR
+         L     R13,PARSAP          RELOAD R13
+         USING WORKLST,R7          WORK LIST ADDRESSABLILTY
+         L     R7,WOSAP            ERROR RETURN ADDRESS
+         CLI   19(R7),0            DID TTE GIVE AN ERROR RETURN
+         BNE   SD82NORM            YES
+         L     R7,PARWORK          GET ADDRESS OF SSOB
+         LA    R7,4(R7)            RESTORE ADDRESS OF SSOB
+         USING SSOB,R7             RESTORE SSOB ADDRESSABILITY
+         B     SD82SEP             GO TO JOB SEPARATOR ROUTINE
+SD82SAME EQU   *
+         TM    VARBA,UNRWR         NO SMF OR PAUSE IF NOT UNIT RECORD
+         BNZ   SD82UR              OUTPUT DEVICE IS UNIT RECORD
+         MVC   SMFJOBNM(8),SSSOJOBN     CHANGE SMF JOB NAME
+         B     SD82DCB             GO INITIALIZE DCB
+SD82UR   SLR   R1,R1               CLEAR R1
+         CLC   SMFJOBNM(8),SSSOJOBN     DID JOBNAME CHANGE
+         BE    TCLAS               NO, TEST FOR CLASS CHANGE
+         LA    R1,1(R1)            INCREMENT R1 TO INDICATE SMF
+TCLAS    CLC   SMFCLASS(1),SSSOCLAS     DID CLASS CHANGE
+         BE    TFORM               NO
+         LA    R1,1(R1)            INDICATE SMF NEEDED
+TFORM    CLC   PARFORM(4),SSSOFORM DID FORM CHANGE?
+         BE    TSMF                NO
+         BAL   R4,WRITSMF          WRITE SMF RECORD
+         MVC   PARFORM(4),SSSOFORM INDICATE NEW FORM UNMBER
+         LA    R11,M82FORM         FORMS MOUNT MESSAGE ADDRESS
+         SR    R15,R15             INDICATE THIS IS FORMS MOUNT MSG.
+         B     SD82WTOR            GO WRITE MSG
+TSMF     LTR   R1,R1               WRITE SMF RECORD?
+         BZ    TPAUS               NO, TEST FOR PAUSE BY DATA SET
+         BAL   R4,WRITSMF          GO WRITE SMF RECORD
+TPAUS    TM    PARSWCH,PARDAT
+         BZ    SD82DCB             NO PAUSE BY DATA SET
+         LA    R11,SD82M7          ADDRESS OF PAUSE MSG.
+         LA    R15,1(,R15)         MAKE R15 NON-ZERO
+         DROP  R3
+SD82WTOR L     R3,WJFCB            MESSAGE AREA
+         MVI   0(R3),X'00'         ZERO FIRST TWO WORDS
+         MVC   1(7,R3),0(R3)       ZERO FIRST TWO WORDS
+         ST    R3,RECBL(R3)        PUT IN PTR. TO ECB
+         LA    R14,REPLY(,R3)      REPLY LOCATION
+         ST    R14,REPLL(,R3)      POINT TO IT
+         MVI   REPLL(R3),1         PUT IN LENGTH 1 FOR REPLY
+         MVC   WTORH(LENGTH,R3),0(R11)  MOVE IN MSG. SKELETON
+         MVC   OFSET(3,R3),PARWTRNM     WRITER IDENTITY
+         LTR   R15,R15             FORMS MSG.?
+         BNZ   PIPAS               NO
+         MVC   FORMN(4,R3),PARFORM MOVE IN FORM NUMBER
+PIPAS    LA    R1,REPLL(,R3)       INCREMENT TO MSG. ITSELF
+         WTOR  MF=(E,(1))          WRITE TO OPERATOR
+         WAIT  ECB=(R3)            WAIT FOR REPLY
+SD82DCB  EQU   *                   INITIALIZE DCB
+*   INITIALIZE INPUT DCB                                              *
+***                                                                 ***
+         L     R5,DCBIN            GET ADDRESS OF INPUT DCB
+         MVC   IHADCB(IDCB),INDCB  INITIALIZE INPUT DCB
+         L     R3,S99TXTPP         ADDRESS OF TEXT UNITS
+         L     R4,DDNTXTPT-DYNTXTPT(R3) ADDRESS OF DDNAME TEXT UNIT
+         MVC   DCBDDNAM(8),6(R4)   PUT DDNAME IN INPUT DCB
+***                                                                 ***
+*   READ JFCB FOR INPUT DCB                                           *
+***                                                                 ***
+         LA    R3,WJFCB            ADDRESS OF INPUT DCB JFCB CORE
+         ST    R3,DCBEXLST         PUT JFCB ADDR. INTO INPUT DCB EXTLST
+         MVI   WJFCB,X'87'         INDICATE THIS IS ONLY ENTRY
+         LA    R3,4                FOUR
+         L     R1,WJFCB            ADDRESS OF JFCB
+         SLR   R1,R3               ADDRESS OF L FORM OF READ JFCB
+         MVC   0(L'JFCBL,R1),JFCBL PUT JFCB LIST INTO GOTTEN CORE
+         RDJFCB ((R5)),MF=(E,(1))  READ JFCB
+         SLR   R3,R3               CLEAR R3
+         L     R1,WJFCB            GET ADDRESS OF JFCB
+         USING INFMJFCB,R1         ADDRESS JFCB
+         CLC   JFCUCSID(4),HASPDFLT     IS UCS HASP DEFAULT
+         BNE   TSTFCB              NO, GO TEST FOR DEFAULT FCB
+         ST    R3,JFCUCSID         MAKE DEFAULT ZERO
+TSTFCB   CLC   JFCFCBID(4),HASPDFLT     IS FCB HASP DEFAULT
+         BNE   CONTCSCB            NO
+         ST    R3,JFCFCBID         MAKE DEFAULT ZERO
+         DROP  R1
+CONTCSCB EQU   *                   GET CSCB
+***                                                                 ***
+*   CREATE CANCEL CSCB FOR SUBTASK - CANCELABLE STEP TYPE             *
+***                                                                 ***
+         LA    R0,CSCBSIZ          GET SIZE OF CSCB
+         LR    R3,R0               SAVE CSCB SIZE
+         ICM   R0,8,SBPL           PUT SUBPOOL NUMBER IN HIGH ORDER BYT
+         MODESET EXTKEY=ZERO       KEY TO ACCESS CSCB
+         GETMAIN R,LV=(0)          GET CORE FOR CSCB
+         USING CHAIN,R1            ADDRESSABILITY FOR CSCB
+         MVI   CHAIN,X'00'         ZERO CSCB CORE
+         MVC   CHAIN+1(CSCBSIZ-1),CHAIN  ZERO CSCB CORE
+         SRL   R3,3                CONVERT TO DOUBLE WORD SIZE
+         STC   R3,CHSZE            STORE CSCB SIZE
+         MVC   CHKEY(8),BLANKS     PUT IN PADDING OF BLANKS
+         MVC   CHKEY(3),PARWTRNM   PUT IDENT. OF WTR IN CSCB
+         MVC   CHUNIT(3),PARWTRNM  PUT IDENT. OF WTR IN CSCB
+         L     R3,PARWKLST         GET ADDR. OF ECBLIST CORE
+         USING WORKLST,R3
+         SR    R2,R2               ZERO R2
+         ICM   R2,7,VARAR+1        GET ADDRESS OF LISTS
+         NI    VARBA,X'EF'         TURN OFF DATASET WTR-FAILURE SWITCH
+         USING LISTS,R2
+         ST    R1,CSCBADDR         SAVE THE NEW CSCB ADDR.
+         LA    R4,CHCECB           ECB ADDR IN NEW CSCB
+         ST    R4,WOTIQ
+         ST    R4,CHECBPTR
+         SR    R0,R0               ZERO REGISTER ZERO
+         ST    R0,CHECB            CLEAR CANCEL ECB
+         ST    R0,ATACHECB         CLEAR ATTACH ECB
+         LA    R4,ATACHECB         SET UP ADDR OF ATTACH ECB
+         ST    R4,ATECBPTR         ATTACH - ECB IN ECBLIST
+         MVI   ATECBPTR,X'80'      MARK AS LAST ECB
+         MVI   CHTRKID,CHJOBID     INDICATE JOB IDENTIFIER
+         L     R4,PSAAOLD-PSA      ADDRESS OF ASCB
+         LH    R4,ASCBASID-ASCB(,R4)    ADDRESS OF ASID
+         STH   R4,CHASID           BUT ASID INTO CSCB
+         OI    CHACT,CHCL          MARK CSCB 'CANCELABLE'
+         OI    CHSTS,CHAD          INDICATE 'ADD TO CHAIN'
+         MGCR  (1),CHAIN
+         DROP  R1
+         MODESET EXTKEY=HASP       NORMAL KEY
+***                                                                 ***
+*        ATTACH THE WRITER                                            *
+***                                                                 ***
+         LA    R1,IASXS82A
+         IDENTIFY EP=IASXS82A,ENTRY=(1)
+         LR    R1,R3               PARAMETER REGISTER FOR 087
+         MVC   ATACHLST(SUPLEND-SUPVLIST),SUPVLIST MOVE ATTACH LIST
+         L     R13,WOSAP           OLD SAVE AREA
+         XC    16(4,R13),16(R13)   INDICATE GOOD RETURN
+         LA    R13,WOSVA           REGISTER SAVE AREA
+         LA    R15,ATACHLST        ADDR. OF ATTACH LIST
+         LA    R14,ATACHECB        ADDRESS OF ECB FOR 087
+         ST    R14,ATACHLST+8      PUT INTO ATTACH LIST
+         ATTACH SF=(E,(15))        AWAY WE GO
+         ST    R1,ATACHTCB         SAVE SUBTASK'S TCB ADDR.
+         LA    R1,ATECBPTR         POINT TO ECBLIST
+         WAIT  ECBLIST=(1)         WAIT ON SUBTASK
+***                                                                 ***
+*        AFTER REGAINING CONTROL, DETACH AND UNCHAIN AND FREE CSCB    *
+***                                                                 ***
+         MODESET EXTKEY=ZERO       KEY TO ACCESS CSCB
+         L     R1,CSCBADDR
+         USING CHAIN,R1
+         NI    CHSTS,255-CHAD      TURN OFF ADD TO CHAIN INDICATOR
+         OI    CHSTS,CHDL+CHFC     INDICATE DELETE AND FREE CORE
+         MGCR  (1),CHAIN           GET RID OF CSCB
+         MODESET EXTKEY=HASP       NORMAL KEY
+         L     R5,DCBOT            GET OUTPUT DCB ADDRESS
+         L     R11,WOSAP           GET ADDRESS ERROR RETURN PUT AT
+         XC    16(4,R11),16(R11)   CLEAR RETURN INDICATION
+         L     R1,ATECBPTR         LOAD ATTACH ECB PTR
+         MVC   19(1,R11),3(R1)     MOVE RC FROM ECB POST CODE TO R15
+         L     R1,ATACHTCB         ADDR. OF SUBTASK TCB
+         MVI   S99VERB,S99VRBUN    UNALLOCATION VERB
+         DROP  R3
+         LA    R3,DISPUAL(R8)      INCREMENT TO UNAL
+         ST    R3,S99TXTPP         STORE ADDR. OF TEXT UNIT PTRS.
+         L     R3,0(R3)            ADDRESS OF DDNAME FOR UNALLOCATE
+         L     R4,DISPDDN(R8)      ADDRESS OF DDNAME UNIT
+         MVC   6(8,R3),6(R4)       PUT DDNAME INTO TEXT FOR UNALLOC
+         L     R4,DISPOVR(R8)      ADDRESS OF OVERIDE UNIT
+         TM    16(R1),X'80'        TEST FOR SUCCESSFUL COMPLETION
+         BO    KEEPDS              ABNORMAL RETURN FROM SUBTASK
+         MVI   6(R4),X'04'         DELETE DATA SET
+         LA    R4,DETACH           NORMAL RETURN FROM SUBTASK
+         B     DYNUN               UNALLOCATE WITH DELETE DISP
+KEEPDS   MVI   6(R4),X'08'         KEEP DATA SET
+         LA    R4,BADSBTSK         BAD RETURN FROM SUBTASK
+DYNUN    BAL   R11,DYNAL           DYNAMICALLY UNALLOCATE DATA SET
+         BR    R4                  DETACH SUBTASK
+DETACH   EQU   *
+* RESTORE I/O PURGED AT END OF SUBTASK
+         L     R1,DCBDEBAD         LOAD DEB POINTER
+         LA    R1,DEBUSRPG(R1)     ADDERESS OF USER PURGE CHAIN
+         RESTORE (1)               SVC 17
+         LA    R1,ATACHTCB         LOAD SUBTASK TCB
+         DETACH (1)                DETACH IT
+         L     R2,PARSMF           ADDRESS SMF RECORD
+         USING SMFREC,R2           ADDRESSABILITY FOR SMF RECORD
+         IC    R1,SMFDSCTF         GET DATA SET COUNT
+         LA    R1,1(,R1)           INCREMENT BY 1
+         STC   R1,SMFDSCTF         STORE NEW COUNT IN SMF RECORD
+         DROP  R2
+TESTCSCB EQU   *
+         BAL   R2,SD82COMD         SEE IF COMMAND ECB POSTED
+         L     R1,PARWORK          SSOB ADDR.
+         B     SD82HASP            GO GET MORE WORK
+SD82WAIT EQU   *                   SET UP TO WAIT FOR DIRECTION
+         L     R2,PARWKLST         ADDR. OF WORK LIST
+         USING WORKLST,R2          WORK LIST ADDRESSABILITY
+         TM    VARBA,UNRWR         NO SMF IF NOT UNIT RECORD
+         BZ    SD82W               SKIP SMF
+         BAL   R4,WRITSMF          GO WRITE SMF RECORD IF NEEDED
+SD82W    EQU   *                   CONTINUE
+         L     R1,WJFCB            USE JFCB AREA FOR MESSAGE AREA
+         L     R4,VARAR            ADDR. OF ECBS,ETC.
+         USING LISTS,R4
+         DROP  R2
+         TM    PARDUM,PARWAIT      IS WRITER TO WRITE WAIT MSG.
+         BZ    WAITWORK            NO
+         LA    R11,M82WAIT         WAIT MESSAGE ADDRESS
+         LH    R3,0(R11)           GET SIZE OF MESSAGE
+         LA    R3,3(R3)            SIZE OF WHOLE WTO
+         EX    R3,SD82MSG          MOVE SKELETON TO MESSAGE AREA
+         MVC   WTRNAM(3,R1),PARWTRNM  PUT IDENT. OF WTR IN MSG.
+         LA    R3,CRITERIA(R1)     INCREMENT TO VARIABLE AREA
+         MVI   0(R3),X'40'         CLEAR VARIABLE AREA
+         MVC   1(VARBLARA-1,R3),0(R3)  BLANK OUT VARIABLE AREA  OZ01279
+         TM    SSSOFLG1,SSSOSCLS   DOES WTR SELECT BY CLASS LIST
+         BZ    TRYFORM             NO
+         MVI   0(R3),C','          SEPARATE KEYWORDS WITH COMMAS
+         MVC   2(6,R3),CLASS       MOVE IN 'CLASS='
+         MVC   8(8,R3),SSSOCLSL    MOVE CLASS LIST FROM SSOB
+         LA    R3,15(R3)           INCREMENT FOR NEXT KEYWORD
+TRYFORM  TM    SSSOFLG1,SSSOSFRM   DOES WTR SELECT BY FORM NUMBER
+         BZ    TRYDEST             NO
+SUB1     BCTR  R3,0                SUBTRACT 1 TO CHECK BLANK
+         CLI   0(R3),C' '          IS THIS A BLANK
+         BE    SUB1                YES, GO SUBTRACT AGAIN
+         MVI   1(R3),C','          SEPARATE KEYWORDS WITH COMMAS
+         MVC   3(6,R3),FORMS       MOVE 'FORMS=' INTO MSG
+         MVC   9(4,R3),SSSOFORM    MOVE FORM NUMBER FROM SSOB
+         LA    R3,12(R3)           INCREMENT TO NEXT KEYWORD SLOT
+TRYDEST  TM    SSSOFLG1,SSSODST    DOES WTR SELECT BY DEST
+         BZ    TRYJOBID            NO
+SUB2     BCTR  R3,0                SUBTRACT 1 TO CHECK BLANK
+         CLI   0(R3),C' '          IS THIS A BLANK
+         BE    SUB2                YES, GO SUBTRACT AGAIN
+         MVI   1(R3),C','          SEPARATE KEYWORDS WITH COMMAS
+         MVC   3(5,R3),DEST        MOVE 'DEST=' INTO MSG.
+         MVC   8(8,R3),SSSODEST    MOVE DEST NAME FROM SSOB
+         LA    R3,15(R3)           INCREMENT TO NEXT KEYWORD SLOT
+TRYJOBID TM    SSSOFLG1,SSSOSJBI   DOES WTR SELECT BY JOBID
+         BZ    TRYWRITR            NO
+SUB3     BCTR  R3,0                SUBTRACT 1 TO CHECK BLANK
+         CLI   0(R3),C' '          IS THIS A BLANK
+         BE    SUB3                YES, GO SUBTRACT AGAIN
+         MVI   1(R3),C','          SEPARATE KEYWORDS WITH COMMAS
+         MVC   3(6,R3),JOBID       MOVE 'JOBID=' INTO MSG.
+         MVC   9(8,R3),SSSOJOBI    MOVE JOBID FROM SSOB
+         LA    R3,17(R3)           INCREMENT FOR NEXT KEYWORD
+TRYWRITR TM    SSSOFLG1,SSSOSPGM   DOES WTR SELECT BY PROGRAM NAME
+         BZ    WRITMSG             NO
+SUB4     BCTR  R3,0                SUBTRACT 1 TO CHECK BLANK
+         CLI   0(R3),C' '          IS THIS A BLANK
+         BE    SUB4                YES, GO SUBTRACT AGAIN
+         MVI   1(R3),C','          SEPARATE KEYWORDS WITH COMMAS
+         MVC   3(7,R3),WRITER      MOVE 'WRITER=' INTO MSG.
+         MVC   10(8,R3),SSSOPGMN   MOVE WRITER NAME FROM SSOB
+WRITMSG  WTO   MF=(E,(1))          WRITE WAITING FOR WORK MSG.
+         NI    PARDUM,WAITAND      CLEAR WAIT A BIT FLAG
+WAITWORK EQU   *
+         MVC   HASPECB,SSSOWTRC    SAVE ADDR. OF HASP ECB
+         MVC   COMNDECB,PARECBL    SAVE ADDR. OF COMMAND ECB FROM CSCB
+         BAL   R2,SD82COMD         SEE IF COMMAND ECB POSTED
+         L     R4,PARWKLST         ADDRESS OF WORK LIST
+         USING WORKLST,R4
+         L     R4,VARAR            ADDRESS OF ECB LISTS
+         USING LISTS,R4
+         OI    COMNDECB,X'80'      INDICATE COMM ECB IS LAST IN LIST
+         LA    R1,HASPECB          ADDR. OF WAIT LIST
+         TM    PARDUM,PARMOD       DOES WRITER WAIT ON ONLY ONE ECB?
+         BZ    WAIT                NO, WAIT ON TWO
+         LA    R1,COMNDECB         WAIT ONLY ON COMMAND ECB
+         NI    PARDUM,255-PARMOD   TURN WAIT BIT OFF
+WAIT     EQU   *
+         WAIT  1,ECBLIST=(1)       WAIT FOR WORK OR COMMAND ECB
+         MVI   SSSODSN,X'00'       INDICATE THIS IS AN INITIAL REQUEST
+         TIME  BIN                 GET TIME FOR SMF RECORD
+         L     R3,PARSMF           ADDRESS SMF RECORD
+         USING SMFREC,R3           SMF RECORD ADDRESSABILITY
+         STM   R0,R1,SMFWORKA      STORE TIME
+         MVC   SMFSTTM(8),SMFWORKA SAVE NEW START TIME
+         DROP  R3
+         BAL   R2,SD82COMD         WAS COMMAND ECB POSTED?
+         L     R1,PARWORK          ADDR. OF SSOB
+         B     SD82HASP            GO TRY TO GET MORE WORK FROM HASP
+         DROP  R4
+***                                                                 ***
+*        STOP THE WRITER                                              *
+***                                                                 ***
+SD82NORM LA    R11,SD82M2          NORMAL STOP MESSAGE
+SD82OK   XC    PARSMB,PARSMB       ZERO ERROR CODE
+SD82HALT OI    SSSOFLG2,SSSOCTRL   INDICATING STOPPING
+         L     R1,PARWORK          SSOB ADDR
+         IEFSSREQ                  TELL HASP WTR IS QUITTING
+SD82STOP EQU   *
+         L     R1,PARWKLST         ADDRESS OF WKT
+         USING WORKLST,R1          WORK LIST ADDRESSABILITY
+         TM    VARBA,UNRWR         IS OUTPUT DEVICE UNIT RECORD
+         BZ    SD82CLR             NO, SKIP SMF
+         BAL   R4,WRITSMF          GO WRITE FINAL SMF RECORD
+         DROP  R1                  DROP SMF ADDRESSABILITY
+SD82CLR  EQU   *
+         LA    R0,SD82CORE         SIZE OF CORE TO BE FREED
+         L     R1,PARWKLST         ADDRESS OF WKT
+         USING WORKLST,R1          ADDRESS WOSAP
+         L     R13,WOSAP           RESTORE REGISTER 13
+         L     R13,4(R13)          RESTORE SAVE AREA ADDRESS
+         DROP  R1
+         FREEMAIN R,LV=(0),A=(1)   FREE CORE
+         L     R1,PARXXA           GET THE SPANNED ADDRESS
+         LTR   R1,R1               IS THE ADDRESS EXISTANT
+         BZ    SD82NOSP            NO, DON'T DELETE IT
+         LA    R0,WORKFEND-WORKFXXX     GET SIZE
+         FREEMAIN R,LV=(0),A=(1)   FREE CORE
+         DELETE EP=IEFSDXXX        DELETE VARIABLE SPANNING MODULE
+SD82NOSP EQU   *
+***
+*        CLOSE OUTPUT DCB                                             *
+***                                                                 ***
+         MVC   PARWORK2(4),SD82CLOS     MOVE CLOSE LIST
+         L     R2,PARDCB           ADDR OF OUTPUT DCB
+         LA    R1,PARWORK2         POINT TO CLOSE LIST
+         CLOSE ((R2),),MF=(E,(1))  CLOSE OUTPUT DCB
+***                                                                 ***
+*        SET UP MESSAGE TO OPERATOR TO INDICATE WRITER CLOSED         *
+***                                                                 ***
+         L     R1,PARWORK          MSG. AREA
+         LH    R3,0(R11)           MSG. SIZE
+         LA    R3,3(R3)            INCREMENT TO INCLUDE DESC. & RT
+         EX    R3,SD82MSG          MOVE IN MESSAGE PATTERN
+         MVC   UNIT(3,R1),PARWTRNM PUT IDENT. OF WTR IN MSG.
+         L     R3,PARCOMM          GET ADDR. OF COMM AREA
+         USING COMMAD,R3           CSCB COMMUNICATIONS AREA
+         L     R3,COMMCIB          GET ADDRESS OF CIB
+         USING CIB,R3
+         SR    R0,R0               CLEAR REGISTER
+         IC    R0,CIBCONID         GET CONSOLE IDENTIFIER
+         SR    R5,R5
+         C     R5,PARSMB           ARE ANY ERROR CODES TO BE PRINTED?
+         BE    SD82WTOO            NO
+         UNPK  SSERR(5,R1),PARSMB+2(3)
+         TR    SSERR(4,R1),TRTBLE-240   MAKE CODE PRINTABLE
+         MVI   SSERR+4(R1),C'/'    INSERT SLASH INTO MESSAGE
+         CH    R5,PARSMB           ANY MORE ERROR CODES?
+         BE    SD82WTOO            NO
+         UNPK  DALERR(5,R1),PARSMB(3)
+         TR    DALERR(4,R1),TRTBLE-240  MAKE CODE PRINTABLE
+         MVI   DALERR+4(R1),X'40'
+         DROP  R3
+***                                                                 ***
+*        WRITE MSG TO OPERATOR TO INDICATE WRITER CLOSED              *
+***                                                                 ***
+SD82WTOO WTO   MF=(E,(1))
+***                                                                 ***
+*        FREE WORK AREAS AND RETURN                                   *
+***                                                                 ***
+SD82PARF L     R1,PARDCB           ADDR OF CORE GOT BY IEFSD080
+         LA    R7,4                DECREMENT TO
+         SR    R1,R7                 LENGTH FIELD ADDR.
+         L     R0,0(R1)            LOAD PREVIOUSLY STORED LENGTH
+         FREEMAIN R,LV=(0),A=(1)   FREE PARLIST AND OUTPUT DCB, ETC.
+         RETURN (14,12),RC=0       ISSUE RETURN
+***                                                                 ***
+*        THE WRITER JUST GAVE UP CONTROL                              *
+***                                                                 ***
+WRITSMF  EQU   *                   WRITE OUT SMF RECORD, IF ANY DATA
+         L     R3,PARSMF           ADDRESS OF SMF RECORD
+         USING SMFREC,R3           ADDRESSABILITY TO TYPE 6 RECORD
+         MVC   SMFWORKA(4),SMFSOCTF     DATA SET COUNT
+         ICM   R0,15,SMFWORKA      TEST FOR ZERO
+         BZ    CRE8NEW             CREATE NEW SMF RECORD
+         MVC   SMFENDFM(SMFEND-SMFRSV1),SMFRSV1  MOVE RECORD INTO PLACE
+         LA    R1,SMFLLBB          ADDRESS OF SMF RECORD
+         SMFWTM (1)                WRITE TYPE 6 RECORD
+         TIME  BIN                 GET TIME FOR NEXT RECORD
+         STM   R0,R1,SMFWORKA      SAVE FOR NEXT RECORD
+         MVC   SMFSTTM(8),SMFWORKA GET NEW START TIME
+CRE8NEW  MVC   SMFJOBNM(8),SSSOJOBN     PUT JOB NAME INTO SMF RECORD
+         MVC   SMFFORM(4),SSSOFORM SAVE FORM UNMBER
+         MVC   SMFCLASS(1),SSSOCLAS     SAVE CLASS OF DATA SET
+         L     R15,SSSOWTRC        ADDRESS OF JOB LOG
+         MVC   SMFRDSTM(16),SSSORDR(R15)     READER START TIME
+         MVC   SMFJOBNO(4),SSSOJOBI+4   JOB NUMBER
+         MVI   SMFSOCTF,0          ZERO COUNTS
+         MVC   SMFSOCTF+1(5),SMFSOCTF   ZERO COUNTS
+         MVC   SMFFCB,PARFCBID     DEFAULT FCBID
+         MVC   SMFUCS,PARUCSID     DEFAULT UCS
+         LA    R1,SMF6             SIZE OF SMF WORK AREA
+         ST    R1,SMFWKLL          SAVE LENGTH OF WORK AREA
+         MVI   SMFDYCNT,0          CLEAR SMF RECORD WORK AREA
+         MVC   SMFDYCNT+1(4),SMFDYCNT   CLEAR AREA
+         DROP  R3
+         BR    R4                  RETURN TO CALLER
+***                                                                ***
+*   SUBROUTINE TO CHECK TO SEE IF THE COMMAND ECB HAS BEEN POSTED     *
+***                                                                ***
+SD82COMD EQU   *
+         L     R4,PARECBL          ADDR OF COMMAND ECB
+         XR    R0,R0
+         TM    0(R4),STOPCM        STOP COMMAND
+         BO    SD82NORM            EXIT
+TESTMOD  TM    0(R4),MODFCM        MODIFY COMMAND?
+         BZR   R2                  NO, RETURN TO CALLER
+MODIFY   LR    R1,R6               RESTORE PARM LIST ADDRESS
+         OI    PARDUM,PARWAIT      PRINT WAIT MSG. NEXT TIME
+         MODESET EXTKEY=ZERO       KEY FOR CSCB ACCESSING
+         ST    R0,0(R4)            ZERO ECB
+         MODESET EXTKEY=HASP       NORMAL KEY
+         STM   R0,R12,20(R13)      SAVE REGISTERS
+         L     R15,SD82EXIT        GO TO SD081 TO PROCESS MODIFY
+         BALR  R14,R15
+         LM    R0,R12,20(R13)      RESTORE REGISTERS
+         TM    PARDUM,PARMOD       WAS MODIFY COMMAND INVALID?
+         BO    SD82WAIT            GO AWAIT COMMAND
+         LTR   R15,R15             NORMAL RETURN?
+         BNZ   SD82NORM            NO, HALT
+         L     R1,PARWORK          ADDR. OF SSOB
+         B     SD82CLSL            GO TO SSREQ WITH NEW CLASS LIST
+***                                                                 ***
+*   DYNAMICALLY ALLOCATE AND UNALLOCATE DATA SET TO DELETE IT         *
+***                                                                 ***
+SD82ALUN MVI   S99VERB,S99VRBAL    ALLOCATION VERB
+         LA    R3,DISPDSN(R8)      ADDR. DSNAME TEXT UNIT
+         ST    R3,S99TXTPP         STORE ADDR. OF TEXT UNIT PTRS.
+         L     R4,0(,R3)           ADDR. OF FIRST TEXT UNIT
+         MVC   6(44,R4),SSSODSN    GET DATA SET NAME FROM SSOB
+         BAL   R11,DYNAL           DYNAMICALLY ALLOCATE DATA SET
+         MVI   S99VERB,S99VRBUN    UNALLOCATION VERB
+         LA    R3,DISPUAL(R8)      INCREMENT TO UNAL
+         ST    R3,S99TXTPP         STORE ADDR. OF TEXT UNIT PTRS.
+         L     R3,0(,R3)           ADDRESS OF DDNAME FOR UNALLOCATE
+         L     R4,DISPDDN(R8)      ADDRESS OF DDNAME UNIT
+         MVC   6(8,R3),6(R4)       PUT DDNAME INTO TEXT FOR UNALLOC
+         L     R4,DISPOVR(R8)      ADDRESS OF OVERIDE UNIT
+         MVI   6(R4),X'04'         DELETE DATA SET
+         BAL   R11,DYNAL           DYNAMICALLY UNALLOCATE DATA SET
+         B     TESTCSCB            RETURN TO SUBSYSTEM
+         TITLE 'LINK TO JOB SEPARATOR ROUTINE'
+         USING SMFREC,R3           ADDRESSABILITY TO SMF RECORD
+SD82SEP  L     R2,PARWKLST         ADDRESS WORK LIST
+         USING WORKLST,R2          ADDRESSABILITY FOR WORK LIST
+         XR    R1,R1               ZERO R1
+         ICM   R1,7,WJFCB+1        SET UP TO CREATE JOB SEP PARM LIST
+         USING JSPARMS,R1          JOB SEP LIST ADDRESSABILITY
+         MVC   JSSWTCHS(1),VARBA   SET SWITCHES BYTE
+         MVC   JSDCBOUT(4),PARDCB  OUTPUT DCB POINTER
+         MVI   JSSWT078,ENTRY82    SET ENTRY FROM IASXSD82
+         LA    R0,SSSOJOBN         GET ADDRESS OF JOB NAME
+         ST    R0,JSNAMEAD         PUT IT INTO JOB SEP PARM LIST
+         LA    R0,JSLTH(R1)        ADDRESS OF SYSOUT CLASS BYTE
+         ST    R0,JSSYSCLA         PUT INTO SYSOUT CLASS POINTER
+         MVC   JSLTH(1,R1),SSSOCLAS     PUT CLASS NAME INTO LIST
+         MVC   JSLIST,LINKLST      MOVE LINK CODE TO CORE
+         ST    R4,JSLIST           STORE EPLOC INTO PARM LIST
+         LA    R15,JSLIST          PTR TO SPVR PARAM. LIST
+         LINK  ,MF=(E,(1)),SF=(E,(15))  LINK TO JOB SEPARATOR RPUTINE
+         LTR   R15,R15             ERROR RETURN?
+         BZ    SD82SAME            NORMAL RETURN
+         DROP  R3
+***                                                                 ***
+*   FOR ABNORMAL RETURN FROM JOB SEPARATOR ROUTINE, UNALLOCATE DATA   *
+*    SET WITH KEEP OPTION, ISSUE OUTPUT ERROR MESSAGE, AND HALT       *
+***                                                                 ***
+         MVI   S99VERB,S99VRBUN    UNALLOCATION VERB
+         LA    R3,DISPUAL(R8)      INCREMENT TO UNAL
+         ST    R3,S99TXTPP         STORE ADDRESS OF TEXT UNIT PTRS.
+         L     R3,0(R3)            ADDRESS OF DDNAME FOR UNALLOCATE
+         L     R4,DISPDDN(R8)      ADDRESS OF DDNAME
+         MVC   6(8,R3),6(R4)       PUT DDNAME INTO UNALLOC TEXT UNIT
+         L     R4,DISPOVR(R8)      ADDRESS OVERRIDE TEXT UNIT
+         MVI   6(R4),X'08'         KEEP DATA SET
+         BAL   R11,DYNAL           DYNAMICALLY UNALLOCATE DATA SET
+         LA    R11,SD82M3          INDICATE OUTPUT ERROR
+         B     SD82OK              RETURN
+         DROP  R1
+         TITLE 'CLEANUP AFTER SUBTASK TERMINATING ABNORMALLY'
+***                                                                 ***
+*   IF THE SUBTASK ABENDED, ISSUE WTO, CLEANUP, AND STOP              *
+***                                                                 ***
+BADSBTSK EQU   *
+         USING LISTS,R2
+         LA    R4,ATACHTCB         SAVE TCB ADDRESS
+         L     R2,ATACHTCB         TCB ADDRESS FOR SUBTASK
+         DROP  R2
+         L     R1,PARWKLST         ADDRESS WORKLIST
+         USING WORKLST,R1          ADDRESS WORKLIST
+         OI    VARBA,X'10'         TURN ON DATASET WTR-FAILURE SWITCH
+         L     R11,WOSAP           ADDRESS OF SAVE AREA
+         MVI   19(R11),X'00'       FAKE GOOD COMPLETION
+         L     R1,WJFCB            USE JFCB AREA FOR WTO
+         LR    R11,R1              SAVE AREA ADDRESS FOR PURGE LIST
+         DROP  R1
+         MVC   0(ABSZ,R1),ABEND    MOVE MSG. SKELETON
+         USING TCB,R2              TCB ADDRESSABILITY
+         L     R3,TCBTIO           ADDR. OF TIOT
+         USING TIOT1,R3
+         MVC   STEPNAME(8,R1),TIOCSTEP  MOVE IN STEPNAME
+         UNPK  CMPCODE(7,R1),TCBCMP+1(4)     TASK COMPLETION CODE
+         TR    CMPCODE(6,R1),TRTBLE-240  MAKE IT PRINTABLE
+         MVC   SYSCODE(3,R1),CMPCODE(R1)     MAKE ROOM FOR SLASH
+         MVI   SLASH(R1),C'/'      SEPARATE SYSTEM AND USER CODE
+         MVI   PERIOD(R1),C'.'     END OF PRINTED MSG.
+STEPNAME EQU   23
+SYSCODE  EQU   61
+CMPCODE  EQU   62
+SLASH    EQU   64
+PERIOD   EQU   68
+         WTO   MF=(E,(1))          WRITE MSG.
+         LR    R1,R4               TCB ADDR
+         DETACH (1)                GET RID OF SUBTASK
+***********************************************************************
+*                                                                     *
+* CLEANUP IOB'S WHOSE I/O REQUESTS HAVE BEEN PURGED BY ABTERM.        *
+* THE ADDRESS OF THE IOB PREFIX IS X'44' BYTES INTO THE DCB.          *
+*                                                                     *
+***********************************************************************
+         NI    DCBIFLGS,X'FF'-X'C0'     TURN OFF I FLAGS IN DCB
+* BUILD PURGE PARAMETER LIST                                          *
+         LR    R1,R11              RESTORE WORK AREA ADDRESS
+         L     R3,DCBDEBAD         GET DEB PTR.
+         ST    R3,PRGDEB(R1)       STORE IN PURGE LIST
+         MVI   PRGOPT(R1),PURGOPT  SET PURGE OPTION BYTE
+         L     R4,DEBTCBAD(R3)     GET TCB ADDRESS
+         ST    R4,PRGTCB(R1)       STORE TCB ADDRESS IN PURGE
+         MVI   PRGTCB(R1),X'00'    ZERO HIGH ORDER BYTE
+         L     R4,DEBUSRPG(R3)     GET LINK FIELD OF USER PURGE CHAIN
+         ST    R4,PRGUSR(R1)       STORE IN PURGE LIST
+         MVI   PRGUSR(R1),X'00'    ZERO HIGH ORDER BYTE
+         PURGE (1)                 ISSUE PURGE MACRO, SVC 16
+         LA    R11,SD82M3          INDICATE OUTPUT ERROR        OZ00573
+         B     SD82HALT            GO STOP
+         TITLE 'CALL DYNAMIC ALLOCATE/UNALLOCATE SUBROUTINE'
+DYNAL    L     R1,PARALLOC         LOAD ADDR. OF ALLOCATE PARM LIST
+         DYNALLOC
+         LTR   R15,R15             RETURN NORMAL?
+         BZR   R11                 RETURN IF NORMAL RETURN
+         STH   R15,PARSMB+2        SAVE RETURN CODE FOR MSG.
+         MVC   PARSMB(2),S99ERROR  SAVE SVC 99 ERROR RETURN
+         LA    R11,SD82M1          ADDR. OF ERROR MSG.
+         B     SD82HALT            GO STOP
+DALOK    EQU   *                   INPUT NOW ALLOCATED
+SD82MSG  MVC   0(1,R1),0(R11)
+         LTORG
+         TITLE 'CONSTANTS AND DSECTS FOR IASXSD82'
+*    CONSTANTS
+OSWTR    DC    CL8'IEFSD087'       DEFAULT WRITER NAME
+IAS82A   DC    CL8'IASXS82A'
+BLANKS   DC    CL8' '              BLANKS
+SD82EXIT DC    V(IASXSD81)         EXIT FOR START COMMAND
+MSGADDR  DC    A(IASXS82M)         ADDRESS OF MESSAGES PUT OUT BY 082
+WTRSSOB  DS    0F
+WTSSOBID DC    CL4'SSOB'
+WTSSOBSZ DC    AL2(SSOBHSIZ)
+WTSSOBFN DC    AL2(SSOBSOUT)
+WTRSOSIZ EQU   *-WTRSSOB
+TRTBLE   DC    C'0123456789ABCDEF'
+JFCBL    RDJFCB (0),MF=L           READ JFCB LIST
+LINKLST  LINK  ,,SF=L              REMOTE SUPV PARAM LIST
+SUPVLIST ATTACH SF=L,EPLOC=IAS82A,SVAREA=YES,SM=PROB,                  C
+               LPMOD=1,DPMOD=-1,GIVEJPQ=NO
+SUPLEND  EQU   *
+*DEFINE DCB AND OPEN AND CLOSE. (EODAD,SYNAD,OPEN AND CLOSE)
+INDCB    DCB   DSORG=PS,MACRF=GL,BUFNO=2
+INOPEN   OPEN  (0,INPUT),MF=L
+SD82CLOS CLOSE (0),MF=L            CLOSE LIST
+SPEXL    DC    F'0'                DCB EXIT LIST
+SPEXL1   DC    F'0'                DCB EXIT LIST
+INDCBEND EQU   *
+FZERO    DC    F'0'                FULL WORD OF ZERO
+CLASS    DC    C'CLASS='
+FORMS    DC    C'FORMS='           FOR WAITING FOR WORK MSG.
+WRITER   DC    C'WRITER='          FOR WAITING FOR WORK MSG.
+DEST     DC    C'DEST='            FOR WAITING FOR WORK MSG.
+JOBID    DC    C'JOBID='           FOR WAITING FOR WORK MSG.
+HASPDFLT DC    CL4'****'           HASP DEFAULT UCS/FCB
+SBPL     DC    AL1(SUBPOOL)        SUBPOOL NUMBER
+         DC    C'ZAPZAPZAPZAPZAPZAP'
+         DC    C'ZAPZAPZAPZAPZAPZAP'
+         DC    C'ZAPZAPZAPZAPZAPZAP'
+         DC    C'ZAPZAPZAPZAPZAPZAP'
+         DC    C'ZAPZAPZAPZAPZAPZAP'
+         DC    C'ZAPZAPZAPZAPZAPZAP'
+         TITLE 'SUBTASK IASXS82A ATTACHED BY IASXSD82'
+***********************************************************************
+*                                                                     *
+* SUBTASK CODE -- THIS IS ATTACHED, IT IN TURN CALLS TO THE WRITER    *
+* PROGRAM.  THIS ALLOWS THE PURGE TO BE DONE WITHIN THE SUBTASK,      *
+* WITHOUT REQUIRING USERS TO PUT PURGE INTO THEIR EXISTING CODE.
+*                                                                     *
+***********************************************************************
+         DS    0F
+         ENTRY IASXS82A            ENTRY FOR SUBTASK
+IASXS82A LR    R2,R14              SAVE RETURN REGISTER
+         LR    R3,R1               SAVE PARM REG
+         USING WORKLST,R3          ADDRESS WORKLIST
+*LOAD AND CALL WRITER PROGRAM
+         LOAD  EPLOC=WOWRN         LOAD WRITER LOAD MODULE
+         LR    R15,R0              PASS ENTRY POINT
+         LR    R1,R3               PASS PARM REGISTER TO SUBTASK
+         CALL  (15),MF=(E,(1))     CALL
+         LR    R4,R15              SAVE RETURN CODE
+*BUILD PURGE PARAMETER LIST
+         L     R5,DCBOT            GET OUTPUT DCB
+* PARWORK IS USED TO READ THE OUTPUT JFCB INTO BY IASXWR00,
+*  THEN TO CREATE THE SSOB INTO BY IASXSD82,
+* AND THIS SUBTASK USES 12 BYTES BEYOND THE SSOB AS A PURGE LIST
+         L     R1,PARWORK          ADDRESS OF SSOB CORE
+         LA    R1,SSOBLEN1+8(R1)   INCREMENT BEYOND SSOB AND POINTER
+         XC    PRGOPT(SIZPRG,R1),PRGOPT(R1)  ZERO CORE
+         L     R11,DCBDEBAD        ADDR. OF DCB TO BE PURGED
+         ST    R11,PRGDEB(R1)
+         LA    R11,DEBUSRPG(R11)   ADDR. TO RECEIVE RESTORE POINTER
+         ST    R11,PRGUSR(R1)      SAVE IN PARMLIST
+         MVI   PRGOPT(R1),PRGOPT2  SET PURGE OTPION BYTE
+         PURGE (1)                 PURGE RQE'S
+         DELETE EPLOC=WOWRN        DELETE LOAD MODULE
+         LR    R15,R4              RESTORE RETURN CODE
+         LR    R14,R2              RESTORE RETURN ADDRESS.
+         BR    R14                 *** END OF SUBTASK ***
+         DROP  R3
+         TITLE 'DSECTS USED BY IASXSD82'
+*    DSECTS
+***********************************************************************
+COMMAD   DSECT                     COMMUMICATIONS AREA IN CSCB
+COMMECB  DS    A                   ADDR OF COMMAND ECB
+COMMCIB  DS    A                   ADDR OF COMMAND INPUT BUFFER
+*ATTACH LIST
+LISTS    DSECT
+CSCBADDR DS    F                   SLOT FOR SUBTASK CSCB ADDR.
+ATACHTCB DS    F                   SLOT FOR SUBTASK TCB ADDR.
+ATACHECB DS    F                   ATTACH - ECB
+ATECBPTR DS    F                   ECBLIST -- ATTACH - ECB PTR.
+CHECBPTR DS    F                   ECBLIST -- CANCEL - ECB PTR.
+*  ECB LIST USED WHEN WAITING FOR WORK OR OS COMMAND                  *
+HASPECB  DS    F                   ECBLIST-- HASP ECB PTR FOR CLASSWRK
+COMNDECB DS    F                   ECBLIST-- CSCB ECB PTR FOR COMMANDS
+ATACHLST EQU   *
+*DYNAMIC ALLOCATION DSECT
+DYNTXTPT DSECT
+DSNTXTPT DS    F                   POINTER TO DSNAME TEXT UNIT
+SSRTXTPT DS    F                   PTR. TO SUBSYSTEM REQUEST TEXT UNIT
+DDNTXTPT DS    F                   PTR TO DDNAME RETURNED TEXT UNIT
+UDNTXTPT DS    F                   DDNAME TEXT PTR. FOR UNALLOCATE
+UORTXTPT DS    F                   OVERRIDE TEXT PTR. FOR UNALLOCATE
+DYNTXTND EQU   *                   END OF TEXT POINTERS
+DSNTXTUT DS    CL50                DSNAME TEXT UNIT
+SSRTXTUT DS    CL10                SUBSYSTEM REQUEST TEXT UNIT
+DDNTXTUT DS    CL14                DDNAME RETURNED  TEXT UNIT
+UDNTXTUT DS    CL14                UNALLOCATE DDNAME TEXT UNIT
+UORTXTUT DS    CL7                 OVERRIDE DISPOSITION FOR UNALLOCATE
+DYNEND   EQU   *
+***********************************************************************
+***                                                                 ***
+*   JOB SEPARATOR PARAM LIST PASSED TO JOB SEPARATOR ROUTINE.         *
+***                                                                 ***
+         DS    0F
+JSPARMS  DSECT
+JSSWTCHS DS    C                   SWITCHES.
+JSP1442  EQU   128                 1442 SWITHC.
+JSPUTYPE EQU   64                  PUNCH TYPE SWITCH.
+JSPUPR   EQU   32                  UNIT RCD WRITER SWITCH.
+JSDCBOUT DS    F                   ADDRESS OF OUTPUT DCB.
+JSNAMEAD DS    F                   ADDRESS OF 8 CHAR JOBNAME FIELD
+JSSYSCLA DS    F                   ADDRESS OF SYSOUT CLASS.
+JSEND    EQU   *                   END OF JSPARMS.
+         DS    F                   SYSOUT CLASS NAME
+JSLIST   DS    CL8                 REMOTE LINK LIST
+JSLTH    EQU   JSEND-JSPARMS       LENGTH OF JSPARMS LIST.
+JSSWT078 EQU   JSSWTCHS+1          SWITCH FOR ENTRY FROM 078
+         IEFSDPAR                  DEFINE PAR WORK LIST
+         IEFSDWKX                  DEFINE WORKX
+         IEFSDWKT                  DEFINE WORKLST
+         IEFSDSMF                  DEFINE TYPE 6 SMF RECORD
+         IEFZB4D0
+         IEFZB4D2
+         IEFJSSOB (SO)
+         IEFJESCT
+         IKJTCB LIST=YES           TCB MAPPING MACRO
+         IEZJSCB ,                 JSCB MAPPING MACRO
+         IEFJSSIB ,                SSIB MAPPING MACRO
+         IEFTIOT1                  DEFINE TIOT
+CIB      DSECT
+         IEZCIB
+         CVT   DSECT=YES
+CHAINDSC DSECT
+         IEECHAIN                  DEFINE CSCB
+         DCBD  DSORG=PS
+JFCBD    DSECT
+         IEFJFCBN LIST=YES
+         DSECT
+         IEFUCBOB LIST=YES         DEFINE UCB
+         IHAPSA
+         IHAASCB
+***********************************************************************
+*EQUATES:                                                             *
+WORKT    EQU   WORKEND-WORKLST
+SMF6     EQU   SMFEND-SMFREC       SIZE OF TYPE 6 SMF RECORD
+TXTPTSIZ EQU   DYNTXTND-DYNTXTPT   SIZE OF TEXT UNIT POINTERS
+DYNRBSIZ EQU   S99RBEND-S99RB      SIZE OF DYN ALLOC REQUEST BLOCK
+DYN      EQU   TXTPTSIZ+DYNRBSIZ+(DYNEND-DSNTXTUT)+L'S99RBPTR
+ATCHADDR EQU   ATACHLST-LISTS      SIZE OF ATTACH LIST ADDRESSES
+ATCHLST  EQU   SUPLEND-SUPVLIST    SIZE OF ATTACH LIST
+IDCB     EQU   INDCBEND-INDCB
+SD82CORE EQU   WORKT+SAVEAREA+IDCB+ATCHADDR+ATCHLST+4+JFCBLGTH+TBLESIZ+C
+               SMF6+DYN            SIZE OF GETMAIN FOR IASXSD82
+DISPDDN  EQU   DYNRBSIZ+DDNTXTPT-DYNTXTPT    ADDR. OF DDNAME IN DYN LST
+DISPOVR  EQU   DYNRBSIZ+UORTXTPT-DYNTXTPT    ADDR. OVRIDE IN DYN LST
+DISPUAL  EQU   DYNRBSIZ+UDNTXTPT-DYNTXTPT    ADDR. UNAL IN DYN LST
+DISPDSN  EQU   DYNRBSIZ+DSNTXTPT-DYNTXTPT    ADDR. DSNAME IN DYN LIST
+SMFJOBNM EQU   SMFJOBLG+4          JOB NAME DISPLACEMENT IN SMF RECORD
+SMFCLASS EQU   SMFJOBLG+28
+SSSORDR  EQU   4                   DISP. IN SSSOWTC OF RDR START TIME
+SMFRDSTM EQU   SMFJOBLG+12
+         TITLE 'ERROR MESSAGES PRODUCED BY THIS EXTERNAL WRITER MODULE'
+***********************************************************************
+IASXS82M CSECT
+SD82M1   WTO   'IEF300I XXX WTR CLOSED - SUBSYSTEM INTERFACE ERROR XXXXC
+               /YYYY',MF=L,ROUTCDE=(2,10),DESC=(4),MCSFLAG=(REG0)
+SD82M2   WTO   'IEF301I XXX WTR CLOSED',MF=L,DESC=(4),MCSFLAG=(REG0)
+SD82M3   WTO   'IEF303I XXX WTR CLOSED - OUTPUT ERROR',MF=L,           X
+               ROUTCDE=(7,10),DESC=(4),MCSFLAG=(REG0)
+SD82M6   WTO   'IEF302A CCC WTR WAITING TO START AAAAAAAA FOR JOBID NNNC
+               NNNNN',MF=L,ROUTCDE=(2,7),DESC=(2)
+SD82M7   WTO   'IEF382A CCC WTR WAIT DUE TO PAUSE',MF=L,               X
+               ROUTCDE=(2,7),DESC=(2)
+M82FORM  WTO   'IEF383A CCC WTR, CHANGE FORM TO NNNN',MF=L,            C
+               ROUTCDE=(7),DESC=(2)
+M82WAIT  WTO   'IEF176I WTR DDD WAITING FOR WORK,                      C
+                                                               ',MF=L,RC
+               OUTCDE=(2),DESC=(4)
+M82KEYBD WTO   'IEF179I WTR DDD INVALID JOBID XXXXXXXX',MF=L,          C
+               ROUTCDE=(2),DESC=(3)
+ABEND    WTO   'IEF438I SUBTASK OF          TERMINATED.  COMPLETION CODX
+               E         ',MF=L,ROUTCDE=(2),DESC=(4)
+ABENDEND EQU   *
+SD82MEND EQU   *
+ABSZ     EQU   ABENDEND-ABEND
+UNIT     EQU   12                  OFFSET OF UNIT NAME FOR CLOSE MSGS
+SSERR    EQU   55                  OFFSET OF RETURN CODE IN MSG.
+DALERR   EQU   60                  DISPLACEMENT INTO MESSAGE
+LENVALID EQU   SD82M7-SD82M6
+OFSETO   EQU   36                  OFFSET OF WRITER IDENT.
+MSGNAME  EQU   61                  OFFSET OF NAME OF WRITER TO BE ATTCH
+OECBL    EQU   20                  LOCATION OF ECB
+OREPLY   EQU   4                   AREA OF REPLY
+OREPLL   EQU   16                  ADDRESS OF WTOR AREA & REPLY ADDR.
+OREPLOC  EQU   8                   LOCATION OF REPLY
+OWTORH   EQU   24                  LENGTH OF HEADER FOR WTOR
+JOBIDSP  EQU   80                  OFFSET OF JOBID NEEDING WTR VALID.
+RECBL    EQU   12                  ECB POINTER LOCATION
+REPLY    EQU   4                   REPLY LOCATION
+REPLL    EQU   8                   ADDRESS OF REPLY LOCATION
+WTORH    EQU   16                  ADDRESS OF WTOR AREA
+LENGTH   EQU   82                  LENGTH OF MESSAGE
+OFSET    EQU   28                  OFSET OF WRITER IDENTITY
+FORMN    EQU   52                  OFSET OF FORM NUMBER
+SIZINVAL EQU   46                  SIZE OF DEST/JOBID MSG
+DISPPARM EQU   34                  DISP. OF JOBID/DEST IN MSG
+DESTDISP EQU   28                  DISP OF 'DEST '
+WTRDISP  EQU   16                  DISP OF WTR ID IN MSG.
+VARBLARA EQU   71                  VARIABLE AREA LENGTH TO BE CLEARED
+CRITERIA EQU   36                  DISP. WHERE VARIABLE AREA STARTS
+WTRNAM   EQU   16                  DISP. OF WTRNAME
+         END

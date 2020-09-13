@@ -1,0 +1,315 @@
+ /* SNOPRS */
+ /**********************************************************************
+ *                                                                     *
+ * GIVEN A STRING, THIS SUBROUTINE WILL ATTEMPT TO PARSE IT FOR A      *
+ * SNOBOL PATTERN/ASSIGNMENT (SEE SNOBOL SUBRTNE).  IF SUCCESSFUL, IT  *
+ * WILL RETURN A POINTER TO THE SET OF CONTROL BLOCKS DESCRIBING       *
+ * THE PARSED PATTERN.  OTHERWISE IT RETURNS NULL.                     *
+ *                                                                     *
+ **********************************************************************/
+ SNOPRS: PROC(CMDDATA,SCANPARM,MSG,SNOEP)
+   RETURNS(PTR) OPTIONS(REENTRANT) RECURSIVE;
+   DCL CMDDATA CHAR(*) VAR;
+   DCL MSG CHAR(80) VAR;
+   % INCLUDE ABESNO;
+   DCL SCANNER ENTRY;
+   DCL NULL BUILTIN;
+   MSG='';
+   RETURN(PRS_STATEMENT(NULL));
+
+ NEW_PATEL: PROC(SPAT) RETURNS(PTR);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO ALLOCATE AND INITIALIZE A NEW PATEL.                      *
+ *                                                                     *
+ **********************************************************************/
+   DCL (P,SPAT) PTR;
+   ALLOCATE PATEL SET(P);
+   P->PATCAT,P->PATALT,P->NEEDLENXT,P->NEEDLELST,P->PATASS,P->PATEFH
+     =NULL;
+   P->PATOWN=SPAT;
+   P->PATTYP,P->PATOFF,P->PATLEN,P->NEEDLECUR,P->THREADED=0;
+   RETURN(P);
+   END NEW_PATEL;
+
+ NEW_TOKEN: PROC RETURNS(PTR);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO ALLOCATE AND INITIALIZE A NEW TOKEN STRUCTURE.            *
+ *                                                                     *
+ **********************************************************************/
+   DCL T PTR;
+   ALLOCATE TOKEN SET(T);
+   T->PRIOR_TOKEN=T;
+   T->NEXT_TOKEN=NULL;
+   T->ELIX,T->TYPE,T->SUBTYPE=0;
+   T->TOKSTR='';
+   RETURN(T);
+   END NEW_TOKEN;
+
+ PRS_ALT_NAME: PROC(ALTPTR);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN <ALTERNATE> IS EXPECTED NEXT.                           *
+ *                                                                     *
+ **********************************************************************/
+   DCL (ALTPTR,T) PTR;
+   ALTPTR->PATEFH=NEW_TOKEN;
+   CALL SNOGOP(TOKSTR,ALTPTR->PATEFH->TOKSTR);
+   ALTPTR->PATEFH->TYPE=QUOTED_STRING;
+   ALTPTR->PATTYP=0;
+   END PRS_ALT_NAME;
+
+ PRS_ALTERNATE: PROC(SPAT) RETURNS(PTR) RECURSIVE;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN <ALTERNATE> IS EXPECTED NEXT.                           *
+ *                                                                     *
+ **********************************************************************/
+   DCL (ALTHD,NXTALT,CURALT,SPAT) PTR;
+   ALTHD=NULL;
+   DO UNTIL(TYPE=NO_MORE_TOKENS ×
+     (TYPE=OPERATOR & (TOKSTR='=' × TOKSTR='×')));
+     NXTALT=PRS_ELEMENT(SPAT); /* GET NEXT ELEMENT */
+     IF NXTALT=NULL
+       THEN LEAVE;
+     IF ALTHD=NULL
+       THEN ALTHD=NXTALT;
+       ELSE CURALT->PATCAT=NXTALT;
+     CURALT=NXTALT;
+     END;
+   RETURN(ALTHD);
+   END PRS_ALTERNATE;
+
+ PRS_ARGLIST: PROC(LHDR);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN <ARGUMENTS> IS EXPECTED NEXT.                           *
+ *                                                                     *
+ **********************************************************************/
+   DCL (LHDR,T) PTR;
+   LHDR=NULL;
+   DO FOREVER=1 REPEAT FOREVER;
+     T=NULL;
+     CALL SCANNER(CMDDATA,SCANPARM,OPERATORS,KEYWORDS,SPCHARS);
+     SELECT;
+       WHEN(TYPE=QUOTED_STRING × TYPE=NUMERIC_CONSTANT) DO;
+         T=NEW_TOKEN;
+         T->TYPE=QUOTED_STRING;
+         T->TOKSTR=TOKSTR;
+         END;
+       WHEN(TYPE=OPERAND × TYPE=KEYWORD) DO;
+         T=NEW_TOKEN;
+         T->TYPE=QUOTED_STRING;
+         CALL SNOGOP(TOKSTR,T->TOKSTR);
+         END;
+       WHEN(TYPE=OPERATOR & TOKSTR='*') DO; /* DEFERRED REFERENCE */
+         CALL SCANNER(CMDDATA,SCANPARM,OPERATORS,KEYWORDS,SPCHARS);
+         T=NEW_TOKEN;
+         T->TYPE=OPERAND;
+         T->TOKSTR=TOKSTR;
+         END;
+       WHEN(^(TYPE=QUOTED_STRING) & TOKSTR=',');
+       WHEN(^(TYPE=QUOTED_STRING) & TOKSTR=')') RETURN;
+       OTHERWISE DO; /* BAD SYNTAX */
+         CALL FREE_TOKENS(LHDR); /* FREE UP NEW TOKEN STRING */
+         MSG='INVALID ARGUMENT LIST';
+         SIGNAL CONDITION(BADALT);
+         END;
+       END; /* SELECT */
+     LHDR=QUEUE(LHDR,T); /* ADD TO ARGUMENT LIST */
+     END;
+   END PRS_ARGLIST;
+
+ PRS_ASSIGNMENT: PROC(SPAT) RETURNS(PTR);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN <ASSIGNMENT> IS EXPECTED NEXT.                          *
+ *                                                                     *
+ **********************************************************************/
+   DCL SPAT PTR;
+   DO FOREVER=1 REPEAT FOREVER;
+     CALL SCANNER(CMDDATA,SCANPARM,OPERATORS,KEYWORDS,SPCHARS);
+     IF TYPE=OPERAND × TYPE=KEYWORD × TYPE=QUOTED_STRING ×
+       TYPE=NUMERIC_CONSTANT
+       THEN SPAT->PATASCT=SPAT->PATASCT+1; /* <NAME> */
+       ELSE LEAVE; /* ALL DONE */
+     IF SPAT->PATASCT=1
+       THEN SPAT->PATASHD=CURTOK;
+     END;
+
+   END PRS_ASSIGNMENT;
+
+ PRS_ELEMENT: PROC(SPAT) RETURNS(PTR) RECURSIVE;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN <ELEMENT> IS EXPECTED NEXT.                             *
+ *                                                                     *
+ **********************************************************************/
+   DCL (ELPTR,SAVCURTOK,ALTPTR,SPAT) PTR;
+   DCL SAVSCANIX FIXED BIN(15,0);
+   SAVCURTOK=CURTOK;
+   SAVSCANIX=SCANIX;
+   ALTPTR=NEW_PATEL(SPAT);
+   ON CONDITION(BADALT) BEGIN;
+     CALL FREE_PATEL(ALTPTR);
+     GO TO PRS_ELEMENT_RETURN;
+     END;
+   CALL PRS_REF(ALTPTR);
+   IF TYPE=OPERATOR & TOKSTR='$'
+     THEN DO;
+       CALL SCANNER(CMDDATA,SCANPARM,OPERATORS,KEYWORDS,SPCHARS);
+       IF TYPE^=OPERAND
+         THEN DO;
+           MSG='NAME EXPECTED AFTER ''$''';
+           CURTOK=SAVCURTOK;
+           SCANIX=SAVSCANIX;
+           CALL FREE_PATEL(ALTPTR);
+           END;
+         ELSE DO;
+           ALTPTR->PATASS=CURTOK;
+           CALL SCANNER(CMDDATA,SCANPARM,OPERATORS,KEYWORDS,SPCHARS);
+           END;
+       END;
+  PRS_ELEMENT_RETURN:
+   RETURN(ALTPTR);
+   END PRS_ELEMENT;
+
+ PRS_PATTERN: PROC(SPAT) RECURSIVE;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN <PATTERN> IS EXPECTED NEXT.                             *
+ *                                                                     *
+ **********************************************************************/
+   DCL (SPAT,LASTPATEL,NEXTPATEL,OPTOKPTR) PTR;
+   IF TYPE=NO_MORE_TOKENS
+     THEN RETURN;
+   DO FOREVER=1 REPEAT FOREVER;
+     NEXTPATEL=PRS_ALTERNATE(SPAT); /* GET STRING OF CONCAT. ELEMENTS */
+     IF NEXTPATEL=NULL
+       THEN DO; /* DIDN'T FIND A VALID <ALTERNATE> */
+         CALL FREE_PAT(SPAT);
+         MSG='PATTERN ELEMENT NOT FOUND WHEN EXPECTED';
+         SIGNAL CONDITION(BADSTMT);
+         END;
+     IF SPAT->PATELHD=NULL
+       THEN SPAT->PATELHD=NEXTPATEL;
+       ELSE LASTPATEL->PATALT=NEXTPATEL;
+     LASTPATEL=NEXTPATEL;
+     IF (TYPE=OPERATOR & TOKSTR='×')
+       THEN CALL SCANNER(CMDDATA,SCANPARM,OPERATORS,KEYWORDS,SPCHARS);
+       ELSE LEAVE; /* CURRENT ELEMENT ISN'T IN <PATTERN> */
+     END;
+   IF SPAT->PATELHD=NULL
+     THEN CALL FREE_PAT(SPAT); /* NO VALID PATTERN WAS FOUND */
+   END PRS_PATTERN;
+
+ PRS_REF: PROC(ALTPTR) RECURSIVE;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN <REF> IS EXPECTED NEXT.                                 *
+ *                                                                     *
+ **********************************************************************/
+   DCL (ALTPTR,SAVCURTOK) PTR;
+   DCL SAVSCANIX FIXED BIN(15,0);
+   SELECT;
+     WHEN(TYPE=QUOTED_STRING × TYPE=NUMERIC_CONSTANT) DO; /* LITERAL */
+       ALTPTR->PATTYP=0; /* INDICATE LITERAL */
+       ALTPTR->PATEFH=NEW_TOKEN; /* GET INITIALIZED TOKEN */
+       ALTPTR->PATEFH->TYPE=TYPE;
+       ALTPTR->PATEFH->TOKSTR=TOKSTR;
+       END;
+     WHEN(TYPE=OPERATOR & TOKSTR='*') DO; /* DEFERRED REFERENCE */
+       CALL SCANNER(CMDDATA,SCANPARM,OPERATORS,KEYWORDS,SPCHARS);
+       IF TYPE=KEYWORD
+         THEN TYPE=OPERAND;
+       IF TYPE^=OPERAND
+         THEN SIGNAL CONDITION(BADALT);
+       ALTPTR->PATTYP=0;
+       ALTPTR->PATEFH=CURTOK;
+       END;
+     WHEN(TYPE=OPERAND) CALL PRS_ALT_NAME(ALTPTR); /* IT IS NAME */
+     WHEN(TYPE=KEYWORD) DO; /* IT MAY BE FUNCTION OR NAME REF */
+       IF TOKSTR='FENCE'
+         THEN DO;
+           ALTPTR->PATTYP=SUBTYPE; /* INDICATE FENCE FUNCTION */
+           ALTPTR->PATEFH=NULL;
+           END;
+         ELSE DO;
+           SAVCURTOK=CURTOK;
+           SAVSCANIX=SCANIX;
+           CALL SCANNER(CMDDATA,SCANPARM,OPERATORS,KEYWORDS,SPCHARS);
+           IF TYPE=TYPE_SPCHAR & TOKSTR='('
+             THEN DO; /* IT IS FUNCTION REFERENCE */
+               ALTPTR->PATTYP=SAVCURTOK->SUBTYPE;
+               CALL PRS_ARGLIST(ALTPTR->PATEFH); /* PARSE ARG LIST */
+               IF ^(TYPE=TYPE_SPCHAR & TOKSTR=')')
+                 THEN SIGNAL CONDITION(BADALT);
+               END;
+             ELSE DO; /* IT IS NAME REFERENCE */
+               CURTOK=SAVCURTOK;
+               SCANIX=SAVSCANIX;
+               TYPE=OPERAND;
+               CALL PRS_ALT_NAME(ALTPTR);
+               END;
+           END;
+       END;
+     WHEN(TYPE=TYPE_SPCHAR & TOKSTR='(') DO; /* SUB-PATTERN */
+       ALTPTR->PATTYP=-1;
+       ALTPTR->PATEFH=PRS_STATEMENT(ALTPTR);
+       END;
+     OTHERWISE SIGNAL CONDITION(BADALT);
+     END; /* SELECT */
+   CALL SCANNER(CMDDATA,SCANPARM,OPERATORS,KEYWORDS,SPCHARS);
+   END PRS_REF;
+
+ PRS_STATEMENT: PROC(ALTPTR) RETURNS(PTR) RECURSIVE;
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN <STATEMENT> IS EXPECTED NEXT.                           *
+ *                                                                     *
+ **********************************************************************/
+   DCL (SPAT,ALTPTR) PTR;
+   ALLOCATE PAT SET(SPAT);
+   SPAT->PATELHD,SPAT->PATASHD,SPAT->NEEDLENXT,SPAT->NEEDLELST=NULL;
+   SPAT->PATASCT,SPAT->PATFENCE=0;
+   SPAT->PATELOWN=ALTPTR;
+   ON CONDITION(BADSTMT) BEGIN;
+     CALL FREE_PAT(SPAT);
+     IF MSG=''
+       THEN MSG='INVALID STATEMENT';
+     GOTO EOJ;
+     END;
+   CALL SCANNER(CMDDATA,SCANPARM,OPERATORS,KEYWORDS,SPCHARS);
+   CALL PRS_PATTERN(SPAT); /* IT IS TIME FOR PATTERN */
+   IF ^(SPAT=NULL × TYPE=NO_MORE_TOKENS ×
+     (TYPE=TYPE_SPCHAR & TOKSTR=')'))
+     THEN DO;
+       IF ^(TOKSTR='=' & TYPE=OPERATOR)
+         THEN DO;
+           MSG='''='' OPERATOR NOT FOUND WHEN EXPECTED';
+           SIGNAL CONDITION(BADSTMT);
+           END;
+       CALL PRS_ASSIGNMENT(SPAT);
+       END;
+ EOJ:
+   RETURN(SPAT);
+   END PRS_STATEMENT;
+
+ QUEUE:  PROC(PTRA,PTRB) RETURNS(PTR);
+ /**********************************************************************
+ * CALLED TO JOIN TWO STRINGS OF TOKENS INTO A SINGLE STRING           *
+ **********************************************************************/
+   DCL (PTRA,PTRB,SAVE) PTR;
+   IF PTRA=NULL
+     THEN RETURN(PTRB);
+   IF PTRB=NULL
+     THEN RETURN(PTRA);
+   SAVE=PTRA->PRIOR_TOKEN;
+   PTRA->PRIOR_TOKEN=PTRB->PRIOR_TOKEN;
+   SAVE->NEXT_TOKEN=PTRB;
+   PTRB->PRIOR_TOKEN=SAVE;
+   RETURN(PTRA);
+   END QUEUE;
+
+   END SNOPRS;

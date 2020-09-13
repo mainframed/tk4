@@ -1,0 +1,2055 @@
+        TITLE 'IGE0000I     LOAD 1     1/2 INCH MAGNETIC TAPE ERPS'
+IGE0000I START X'00'                   LOAD 1
+*
+***********************************************************************
+*                                                                     *
+* STATUS:                                                             *
+*    CHANGE LEVEL:  VS2/REL3                                          *
+*                                                                     *
+* FUNCTION/OPERATION:                                                 *
+*    THIS LOAD IS ENTERED EACH TIME ERP'S ARE CALLED                  *
+*    1.  XCTL TO LOAD 2, PART 9, IF ICC/CCC CHANNEL ERROR             *
+*    2.  GO TO PART 5 TO DO STAT UPDATE IF FIRST ENTRY FOR AN ERROR   *
+*    3.  GO TO PART 3 IF ROR IN PROGRESS                              *
+*    4.  XCTL TO LOAD 2, PART 1, IF:                                  *
+*        A.  ERROR ON REPOSITIONING                                   *
+*        B.  IOB INTERCEPT                                            *
+*        C.  UNSOLICITED DEVICE END FROM A NEW DEVICE TYPE            *
+*        D.  NOISE BLOCK FOUND ON READ (<12 BYTES)                    *
+*    5.  SET CCW START ADDRESS DEPENDING ON CCW CHAINING FLAGS        *
+*    6.  SET REPOSITIONING COMMAND OP CODE FOR READ/WRITE ERRORS      *
+*    7.  HANDLE FIRST 40 READ RETRIES WITH REPOSITIONING AND          *
+*        CLEANER ACTIONS.  GO TO PART 3 IF ROR NEEDED.                *
+*    8.  HANDLE WRITE-TYPE RETRIES WITH REPOSITIONING,                *
+*        XCTL TO WTO IF A PERMANENT ERROR.                            *
+*    9.  XCTL TO LOAD 2, PART 4, IF ERROR OTHER THAN DATA CHECK       *
+*        ON READ OR WRITE TYPE COMMANDS.                              *
+*    10. GO TO PART 4 IF NO ERROR IS APPARENT OR ERROR IS RECOVERED   *
+*    11. IF IDAL BIT IS ON IN ERROR CCW, GO TO PART 6 TO CREATE       *
+*        ERP IDAL LIST FOR ROR.                                       *
+* ENTRY POINTS:                                                       *
+*         ER2401A - CALLED BY I/O SUPERVISOR                          *
+*         IGE0100I LOAD 2                                             *
+*                                                                     *
+* INPUT:                                                              *
+*    REGISTER 1 CONTAINS A POINTER TO THE IOSB                        *
+*                                                                     *
+* OUTPUT:  N/A                                                        *
+*                                                                     *
+* EXTERNAL ROUTINES:                                                  *
+*         INTERPRETER ROUTINE - CHECKS SENSE AND STATUS BYTES         *
+*                                                                     *
+* EXITS - NORMAL:                                                     *
+*         1.  SVC 15/3 EXIT TO IOS TO REPOSITION TAPE & REEXECUTE     *
+*         2.  XCTL TO IGE0100I (LOAD 2)                               *
+*         3.  XCTL TO IGE0025C (WTO ROUTINE)                          *
+*         4.  XCTL TO IGE0025F (OBR ROUTINE)                          *
+*                                                                     *
+* EXITS - ERROR:  N/A                                                 *
+*                                                                     *
+* ATTRIBUTES:                                                         *
+*    REENTRANT                                                        *
+*                                                                     *
+* NOTES:                                                              *
+*    VS2/REL2 - LOADS 1, 3, 4 AND 5 OF PREVIOUS RELEASES HAVE BEEN    *
+*    COMBINED TO CREATE LOAD 1 OF THIS RELEASE.  PART 6 WAS ADDED     *
+*    IN ORDER TO CREATE AN ERP IDAL LIST FOR ROR.                     *
+*    THIS LOAD INCLUDES:                                              *
+*        1.  ERROR HANDLING FOR OTHER THAN ERP-ORIGINATED ERRORS      *
+*        2.  READ OPPOSITE RECOVERY                                   *
+*        3.  STATISTICS UPDATE                                        *
+*                                                                     *
+*    PTM YM6412  REPOSITION BIT NOT TURNED OFF ON PERM ERR EXIT       *
+*                                                                     *
+*    PTM 7116 SENSE DATA OVERLAYS I/O COMMAND DURING RECOVERY         *
+*                                                                     *
+*    CODE CHANGES FOR 16 BIT UCB ADDRESSING                  @Z30AB01 *
+*                                                                     *
+*    APAR FIX TO ZERO & THES BOTH BYTES ON WLI               @ZA00656 *
+*    CHANGE TO NOT OVERLAY FIRST 4 BYTES PAST EWA            @ZA05117 *
+*    MOVE TIE BYTE TO IOSB                                   @ZA08849 *
+*    SET UP IOSB FOR 7 TRACK PARITY SWITCH                   @ZA05130 *
+*    GET FAILING CCW ADDR INSTEAD OF FIRST CCW ADDR.         @ZA08853 *
+*    APAR OZ08856 MOVE CORRECT BYTES FOR BLKCNT TO EWA       @ZA08856 *
+*    REMOVE FIX FOR OX08853 TO PREVENT BAD IDAL              @ZA14734 *
+*    FIX FOR LOW CORE OVERLAY PROBLEM                        @ZA14748 *
+*    FIX FOR E00-0C4 ABEND PROBLEM                           @ZA14752 *
+*    PREVENT OVERLAYING SQA FOR CCW COUNT > X'7FFF'          @ZA17538 *
+*    PREVENT LOSING BLOCKS WITH CHAIN SCHEDULING & DDR       @ZA16828 *
+*    ZERO SDR OVERFLOW COUNTER (A244000)                     @ZA27822 *
+*    SDR RECORD FOR DATA CHAINING (A752040-752050            @ZA30317 *
+*    LOADPOINT ON PE REPOSITIONING (A269000-269500)          @ZA30781 *
+*    TURN ON EWADDMSG FOR WTO                                @ZA31011 *
+*    DELETE OZ30781 CODE                                     @ZA32492 *
+***********************************************************************
+*
+         EJECT
+*
+*           R E G I S T E R   A S S I G N M E N T S
+*
+R0       EQU   0                       WORK REG
+IOSREG   EQU   1                       IOSB ADDRESS
+R1       EQU   1                       WORK REG
+ERPREG   EQU   2                       ERP IDAL ADDRESS
+UXREG    EQU   2                       UCB EXTENSION ADDRESS
+R3       EQU   3                       WORK REG
+CCWREG   EQU   3                       CCW ADDRESS
+R4       EQU   4                       WORK REG
+R5       EQU   5                       WORK REG
+EXITREG  EQU   5                       EXIT REG - SVC 15/3
+SDRREG   EQU   6                       SDR TABLE ADDRESS
+UCBREG   EQU   7                       UCB ADDRESS
+R8       EQU   8                       WORK REG (STAT UPDATE)
+BALREG   EQU   8                       BALR RETURN REG
+R9       EQU   9                       WORK REG
+SAVREG   EQU   9                       SAVE REG
+EWAREG   EQU   10                      EXTENDED WORK AREA ADDR
+RETREG   EQU   11                      BALR RETURN REG
+USEREG   EQU   11                      USER IDAL ADDR
+R12      EQU   12                      WORK REGISTER
+R13      EQU   13                      WORK REG
+TABREG   EQU   13                      SDR TABLE ADDRESS
+LNKREG   EQU   14                      LINK REG
+XCTLREG  EQU   14                      XCTL ROUTINE ADDRESS
+SDRR14   EQU   14                      WORK REG FOR SDR ADDRESS
+BASREG   EQU   15                      BASE REG
+         EJECT
+*
+*                U S E R   C C W   D S E C T
+*
+CCW      DSECT                         ERROR CCW IN USER'S CHAIN
+CCWOP    DS    CL1                     CCW COMMAND CODE
+         ORG   CCWOP                   **
+CCWADR   DS    CL4                     CCW DATA ADDRESS
+CCWFLS   DS    CL2                     CCW FLAGS
+CCWCNT   DS    CL2                     CCW BYTE COUNT
+*
+*   CCW REFERENCES
+*
+CCWIDAL  EQU   X'04'                   IDAL LIST BEING USED
+CCWSILI  EQU   X'20'                   SUPPRESS INCORRECT LENGTH BIT
+*
+*                U S E R   I D A L   D S E C T
+*
+USERIDAL DSECT                         USER IDAL LIST
+UIDAL    DS    9F                      IDAL ENTRIES
+*
+*                 E R P   I D A L   D S E C T
+*
+ERPIDAL  DSECT                         ERP IDAL LIST
+EIDAL    DS    9F                      IDAL ENTRIES
+         EJECT
+IGE0000I CSECT
+*
+*                 E   Q   U   A   T   E   S
+*
+*   EWACNTR1 - ERROR COUNT 1 REFERENCES
+*
+CLNCNT0  EQU   X'07'                   CLEANER CONTROL COUNT ZERO
+CLNCNT3  EQU   X'03'                   NO. BSRS FOR RB CLEANER
+CLNCNT4  EQU   X'04'                   NO. BSRS FOR RF CLEANER
+OVRCNT5  EQU   X'50'                   OVERRUN COUNT MAXIMUM VALUE
+HEXF8    EQU   X'F8'                   SET CLEANER COUNT TO 0
+HEX88    EQU   X'88'                   SET CLEANER & BUS OUT TO 0
+*
+*   EWACNTR2 - ERROR COUNT 2 REFERENCES
+*
+X1       EQU   X'01'                   ONE READ ERROR
+X4       EQU   X'04'                   MULTIPLE OF 4
+ERGCNT   EQU   X'70'                   ERASE GAP COUNT
+NUMB15   EQU   X'0F'                   15 RETRIES
+NUMB40   EQU   X'94'                   40 RETRIES
+*
+*   EWACNTR3 - ERROR COUNT 3 REFERENCES (FLAG BITS)
+*
+EWTUEX   EQU   X'80'                   UNIT EXCEPTION FLAG
+EWTNB    EQU   X'40'                   NOISE BIT
+EWTRST   EQU   X'20'                   START FLAG
+EWTROC   EQU   X'10'                   USE ROR CCW
+EWTBIT   EQU   X'08'                   COUNTER INCREMENT BIT
+EWTLWR   EQU   X'04'                   LOOP WRITE TO READ FLAG
+EWTEXIT  EQU   X'02'                   TEMPORARY ERROR EXIT FLAG
+EWTDEP   EQU   X'01'                   DEVICE END POST BIT
+*
+*   EWAFLG3 - FLAG 3 REFERENCES
+*
+EWTROR   EQU   X'80'                   READ OPPOSITE IN PROGRESS
+EWTRTN2  EQU   X'40'                   RETURN FROM LOAD 2
+EWTTPC   EQU   X'20'                   TAPE CLEANING BIT
+EWTBKS   EQU   X'10'                   BACKSPACE ERASE CLEANING FLAG
+EWTOVER  EQU   X'08'                   SDR OVERFLOW
+EWTPT4A  EQU   X'04'                   ENTRY FOR LOAD 2, PART 4A
+EWTPT4B  EQU   X'02'                   ENTRY FOR LOAD 2, PART 4B
+EWTRBLD  EQU   X'01'                   REBUILD IDAL LIST
+*
+*   EWA SENSE REFERENCES
+*
+BIRCH    EQU   X'08'                   BYTE 6 & 9 BIRCH TEST   @YL02128
+INVAL    EQU   X'03'                   INVALID CODE
+NRZIMODE EQU   X'10'                   BYTE 6 NRZI TEST BIT    @YL02128
+SNSTST   EQU   X'F4'                   TEST FOR:  CR,IR,BO,EQ,OR
+TIE      EQU   X'FF'                   TEST FOR TIE BYTE NOT ZERO
+*
+*   DEB REFERENCES
+*
+DEBDCB   EQU   24                      DCB POINTER
+DEBEMU   EQU   4                       EMULATOR BIT
+DEBMOD   EQU   32                      MODE SET MODIFIER
+DEBOFL   EQU   8                       DEBOFLGS
+DEBPAR   EQU   16                      PARITY FLIP MASK
+DEBRER   EQU   X'01'                   REDUCED ERROR RECOVERY BIT
+*
+*   DCB REFERENCES
+*
+DCBMOD   EQU   16                      RECORDING TECHNIQUE
+DCBDCF   EQU   X'13'                   DATA CONVERTER FEATURE
+*
+*   ROR CCW REFERENCES
+*
+RORSDT   EQU   X'10'                   SUPPRESS DATA TRANSFER BIT
+RORSDT1  EQU   X'14'                   SDT AND IDAL BITS
+RORSILI  EQU   X'20'                   SUPPRESS INCORRECT LENGTH BIT
+ROR0F    EQU   X'0F'                   TURN OFF FLAG BITS
+*
+*   COMMANDS
+*
+CMDERG   EQU   X'17'                   ERASE GAP
+CMDBSR   EQU   X'27'                   BACK SPACE RECORD
+CMDFSR   EQU   X'37'                   FORWARD SPACE RECORD
+CMDRDB   EQU   X'0C'                   READ BACKWARDS
+CMDSNS   EQU   X'04'                   SENSE COMMAND           @YM07116
+CMDWRT   EQU   X'01'                   WRITE
+CMDCTL   EQU   X'03'                   CONTROL
+CMDREW   EQU   X'07'                   REWIND
+CMDWTM   EQU   X'1F'                   WRITE TAPE MARK
+CMDRED   EQU   X'02'                   READ
+CMDTIC   EQU   X'08'                   TIC
+CMDLWR   EQU   X'8B'                   LOOP WRITE TO READ
+CMDRDF   EQU   X'02'                   READ FORWARD
+*
+*   STATUS INDICATORS
+*
+CSWUCK   EQU   X'02'                   UNIT CHECK
+CSWCCC   EQU   X'04'                   CHANNEL CONTROL CHECK
+CSWICC   EQU   X'02'                   INTERFACE CONTROL CHECK
+CSWCDC   EQU   X'08'                   CHANNEL DATA CHECK
+CSWCUB   EQU   X'50'                   CU BUSY
+CSWICL   EQU   X'40'                   INCORRECT LENGTH
+CSWDVE   EQU   X'04'                   DEVICE END
+CSWUEX   EQU   X'01'                   UNIT EXCEPTION
+CSWSTB   EQU   X'39'                   CDC, CHC, PGC, PTC
+         EJECT
+*
+*   MISCELLANEOUS REFERENCES
+*
+BLKCNT   EQU   12                      BLK COUNT OFFSET FROM DCB
+CDCNT    EQU   7                       CHANNEL DATA CHECK
+CDFULL   EQU   X'0F'                   CHANNEL DATA COUNT FULL
+CHDAT    EQU   X'08'                   CHANNEL DATA CHECK
+CHEND    EQU   X'08'                   CHANNEL END
+CNTEND   EQU   X'FF'                   END OF COUNTER FLAG
+CNT0     EQU   X'F0'                   RESET CLEANER COUNT TO 0
+CTROK    EQU   X'80'                   FAKE COUNTER INDICATOR
+CVTPTRV  EQU   288                     CVT OFFSET FOR TRANSLATE RTN
+C1       EQU   1                       COUNT OF 1
+C2       EQU   2                       COUNT OF 2
+C3       EQU   3                       COUNT OF 3              @Z30AB01
+C4       EQU   4                       COUNT OF 4
+C5       EQU   5                       COUNT OF 5
+C6       EQU   6                       COUNT OF 6
+C7       EQU   7                       COUNT OF 7              @YM07116
+C8       EQU   8                       COUNT OF 8
+C11      EQU   11                      COUNT OF 11             @YM07116
+C13      EQU   13                      COUNT OF 13
+C16      EQU   16                      COUNT OF 16
+C20      EQU   20                      COUNT OF 20
+C36      EQU   36                      COUNT OF 36
+C56      EQU   56                      COUNT OF 56
+C68      EQU   68                      COUNT OF 68
+C104     EQU   104                     COUNT OF 104
+C256     EQU   256                     COUNT OF 256
+C512     EQU   512                     COUNT OF 512
+ELEVEN   EQU   11                      COUNT OF 11
+EXCPER   EQU   15                      ERROR EXCP
+FULL     EQU   X'FF'                   FULL COUNT
+HEX24    EQU   X'18'                   COUNT OF 24
+HIBIT    EQU   128                     SET HI-ORDER BIT IN A BYTE
+IOSREP   EQU   X'10'                   REPOSITION TAPE FLAG
+IOSCRC   EQU   X'08'                   CRC FLAG
+LOAD2    EQU   1009                    LOAD 2 ADDRESS
+LOC16    EQU   16                      COMMUNICATION TABLE ADDRESS
+ON       EQU   X'80'                   SET HI-ORDER BIT ON
+PARON    EQU   X'01'                   TIE COUNTER PARITY BIT
+RDFULL   EQU   X'F0'                   READ COUNT FULL
+RETURN   EQU   3                       RETURN - SVC 3
+ROR      EQU   7                       ROR OFFSET
+SDRPI    EQU   8                       PE ID BURST SDR COUNT
+SDR20    EQU   X'01'                   20-BYTE SDR FLAG
+SERLOG   EQU   256                     ADDRESS OF OBR
+SNSCT    EQU   4                       COUNT OF SENSE BYTES
+STATAB   EQU   112                     STATISTICS TABLE ADDRESS
+STI      EQU   1                       STAT TABLE INDEX
+VECTXL   EQU   44                      VECTOR TO XCTL ROUTINE
+WORD     EQU   32                      NUMBER OF BITS IN WORD
+WRFULL   EQU   X'0F'                   WRITE COUNT FULL
+WTORTN   EQU   253                     LOAD NAME TO WTO ROUTINE
+ZERO     EQU   X'00'                   ZERO
+*
+*
+         EJECT
+         USING *,BASREG
+ERP1     B     ER2401A                 BRANCH AROUND DECLARES
+         DC    C'** IGE0000I-TAPE ERP 08-21-74 **'    **
+*
+***********************************************************************
+*                        C O N S T A N T S                            *
+***********************************************************************
+*
+         DS    0F                      ALIGN
+MASK     DC    X'0000FFFF'             COMPARE MASK
+MASK1    DC    X'0000001F'             SDR COUNTER LENGTH MASK
+MASK2    DC    X'0000003F'             SENSE BYTE NUMBER MASK
+SDRCON   DC    X'00000239'             MASK TO CHECK STATUS BITS
+ONE      DC    X'00000001'             COUNT OF 1
+FOUR     DC    X'00000004'             COUNT OF 4
+FZERO    DC    X'00000000'             COUNT OF 0
+F2047    DC    X'000007FF'             COUNT OF 2047
+ONEPAGE  DC    X'00000800'             COUNT OF 2048
+EIGHT    DC    AL2(8)                  HALFWORD OF 8
+TEN      DC    AL2(10)                 HALFWORD OF 10
+TWELVE   DC    AL2(12)                 HALFWORD OF 12
+H512     DC    H'512'                  HALFWORD OF 512
+         EJECT
+*
+*   STAT UPDATE TABLE
+*
+         DS    0F                      ALIGN
+TAB2400  EQU   *
+         DC    X'0480'                 TEMP READS
+         DC    X'0480'                 TEMP WRITES
+         DC    X'2400'                 INTERVENTION REQUIRED
+         DC    X'4400'                 BUS OUT
+         DC    X'6400'                 EQUIPMENT CHECK
+         DC    X'A400'                 OVERRUN
+         DC    X'C400'                 WORD COUNT ZERO
+         DC    X'E400'                 DATA CONVERTER CHECK
+         DC    X'0403'                 R/W VRC
+         DC    X'2403'                 LRCR
+         DC    X'4403'                 SKEW
+         DC    X'6403'                 CRC
+         DC    X'8403'                 SKEW REG VRC
+         DC    X'0401'                 NOISE
+         DC    X'0480'                 ROR
+         DC    X'0480'                 CHANNEL DATA CHECK
+         DC    X'00FF'                 END
+*
+TAB3420  EQU   *
+         DC    X'0880'                 SDR COUNTER FLAG BYTE
+         DC    X'0801'                 NOISE
+         DC    X'0803'                 R/W VRC
+         DC    X'2803'                 MTE/LRCR
+         DC    X'6803'                 EDC/CRC
+         DC    X'8803'                 ENV CK/VRC
+         DC    X'A400'                 OVERRUN
+         DC    X'4403'                 SKEW
+         DC    X'E403'                 C COMPARE
+         DC    X'6404'                 WRT TRIG VRC
+         DC    X'1080'                 PE ID BURST / TIE MASK
+         DC    X'4405'                 WTM CK
+         DC    X'8405'                 START RD CK
+         DC    X'A405'                 PARTIAL REC
+         DC    X'C405'                 EXCESS POSTAMBLE
+         DC    X'0408'                 IBG DROP IN WRT
+         DC    X'2408'                 FEED THRU CK
+         DC    X'4408'                 SPARE
+         DC    X'6408'                 EARLY BEGIN RD CK
+         DC    X'8408'                 EARLY END RD CK
+         DC    X'A408'                 SLOW BEGIN RD CK
+         DC    X'C408'                 SLOW END RD CK
+         DC    X'E408'                 VELOCITY RETRY
+         DC    X'0409'                 SPARE
+         DC    X'2409'                 VELOCITY CHANGE DURING WR
+         DC    X'4409'                 SPARE
+         DC    X'6409'                 SPARE
+         DC    X'C803'                 BACKWARD
+         DC    X'4400'                 BUS OUT CHECK
+         DC    X'0404'                 ALU HARDWARE ERROR
+         DC    X'00FF'                 END
+         DS    0F                      ALIGN
+         EJECT
+***********************************************************************
+*                          P A R T   1                                *
+***********************************************************************
+*                                                                     *
+*    THIS IS ENTRY TO THE 2400/3400 SERIES MAG TAPE ERROR ROUTINE     *
+*                                                                     *
+***********************************************************************
+*                                                                     *
+*    WHEN ENTERED, THE IOSEX AND THE IOSERR FLAGS WILL BE SET TO 1    *
+*    BY THE ERROR ROUTINE.                                            *
+*                                                                     *
+*    ON RETURN, THESE TWO FLAGS SHOULD BE INTERPRETED AS FOLLOWS:     *
+*        IOSEX ON AND IOSERR ON  - ERP IN CONTROL                     *
+*        IOSEX ON AND IOSERR OFF - PERMANENT ERROR                    *
+*        IOSEX OFF AND IOSERR OFF - ERROR CORRECTED                   *
+*                                                                     *
+***********************************************************************
+*
+         USING IOSB,IOSREG                                       Y02032
+         USING UCB,UCBREG
+         USING EWA,EWAREG                                        Y02032
+         USING CCW,CCWREG                                        Y02032
+         USING UCBMT,UXREG                                       Y02032
+ER2401A  EQU   *
+         L     UCBREG,IOSUCB           GET UCB ADR FROM IOSB     Y02032
+         SH    UCBREG,H512             POINT TO UCB PREFIX       Y02032
+         L     EWAREG,IOSERP           GET EWA ADDR FROM IOSB    Y02032
+         OI    IOSFLA,IOSEX            TURN ON EXCEPTION FLAG    Y02032
+         TM    EWAFLG1,EWABDSNS        TEST FOR SENSE FAILURE  @YM07116
+         BO    A003                    BRANCH ON SENSE FAILURE @YM07116
+*
+*   TEST FOR ICC OR CCC.  IF ON, GO TO LOAD 2, PART 9          @ZA14752
+*
+         TM    IOSTSB,CSWCCC+CSWICC    IS ICC OR CCC ON?       @ZA14752
+         BNZ   A2020                   YES - GO TO LOAD 2, PART 9
+         L     CCWREG,IOSCSW-C1        GET CCW ADDRESS         @YM07116
+         LA    CCWREG,0(CCWREG)        ZERO HI-ORDER BYTE      @YM07116
+         SH    CCWREG,EIGHT            POINT TO FAILING CCW    @YM07116
+         LTR   CCWREG,CCWREG           IS ADDRESS MINUS?       @YM07116
+         BM    A003                    BRANCH YES              @YM07116
+         CLI   0(CCWREG),CMDSNS        IS FAILING CCW A SNS    @YM07116
+         BNE   A003                    BRANCH NO               @YM07116
+         TM    IOSCC,IOSCC3            IS COND CODE 3          @YM07116
+         BO    A003                    BRANCH YES              @YM07116
+         TM    IOSCC,IOSCC1            IS COND CODE 1          @YM07116
+         BZ    A001                    BRANCH NO               @YM07116
+         MVC   0(C1,CCWREG),IOSFMSK    MOVE MODE SET TO CCW OP @YM07116
+A001     EQU   *
+         TM    IOSFLA,IOSREP           IS IT ERP REPOSITION?   @YM07116
+         BZ    A002                    BRANCH NO               @YM07116
+         MVC   0(C1,CCWREG),IOSMDB     MOVE REPO OP TO CCW OP  @YM07116
+A002     EQU   *
+         XC    C1(C7,CCWREG),C1(CCWREG) ZERO REST OF CCW       @YM07116
+         MVC   IOSMDM(1),EWTSNS2       MOVE TIE BYTE TO IOSB   @ZA08849
+A003     EQU   *
+         TM    UCBTBYT4,UCB3400        3400 TYPE DEVICE        @YM07116
+         BNO   A004                    NO, BRANCH              @YM07116
+         L     R8,UCBXTN               GET ADDR OF VES COUNTER @YM07116
+         LA    R8,C11(R8)              STEP TO MODE SET BYTE   @YM07116
+         MVC   0(C1,R8),IOSFMSK        MOVE IN MODE SET        @YM07116
+*
+*   CHECK FOR UNSOLICITED DEVICE END OR IOB INTERCEPT
+*
+A004     EQU   *
+         TM    IOSFLC,IOSVERIF         UNSOLICITED DEVICE END    Y02032
+         BO    A2020                   YES - XCTL TO LOAD 2
+         CLI   IOSCOD,IOSFINTC         IOB INTERCEPT?            Y02032
+         BE    A2020                   YES - XCTL TO LOAD 2
+*
+*   GET SDR TABLE ADDRESS
+*
+BEGIN    EQU   *
+         LA    R13,C512(UCBREG)        POINT TO UCB BASE
+         L     R8,LOC16                GET ADDRESS OF CVT
+         L     R8,STATAB(R8)           ADDRESS OF SDR TABLE
+         SR    R9,R9                   ZERO WORK REG
+         L     R4,UCBEXTPT             GET ADDR OF UCB COMMON EXTN.
+         LA    R4,0(R4)                GET 3-BYTE ADDRESS
+         IC    R9,STI(R4)              GET INDEX
+         LR    SDRREG,R8               SAVE SDR TABLE ADDRESS
+A005     EQU   *
+         CLM   R13,C3,0(R8)            SDR AREA SECTION?       @Z30AB01
+         BNH   A010                    YES-GET OUT OF LOOP     @Z30AB01
+         LA    R8,C2(R8)               INCREMENT TO NEXT SECTION
+         LA    R9,C256(R9)             STEP INDEX
+         B     A005                    NOT FOUND - LOOP AGAIN
+A010     EQU   *
+         MH    R9,TEN                  TIMES 10
+         AR    SDRREG,R9               ENTRY FOR THIS UNIT
+         EJECT
+*
+*   SET UP REMAINING ADDRESSES
+*
+*   IF THIS IS AN EXCP REQUEST, WE GET THE DEB ADDRESS FROM THE
+*   RQE AND THE DCB ADDRESS FROM THE DEB, OTHERWISE THEY ARE ZERO
+*
+         CLI   IOSDVRID,IOSXCPID       WAS THIS AN EXCP REQUEST? Y02032
+         BNE   A015                    NO-GO ZERO ADDRESS FIELDS Y02032
+         L     R13,IOSUSE              YES-GET RQE ADR FROM IOSB Y02032
+         L     R13,C8(R13)             GET DEB ADR FROM RQE      Y02032
+         ST    R13,EWTDEB              SAVE DEB ADR IN EWA       Y02032
+         L     R13,DEBDCB(R13)         GET DCB ADR FROM DEB      Y02032
+         ST    R13,EWTDCB              STORE IN EWA SAVE AREA    Y02032
+         B     A020                    GO GET REMAINING ADDR.    Y02032
+A015     EQU   *
+         SR    R13,R13                 ZERO WORK REG             Y02032
+         ST    R13,EWTDEB              ZERO DEB ADDRESS          Y02032
+         ST    R13,EWTDCB              ZERO DCB ADDRESS          Y02032
+*
+A020     EQU   *
+         L     UXREG,UCBXTN            GET ADR OF UCB EXTENSION  Y02032
+         LA    UXREG,0(UXREG)          GET 3-BYTE ADDRESS
+         LA    EXITREG,RETN            GET ERROR EXCP ADDR - SVC 15/3
+*
+         L     CCWREG,IOSCSW-C1        GET CCW ADDR FROM STATUS
+         LA    CCWREG,0(CCWREG)        GET 3-BYTE ADDRESS
+         SH    CCWREG,EIGHT            SUBTRACT 8
+         LTR   CCWREG,CCWREG           NEGATIVE ADDRESS?
+         BM    A1000                   YES - SET X'4B' & GO TO LOAD 2
+*
+         TM    EWACNTR3,EWTEXIT        IS TEMP EXIT BIT ON?
+         BO    D130                    YES - GO UPDATE COUNTERS
+*
+*   TEST FOR FIRST ENTRY INTO LOAD 1
+*   DO STAT UPDATE IF FIRST ENTRY
+*
+A100     EQU   *
+         TM    IOSFLA,IOSERR           FIRST ENTRY TO ERP        S21048
+         BO    A120                    NO - DON'T DO STAT UPDATE S21048
+*
+         NI    EWAFLG3,X'FF'-EWTOVER   ZERO SDR OVERFLOW       @ZA27822
+         XC    EWTIDAL(C68),EWTIDAL    SET EWT WORK AREA TO 0    Y02032
+         XC    EWTRRCCW(C8),EWTRRCCW   SET EWT WORK AREA TO 0    Y02032
+         XC    EWTRES(C16),EWTRES      SET EWT WORK AREA TO 0  @ZA05117
+*
+         OI    IOSFLA,IOSEX+IOSERR     SET ERP IN CONTROL
+         TM    IOSOPT,IOSDEP           DEVICE END POST BIT ON?   Y02032
+         BZ    A105                    NO - LEAVE DEP SAVE BIT OFF
+         OI    EWACNTR3,EWTDEP         YES - TURN ON DEP SAVE BIT
+*
+*   GO TO PART 5 TO DO STAT UPDATE IF ANY OF THE FOLLOWING ARE ON:
+*        UNIT CHECK
+*        PROGRAM CHECK
+*        PROTECTION CHECK
+*        CHANNEL DATA CHECK
+*        CHAINING CHECK
+*
+A105     EQU   *
+         LH    R0,IOSTATUS             GET STATUS
+         N     R0,SDRCON               ANY BITS ON?              S21048
+         BNZ   PART5                   YES - GO TO STAT UPDATE   S21048
+*
+*
+A120     EQU   *
+*
+         TM    EWAFLG3,EWTROR          TEST FOR READ OPPOSITE    Y02032
+         BO    PART3                   YES - BRANCH TO PART 3, ROR
+*
+         TM    EWACNTR3,EWTLWR         WAS LOOP WRITE TO READ DONE?
+         BNO   A130                    NO - GO CHECK REPOSITION
+*
+         NI    EWACNTR3,X'FF'-EWTLWR   RESET LWR FLAG
+         L     R13,EWTVIRT             GET ADDR OF USER CCW      Y02032
+         ST    R13,IOSVST              RESTORE START ADR (VIRT)  Y02032
+         LRA   R13,0(R13)              GET REAL ADDRESS          Y02032
+         ST    R13,IOSRST              RESTORE START ADR (REAL)  Y02032
+         B     A600                    GO BACKSPACE/ERASE GAP    Y02032
+*
+A130     EQU   *
+         TM    IOSFLA,IOSREP           WAS TAPE BEING REPOSITIONED?
+         BZ    A170                    NO - GO CONTINUE CHECKS
+         EJECT
+*
+*   R E P O S I T I O N I N G
+*
+A145     EQU   *
+         TM    IOSTSA,CSWUCK           TEST FOR ERROR ON REPOSITION
+         BZ    A150                    NO - BR AROUND LOAD 2 TEST
+*
+*
+*   ERROR ON REPOSITIONING - TEST FOR RETURN FROM LOAD 2
+*
+A145A    TM    EWAFLG3,EWTRTN2         RETURN FROM LOAD 2?       Y02032
+         BO    A160                    YES - GO CHK FOR CLEAN OR ERASE
+         B     A2020                   NO  - XCTL TO LOAD 2
+*
+A150     EQU   *
+         TM    IOSTSA,CSWCUB           CONTROL UNIT BUSY?
+         BCR   1,EXITREG               YES - RESTART, SVC 15/3
+*
+A160     NI    EWAFLG3,X'FF'-EWTRTN2   RESET LOAD 2 SWITCH       Y02032
+*
+*   TEST FOR TAPE CLEAN OR TAPE ERASE
+*
+         TM    EWAFLG3,EWTTPC+EWTBKS   IS THIS CLEANING OR ERASE?
+         BC    5,A400                  YES - BRANCH
+         TM    EWACNTR1,CLNCNT0        IS CLEANER CONTROL COUNT ZERO?
+         BC    5,C485                  NO - SVC 15/3
+*
+A165     EQU   *
+         NI    IOSFLA,X'FF'-IOSREP     SET TAPE REPOSITION BIT OFF
+*
+*   RESTORE DEVICE END POST BIT
+*
+A166     TM    EWACNTR3,EWTDEP         WAS ORIGINAL DEV END POST ON?
+         BO    A168                    YES - LEAVE IT ON
+         NI    IOSOPT,X'FF'-IOSDEP     NO - TURN IT OFF
+A168     EQU   *
+         BR    EXITREG                 GO RETRY - SVC 15/3
+         EJECT
+*
+*   N O T   R E P O S I T I O N I N G
+*
+A170     EQU   *
+         NI    IOSFLA,X'FF'-IOSCRC     TURN OFF CRC
+*
+*   TEST FOR INITIAL SELECTION
+*
+         TM    IOSCC,IOSCC3            SIO CONDITION CODE = 3?
+         BO    A570                    YES - GO XCTL TO WTO
+         BM    A210                    BR IF COND CODE = 1 (INIT SEL)
+*
+*   TEST FOR CHAINING
+*
+         TM    IOSFLA,IOSACHN          DATA OR COMMAND CHAINING?
+         BZ    A200                    NEITHER - GO SET REP DIRECTION
+         BO    A525                    BOTH - GO EXIT ERP
+*
+*   DATA CHAINING OR COMMAND CHAINING
+*
+         TM    IOSFLA,IOSCCHN          COMMAND CHAINING?
+         BO    A180                    YES - BR AROUND DATA CHAINING
+*
+*   DATA CHAINING ONLY - START AT TOP OF CHANNEL PROGRAM
+*
+         L     CCWREG,IOSVST           GET START ADDRESS (VIRTUAL)
+         B     A200                    GO SET DIRECTION
+*
+*   COMMAND CHAINING
+*
+A180     TM    EWACNTR3,EWTRST         FIRST ENTRY (START FLAG OFF)?
+* *
+*   SAVE ORIGINAL FAILING CCW ADDRESS IN CASE OF MULTIPLE
+*   FAILURES IN THE SAME CCW CHAIN.
+**
+         BNE   A181                    NO, BRANCH AROUND      @ZA16828
+         ST    CCWREG,EWADCNT          SAVE CCW ORIGINAL CCW  @ZA16828
+         B     A190                    GO SET RESTART         @ZA16828
+*
+*   NOT FIRST ENTRY
+*
+A181     NI    IOSMDB,ZERO             CLEAR MOD BYTE
+         LR    R13,CCWREG              SET WORK REG TO CCW ADDRESS
+         S     R13,IOSVST              COMPARE TO RESTART ADDRESS
+         BZ    A200                    EQUAL - BRANCH TO SET DIRECTION
+*
+*   COMMAND CHAINING AND CHAIN BROKE IN DIFFERENT PLACE
+*
+         XC    EWACNTR1(C2),EWACNTR1   CLEAR ERROR COUNTS        Y02032
+A190     EQU   *
+         OI    EWACNTR3,EWTRST         SET RESTART FLAG          Y02032
+         ST    CCWREG,IOSVST           SET ADDRESS TO RESTART
+         LRA   R13,CCW                 TRANSLATE VIRT START ADDR Y02032
+         ST    R13,IOSRST              STORE IN REAL START ADDR  Y02032
+*
+*   SET REPOSITION DIRECTION FOR ALL READ/WRITE ERRORS
+*
+A200     EQU   *
+         LTR   CCWREG,CCWREG           NEGATIVE ADDRESS?         A29974
+         BM    A1000                   YES - SET X'4B' & GO TO LOAD 2
+         MVI   IOSMDB,CMDBSR           SET TO BACKSPACE          A29974
+         CLI   CCWOP,CMDRDB            IS IT READ BACK?
+         BNE   A210                    NO - LEAVE BSR
+         MVI   IOSMDB,CMDFSR           SET TO FORWARD SPACE
+*
+*   TEST FOR UNIT CHECK
+*
+A210     EQU   *
+         TM    IOSTSA,CSWUCK           UNIT CHECK?
+         BO    A220                    YES - GO TEST SENSE
+         CLI   IOSTSA,CSWCUB           IS CONTROL UNIT BUSY?
+         BNE   PART4                   NO - GO TEST CSW, PART 4
+         BR    EXITREG                 ERROR EXCP - SVC 15/3
+         EJECT
+*
+*                        U N I T   C H E C K
+*
+*   TEST SENSE BITS ACCORDING TO PRIORITY
+*
+A220     EQU   *
+         TM    EWTSNS0,SNSTST          PRIORITY TEST OF SENSE    Y02032
+*                                      CR, IR, BO, EQ, OR
+         BC    5,A2010                 ANY OR ALL TO LOAD 2, PART 4
+         TM    EWTSNS1,EWTLP           BACKED INTO LOAD POINT ON READ?
+         BO    A2010                   YES - BRANCH TO LOAD 2, PART 4
+         TM    EWTSNS0,EWTDATA         DATA CHECK?               Y02032
+         BO    A230                    YES - BR AROUND CHANNEL DATA CK
+*
+*   TEST FOR CHANNEL DATA CHECK
+*
+         TM    IOSTSB,CSWCDC           CHANNEL DATA CHECK?
+         BO    A2000                   YES - BR TO LOAD 2, PART 4B
+         TM    EWTSNS5,EWTPEID         IS IT PE ID CHECK         Y02032
+         BNO   A2010                   NO - BR TO LOAD 2, PART 4
+*
+*                         D A T A   C H E C K
+*
+A230     EQU   *
+         TM    CCWOP,CMDWRT            WRITE OR CONTROL?         A29974
+         BO    A580                    YES - GO CHECK 15 RETRIES
+*
+*   TEST NOISE BIT
+*   ALWAYS ON FOR PE, INDICATING THAT IT IS NOT A NOISE BLOCK
+*
+         TM    EWTSNS1,EWTNOISE        NOISE BIT ON?             Y02032
+         BO    A260                    YES - CHECK FOR RETRIES
+*
+*   CHECK BLOCK LENGTH FOR SHORT BLOCK
+*
+         TM    IOSFLA,IOSDCHN          DATA CHAINING?
+         BZ    A250                    NO - GO CHECK RESIDUAL
+*
+*   TEST FOR NOISE WHEN DATA CHAINING.  CCWREG IS START ADDRESS
+*
+         LA    CCWREG,CCWADR           GET ADDRESS ONLY (START)
+         L     R13,IOSCSW-C1           GET INTERRUPT + 8
+         LA    R13,0(R13)              GET ADDRESS ONLY
+         SH    R13,EIGHT               SUBTRACT 8
+         CR    CCWREG,R13              ERROR ON FIRST CCW?
+         BL    A260                    NO - BR AROUND NOISE TEST
+         CLC   CCWCNT,TWELVE           1ST CCW COUNT GREATER THAN 11?
+         BL    A2020                   NO - NOISE BLOCK, BR TO LOAD 2
+*
+*   TEST COUNT - RESIDUAL FOR NOISE BLOCK
+*
+A250     EQU   *
+         LH    R13,CCWCNT              GET CCW COUNT
+         SH    R13,IOSCSWRC            LESS RESIDUE IN CSW
+         N     R13,MASK                ZERO HIGH ORDER BITS
+         SH    R13,TWELVE              SUBTRACT MINIMUM SIZE
+         BM    A2020                   SHORT BLOCK - GO TO LOAD 2
+*
+*   TEST IF TAPE CLEANING TO BE USED
+*
+A260     EQU   *
+         L     R13,EWTDEB              GET DEB ADDR              Y02032
+         CL    R13,FZERO               VALID DEB ADDR?           Y02032
+         BE    A270                    NO - SKIP EMULATOR        Y02032
+         TM    DEBOFL(R13),DEBEMU      IS EMULATOR BIT ON?
+         BZ    A270                    NO - BR AROUND PARITY FLIP
+         XI    DEBMOD(R13),DEBPAR      YES - FLIP PARITY
+         MVC   IOSFMSK(1),DEBMOD(R13)  PUT MODESET TO IOSB     @ZA05130
+A270     EQU   *
+         TM    EWACNTR2,X4             IS THIS A MULTIPLE OF 4?  Y02032
+         BZ    A300                    NO - CONTINUE
+*
+*   IS REDUCED ERROR RECOVERY SPECIFIED?
+*
+         CL    R13,FZERO               VALID DEB ADDR?           Y02032
+         BE    A280                    NO - SKIP RER             Y02032
+         TM    DEBOFL(R13),DEBRER      IS RER BIT ON?
+         BZ    A280                    NO - CONTINUE
+         BAL   RETREG,A575             YES-GO UPDATE PR VES COUNTER
+*
+*   PERMANENT ERROR EXIT
+*
+A275     EQU   *
+         NI    IOSFLA,X'FF'-IOSERR-IOSSMDA SET PERM ERR EXIT   @YM06412
+         BR    EXITREG                 EXIT VIA SVC 15/3
+         EJECT
+*
+*                       C L E A N I N G
+*
+*   NOT REDUCED ERROR RECOVERY - TEST FOR LAST READ RETRY
+*
+A280     EQU   *
+         TM    EWACNTR2,NUMB40         40TH RETRY?
+         BO    PART3                   YES - BRANCH TO PART 3, ROR
+*
+*   THIS SECTION IS ENTERED EVERY 4TH RETRY ON A READ ERROR TO
+*   PERFORM A CARRY OPERATION AND INITIATE TAPE CLEANING
+*
+         LH    R13,UCBCLN              GET ESV CLEANER COUNT
+         CH    R13,MASK+C2             IS COUNTER FULL?
+         BE    A290                    YES - BR AROUND INCREMENT
+         LA    R13,C1(R13)             ADD ONE TO COUNT
+         STH   R13,UCBCLN              STORE UPDATED COUNT
+*
+*   INCREMENT READ DATA CHECK COUNT
+*
+A290     EQU   *
+         SR    R13,R13                 ZERO REGISTER
+         IC    R13,EWACNTR2            GET ERROR COUNT
+         LA    R13,C13(R13)            PERFORM CARRY
+         STC   R13,EWACNTR2            STORE UPDATED COUNT       Y02032
+         OI    EWAFLG3,EWTTPC          SET TAPE CLEAN BIT        Y02032
+         OI    IOSFLA,IOSREP+IOSCRC    SET REPOSITION AND CRC FLAGS
+         OI    IOSOPT,IOSDEP           SET DEVICE END POST BIT   Y02032
+*
+*   SET UP FOR BACK SPACES (4 IF RDF, 3 IF RDB)
+*
+         OI    EWACNTR1,CLNCNT4        ASSUME READ FORWARD       Y02032
+         CLI   CCWOP,CMDRDB            READ BACKWARDS?
+         BCR   7,EXITREG               NO - SVC 15/3
+         NI    EWACNTR1,CNT0           SET COUNT TO ZERO         Y02032
+         OI    EWACNTR1,CLNCNT3        SET COUNT TO 3            Y02032
+         OI    EWAFLG3,EWTBKS          SET BACKSPACE ERASE FLAG  Y02032
+         MVI   IOSMDB,CMDBSR           SET BSR COMMAND
+         BR    EXITREG                 EXIT - SVC 15/3
+*
+*   N O   C L E A N I N G
+*
+A300     EQU   *
+         MVI   EWTRRCMD,ZERO           ZERO ROR COMMAND
+         OI    IOSFLA,IOSREP+IOSCRC    SET TAPE REPOSITION & CRC
+         OI    IOSOPT,IOSDEP           SET DEVICE END POST BIT   Y02032
+         IC    R13,EWACNTR2            GET CURRENT COUNT         Y02032
+         LA    R13,C1(R13)             ADD ONE TO COUNT
+         STC   R13,EWACNTR2            STORE UPDATED COUNT       Y02032
+         BR    EXITREG                 GO REPOSITION - SVC 15/3
+*
+*   NOT DATA CHECK ON READ - CHECK SENSE
+*
+A400     EQU   *
+         TM    EWAFLG3,EWTTPC          IS TAPE CLEANING USED?    Y02032
+         BO    A510                    YES - GO TEST FOR END OF CLEANER
+         NI    EWAFLG3,X'FF'-EWTBKS    SET BKS ERASE FLAG OFF    Y02032
+         MVI   IOSMDB,CMDERG           SET CONTROL COMMAND TO ERASE
+         BR    EXITREG                 TO ERROR EXCP - SVC 15/3
+*
+*   TEST FOR END OF CLEANER BSR (DECREMENT COUNT OR SET FSR)
+*
+A510     EQU   *
+         TM    EWACNTR1,CLNCNT0        IS CLEANER CTL COUNT ZERO?
+         BC    5,C485                  NO - DECREMENT COUNT, SVC 15/3
+         MVI   IOSMDB,CMDFSR           SET CONTROL COMMAND TO FSR
+         OI    EWACNTR1,CLNCNT3        SET CONTROL COUNT TO 3    Y02032
+         TM    EWAFLG3,EWTBKS          IS BACKSPACE ERASE FLAG ON?
+         BZ    A520                    NO - GO RESET CONTROL FLAGS
+*
+         NI    EWACNTR1,HEXF8          SET COUNT TO 0            Y02032
+         OI    EWACNTR1,CLNCNT4        SET COUNT TO 4            Y02032
+*
+A520     EQU   *
+         NI    EWAFLG3,X'FF'-EWTTPC-EWTBKS   CLEAR FLAGS         Y02032
+         BR    EXITREG                 EXIT VIA SVC 15/3
+         EJECT
+*
+*                L O G O U T
+*
+A525     EQU   *
+         TM    CCWOP,CMDWRT            WRITE OR CONTROL?
+         BO    A530                    YES-GO UPDATE PW VES CNTR
+         BAL   RETREG,A575             NO-GO UPDATE PR VES CONTR
+         B     A560                    GO LOG OUT
+*
+*   UPDATE PERMANENT WRITE VES COUNTER
+*
+A530     EQU   *
+         TM    UCBPW,FULL              IS PERM. WRITE COUNT FULL?
+         BO    A560                    YES - SKIP UPDATE
+         IC    R4,UCBPW                NO - GET PERM WRITE COUNT
+         LA    R4,C1(R4)               ADD ONE TO COUNT
+         STC   R4,UCBPW                STORE BACK
+*
+*   SET MESSAGE BIT
+*
+A560     EQU   *
+         NI    IOSFLA,X'FF'-IOSERR-IOSSMDA  SET PERM ERR EXIT  @YM06412
+         OI    IOSFLB,IOSMSG+IOSLOG    SET MESSAGE TYPE & LOGOUT
+**
+*   RESTORE ORIGINAL FAILING CCW ADDRESS
+**
+         TM    IOSFLA,IOSCCHN          COMMAND CHAINING ?     @ZA16828
+         BNO   A570                    NO, BRANCH AROUND      @ZA16828
+         L     R13,EWADCNT             GET FIRST FAILING CCW  @ZA16828
+         LTR   R13,R13                 CCW POINTER ZERO ?     @ZA16828
+         BZ    A570                    YES, BRANCH AROUND     @ZA16828
+         LA    R13,0(R13)              ZERO HIGH ORDER BYTES  @ZA16828
+         ST    R13,IOSVST              RESTORE VIRTUAL START  @ZA16828
+         LRA   R13,0(R13)              GET REAL ADDRESS       @ZA16828
+         ST    R13,IOSRST              RESTORE REAL START     @ZA16828
+A570     EQU   *
+         LA    R13,WTORTN              LOAD WTO ADDRESS
+         B     XCTL1                   XCTL TO WTO
+*
+*   UPDATE PERMANENT READ VES COUNTER
+*
+A575     EQU   *
+         TM    UCBPR,FULL              IS READ COUNT FULL?
+         BO    A577                    YES - SKIP UPDATE
+         IC    R4,UCBPR                GET PERM READ COUNT
+         LA    R4,C1(R4)               ADD ONE TO COUNT
+         STC   R4,UCBPR                STORE BACK
+A577     BR    RETREG                  RETURN
+         EJECT
+*
+*                  D A T A   C H E C K
+*
+*                   WRITE OR CONTROL
+*
+A580     EQU   *
+         TM    EWACNTR2,NUMB15         15 RETRIES?               Y02032
+         BO    A530                    YES - BRANCH TO PERM ERROR
+*
+         IC    R13,EWACNTR2            GET ERROR COUNT           Y02032
+         LA    R13,C1(R13)             ADD ONE TO COUNT
+         STC   R13,EWACNTR2            STORE UPDATED COUNT       Y02032
+         TM    EWACNTR2,NUMB15         14 RETRIES?               Y02032
+         BO    A620                    YES - BR TO LOOP WR/RD    S21048
+*
+         TM    CCWOP,CMDCTL            IS THIS A CONTROL COMMAND?
+         BNO   A585                    NO - GO TEST PE ID BURST
+*
+         CLI   CCWOP,CMDWTM            IS CTL COMMAND A WTM?
+         BE    A585                    YES - GO TEST PE ID BURST
+*
+         TM    EWTSNS5,EWTPEID         IS IT PE ID BURST?        Y02032
+         BO    A587                    YES - GO SET TO REWIND
+*
+*   ERG DATA CHECK - CHECK FOR 4 (3 RETRIES)
+*
+         TM    EWACNTR2,CLNCNT4        HAD 3 RETRIES?            Y02032
+         BCR   14,EXITREG              NO - RETRY, SVC 15/3
+         B     A530                    YES - PERM ERROR, GO WRITE MSG
+*
+A585     EQU   *
+         TM    EWTSNS5,EWTPEID         PE ID BURST CHECK?        Y02032
+         BZ    A600                    NO - GO CHECK FOR REWIND  S21048
+A587     EQU   *
+         MVI   IOSMDB,CMDREW           SET REWIND COMMAND        S21048
+A590     EQU   *
+         OI    IOSFLA,IOSREP           SET REPOSITION BIT
+         OI    IOSOPT,IOSDEP           SET DEVICE END POST BIT   Y02032
+A595     EQU   *
+         BR    EXITREG                 GO REWIND/RETRY - SVC 15/3
+*
+*   SET FOR ERG AND REPOSITION
+*
+A600     EQU   *
+         CLI   IOSMDB,CMDREW           WAS COMMAND A REWIND?     S21048
+         BE    A610                    YES-BR AROUND ERASE LOGIC S21048
+*
+         OI    EWAFLG3,EWTBKS          SET BACKSPACE ERASE FLAG  Y02032
+         NI    EWACNTR2,X'FF'-ERGCNT   RESET ERG D.C. COUNT      Y02032
+         LH    R13,UCBERG              GET ERG COUNT
+         CH    R13,MASK+C2             IS COUNT FULL?
+         BE    A610                    YES - BR AROUND ERG COUNTER
+*
+         LA    R13,C1(R13)             ADD ONE TO COUNT
+         STH   R13,UCBERG              STORE UPDATED COUNT
+A610     EQU   *
+         TM    EWACNTR3,EWTROC         ROR COMMAND IN USE?       Y02032
+         BZ    A590                    NO - GO SET REP, SVC 15/3 S21048
+*
+         NI    EWACNTR3,X'FF'-EWTROC   RESET USE ROR COMMAND     Y02032
+         TM    IOSTSA,CSWUCK           IS UNIT CHECK ON?         M0907
+         BZ    A590                    NO - GO RETRY             A52064
+*
+         OI    IOSFLA,IOSREP           SET REPOSITION BIT        Y02032
+         OI    IOSOPT,IOSDEP           SET DEVICE END POST BIT   Y02032
+         OI    EWAFLG3,EWTOVER         SET SDR OVERFLOW FLAG ON  Y02032
+         LA    R13,SERLOG              GET ADDRESS OF OBR        S21048
+         B     XCTL1                   GO TO OBR
+*
+A620     EQU   *
+         CLI   CCWOP,CMDWRT            IS COMMAND A WRITE?       S21048
+         BNE   A585                    NO - GO TEST FOR PE ID BURST
+*
+         TM    UCBTBYT4,UCB3400        3400 TAPE UNIT?           S21048
+         BNO   A585                    NO - GO TEST FOR PE ID BURST
+*
+*   SET LOOP WRITE TO READ
+*
+         MVC   EWTRRCCW,CCW            MOVE IN USER CCW          S21048
+         MVI   EWTRRCMD,CMDLWR         SET LOOP WRT/RD OP CODE   S21048
+         OI    EWACNTR3,EWTLWR         SET LOOP WRITE TO READ FLAG
+         OI    EWTRRFLS,RORSILI        SUPPRESS INCORRECT LENGTH Y02032
+         NI    EWTRRFLS,X'FF'-IOSACHN  TURN OFF CHAINING FLAGS
+         OI    EWACNTR3,EWTROC         SET USE ROR COMMAND       S21048
+*
+*   SET UP RORCCW ADDRESS FOR IOS
+*
+         MVC   EWTVIRT,IOSVST          SAVE START ADDR (VIRT)
+         LA    R13,EWTRRCCW            GET ADDR OF RORCCW (VIRT)
+         ST    R13,IOSVST              STORE IOSB VIRT START ADDR
+         LRA   R13,EWTRRCCW            GET ADDR OF RORCCW (REAL)
+         ST    R13,IOSRST              STORE IOSB REAL START ADDR
+*
+         TM    EWTSNS5,EWTPEID         PE ID BURST CHECK?        S21048
+         BZ    A595                    NO  - GO SVC 15/3
+         MVI   IOSMDB,CMDREW           SET REWIND COMMAND        S21048
+         BR    EXITREG                 GO REWIND - SVC 15/3
+         EJECT
+A1000    EQU   *
+         MVI   IOSCOD,IOSTAPEC         X'4B' IN IOB ECB CODE     A29974
+*                                      INDICATES ERP ERROR
+         B     A2020                   GO TO LOAD 2, PART 1
+*
+*   TRANSFER CONTROL TO LOAD 2
+*
+A2000    EQU   *
+         OI    EWAFLG3,EWTPT4B         SET UP FOR ENTRY TO PART 4B
+         B     A2020                   GO TO LOAD 2
+A2010    EQU   *
+         OI    EWAFLG3,EWTPT4A         SET UP FOR ENTRY TO PART 4A
+A2020    EQU   *
+         LA    R13,LOAD2               GET LOAD 2 ADDRESS
+         B     XCTL4                   GO XCTL
+*
+XCTL1    EQU   *                       SET UP OBR INFO IN EWA    Y02032
+         L     R5,EWTDCB               GET DCB ADDR              Y02032
+         LA    R4,EWTVOLID             GET ADDR OF OBR AREA      Y02032
+         ST    R4,EWADCNT              STORE ADDR IN EWA         Y02032
+         MVI   EWADCNT,HEX24           MOVE IN #BYTES OF OBR     Y02032
+         MVC   EWTVES,UCBCTD           GET VES INFO              Y02032
+         CL    R5,FZERO                VALID DCB?                Y02032
+         BE    XCTL2                   NO - SKIP BLOCK COUNT     Y02032
+         OI    EWAFLG1,EWADDMSG        SET WTO FLAG ON         @ZA31011
+         CLC   BLKCNT(4,R5),MASK       IS BLKCNT = TO 65K?     @ZA08856
+         BNH   MOVIT                   BR IF BLKCNT IS LESS    @ZA08856
+         MVC   EWTBLK,MASK+2           MOVE FFFF TO RECORD     @ZA08856
+         B     XCTL3                   GO XCTL                 @ZA08856
+MOVIT    EQU   *
+         MVC   EWTBLK,BLKCNT+C2(R5)    YES - GET BLOCK COUNT     Y02032
+         B     XCTL3                   GO XCTL                   Y02032
+*
+XCTL2    EQU   *
+         MVC   EWTBLK,FZERO            SET BLOCK COUNT TO 0      Y02032
+*
+XCTL3    EQU   *
+         MVC   EWTVOLID,UCBVOLI        GET VOL SER               Y02032
+XCTL4    EQU   *
+         L     XCTLREG,LOC16           GET ADDRESS OF CVT
+         L     XCTLREG,VECTXL(XCTLREG) GET ADDRESS FOR XCTL ROUTINE
+         BR    XCTLREG                 BRANCH TO XCTL
+*
+*   ALL EXITS VIA SVC 15/3 COME HERE
+*
+RETN     EQU   *
+         SVC   EXCPER                  SVC 15 - ERROR EXCP
+         SVC   RETURN                  SVC 3  - EXIT
+*************   E N D   O F   P A R T   1   *************
+         EJECT
+***********************************************************************
+*                             P A R T   3                             *
+*                                                                     *
+*                       READ OPPOSITE RECOVERY                        *
+***********************************************************************
+*                                                                     *
+*        ISSUE A READ COMMAND IN THE OPPOSITE DIRECTION               *
+*        WITH THE SUPPRESS DATA TRANSFER BIT ON.  REPEAT              *
+*        40 TIMES OR UNTIL THE BLOCK IS READ SUCCESSFULLY.            *
+*                                                                     *
+*        AFTER EVERY FOURTH RETRY, GO THROUGH A TAPE                  *
+*        CLEANING SEQUENCE.                                           *
+*                                                                     *
+*        ROR IS NOT POSSIBLE IF:                                      *
+*              1.  DATA CHAINING                                      *
+*              2.  OPERATING IN 7-TRACK DATA CONVERT MODE             *
+*              3.  SUPPRESS DATA TRANSFER BIT IS SET IN FAILING CCW   *
+***********************************************************************
+PART3    EQU   *
+*
+*   TEST FOR READ OPPOSITE IN PROGRESS
+*
+         TM    EWAFLG3,EWTROR          ROR BIT ON?               Y02032
+         BO    C160                    YES - GO TEST FOR ERROR
+*
+*   IF RORCCW IS NOT ZERO, WE HAD A PERMANENT ROR ERROR
+*
+         CLI   EWTRRCMD,ZERO           IS COMMAND ZERO?
+         BNE   C120                    NO - BR TO PERM ERROR
+*
+*   THIS IS FIRST ENTRY FOR ROR ON A READ OR READ BACK
+*   DATA CHECK.  TEST FOR CONDITIONS NOT APPLICABLE
+         TM    EWTSNS1,EWT7TK          IS THIS 7-TRACK?          Y02032
+         BZ    C110                    NO-GO TEST FOR SUPP DATA XFER
+*
+*   TEST FOR DATA CONVERTER MODE SET
+*
+         L     R13,EWTDCB              GET ADDRESS OF DCB        Y02032
+         CL    R13,FZERO               VALID DCB ADDR?           Y02032
+         BE    C110                    NO - SKIP DATA CON TEST   Y02032
+         CLI   DCBMOD(R13),DCBDCF      DATA CONVERTER BEING USED?
+         BE    C120                    YES-SKIP TEST FOR SUPP DATA TR.
+*
+*   TEST FOR SUPPRESS DATA TRANSFER IN ORIGINAL CCW
+*
+C110     EQU   *
+         TM    CCWFLS,RORSDT           SUPPRESS DATA TRANSFER?   A29974
+         BO    C120                    YES - BRANCH TO PERM ERROR
+*
+*   TEST FOR CCW COUNT GREATER THAN X'7FFF'
+*
+         CLI   CCWCNT,HIBIT            COUNT TOO HIGH          @ZA17538
+         BNL   C120                    YES, PERMANENT ERROR    @ZA17538
+*
+*   TEST FOR DATA CHAINING
+*
+         TM    IOSFLA,IOSDCHN          DATA CHAINING?
+         BZ    C140                    NO - GO SET UP RORCCW
+C120     EQU   *
+         BAL   RETREG,A575             GO UPDATE PR VES COUNTER
+C130     EQU   *
+         B     A560                    BRANCH TO PERM ERROR      S21048
+         EJECT
+*
+*                        F I R S T   E N T R Y
+*
+*             SET UP INITIAL RORCCW ON FIRST ENTRY ONLY
+*
+C140     EQU   *
+         MVC   EWTRRCCW,CCW            MOVE USER CCW TO RORCCW   Y02032
+         CLC   EWTRRCNT,IOSCSWRC       USER BYTE CNT = RESIDUAL CNT?
+         BE    C120                    YES - PERMANENT ERROR     Y02032
+*
+*   SET UP IOSB START ADDRESSES (REAL & VIRT) WITH ADDRESS OF
+*   RORCCW TO BE USED DURING ROR
+*
+         MVC   EWTVIRT,IOSVST          SAVE START ADDR (VIRT)    Y02032
+         LA    R13,EWTRRCCW            GET ADDR OF RORCCW (VIRT) Y02032
+         ST    R13,IOSVST              STORE IOSB VIRT START ADR Y02032
+         LRA   R13,EWTRRCCW            GET ADDR OF RORCCW (REAL) Y02032
+         ST    R13,IOSRST              STORE IOSB REAL START ADR Y02032
+*
+         XC    IOSCSWRC,IOSCSWRC       ZERO RESIDUAL COUNT       Y02032
+         BAL   BALREG,PART6            GO SET UP ADDRESSABILITY
+*
+*   UPDATE SDR
+*
+C142     EQU   *
+         TM    UCBTBYT4,UCB3400        3400 TAPE UNIT?
+         BO    C145                    YES - SKIP ROR COUNT
+*
+         IC    R4,ROR(SDRREG)          GET ROR COUNT
+         LA    R4,C16(R4)              ADD ONE TO COUNT
+         STC   R4,ROR(SDRREG)          STORE BACK
+         TM    ROR(SDRREG),RDFULL      IS COUNT FULL?
+         BNO   C145                    NO - SKIP OVERFLOW
+*
+         OI    EWAFLG3,EWTOVER         YES - SET SDR OVERFLOW    Y02032
+C145     EQU   *
+         XC    EWACNTR1(C2),EWACNTR1   ZERO ERROR COUNTERS       Y02032
+         OI    EWACNTR2,X1             SET READ COUNT TO ONE     Y02032
+         B     C510                    GO READ OPPOSITE
+         EJECT
+*
+*                      R O R   I N   P R O G R E S S
+*
+*   TEST FOR ERROR ON RETRY OR SPACE
+*
+C160     EQU   *
+         TM    EWAFLG3,EWTRBLD         REBUILD IDAL LIST?        Y02032
+         BNO   C165                    NO  - BRANCH AROUND       Y02032
+         BAL   BALREG,F030             YES - GO TO PART 6        Y02032
+C165     EQU   *
+         TM    IOSTSA,CSWUCK           UNIT CHECK?
+         BO    C230                    YES - BRANCH
+*
+*   TEST FOR CONTROL UNIT BUSY
+*
+         TM    IOSTSA,CSWCUB           CU BUSY?
+         BCR   1,EXITREG               YES - GO RETRY, SVC 15/3
+*
+*   TEST FOR RETRY OR SPACE
+*
+         TM    EWACNTR3,EWTROC         IOS USE RORCCW BIT ON?    Y02032
+         BZ    C410                    NO - GO RETRY
+         NI    EWACNTR3,X'FF'-EWTROC   RESET IOS USE RORCCW      Y02032
+         OI    IOSFLA,IOSREP+IOSCRC    SET REPOSITION BIT & CRC  Y02032
+         OI    IOSOPT,IOSDEP           SET DEVICE END POST BIT   Y02032
+*
+*   WE HAVE JUST READ OPPOSITE.  IF SUPPRESS DATA TRANSFER
+*   BIT IS OFF, WE HAVE RECOVERED THE UC-DC CONDITION.
+*
+         TM    IOSTSB,CSWCDC           CHANNEL DATA CHECK?
+         BO    C285                    YES - GO RESET USE RORCCW BIT
+*
+         TM    EWTRRFLS,RORSDT         SUPPRESS DATA TRANSFER?
+         BO    C180                    YES - GO BUILD FINAL RORCCW
+*
+         TM    IOSTSA,CSWUEX           UNIT EXCEPTION?
+         BZ    C170                    NO - BRANCH
+         OI    EWACNTR3,EWTUEX         SET UNIT EXCEPTION FLAG   Y02032
+*
+C170     EQU   *
+         MVI   EWTRRCMD,ZERO           ZERO COMMAND (SWITCH)
+         BR    EXITREG                 GO SPACE OVER RECORD
+         EJECT
+*
+*            B U I L D   F I N A L   R O R C C W
+*
+C180     EQU   *
+         LH    R4,EWTRRCNT             GET ORIGINAL COUNT
+         N     R4,MASK                 RESET HIGH ORDER BITS
+         TM    IOSTSB,CSWICL           INCORRECT LENGTH?
+         BZ    C200                    NO - BRANCH AROUND
+*
+         CLC   IOSCSWRC,FZERO          IS RESIDUAL COUNT ZERO
+         BNE   C190                    NO - BRANCH AROUND
+*
+         MVI   EWACNTR2,NUMB40         SET MAXIMUM COUNT TO 40   Y02032
+         B     C380                    BRANCH TO ONE FINAL RETRY
+*
+*   CCW COUNT IS GREATER THAN OR EQUAL TO THE BLOCK SIZE
+*
+C190     EQU   *
+         BAL   BALREG,F010             GO SET UP ADDRESSES       Y02032
+*
+C200     EQU   *
+         NI    EWTRRFLS,X'FF'-RORSDT   ENABLE DATA TRANSFER
+         BR    EXITREG                 GO SPACE - SVC 15/3
+         EJECT
+*
+*                      U N I T   C H E C K
+*
+*   EQUIPMENT CHECK IS A VALID ERROR ONLY WITH DEVICE END
+*
+C230     EQU   *                       E Q U I P M E N T   C H E C K
+         TM    EWTSNS0,EWTEQU          EQUIPMENT CHECK?          Y02032
+         BZ    C250                    NO - GO CONTINUE TEST
+         TM    IOSTSA,CSWDVE           DEVICE END?
+         BNO   C250                    NO - GO CONTINUE TEST
+*
+*   RESTORE START ADDRESSES AND XCTL TO WTO
+*
+C240     EQU   *
+         L     R13,EWTVIRT             GET ADDR OF USER CCW      Y02032
+         ST    R13,IOSVST              RESTORE START ADR (VIRT)  Y02032
+         LRA   R13,0(R13)              GET REAL ADDRESS          Y02032
+         ST    R13,IOSRST              RESTORE START ADR (REAL)  Y02032
+         B     A560                    GO XCTL TO WTO
+*
+C250     EQU   *                       B U S   O U T   C H E C K
+         TM    EWTSNS0,EWTBUSO         BUS OUT CHECK?            Y02032
+         BNO   C270                    NO - GO CONTINUE TEST
+         TM    EWACNTR1,OVRCNT5        LAST RETRY (5)?           Y02032
+         BO    C260                    YES - SKIP COUNT UPDATE
+*
+*   UPDATE RETRY COUNT
+*
+         IC    R13,EWACNTR1            GET RETRY COUNT           Y02032
+         LA    R13,C16(R13)            ADD ONE TO COUNT
+         STC   R13,EWACNTR1            STORE NEW COUNT           Y02032
+*
+         CLI   CCWOP,CMDCTL            NOP COMMAND?
+         BCR   7,EXITREG               NO - GO RETRY
+         B     C410                    YES - SPACE OK, CONTINUE
+*
+C260     EQU   *
+         TM    EWACNTR3,EWTROC         USE RORCCW BIT ON?        Y02032
+         BO    C417                    YES - BR TO PERM ERROR
+C265     EQU   *
+         MVI   EWACNTR2,NUMB40         SET MAXIMUM COUNT TO 40   Y02032
+         B     C380                    BRANCH TO ONE MORE READ
+*
+C270     EQU   *                       I N T E R V E N T I O N   R E Q
+         TM    EWTSNS0,EWTINT          INTERVENTION REQUIRED?
+         BNO   C280                    NO - GO CONTINUE TEST
+         TM    IOSTSA,CSWDVE           DEVICE END?
+         BZ    A570                    NO - BRANCH TO PRINT MSG
+*
+C280     EQU   *                       O V E R R U N
+         TM    EWTSNS0,EWTOVRN         OVERRUN?                  Y02032
+         BNO   C290                    NO - GO CONTINUE TEST
+C285     EQU   *
+         NI    EWACNTR3,X'FF'-EWTROC   RESET USE RORCCW BIT      Y02032
+         OI    IOSFLA,IOSREP           SET REPOSITION BIT        Y02032
+         TM    EWACNTR1,OVRCNT5        LAST RETRY (5)?           Y02032
+         BO    C265                    YES - GO SET TO PERM READ
+*
+*   UPDATE RETRY COUNT
+*
+         IC    R13,EWACNTR1            GET RETRY COUNT           Y02032
+         LA    R13,C16(R13)            ADD ONE TO COUNT
+         STC   R13,EWACNTR1            STORE NEW COUNT           Y02032
+         BR    EXITREG                 GO RETRY OR SPACE
+*
+C290     EQU   *                       L O A D   P O I N T
+         TM    EWTSNS1,EWTLP           LOAD POINT?               Y02032
+         BO    A2020                   YES - GO TO PART 2 OF LOAD 2
+*
+*                                      D A T A   C H E C K
+         TM    EWTSNS0,EWTDATA         DATA CHECK?               Y02032
+         BNO   C310                    NO - GO CONTINUE TEST
+         TM    EWTSNS1,EWTNOISE        NOISE BIT ON?             Y02032
+         BO    C300                    YES - SKIP NOISE BLOCK TEST
+*
+*   TEST FOR NOISE BLOCK
+*
+         LH    R0,EWTRRCNT             GET RORCCW COUNT
+         N     R0,MASK                 RESET HIGH ORDER BITS
+         SH    R0,IOSCSWRC             LESS RESIDUAL IN CSW
+         SH    R0,TWELVE               SUBTRACT MINIMUM SIZE
+         BC    11,C300                 BRANCH IF OK
+         B     A2020                   ELSE GO TO PART 2, LOAD 2
+*
+*   THE BLOCK WAS NOT NOISE
+*
+C300     EQU   *
+         NI    EWACNTR3,X'FF'-EWTROC   RESET USE RORCCW BIT      Y02032
+*
+*   ARE WE READY FOR A CLEANER?
+*
+         OI    IOSFLA,IOSREP           SET REPOSITION BIT        Y02032
+         OI    IOSOPT,IOSDEP           SET DEVICE END POST BIT   Y02032
+         TM    EWACNTR2,X4             MULTIPLE OF 4?            Y02032
+         BO    C370                    YES - GO SET UP CLEANER
+*
+         IC    R13,EWACNTR2            GET CURRENT COUNT         Y02032
+         LA    R13,C1(R13)             ADD ONE TO COUNT
+         STC   R13,EWACNTR2            STORE NEW COUNT           Y02032
+         BR    EXITREG                 GO SPACE
+*
+*   TEST FOR CHANNEL DATA CHECK WHEN INT. REQ. IS IGNORED
+*
+C310     EQU   *                       C H A N N E L   D A T A   C H K
+         TM    IOSTSB,CSWCDC           CHANNEL DATA CHECK?
+         BZ    C240                    NO - GO HANDLE PERM ERROR
+         B     C285                    YES - GO RETRY
+         EJECT
+*
+*                    C L E A N E R
+*
+*          SET UP FOR CLEANER UNLESS WE ARE DONE
+*
+C370     EQU   *
+         TM    EWACNTR2,NUMB40         LAST RETRY?               Y02032
+         BNO   C390                    NO - GO SET UP CLEANER
+*
+*   END OF RECOVERY ATTEMPTS - SET UP TO READ ORIGINAL
+*
+C380     EQU   *
+         L     R13,EWTVIRT             GET ADDR OF USER CCW      Y02032
+         ST    R13,IOSVST              RESTORE START ADR (VIRT)  Y02032
+         LRA   R13,0(R13)              GET REAL ADDRESS          Y02032
+         ST    R13,IOSRST              RESTORE START ADDR(REAL)  Y02032
+         TM    IOSFLA,IOSCCHN          COMMAND CHAINING?
+         BO    C460                    YES - GO SET RESTART FLAG
+         B     C470                    NO-SET REP & CRC, FINISH CHAIN
+*
+*   SET UP CLEANER
+*
+C390     EQU   *
+         IC    R13,EWACNTR2            GET COUNT                 Y02032
+         LA    R13,C13(R13)            CARRY TO TENS POSITION
+         STC   R13,EWACNTR2            STORE UPDATED COUNT       Y02032
+         OI    EWAFLG3,EWTTPC          SET TAPE CLEAN BIT        Y02032
+         LH    R13,UCBCLN              GET ESV CLEANER COUNT
+         CH    R13,MASK+C2             IS COUNT FULL?
+         BE    C400                    YES - BR AROUND COUNT INCREMENT
+         LA    R13,C1(R13)             ADD ONE TO COUNT
+         STH   R13,UCBCLN              STORE BACK
+*
+*   SET UP NUMBER OF BACK SPACES
+*
+C400     EQU   *
+         OI    EWACNTR1,CLNCNT4        ASSUME RD FWD - SET COUNT TO 4
+         CLI   EWTRRCMD,CMDRED         IS IT READ FORWARD?
+         BCR   8,EXITREG               YES - START CLEANER
+*
+         MVI   IOSMDB,CMDBSR           NO - SET BACK SPACE
+         NI    EWACNTR1,HEXF8          SET COUNT TO 0            Y02032
+         OI    EWACNTR1,CLNCNT3        SET COUNT TO 3 FOR RD BACK CLEAN
+         OI    EWAFLG3,EWTBKS          SET BKSP ERASE CLEANER    Y02032
+         BR    EXITREG                 START CLEANER
+*
+*   END OF CLEANER
+         EJECT
+*
+*   WE HAVE JUST SPACED OVER THE ERROR BLOCK.
+*   IF THE RORCCW COMMAND IS ZERO, WE HAVE RECOVERED.
+*
+C410     EQU   *
+         CLI   EWTRRCMD,ZERO           IS THE COMMAND ZERO?
+         BNE   C480                    NO - BR TO CONTINUE ROR
+         EJECT
+*
+*                      R E C O V E R Y
+*
+*        CLEAN UP AFTER RECOVERY IN OPPOSITE DIRECTION
+*
+         NI    IOSFLA,X'FF'-IOSREP-IOSCRC     RESET REP & CRC
+*
+*   RESTORE DEVICE END POST BIT
+*
+         TM    EWACNTR3,EWTDEP         WAS IT ON ORIGINALLY?     Y02032
+         BO    C415                    YES - LEAVE IT ON         Y02032
+         NI    IOSOPT,X'FF'-IOSDEP     NO  - TURN IT OFF         Y02032
+C415     EQU   *
+         NI    EWAFLG3,X'FF'-EWTROR    RESET ROR IN PROGRESS     Y02032
+         TM    IOSTSB,CSWICL           INCORRECT LENGTH?         Y02032
+         BO    C417                    YES - LEAVE CNTR SET      Y02032
+         NI    EWACNTR1,HEX88          SET BUS OUT & CLNR CNT TO 0
+*
+C417     EQU   *
+         L     R13,EWTVIRT             GET ADDR OF USER CCW      Y02032
+         ST    R13,IOSVST              RESTORE START ADR (VIRT)  Y02032
+         LRA   R13,0(R13)              GET REAL ADDRESS          Y02032
+         ST    R13,IOSRST              RESTORE START ADR (REAL)  Y02032
+*
+*   PERMANENT BUS OUT ON RORCCW COMES HERE
+*
+C420     EQU   *
+         L     CCWREG,IOSVST           GET START ADDRESS
+         LA    R13,C8(CCWREG)          GET ERR CCW ADDRESS + 8
+         IC    R4,IOSCSW-C1            GET IOSCC
+         ST    R13,IOSCSW-C1           STORE ERR CCW ADDRESS + 8
+         STC   R4,IOSCSW-C1            RESTORE IOSCC
+*
+*   TEST FOR PERMANENT BUS OUT
+*
+         TM    EWACNTR1,OVRCNT5        PERMANENT BUS OUT (5 RETRIES)?
+         BO    C240                    YES - BR TO PERMANENT ERROR
+*
+*   CONTINUE CLEANUP
+*
+         LH    R0,CCWCNT               GET ORIGINAL COUNT
+         N     R0,MASK                 ZERO HIGH ORDER BITS
+         SH    R0,EWTRRCNT             SUBTRACT RORCCW COUNT
+         STH   R0,IOSCSWRC             SET RESIDUAL COUNT
+         BZ    C440                    BRANCH IF RESIDUAL IS ZERO
+*
+         TM    CCWFLS,CCWSILI          SILI BIT ON?
+         BO    C440                    YES - BR AROUND INCORRECT LENGTH
+         OI    IOSTSB,CSWICL           NO - SET INCORRECT LENGTH
+*
+C440     EQU   *
+         TM    EWACNTR3,EWTUEX         UNIT EXCEPTION FLAG ON?   Y02032
+         BO    PART4                   YES - GO TO PART 4
+*
+         TM    IOSTSB,CSWICL           INCORRECT LENGTH?
+         BO    PART4                   YES - GO TO PART 4
+*
+         TM    IOSFLA,IOSCCHN          COMMAND CHAINING?
+         BZ    PART4                   NO - GO TO PART 4
+*
+         TM    CCWFLS,IOSCCHN          CCW CHAINED?
+         BZ    PART4                   NO - GO TO PART 4
+*
+*   SET UP TO FINISH CHAIN
+*
+         LA    CCWREG,C8(CCWREG)       GET NEXT CCW ADDR
+         CLI   CCWOP,CMDTIC            NEXT COMMAND A TIC?
+         BNE   C450                    NO - BRANCH AROUND TIC
+*
+*   TRANSLATE REAL ADDRESS IN TIC TO VIRTUAL
+*
+         LR    R4,IOSREG               SAVE IOSB ADDRESS
+         L     R1,CCWADR               GET ADDRESS FROM TIC
+         LA    R1,0(R1)                ZERO HI-ORDER BYTE
+         LR    R8,BASREG               SAVE BASE ADDRESS
+         L     BASREG,LOC16            GET ADDRESS OF CVT
+         L     BASREG,CVTPTRV(BASREG)  GET ADDR OF TRANSLATE RTN.
+         BALR  LNKREG,BASREG           LINK TO TRANSLATE ROUTINE
+         LR    CCWREG,R1               GET VIRTUAL CCW ADDRESS
+         LR    BASREG,R8               RESTORE BASE REGISTER
+         LR    IOSREG,R4               RESTORE IOSB REGISTER
+*
+C450     EQU   *
+         ST    CCWREG,IOSVST           SET CONTINUE CCW ADDRESS
+         LRA   R13,CCW                 TRANSLATE VIRT START ADR  Y02032
+         ST    R13,IOSRST              STORE IN REAL START ADR   Y02032
+         NI    EWAFLG3,EWTOVER         RESET ALL BUT SDR OVERFLOW
+         XC    EWACNTR1,EWACNTR1       RESET ERROR COUNTERS      Y02032
+*
+C460     OI    EWACNTR3,EWTRST         SET RESTART FLAG ON       Y02032
+*
+C470     EQU   *
+         NI    IOSFLA,X'FF'-IOSREP-IOSCRC     RESET REP & CRC
+         NI    EWAFLG3,X'FF'-EWTROR    RESET ROR IN PROGRESS     Y02032
+         B     A166                    GO FINISH CHAIN - SVC 15/3
+*
+*   END OF RECOVERY
+         EJECT
+*
+*   WE HAVE JUST SPACED.  CHECK FOR CLEANER IN PROGRESS
+*
+C480     EQU   *
+         TM    EWACNTR1,CLNCNT0        IS CLEANER CONTROL COUNT ZERO?
+         BZ    C490                    YES - BR AROUND COUNT UPDATE
+*
+*   DECREMENT CLEANER CONTROL COUNT
+*
+C485     EQU   *
+         IC    R0,EWACNTR1             GET CONTROL COUNT         Y02032
+         BCTR  R0,R0                   DECREMENT
+         STC   R0,EWACNTR1             STORE NEW COUNT           Y02032
+         BR    EXITREG                 CONTINUE - SVC 15/3
+*
+*   TEST FOR END OF CLEANER BSRS
+*
+C490     EQU   *
+         TM    EWAFLG3,EWTTPC          CLEANER BIT ON?           Y02032
+         BZ    C510                    NO - GO SET UP TO READ OPPOSITE
+*
+*   CHANGE CLEANER DIRECTION
+*
+         MVI   IOSMDB,CMDFSR           SET FORWARD SPACE
+         OI    EWACNTR1,CLNCNT4        SET COUNT TO 4            Y02032
+         TM    EWAFLG3,EWTBKS          READ BACK CLEANER?        Y02032
+         BO    C500                    YES - BRANCH AROUND
+*
+         NI    EWACNTR1,HEXF8          SET COUNT TO 0            Y02032
+         OI    EWACNTR1,CLNCNT3        SET COUNT TO 3 - RD BK    Y02032
+*
+C500     EQU   *
+         NI    EWAFLG3,X'FF'-EWTTPC-EWTBKS      CLEAR FLAGS      Y02032
+         BR    EXITREG                 EXIT VIA SVC 15/3
+*
+*   SET SPACE DIRECTION AND SET UP TO READ OPPOSITE
+*   RESTORE DEVICE END POST BIT
+*
+C510     EQU   *
+         OI    EWACNTR3,EWTROC         SET USE RORCCW BIT        Y02032
+         OI    IOSFLA,IOSCRC           SET CRC
+         NI    IOSFLA,X'FF'-IOSREP     RESET REPOSITION
+*
+         TM    EWACNTR3,EWTDEP         WAS DEP BIT ON ORIGINALLY?
+         BO    C520                    YES - LEAVE IT ON         Y02032
+         NI    IOSOPT,X'FF'-IOSDEP     NO  - TURN IT OFF         Y02032
+*
+C520     EQU   *
+         MVI   IOSMDB,CMDFSR           SET FORWARD SPACE
+         CLI   EWTRRCMD,CMDRDB         RORCCW READ BACK?
+         BE    RETN                    YES - EXIT VIA SVC 15/3
+         MVI   IOSMDB,CMDBSR           NO - SET BACK SPACE
+         BR    EXITREG                 SVC 15/3
+*************    E N D   O F   P A R T    3    *************
+         EJECT
+***********************************************************************
+*                          P A R T   4                                *
+*                                                                     *
+*                       TEMPORARY ERRORS                              *
+***********************************************************************
+*        THIS SECTION HANDLES THE FOLLOWING CONDITIONS                *
+*              1.  UNIT EXCEPTION (NO ERROR)                          *
+*              2.  INCORRECT LENGTH (NO ERROR)                        *
+*              3.  TEMPORARY ERRORS - RECOVERED                       *
+*        BY UPDATING SDR COUNTERS AND VES COUNTERS, THEN              *
+*        EXITING THE ERP VIA OBR, WTO OR SVC 15/3.                    *
+***********************************************************************
+*
+*   TEST STATUS INFORMATION
+*
+PART4    EQU   *
+         TM    IOSTSB,CSWSTB           CDC, CHC, PGC, OR PTC?
+         BC    5,A2000                 YES - GO TO LOAD 2, PART 4B
+*
+         TM    IOSTSA,CSWUEX           UNIT EXCEPTION?
+         BO    D260                    YES - GO CHECK IF 1ST ENTRY ERR
+*
+         TM    IOSTSB,CSWICL           INCORRECT LENGTH?
+         BO    D260                    YES - GO CHECK IF 1ST ENTRY ERR
+*
+*   END OF TEST - RECOVERED
+*
+D130     EQU   *
+*
+*              ZERO ERROR COUNTERS (2 BYTES)                   @ZA00656
+*
+         XC  EWACNTR1(2),EWACNTR1                              @ZA00656
+         NI    EWACNTR3,X'FF'-EWTRST   RESET RESTART BIT         S21048
+         NI    IOSFLA,X'FF'-IOSERR-IOSEX   SET FOR TEMP ERROR EXIT
+*
+*
+         CLI   CCWOP,X'17'             ERG?                      S21048
+         BE    D240                    YES-GO UPDTE SDR CNTRS    S21048
+*
+         TM    EWTSNS1,EWTWRT          WAS IT A WRITE TYPE CMD?  S21048
+         BO    D240                    YES-GO UPDTE SDR CNTRS    S21048
+*
+         TM    IOSFLA,IOSDCHN          DATA CHAINING?          @ZA30317
+         BO    D200                    YES-GO UPDTE SDR CNTRS  @ZA30317
+         CLI   CCWOP,CMDRDF            IS IT RDF OR CHAINED READ?
+         BC    12,D200                 YES-GO UPDTE SDR CNTRS    S21048
+*
+         CLI   CCWOP,CMDRDB            IS IT A RDB?
+         BNE   D300                    NO - GO EXIT ERP
+*
+*   TEMPORARY READ EXIT ROUTINE
+*
+D200     EQU   *
+         TM    UCBTBYT4,UCB3400        3400 TAPE UNIT?
+         BO    D210                    YES - GO UPDATE VES COUNTERS
+*
+         IC    R4,0(SDRREG)            GET TEMP RD/WT COUNT      S21048
+         LA    R4,C16(R4)              STEP READ COUNT           S21048
+         STC   R4,0(SDRREG)            STORE BACK                S21048
+         TM    0(SDRREG),RDFULL        IS COUNT FULL?            S21048
+         BM    D210                    NO - SKIP OVERFLOW        S21048
+         OI    EWAFLG3,EWTOVER         YES - SET SDR OVERFLOW    S21048
+*
+D210     EQU   *
+         TM    UCBTR,FULL              IS TEMP READ COUNT FULL?  S21048
+         BO    D300                    YES - GO EXIT ERP         S21048
+*
+         IC    R4,UCBTR                GET TEMP READ COUNT       S21048
+         LA    R4,C1(R4)               ADD ONE TO COUNT          S21048
+         STC   R4,UCBTR                STORE BACK                S21048
+         B     D300                    GO EXIT ERP
+*
+*   TEMPORARY WRITE EXIT ROUTINE
+*
+D240     EQU   *
+         TM    UCBTBYT4,UCB3400        3400 TAPE UNIT?           S21048
+         BO    D250                    YES - GO UPDATE VES COUNTERS
+*
+         IC    R4,0(SDRREG)            GET TEMP RD/WT COUNT      S21048
+         LA    R4,C1(R4)               STEP WRITE COUNT          S21048
+         STC   R4,0(SDRREG)            STORE BACK                S21048
+         TM    0(SDRREG),WRFULL        IS COUNT FULL?            S21048
+         BM    D250                    NO - SKIP OVERFLOW        S21048
+         OI    EWAFLG3,EWTOVER         YES - SET SDR OVERFLOW    S21048
+*
+D250     EQU   *
+         TM    UCBTW,FULL              IS COUNT FULL?            S21048
+         BO    D300                    YES - GO EXIT ERP         S21048
+*
+         IC    R4,UCBTW                GET WRITE COUNT           S21048
+         LA    R4,C1(R4)               ADD ONE TO COUNT          S21048
+         STC   R4,UCBTW                STORE BACK                S21048
+         B     D300                    GO EXIT ERP
+*
+*   UNIT EXCEPTION OR INCORRECT LENGTH -
+*   IF EWACNTR1 IS ZERO, THIS IS A FIRST ENTRY ERROR
+*
+D260     EQU   *
+*
+*              TEST ERROR COUNTERS (2 BYTES) FOR ZERO          @ZA00656
+*
+         NC    EWACNTR1(2),EWACNTR1                            @ZA00656
+         BNZ   D130                    NO - CONTINUE
+         NI    IOSFLA,X'FF'-IOSERR-IOSSMDA SET PERM ERR EXIT   @YM06412
+         MVI   EWAFLG3,ZERO            CLEAR ERROR FLAGS         Y02032
+         EJECT
+*                             E X I T
+*                    TEMPORARY READS AND WRITES
+*
+D300     EQU   *
+         TM    IOSFLB,IOSLOG           LOG ON?                   S21048
+         BO    D310                    YES - EXIT VIA OBR
+         TM    EWAFLG3,EWTOVER         SDR OVERFLOW ON?          Y02032
+         BZ    RETN                    NO - EXIT VIA SVC 15/3
+D310     EQU   *
+         LA    R13,SERLOG              GET ADDRESS OF OBR        S21048
+         B     XCTL1                   XCTL TO OBR               S21048
+         EJECT
+***********************************************************************
+*                            P A R T   5                              *
+*                                                                     *
+*                         STATISTICS UPDATE                           *
+***********************************************************************
+*                                                                     *
+*        UPDATE SDR COUNTERS AND SET AN OVERFLOW FLAG IF ANY          *
+*        COUNTER IS STEPPED FULL.  A RECORDING WILL BE MADE           *
+*        AT ERP EXIT TIME IF OVERFLOW IS ON.                          *
+***********************************************************************
+PART5    EQU   *
+         TM    IOSTSA,CHEND+CSWUCK     CHANNEL END & UNIT CHECK?
+         BNO   E110                    NO - GO FIND SDR COUNTER ADDR
+*
+         LH    R4,UCBSIO               YES - GET SIO COUNT
+         LA    R4,C1(R4)               ADD ONE
+         STH   R4,UCBSIO               STORE BACK
+*
+*   TEST FOR NEW DEVICES AND GET CORRECT
+*   SDR COUNTER TABLE FOR THE DEVICE
+*
+E110     EQU   *
+         TM    UCBTBYT4,UCB3400        3400 TAPE UNIT?
+         BO    E160                    YES - BR TO 3420 UPDATE
+*
+*   DO UPDATE FOR 2400 SDR COUNTERS
+*
+         TM    IOSTSA,CSWUCK           IS UNIT CHECK ON?
+         BZ    E150                    NO - BR AROUND STAT UPDATE
+         LA    TABREG,TAB2400          ADDR OF 2400 SDR DATA TABLE
+         BAL   RETREG,STATUPD          GO UPDATE SDR
+*
+*   DO AN UPDATE TO THE CHANNEL DATA CHECK SDR COUNTER
+*   IF THE CHANNEL DATA CHECK BIT IS ON IN STATUS
+*
+E150     EQU   *
+         TM    IOSTSB,CHDAT            CHANNEL DATA CK ON IN STATUS?
+         BZ    BEGIN                   NO - GO TO BEGINNING OF LOAD 1
+*
+         SR    R13,R13                 ZERO WORK REG
+         IC    R13,CDCNT(SDRREG)       GET SDR COUNTER FOR CDC
+         LA    R13,C1(R13)             ADD ONE
+         STC   R13,CDCNT(SDRREG)       STORE BACK
+         TM    CDCNT(SDRREG),CDFULL    IS COUNT FULL?
+         BNO   BEGIN                   NO - GO TO BEGINNING OF LOAD 1
+*
+         OI    EWAFLG3,EWTOVER         SET SDR OVERFLOW BIT ON   Y02032
+         B     BEGIN                   GO TO BEGINNING OF LOAD 1
+         EJECT
+*
+*   DO UPDATE TO SDR COUNTERS FOR NEW DEVICES (3420)
+*
+E160     EQU   *
+         OI    0(SDRREG),SDR20         SET 20-BYTE SDR FLAG
+         TM    IOSTSA,CSWUCK           UNIT CHECK?
+         BZ    BEGIN                   NO - GO TO BEGINNING OF LOAD 1
+         CLI   EWTSNS0,EWTINT          INTERVENTION REQUIRED?  @YL02128
+         BE    BEGIN                   YES, NO SDR RECORDING   @YL02128
+         LA    TABREG,TAB3420          ADDR OF 3420 SDR DATA TABLE
+         BAL   RETREG,STATUPD          GO UPDATE SDR
+*
+*   DO UPDATE TO SDR COUNTERS FOR PE ID BURST CHECK
+*
+         TM    EWTSNS5,EWTPEID         PE ID BURST CHECK ON?     Y02032
+         BZ    E170                    NO - BR AROUND SDR COUNT
+         OI    SDRPI(SDRREG),ON        SET SDR COUNT
+*
+*   DO UPDATE TO SDR COUNTERS FOR TRACK IN ERROR BYTE
+*
+E170     EQU   *
+         TM    EWTSNS2,TIE             TIE BYTE BIT TEST
+         BO    BEGIN                   BR ON BYTE FULL
+         BNZ   E171                    NOT '00' OR 'FF'
+         OI    SDRPI(SDRREG),PARON     SET PARITY BIT
+         B     E180                    SET REST OF RECORD
+E171     CLI   EWTSNS2,INVAL           IS TIE BYTE INVALID?    @YA00088
+         BNE   E180                    BR VALID TO RECORD      @YA00088
+         TM    EWTSNS9,BIRCH           3803-II CONTROL UNIT?   @YL02128
+         BZ    BEGIN                   NO, DO NOT RECORD       @YL02128
+         TM    EWTSNS6,BIRCH           BIRCH DRIVE?            @YL02128
+         BZ    BEGIN                   NO, DO NOT RECORD       @YL02128
+         TM    EWTSNS6,NRZIMODE        IS IT NRZI MODE?        @YL02128
+         BO    BEGIN                   YES, DO NOT RECORD      @YL02128
+*
+E180     EQU   *
+         OC    SDRPI+C1(C1,SDRREG),EWTSNS2    PUT IN SDR COUNTER
+         B     BEGIN                   GO TO PART 1
+         EJECT
+***********************************************************************
+*             S T A T   U P D A T E   R O U T I N E                   *
+*                                                                     *
+*        EACH DEVICE TYPE HAS ITS OWN TABLE CONTAINED IN THIS ERP     *
+*        LOAD TO DEFINE ITS OWN SDR TABLE.  YOU LINK TO THE STAT      *
+*        UPDATE ROUTINE VIA REG. 12 AND WITH THE DEFINE TABLE         *
+*        ADDRESS CONTAINED IN REG 13.                                 *
+*                                                                     *
+*        AS EACH COUNT IS ADDED, THE COUNTER IS CHECKED FOR           *
+*        OVERFLOW.  A RECORDING WILL BE MADE AT ERP EXIT TIME         *
+*        IF OVERFLOW IS ON.                                           *
+*                                                                     *
+*        EACH COUNTER IN AN SDR TABLE IS DEFINED BY 2 BYTES IN        *
+*        A DEVICE-DEPENDENT TABLE.                                    *
+*                                                                     *
+*              BYTE A  0-2 = SENSE BIT POSITION                       *
+*                      3-7 = SDR COUNTER LENGTH                       *
+*                                                                     *
+*              BYTE B  0   = IF ON, SKIP - AN UNUSED COUNTER          *
+*                      1   = N/A                                      *
+*                      2-7 = SENSE BYTE POSITION                      *
+*                      0-7 = IF FULL BYTE=FF, END OF COUNTERS         *
+***********************************************************************
+*
+STATUPD  EQU   *
+         LR    SDRR14,SDRREG           MOVE SDR ADDR INTO WORK REG
+         XC    EWTTST,EWTTST           INITIALIZE TO ZERO        Y02032
+*
+*   INITIALIZE FOR START OF UPDATE TO COUNTERS
+*
+         LA    R3,WORD                 NUMB OF BITS PER FULL WORD
+         SR    R4,R4                   ZERO SHIFT WORK REG
+         MVC   EWTWORD(C4),0(SDRR14)   MOVE WORD TO BOUNDARY     Y02032
+         L     R5,EWTWORD              GET FIRST WORD OF COUNTERS
+*
+*   DO SDR UPDATE
+*
+STAT130  EQU   *
+         L     R12,UCBEXTPT            GET ADDR OF UCB COMMON EXTN.
+         LA    R12,0(R12)              GET 3-BYTE ADDRESS
+         IC    R8,SNSCT(R12)           GET SENSE COUNT
+         BCTR  R8,R0                   REDUCE SENSE COUNT BY 1
+         LA    R0,HIBIT                R0 = 00 00 00 80 (1000 0000)
+         SR    R9,R9                   ZERO REG
+         IC    R9,0(TABREG)            GET SENSE BIT POSITION
+         SRL   R9,C5                   RIGHT JUSTIFY BITS
+         LTR   R9,R9                   IS IT ZERO?
+         BZ    STAT150                 BR IF ZERO - SNS BIT 0
+*
+STAT140  EQU   *
+         SRL   R0,C1                   SHIFT 1000 0000 RIGHT 1 TIME
+         BCT   R9,STAT140              BRANCH TILL DONE
+*
+STAT150  EQU   *
+         STC   R0,EWTTST               SAVE R0 (SNS BIT POS POINTER)
+         TM    C1(TABREG),CNTEND       IS THIS END OF COUNTERS?
+         BCR   1,RETREG                YES - BRANCH BACK TO BALR
+*
+         NI    EWACNTR3,X'FF'-EWTBIT   ZERO 'BIT ON' FLAG        Y02032
+         TM    C1(TABREG),CTROK        IS THIS COUNTER FOR REAL?
+         BO    STAT160                 NO - BR, IT'S A FULL WORD FILLER
+         SR    R9,R9                   ZERO REG
+         IC    R9,C1(TABREG)           GET SENSE BYTE NUMBER
+         N     R9,MASK2                MASK2 = 00 00 00 3F
+         CR    R9,R8                   IS SENSE BYTE COUNT VALID?
+         BH    STAT160                 NO - BRANCH AROUND SENSE
+         LA    R0,EWTSNS               GET SENSE ADDRESS         Y02032
+         AR    R9,R0                   ADD TO SENSE ADDRESS
+         NC    EWTTST(C1),0(R9)        WAS SENSE BIT ON?
+         BZ    STAT160                 NO - BR AROUND BIT ON FLAG
+         OI    EWACNTR3,EWTBIT         SET 'BIT ON' FLAG ON      Y02032
+*
+STAT160  EQU   *
+         SR    R9,R9                   ZERO REG
+         IC    R9,0(TABREG)            GET COUNTER LENGTH
+         N     R9,MASK1                MASK1 = 00 00 00 1F
+         SR    R8,R8                   ZERO REG
+*
+STAT170  EQU   *
+         SLL   R8,C1                   SHIFT REG ONE TIME
+         SLDL  R4,C1                   SHIFT COUNTER R5 TO R4 LO-ORDER
+         LA    R8,C1(R8)               AND GENERATE MASK IN R8
+         BCTR  R3,ZERO                 REDUCE FULL WORD BIT COUNTER
+         BCT   R9,STAT170              SHIFT UNTIL WHOLE COUNTER
+*
+         TM    EWACNTR3,EWTBIT         DO WE ADD TO COUNTER      Y02032
+         BZ    STAT180                 NO - BR AROUND COUNTER INCREMENT
+         A     R4,ONE                  ADD 1 TO COUNTER
+         ST    R8,EWTMASK              SAVE COUNTER MASK         Y02032
+         NR    R8,R4                   SAVE ONLY COUNTER IN 48
+         C     R8,EWTMASK              IS COUNTER FULL?          Y02032
+         BNE   STAT180                 NO - BR AROUND OVERFLOW FLAG
+         OI    EWAFLG3,EWTOVER         YES - SET SDR OVERFLOW FLAG
+*
+STAT180  EQU   *
+         LTR   R3,R3                   IS FULL WORD DONE?
+         BNZ   STAT190                 NO - BR AROUND RESET FULL WORD
+         ST    R4,EWTWORD              STORE UPDATED COUNTERS BACK
+         MVC   0(C4,SDRR14),EWTWORD    MOVE WORD BACK            Y02032
+         LA    SDRR14,C4(SDRR14)       STEP TO NEXT FULL WORD
+         LA    R3,WORD                 NUMBER OF BITS PER FULL WORD
+         SR    R4,R4                   ZERO SHIFT WORK REGISTER
+         MVC   EWTWORD(C4),0(SDRR14)   MOVE WORD TO BOUNDARY     Y02032
+         L     R5,EWTWORD              PUT WORD IN WORK REG      Y02032
+*
+STAT190  EQU   *
+         LA    TABREG,C2(TABREG)       STEP TABLE TO NEXT COUNTER
+         B     STAT130                 BRANCH TO NEXT COUNTER
+         EJECT
+***********************************************************************
+*                            P A R T   6                              *
+*                                                                     *
+*                           ADDRESSABILITY                            *
+*                        CREATE ERP IDAL LIST                         *
+***********************************************************************
+*                                                                     *
+*        THIS SECTION IS ENTERED TO SET UP ADDRESSABILITY.            *
+*        IF BIT 37 OF THE CCW IS ON, THIS INDICATES THAT AN           *
+*        IDAL LIST IS BEING USED & AN ERP IDAL LIST MUST BE           *
+*        CREATED FOR ROR.                                             *
+***********************************************************************
+PART6    EQU   *
+         NI    EWTRRFLS,ROR0F          TURN OFF FLAG BITS        Y02032
+         OI    EWTRRFLS,RORSDT         SET FLAG TO SKIP DATA XFER
+         MVI   EWTRRCCW,CMDRDB         SET READ BACKWARD         Y02032
+*
+*   TEST ORIGINAL DIRECTION
+*
+         CLI   CCWOP,CMDRED            IS IT READ?
+         BE    F005                    YES - BRANCH AROUND
+         MVI   EWTRRCMD,CMDRED         NO - SET READ IN ROR CCW
+F005     EQU   *
+         OI    EWAFLG3,EWTROR          SET READ OPPOSITE REC.    Y02032
+F010     EQU   *
+         L     R13,EWTVIRT             GET ADDR OF FAILING CCW @ZA14734
+         TM    C4(R13),CCWIDAL         IS IDAL BIT ON IN CCW?    Y02032
+         BO    F030                    YES - GO SET UP IDALS     Y02032
+*
+         LH    R4,EWTRRCNT             GET ORIGINAL COUNT
+         N     R4,MASK                 RESET HIGH ORDER BITS
+         SH    R4,IOSCSWRC             SUBTRACT RESIDUAL
+         STH   R4,EWTRRCNT             STORE ACTUAL COUNT
+*
+         IC    R0,EWTRRCMD             SAVE COMMAND              Y02032
+         L     R13,EWTVIRT             GET ADDR OF FAILING CCW @ZA14734
+         L     R13,0(R13)              GET DATA ADDR FROM CCW    Y02032
+         LA    R13,0(R13)              ZERO HI-ORDER BYTE        Y02032
+         BCTR  R4,R0                   REDUCE COUNT BY 1         Y02032
+*
+         CLI   EWTRRCMD,CMDRED         READ FORWARD?
+         BNE   F012                    NO - GO BUILD READ BKWD ADDR
+*
+*   BUILD READ FORWARD ADDRESS (ADDRESS-COUNT+1)
+*
+         SR    R13,R4                  ADDRESS - (COUNT-1)
+         B     F014                    GO SPACE
+*
+*   BUILD READ BACKWARD ADDRESS  (ADDRESS+COUNT-1)
+*
+F012     EQU   *
+         AR    R13,R4                  ADDRESS + (COUNT-1)
+F014     EQU   *
+         ST    R13,EWTRRADR            STORE ADDRESS
+         STC   R0,EWTRRCMD             RESTORE COMMAND
+         BR    BALREG                  RETURN
+*
+*   CALCULATE CSW RESIDUAL COUNT WHEN REBUILDING
+*   IDAL AFTER ISSUING SVC 35 (WTO WIPES OUT IDAL)
+*
+F020     EQU   *
+         L     R13,EWTVIRT             GET ADDR OF FAILING CCW @ZA14734
+         LH    R4,C6(R13)              GET USER CCW BYTE COUNT   Y02032
+         SH    R4,EWTRRCNT             SUBTRACT ROR BYTE COUNT   Y02032
+         STH   R4,IOSCSWRC             STORE NEW RESIDUAL IN CSW Y02032
+*
+*   INITIALIZE REGISTERS AND WORK AREAS
+*
+F030     EQU   *
+         USING USERIDAL,USEREG
+         USING ERPIDAL,ERPREG
+         LA    ERPREG,EWTIDAL          GET ERP IDAL ADDR (VIRT)  Y02032
+         LRA   R5,EWTIDAL              GET ERP IDAL ADDR (REAL)  Y02032
+         IC    R4,EWTRRCMD             SAVE ROR COMMAND          Y02032
+         ST    R5,EWTRRADR             STORE REAL ADDR IN RORCCW Y02032
+         STC   R4,EWTRRCMD             RESTORE COMMAND           Y02032
+*
+*   TRANSLATE USER IDAL ADDRESS TO VIRTUAL
+*
+         LR    R4,IOSREG               SAVE IOSB ADDRESS         Y02032
+         L     R1,EWTVIRT              GET ADDR OF ORIG CCW      Y02032
+         L     R1,0(R1)                GET USER IDAL ADDR (REAL) Y02032
+         LA    R1,0(R1)                ZERO HI-ORDER BYTE        Y02032
+         LR    R5,BASREG               SAVE BASE ADDRESS (R15)   Y02032
+         L     BASREG,LOC16            GET ADDRESS OF CVT        Y02032
+         L     BASREG,CVTPTRV(BASREG)  GET ADDR OF TRANS RTN     Y02032
+         BALR  LNKREG,BASREG           LINK TO TRANS RTN         Y02032
+         LR    USEREG,R1               GET USER IDAL ADDR (VIRT) Y02032
+         LR    BASREG,R5               RESTORE BASE REGISTER     Y02032
+         LR    IOSREG,R4               RESTORE IOSB REGISTER     Y02032
+*
+*   CALCULATE NUMBER OF BYTES TRANSFERRED
+*
+         L     R13,EWTVIRT             GET ADDR OF FAILING CCW @ZA14734
+         LH    R4,C6(R13)              GET CCW BYTE COUNT        Y02032
+         SH    R4,IOSCSWRC             SUBTRACT RESIDUAL FROM BYTE CNT
+         STH   R4,EWTRRCNT             PUT # BYTES XFERRED IN ROR CCW
+*
+*   WAS USER DOING A FORWARD OR BACKWARD READ?
+*
+         L     R5,UIDAL                GET 1ST ENTRY IN USER IDAL LIST
+         CLI   EWTRRCMD,CMDRDB         READ BACKWARD?            Y02032
+         BNE   F100                    YES - GO CONTINUE SETUP   Y02032
+         A     R5,ONEPAGE              NO - ADD 2048 TO FIRST ENTRY
+*
+*   FIND NUMBER OF BYTES IN USER FIRST PAGE
+*
+F100     EQU   *
+         SRA   R5,ELEVEN               ROUND OFF TO PAGE BY SHIFTING
+         SLA   R5,ELEVEN               OFF BITS 20 - 31          Y02032
+         S     R5,UIDAL                SUBTRACT FIRST ENTRY      Y02032
+         LPR   R5,R5                   GET ABSOLUTE VALUE        Y02032
+*
+         CLI   EWTRRCMD,CMDRDB         WAS USER CMD READ BKWD?   Y02032
+         BE    F200                    NO - NOBIFP VALID, BRANCH
+         A     R5,ONE                  YES - ADD 1 TO NOBIFP     Y02032
+*
+F200     EQU   *
+         ST    R5,EWTNBFP              SAVE # BYTES IN 1ST PAGE  Y02032
+*
+*   FIND NUMBER OF USER IDAL ENTRIES IN THE LIST
+*   R4 CONTAINS NUMBER OF BYTES TRANSFERRED
+*
+         CL    R4,EWTNBFP              ONLY ONE ENTRY REQUIRED
+         BH    F250                    NO - CONTINUE CALC IDAL
+         ST    R4,EWTNBFP              SAVE BYTES FOR ONE IDAL
+         MVC   EWTRES,FZERO            SET RESIDUAL CNT TO ZERO
+         L     R4,FZERO                SET INDEX TO ZERO
+         B     F400                    GET OUT OF LOOP
+*
+F250     EQU    *
+         S     R4,EWTNBFP              CALCULATE RESIDUAL COUNT  Y02032
+         ST    R4,EWTRES               SAVE RESIDUAL COUNT       Y02032
+         L     R4,FZERO                SET INDEX TO 0            Y02032
+*
+F300     EQU   *
+         A     R4,FOUR                 ADD FOUR TO USER INDEX    Y02032
+         CLC   EWTRES,ONEPAGE          RESIDUAL <= 2048?         Y02032
+*                                      (MEANS ALL ENTRIES FOUND) Y02032
+         BNH   F400                    YES - GET OUT OF LOOP     Y02032
+*
+         L     R13,EWTRES              NO - GET RESIDUAL COUNT   Y02032
+         S     R13,ONEPAGE             SUBTRACT 2048             Y02032
+         ST    R13,EWTRES              SAVE RESIDUAL COUNT       Y02032
+         B     F300                    LOOP BACK                 Y02032
+         EJECT
+*
+*                   C R E A T E   E R P   I D A L
+*
+F400     EQU   *
+         CLI   EWTRRCMD,CMDRDB         WAS COMMAND READ BACK?    Y02032
+         BE    F410                    NO - VALUES VALID, BR     Y02032
+*
+         L     R13,EWTRES              YES - GET RESIDUAL CNT    Y02032
+         LCR   R13,R13                 SET TO NEGATIVE FOR RDB   Y02032
+         ST    R13,EWTRES              SAVE                      Y02032
+*
+         L     R13,EWTNBFP             GET # BYTES IN 1ST PAGE   Y02032
+         LCR   R13,R13                 SET TO NEGATIVE FOR RDB   Y02032
+         ST    R13,EWTNBFP             SAVE                      Y02032
+*
+         L     R13,ONE                 GET VALUE - 1             Y02032
+         LCR   R13,R13                 SET TO NEGATIVE FOR RDB   Y02032
+         ST    R13,EWTC1               SAVE                      Y02032
+*
+         L     R13,F2047               GET VALUE - 2047          Y02032
+         LCR   R13,R13                 SET TO NEGATIVE FOR RDB   Y02032
+         ST    R13,EWTC7FF             SAVE                      Y02032
+         B     F500                    CONTINUE TO SETUP IDAL
+*
+F410     EQU   *
+         MVC   EWTC1,ONE               SET CONSTANT TO ONE
+         MVC   EWTC7FF,F2047           SET CONSTANT TO 2047
+*
+*   SUBTRACT VALUE FROM RESIDUAL COUNT TO GET FINAL COUNT
+*   SUBTRACT VALUE FROM NOBIFP TO GET COUNT FOR FINAL ERP IDAL ENTRY
+*
+F500     EQU   *
+         L     R13,EWTRES              GET RESIDUAL COUNT        Y02032
+         S     R13,EWTC1               SUBTRACT NEG OR POS 1     Y02032
+         ST    R13,EWTRES              SAVE                      Y02032
+*
+         L     R13,EWTNBFP             GET # BYTES IN 1ST PAGE   Y02032
+         S     R13,EWTC1               SUBTRACT NEG OR POS 1     Y02032
+         ST    R13,EWTNBFP             SAVE                      Y02032
+*
+         CL    R4,FZERO                IS THIS THE LAST ENTRY?   Y02032
+         BE    F700                    YES - GO CALC LAST ERP ENTRY
+*
+*   CALCULATE ENTRY FOR ERP IDAL LIST
+*
+         L     R13,UIDAL(R4)           GET LAST ENTRY FROM USER IDAL
+         A     R13,EWTRES              ADD RESIDUAL COUNT        Y02032
+*
+F600     EQU   *
+         ST    R13,EIDAL               MOVE IN CALC. ERP ENTRY   Y02032
+         S     R4,FOUR                 SUB. FOUR FROM USER INDEX Y02032
+         LA    ERPREG,C4(ERPREG)       INCR TO NEXT ERP ENTRY    Y02032
+*
+*   IS THIS THE LAST ERP IDAL ENTRY TO BE CREATED?
+*
+         CL    R4,FZERO                IS THIS THE LAST ENTRY?   Y02032
+         BE    F700                    YES - GO CALC LAST ERP ENTRY
+*
+*   CALCULATE NEXT ERP IDAL ENTRY
+*
+         L     R13,UIDAL(R4)           GET NEXT USER ENTRY       Y02032
+         A     R13,EWTC7FF             ADD 2047                  Y02032
+         B     F600                    BRANCH BACK THRU LOOP     Y02032
+*
+*   CALCULATE LAST ERP IDAL ENTRY
+*
+F700     EQU   *
+         L     R13,UIDAL(R4)           GET LAST USER ENTRY       Y02032
+         A     R13,EWTNBFP             ADD # BYTES IN 1ST PAGE   Y02032
+         ST    R13,EIDAL               PUT IN LAST ERP IDAL ENTRY
+         L     UXREG,UCBXTN            RESET REG TO UCB EXT.     Y02032
+         LA    UXREG,0(UXREG)          GET 3-BYTE ADDRESS        Y02032
+         NI    EWAFLG3,X'FF'-EWTRBLD   RESET REBUILD IDAL BIT    Y02032
+         LA    EXITREG,RETN            RESTORE SVC 15/3 ADDR     Y02032
+         BR    BALREG                  RETURN                    Y02032
+*************    E N D   O F   P A R T   6    *************
+PATCH    DC    (4096-(PATCH-ERP1))X'00'
+         EJECT
+         IECDERWA  EWT
+         EJECT
+         IECDIOSB
+         EJECT
+         IEFUCBOB  PREFIX=YES
+         END

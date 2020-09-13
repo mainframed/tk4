@@ -1,0 +1,611 @@
+ /**********************************************************************
+ *                                                                     *
+ *    THIS PROGRAM IS A GENERALIZED SORT AND WILL SORT ANY FILE OF ANY *
+ * SIZE ON ANY NUMBER OF KEY FIELDS IN ANY COMBINATION OF ASCENDING OR *
+ * DESCENDING ORDER.                                                   *
+ *    SORT KEY FIELDS ARE SPECIFIED ON A SYSIN DATA SET OF THE FORMAT  *
+ * OFF1 LEN1 SEQ1 OFF2 LEN2 SEQ2 ... OFFN LENN SEQN.  THE SEQUENCE     *
+ * 'OFF1 LEN1 SEQ1' SPECIFIES THE MAJOR SORT KEY FIELD.  THE SEQUENCE  *
+ * 'OFF2 LEN2 SEQ2' SPECIFIES THE FIRST INTERMEDIATE SORT KEY FIELD,   *
+ * AND 'OFFN LENN SEQN' SPECIFIES THE MINOR SORT KEY FIELD.            *
+ *    FOR SORT KEY FIELD M, OFFM AND LENM MUST BOTH BE NUMERIC, AND    *
+ * SPECIFY THE OFFSET (RELATIVE 1) AND LENGTH OF THE FIELD.  SEQM      *
+ * MUST BE EITHER 'A' OR 'D', WHICH INDICATE RESPECTIVELY ASCENDING    *
+ * AND DESCENDING SEQUENCE.                                            *
+ *    FORMAT FOR THE SORT CONTROL SPECIFICATIONS IN THE SYSIN DATA     *
+ * SET IS FREE FORM.  THAT IS, ANY NUMBER OF BLANKS MAY APPEAR BETWEEN *
+ * EACH ITEM, AND ANY NUMBER OF CONTINUATION LINES MAY BE USED.        *
+ * 80-COLUMN CARD IMAGES ARE ASSUMED, AND ONLY THE FIRST 72 POSITIONS  *
+ * WILL BE SCANNED FOR SORT KEY SPECIFICATIONS, LEAVING COLUMNS 73     *
+ * THRU 80 FOR SEQUENCE NUMBERS.                                       *
+ *    A TYPICAL SORT CONTROL SPECIFICATION MIGHT BE -                  *
+ *                                                                     *
+ *         9 8 A 53 4 D 10 1 A                                         *
+ *                                                                     *
+ * WHICH INDICATES THAT THE MAJOR SORT FIELD IS AT OFFSET 9 FOR A      *
+ * LENGTH OF 8 IN EACH RECORD, AND IS TO BE SORTED INTO ASCENDING      *
+ * SEQUENCE.  ONE INTERMEDIATE SORT FIELD IS AT OFFSET 53 FOR A        *
+ * LENGTH OF 4, AND IS TO BE SORTED INTO DESCENDING SEQUENCE.  THE     *
+ * MINOR SORT FIELD IS AT OFFSET 10 FOR A LENGTH OF 1, AND IS TO BE    *
+ * SORTED IN ASCENDING SEQUENCE.                                       *
+ *    A MINIMUM OF AT LEAST 3 SORT WORK DATA SETS MUST BE SUPPLIED TO  *
+ * THIS PROGRAM, BUT YOU CAN OPTIONALLY USE ANY NUMBER UP TO 6.  THEY  *
+ * CAN BE EITHER TAPE OR DISK DATA SETS.  THE DDNAMES FOR THE WORK     *
+ * DATA SETS MUST BE OF THE FORM 'SORTKDD' WHERE DD IS 01, 02, 03, 04, *
+ * 05, OR 06.  NOTE THAT YOU MUST SUPPLY DCB INFORMATION MATCHING THE  *
+ * FILE FORMAT TO BE SORTED ON EACH SORT WORK DD STATEMENT.            *
+ *    THE INPUT DATA SET TO BE SORTED MUST BE SUPPLIED UNDER THE       *
+ * DDNAME SORTIN.  THE FINAL SORTED DATA SET WILL BE WRITTEN TO THE    *
+ * DATA SET UNDER THE DDNAME SORTOUT.  AGAIN, YOU MUST SUPPLY DCB      *
+ * INFORMATION ON THE SORTOUT DD STATEMENT MATCHING THE FORMAT OF THE  *
+ * FILE TO BE SORTED.                                                  *
+ *    THE PROGRAM BY DEFAULT HOLDS A MAXIMUM OF 12 RECORDS IN ITS      *
+ * INTERNAL BUFFERS DURING THE SORT/MERGE.  YOU CAN OPTIONALLY         *
+ * OVERRIDE THIS NUMBER VIA THE PARM FIELD ON THE EXEC STATEMENT AS    *
+ * FOLLOWS:                                                            *
+ *                                                                     *
+ *       //STEP EXEC PGM=PROG2,PARM='/23'                              *
+ *                                                                     *
+ * THE ABOVE OVERRIDE SPECIFIES THAT THE INTERNAL BUFFER IS TO HOLD    *
+ * 23 RECORDS INSTEAD OF THE DEFAULT OF 12.                            *
+ *    YOU CAN ALSO OPTIONALLY SUPPLY A DEBUG DD STATEMENT.  IF YOU DO, *
+ * THE PROGRAM WILL WRITE A LISTING OF THE RUNS AS THEY ARE CREATED.   *
+ *                                                                     *
+ **********************************************************************/
+1PROG2: PROC(PARM) OPTIONS(MAIN);
+   DCL PARM CHAR(100) VAR;
+   DFT RANGE(*) FIXED BIN VALUE(FIXED BIN(31,0));
+   DCL NULL BUILTIN;
+   DCL 1 DSTR BASED(DPTR),
+     /******************************************************************
+     *                                                                 *
+     * THIS STRUCTURE CONTAINS VALUES USED BY THE DISTRIBUTE_RUNS      *
+     * PROCEDURE.  IT IS DYNAMICALLY ALLOCATED DURING PROGRAM          *
+     * INITIALIZATION.                                                 *
+     *                                                                 *
+     ******************************************************************/
+     2 LEVEL FIXED BIN(31,0) INIT(0), /* CURRENT MERGE PASS LEVEL */
+     2 CURRUN FIXED BIN(31,0) INIT(0), /* CURRENT RUN BEING WRITTEN */
+     2 TIX FIXED BIN(31,0) INIT(1), /* TAPE ON WHICH CURRENT RUN GOES */
+     2 DCNT FIXED BIN(31,0), /* COUNT OF NUMBER OF SORT TAPES */
+     2 D(L REFER(DCNT)), /* ONE ELEMENT PER SORT TAPE */
+      3 DUMCNT FIXED BIN(31,0), /* COUNT DUMMY RUNS ON EACH TAPE */
+      3 MAXCNT FIXED BIN(31,0), /* IDEAL RUN DISTRIBUTION FOR LEVEL */
+      3 LAGCNT FIXED BIN(31,0), /* IDEAL RUN DISTRIBUTION PRIOR LEV. */
+      3 CURCNT FIXED BIN(31,0), /* CURRENT RUN COUNT BY TAPE */
+      3 EOFSW  FIXED BIN(15,0); /* ENDFILE SWITCH */
+   DCL 1 MERGESTR BASED(MPTR),
+     /******************************************************************
+     *                                                                 *
+     * THIS STRUCTURE CONTAINS THE BUFFERS USED DURING THE POLYPHASE   *
+     * MERGE.  IT IS DYNAMICALLY ALLOCATED DURING INITIALIZATION OF    *
+     * THE POLYPHASE_MERGE PROCEDURE, AND FREED WHEN THAT PROCEDURE IS *
+     * DONE.                                                           *
+     *                                                                 *
+     ******************************************************************/
+     2 MERGECNT FIXED BIN(31,0),
+     2 MERGE_LRECL FIXED BIN(31,0),
+     2 MERGE_ARY(DCNT REFER(MERGECNT)),
+      3 LASTKEY      CHAR(LRECL REFER(MERGE_LRECL)) VAR,
+      3 MERGE_BUFFER CHAR(LRECL REFER(MERGE_LRECL)) VAR;
+
+   % INCLUDE JFCB;
+   DCL JFCBCOR CHAR(176);
+   DCL SYSJFCB ENTRY(CHAR(8),PTR);
+   DCL INREC CHAR(80) VAR;
+   DCL (PREFIX,SUFFIX) ENTRY(CHAR(*),CHAR(*)) RETURNS(FIXED BIN(15,0));
+
+1/**********************************************************************
+ *                                                                     *
+ * FOLLOWING DECLARES ARE FOR THE USE OF A GENERALIZED SCAN ROUTINE    *
+ * CALLED SCANNER.  SEE ELSEWHERE FOR DETAILED DOCUMENTATION ON THIS   *
+ * ROUTINE.  BRIEFLY ITS FUNCTION IS TO TOKENIZE A STREAM OF TEXT.     *
+ *                                                                     *
+ **********************************************************************/
+   % DCL SCAN CHAR;
+   % SCAN = 'CALL SCANNER(INREC,SCANPARM,OPERATORS,KEYWORDS,SPCHARS)';
+   DCL SCANNER ENTRY;
+   DCL 1 SCANPARM,
+     2 TOKHDR PTR,
+     2 CURTOK PTR,
+     2 SCANIX FIXED BIN(15,0) INIT(1);
+   DCL 1 TOKEN BASED(CURTOK),
+     2 PRIOR_TOKEN PTR,
+     2 NEXT_TOKEN PTR,
+     2 ELIX FIXED BIN(15,0),
+     2 TYPE FIXED BIN(15,0),
+     2 SUBTYPE FIXED BIN(15,0),
+     2 TOKSTR CHAR(256) VAR;
+   DCL KEYWORD FIXED BIN(15,0) STATIC INIT(2);
+   DCL OPERAND FIXED BIN(15,0) STATIC INIT(0);
+   DCL NO_MORE_TOKENS FIXED BIN(15,0) STATIC INIT(6);
+   DCL NUMBER FIXED BIN(15,0) STATIC INIT(5);
+   DCL KEYWORDS(1)  CHAR(12) VAR;
+   DCL OPERATORS(1) CHAR(2) VAR;
+   DCL PRECEDENCE(2,1) FIXED BIN(15,0) STATIC INIT(0,0);
+   DCL SPCHARS CHAR(1) VAR STATIC INIT('');
+ /*
+ * END OF DECLARES FOR GENERALIZED SCAN ROUTINE.                       *
+ *                                                                     *
+ **********************************************************************/
+
+1  DCL L FIXED BIN(15,0);  /* # SCRATCH TAPES AVLBL */
+   DCL (SORTK01,SORTK02,SORTK03,SORTK04,SORTK05,SORTK06,SORTOUT)
+     FILE RECORD;
+   DCL TAPES(6) FILE;
+   DCL DEBUG FILE STREAM OUTPUT;
+   DCL DEBUGSW BIT(1) INIT('1'B);
+
+1  /* INITIALIZATION */
+   ON UNDF(DEBUG) DEBUGSW='0'B;
+   OPEN FILE(DEBUG) LINESIZE(132);
+   IF DEBUGSW
+     THEN DO;
+       PUT FILE(DEBUG) SKIP EDIT('DEBUG FILE DIAGNOSTIC OUTPUT')(A);
+       PUT FILE(DEBUG) SKIP(2) EDIT('TAPE  RUN   RECORD')(A);
+       END;
+   /* GET MAXIMUM ALLOWABLE RECORDS IN MEMORY */
+   IF PARM=''
+     THEN N=12; /* DEFAULT NUMBER OF RECORDS IN MEMORY AT ONE TIME */
+     ELSE IF VERIFY(PARM,'0123456789')=0
+       THEN N=PARM; /* USER OVERRIDES NUMBER OF RECORDS IN MEMORY */
+       ELSE DO;
+         PUT SKIP LIST('ERROR - PARM FIELD MUST BE NUMERIC');
+         SIGNAL ERROR;
+         END;
+
+   /* NOW GET THE LRECL FROM SORTIN */
+   JFCBPTR=ADDR(JFCBCOR);
+   CALL SYSJFCB('SORTIN',JFCBPTR);
+   LRECL=JFCLRECL;
+   IF LRECL=0
+     THEN DO;
+       PUT SKIP LIST('ERROR - YOU MUST SPECIFY DCB INFORMATION ON THE');
+       PUT SKIP LIST('JCL DD STATEMENT FOR THE SORTIN DATA SET.');
+       SIGNAL ERROR;
+       END;
+
+1  /* NOW GET THE SORT CONTROL FIELDS */
+   INREC='';
+   TOKHDR=NULL;
+   KEYWORDS(1),OPERATORS(1)=HIGH(1); /* SET DUMMY KEYWORD/OPERATORS */
+   ON ENDFILE(SYSIN) GO TO INEOF;
+   DO I=1 REPEAT I+1;
+     DO WHILE(SCANIX>LENGTH(INREC));
+       READ FILE(SYSIN) INTO(INREC);
+       IF LENGTH(INREC)>72
+         THEN INREC=SUBSTR(INREC,1,72); /* STRIP OFF SEQUENCE NUMBERS */
+       INREC=SUBSTR(INREC,1,SUFFIX(INREC,' '));/* STRIP TRAILING BLNKS*/
+       SCANIX=1;
+       END;
+     SCAN; /* GET NEXT TOKEN */
+     SELECT(MOD(I,3));
+       WHEN(1,2) /* CURRENT TOKEN IS OFFSET OR LENGTH */
+         IF TYPE^=NUMBER
+           THEN DO;
+             PUT SKIP LIST('ERROR - INVALID NUMERIC IN CONTROL STMT');
+             SIGNAL ERROR;
+             END;
+       OTHERWISE /* CURRENT TOKEN MUST BE 'A' OR 'D' */
+         IF TOKSTR^='A' & TOKSTR^='D'
+           THEN DO;
+             PUT SKIP LIST('ERROR - SEQUENCE MUST BE ''A'' OR ''D''');
+             SIGNAL ERROR;
+             END;
+       END; /* SELECT */
+     END;
+ INEOF:;
+   IF I=1
+     THEN DO;
+       PUT SKIP LIST('ERROR - AT LEAST ONE SORT FIELD MUST BE DEFINED');
+       SIGNAL ERROR;
+       END;
+   IF MOD(I,3)^=1
+     THEN DO;
+       PUT SKIP LIST('ERROR - OFFSET, LENGTH, AND SEQUENCE MUST BE');
+       PUT SKIP LIST('        DEFINED FOR EACH SORT FIELD.');
+       END;
+   INREC=' ';
+   SCANIX=1;
+   SCAN; /* SET UP NO-MORE-TOKENS TOKEN */
+1  /* NOW DETERMINE NUMBER OF SCRATCH TAPES AVAILABLE */
+   TAPES(1)=SORTK01;
+   TAPES(2)=SORTK02;
+   TAPES(3)=SORTK03;
+   TAPES(4)=SORTK04;
+   TAPES(5)=SORTK05;
+   TAPES(6)=SORTK06;
+   ON ENDFILE(SORTK01) EOFSW(1)=1;
+   ON ENDFILE(SORTK02) EOFSW(2)=1;
+   ON ENDFILE(SORTK03) EOFSW(3)=1;
+   ON ENDFILE(SORTK04) EOFSW(4)=1;
+   ON ENDFILE(SORTK05) EOFSW(5)=1;
+   ON ENDFILE(SORTK06) EOFSW(6)=1;
+   ON UNDF(SORTK01) GOTO BYOPEN;
+   ON UNDF(SORTK02) GOTO BYOPEN;
+   ON UNDF(SORTK03) GOTO BYOPEN;
+   ON UNDF(SORTK04) GOTO BYOPEN;
+   ON UNDF(SORTK05) GOTO BYOPEN;
+   ON UNDF(SORTK06) GOTO BYOPEN;
+   DO L=1 TO 6;
+     OPEN FILE(TAPES(L)) OUTPUT;
+     END;
+ BYOPEN:;
+   L=L-1;
+   IF L<3
+     THEN DO;
+       PUT SKIP LIST('ERROR - AT LEAST 3 SORT WORK FILES MUST BE USED');
+       SIGNAL ERROR;
+       END;
+   ALLOCATE DSTR;
+   DO I=1 TO DCNT;
+     DUMCNT(I)=0;
+     MAXCNT(I)=0;
+     LAGCNT(I)=0;
+     CURCNT(I)=0;
+     EOFSW(I)=0;
+     END;
+   MAXCNT(1)=1; /* SET IDEAL DISTRIBUTION FOR LEVEL 0 */
+
+   CALL RUNS_GENERATOR(N);
+   CALL POLYPHASE_MERGE;
+   IF DEBUGSW
+     THEN PUT FILE(DEBUG) SKIP(2) LIST('END OF DIAGNOSTIC OUTPUT');
+
+1ADJUST: PROC(I,N,R,SIGNUM);
+ /**********************************************************************
+ *                                                                     *
+ *    THIS PROCEDURE TAKES A BINARY TREE, R, WHOSE LEFT AND RIGHT      *
+ * SUBTREES SATISFY THE HEAP PROPERTY BUT WHOSE ROOT MAY NOT, AND      *
+ * ADJUSTS R SO THAT THE ENTIRE BINARY TREE SATISFIES THE HEAP         *
+ * PROPERTY.                                                           *
+ *    ACCORDING TO "FUNDAMENTALS OF DATA STRUCTURES" BY HOROWITZ AND   *
+ * SAHNI, A HEAP IS DEFINED TO BE A BINARY TREE WITH THE PROPERTY THAT *
+ * THE VALUE OF EACH NODE IS AT LEAST AS LARGE AS THE VALUE OF ITS     *
+ * CHILDREN NODES, IF THEY EXIST.  THE HEAP IN THIS PROGRAM DIFFERS    *
+ * FROM THAT DEFINITION ONLY IN THAT DESCENDING COLLATING SEQUENCE IS  *
+ * USED RATHER THAN ASCENDING.  THAT IS, THE VALUE OF EACH NODE IS AS  *
+ * LEAST AS SMALL AS THE VALUE OF ITS CHILDREN NODES.  THUS, THE ROOT  *
+ * NODE IN THE PROPERLY ORDERED HEAP WILL HAVE THE SMALLEST KEY.       *
+ *    THIS ALGORITHM WAS TAKEN FROM THE REFERENCE INDICATED IN THE     *
+ * PREVIOUS PARAGRAPH.  IT ADJUSTS THE SUBTREE WITH ROOT I IN R TO     *
+ * SATISFY THE HEAP PROPERTY.  THE LEFT AND RIGHT SUBTREES OF I, I.E.  *
+ * WITH ROOTS 2I AND 2I+1, ALREADY SATISFY THE HEAP PROPERTY.          *
+ *    SIGNUM IS A PROCEDURE WHICH IS INVOKED BY PROCEDURE ADJUST TO    *
+ * DETERMINE THE COLLATING RELATIONSHIP BETWEEN TWO ENTRIES IN R.      *
+ *    NOTE THAT R, REPRESENTING THE HEAP, IS AN ARRAY OF ARBITRARY     *
+ * LENGTH OF FIXED BINARY(31,0) ITEMS.  EACH ELEMENT CONTAINS AN       *
+ * AN INDEXING VALUE WHICH UNIQUELY IDENTIFIES A RECORD TO PROCEDURE   *
+ * SIGNUM.  THUS, PROCEDURE ADJUST CAN PERFORM ITS FUNCTION ON THE     *
+ * HEAP TOTALLY INDEPENDENT OF THE ACTUAL RECORD FORMAT.               *
+ *                                                                     *
+ **********************************************************************/
+   DCL SIGNUM ENTRY(FIXED BIN(31,0),FIXED BIN(31,0))
+     RETURNS(BIT(1));
+   DCL (I,J,K,N,SAVE) FIXED BIN(31,0);
+   DCL R(*) FIXED BIN(31,0);
+
+   SAVE=R(I);
+   J=2*I;
+   DO WHILE(J<=N);
+     IF J<N
+       THEN IF SIGNUM(R(J),R(J+1))
+         THEN J=J+1; /* FIND MIN OF LEFT AND RIGHT CHILD */
+     /* COMPARE MIN CHILD WITH PARENT. IF PARENT IS MIN THEN DONE */
+     IF ^SIGNUM(SAVE,R(J))
+       THEN DO;
+         R(J/2)=SAVE;
+         RETURN;
+         END;
+     R(J/2)=R(J); /* MOVE R(J) UP THE TREE */
+     J=2*J;
+     END;
+   R(J/2)=SAVE;
+   END ADJUST;
+
+1DISTRIBUTE_RUNS: PROC(RUN,REC);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WITH EACH SUCCESSIVE RECORD BY THE RUNS_GENERATOR ROUTINE.   *
+ * THIS ROUTINE WILL DISTRIBUTE THE INITIAL RUNS ON THE SCRATCH        *
+ * TAPES IDENTIFIED IN GLOBAL ARRAY TAPES.                             *
+ *                                                                     *
+ * STRUCTURE DSTR, WHICH IS GLOBAL TO THIS PROCEDURE, IS USED TO KEEP  *
+ * TRACK OF RUNS DISTRIBUTION.  NOTE THAT THIS PROCEDURE IS            *
+ * INDEPENDENT OF THE NUMBER OF SCRATCH TAPES AVAILABLE FOR SORTING.   *
+ * THAT IS, REGARDLES OF THE NUMBER OF SCRATCH TAPES AVAILABLE, IT     *
+ * WILL WORK CORRECTLY.                                                *
+ *                                                                     *
+ **********************************************************************/
+   DCL RUN FIXED BIN(31,0); /* CURRENT RUN NUMBER */
+   DCL REC CHAR(*) VAR; /* NEXT RECORD IN CURRENT RUN */
+   DCL I FIXED BIN;
+
+   IF RUN^=CURRUN
+     THEN DO;
+       IF CURRUN^=0
+         THEN DO UNTIL(CURCNT(TIX)<MAXCNT(TIX));
+           TIX=1;
+           /* DO LOOP ENSURES AN EVEN DISTRIBUTION OF DUMMY RUNS */
+           DO I=2 TO DCNT-1;
+             IF (MAXCNT(I)-CURCNT(I))>(MAXCNT(TIX)-CURCNT(TIX))
+               THEN TIX=I;
+             END;
+           IF MAXCNT(TIX)-CURCNT(TIX)=0
+             THEN DO; /* TIME TO START A NEW LEVEL */
+               LEVEL=LEVEL+1;
+               TIX=1;
+               LAGCNT=MAXCNT; /* SAVE IDEAL DISTRIBUTION */
+               DO I=1 TO DCNT-1; /* SET NEXT IDEAL DISTRIBUTION */
+                 MAXCNT(I)=LAGCNT(1)+LAGCNT(I+1);
+                 END;
+               END;
+           END;
+       CURCNT(TIX)=CURCNT(TIX)+1;
+       CURRUN=RUN;
+       END;
+   WRITE FILE(TAPES(TIX)) FROM(REC);
+   IF DEBUGSW
+     THEN PUT FILE(DEBUG) SKIP
+       EDIT(TIX,RUN,REC)(F(1),X(1),F(5),X(1),A);
+   END DISTRIBUTE_RUNS;
+
+1POLYPHASE_MERGE: PROC RETURNS(FIXED BIN(31,0));
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO DO A POLYPHASE MERGE ON THE INITIAL RUNS, WHICH ARE       *
+ * WRITTEN ON THE SCRATCH TAPES.                                       *
+ *                                                                     *
+ **********************************************************************/
+   DCL (I,J,K,L,M,POLYRUN) FIXED BIN(31,0);
+
+   POLYRUN=0; /* USED TO KEEP TRACK OF RUN */
+   IF DEBUGSW
+     THEN DO;
+       PUT FILE(DEBUG) SKIP(3) LIST('START OF MERGE PHASE');
+       PUT FILE(DEBUG) SKIP(2) EDIT('TAPE LEVEL RUN RECORD')(A);
+       PUT FILE(DEBUG) SKIP(1);
+       END;
+   ALLOCATE MERGESTR;
+   DO I=1 TO DCNT-1;
+     CLOSE FILE(TAPES(I)); /* REWIND TAPES */
+     OPEN FILE(TAPES(I)) INPUT;
+     READ FILE(TAPES(I)) INTO(MERGE_BUFFER(I)); /* INITIALIZE BUFFER */
+     DUMCNT(I)=MAXCNT(I)-CURCNT(I); /* # DUMMY RUNS THIS TAPE */
+     EOFSW(I)=0; /* INITIALIZE EOFSW */
+     END;
+   M=DCNT; /* FIRST OUTPUT SORT TAPE */
+   K=M-1; /* FIRST INPUT TAPE TO CLEAN OFF */
+   DUMCNT(M)=0;
+   EOFSW(M)=0;
+
+1  DO WHILE(LEVEL^=0);
+     DO WHILE(EOFSW(K)=0);
+       J=1; /* ALL DUMMIES=TRUE */
+       DO I=1 TO DCNT;
+         IF I^=M
+           THEN IF DUMCNT(I)=0
+             THEN J=0; /* ALL DUMMIES=FALSE */
+         END;
+       IF J=1 /* ALL DUMMIES? */
+         THEN DUMCNT(M)=DUMCNT(M)+1;
+         ELSE CALL POLYPHASE_MERGE_SUB(M,LEVEL,POLYRUN);
+           /* MERGE RUN FROM EACH TAPE W/NO DUMMIES TO TAPES(M) */
+       DO I=1 TO DCNT; /* NOW REDUCE DUMMY COUNTS */
+         IF I^=M
+           THEN IF DUMCNT(I)>0
+             THEN DUMCNT(I)=DUMCNT(I)-1;
+         END;
+       END;
+     /* GO DOWN BY ONE LEVEL AND START A NEW MERGE PASS */
+     LEVEL=LEVEL-1;
+     CLOSE FILE(TAPES(M)); /* CLOSE & REWIND OUTPUT TAPE */
+     CLOSE FILE(TAPES(K)); /* CLOSE CLEANED OFF INPUT TAPE */
+     EOFSW(K)=0; /* RESET ENDFILE SWITCH */
+     IF LEVEL>0
+       THEN DO;
+         OPEN FILE(TAPES(M)) INPUT; /* REOPEN AS INPUT */
+         READ FILE(TAPES(M)) INTO(MERGE_BUFFER(M)); /* INIT BUFFER */
+         IF LEVEL=1
+           THEN TAPES(K)=SORTOUT;
+         OPEN FILE(TAPES(K)) OUTPUT; /* NEW OUTPUT TAPE */
+         M=K; /* M IDENTIFIES NEW OUTPUT TAPE */
+         IF M=1
+           THEN K=DCNT;
+           ELSE K=M-1;
+         /* K IDENTIFIES NEW TAPE TO CLEAN OFF */
+         END;
+     END;
+   FREE MERGESTR;
+   /* AT THIS POINT SORTING IS COMPLETE.  TAPES(M) HAS SORTED FILE */
+   END POLYPHASE_MERGE;
+
+1POLYPHASE_MERGE_SUB: PROC(M,LEVEL,POLYRUN);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN IT IS TIME TO MERGE ONE RUN FROM EACH INPUT SCRATCH     *
+ * SORT TAPE THAT HAS NO DUMMIES TO THE OUTPUT SCRATCH SORT TAPE.      *
+ *                                                                     *
+ **********************************************************************/
+   DCL (I,J,M,LEVEL,POLYRUN) FIXED BIN(31,0);
+   /* M = INDEX OF OUTPUT TAPE */
+
+   POLYRUN=POLYRUN+1;
+   /* INITIALIZE END-OF-RUN CHECKS */
+   DO I=1 TO DCNT;
+     IF I^=M
+       THEN LASTKEY(I)=MERGE_BUFFER(I);
+     END;
+
+   DO UNTIL(J=0);
+     /* FIND THE LOWEST KEY TO WRITE OUT NEXT */
+     J=0;
+     DO I=1 TO DCNT;
+       IF I^=M /* INPUT TAPE ON THIS LEVEL? */
+         THEN IF DUMCNT(I)=0 /* NO DUMMIES? */
+           THEN IF EOFSW(I)=0 /* NOT AT END OF FILE? */
+             THEN IF SIGNUM(LASTKEY(I),MERGE_BUFFER(I))<=0
+               THEN IF J=0 /* IT IS NOT END OF RUN */
+                 THEN J=I;
+                 ELSE IF SIGNUM(MERGE_BUFFER(I),MERGE_BUFFER(J))<0
+                   THEN J=I;
+       END;
+     IF J>0
+       THEN DO;
+         WRITE FILE(TAPES(M)) FROM(MERGE_BUFFER(J));
+         IF DEBUGSW
+           THEN PUT FILE(DEBUG) SKIP
+             EDIT(M,LEVEL,POLYRUN,MERGE_BUFFER(J))
+             (F(1),X(1),F(5),X(1),F(5),A);
+         LASTKEY(J)=MERGE_BUFFER(J);
+         READ FILE(TAPES(J)) INTO(MERGE_BUFFER(J));
+         END;
+     END;
+   END POLYPHASE_MERGE_SUB;
+
+1RUNS_GENERATOR: PROC(M);
+ /**********************************************************************
+ *                                                                     *
+ *   CALLED TO GENERATE THE INITIAL RUNS.  THE SOLE ARGUMENT TO THIS   *
+ * ROUTINE IS M, THE MAXIMUM ALLOWABLE NUMBER OF RECORDS ALLOWED IN    *
+ * MEMORY AT ONE TIME.  THE INITIAL RUNS GENERATED WILL BE AT LEAST    *
+ * M RECORDS LONG.  THE RECORDS WILL BE PASSED ONE AT A TIME TO THE    *
+ * DISTRIBUTE_RUNS ROUTINE, ALONG WITH THE RUN NUMBER TO WHICH THEY    *
+ * BELONG.                                                             *
+ *   NOTE THAT THIS ROUTINE IS WRITTEN SO THAT IT IS INDEPENDENT OF    *
+ * THE FORMAT OF THE RECORDS TO BE SORTED.                             *
+ *                                                                     *
+ **********************************************************************/
+   DCL (I,J,L,M,N,PNEXT,PSIZE,R) FIXED BIN(31,0);
+   DCL 1 PSTR BASED(PSTRPTR),
+     2 PSTRLEN FIXED BIN(31,0),
+     2 PIX(M REFER(PSTRLEN)) FIXED BIN(31,0), /* HEAP REPRESENTATION */
+     2 PSTR_LRECL FIXED BIN(31,0),
+     2 LASTOUT,
+       3 PRTY FIXED BIN(31,0),
+       3 PREC CHAR(LRECL REFER(PSTR_LRECL)) VAR,
+     2 P(M REFER(PSTRLEN)),
+       3 PRTY FIXED BIN(31,0),
+       3 PREC CHAR(LRECL REFER(PSTR_LRECL)) VAR;
+   DCL EOFSW BIT(1) INIT('0'B);
+
+1  ALLOCATE PSTR;
+
+   /* INITIALIZE HEAP */
+   DO I=1 TO M;
+     PIX(I)=I;
+     P.PRTY(I)=99999999;
+     END;
+
+   /* READ FIRST M RECORDS INTO P */
+   ON ENDFILE(SORTIN) EOFSW='1'B;
+   PSIZE=0;
+   DO WHILE(^EOFSW) UNTIL(PSIZE=M);
+     READ FILE(SORTIN) INTO(P.PREC(PSIZE+1));
+     IF ^EOFSW
+       THEN DO;
+         PSIZE=PSIZE+1;
+         P.PRTY(PSIZE)=1;
+         END;
+     END;
+   IF EOFSW
+     THEN TAPES(TIX)=SORTOUT; /* RECORDS CAN BE SORTED IN MEMORY */
+   PNEXT=1; /* NEXT RECORD TO USE FROM INPUT */
+   DO I=PSIZE/2 TO 1 BY -1; /* SET UP INITIAL HEAP */
+     CALL ADJUST(I,PSIZE,PIX,RUNS_SIGNUM);
+     END;
+
+   R=0; /* CURRENT RUN # */
+   DO WHILE(PNEXT<=PSIZE);
+     LASTOUT.PRTY=P.PRTY(PIX(1));
+     LASTOUT.PREC=P.PREC(PIX(1));
+     IF LASTOUT.PRTY^=R
+       THEN R=R+1; /* BEGIN A NEW RUN */
+     CALL DISTRIBUTE_RUNS(LASTOUT.PRTY,LASTOUT.PREC); /* ADD TO RUN */
+     IF ^EOFSW
+       THEN DO;
+         READ FILE(SORTIN) INTO(P.PREC(PIX(1)));
+         IF ^EOFSW
+           THEN IF SIGNUM(P.PREC(PIX(1)),LASTOUT.PREC)>=0
+             THEN P.PRTY(PIX(1))=R;   /* IS PART OF CURRENT RUN */
+             ELSE P.PRTY(PIX(1))=R+1; /* IS PART OF NEXT RUN */
+         END;
+     IF EOFSW
+       THEN DO;
+         PNEXT=PNEXT+1;
+         P.PRTY(PIX(1))=99999999; /* EMPTY GOES TO BOTTOM OF HEAP */
+         END;
+     CALL ADJUST(1,PSIZE,PIX,RUNS_SIGNUM); /* ADJUST HEAP */
+     END;
+   FREE PSTR;
+   CLOSE FILE(SORTIN);
+
+1RUNS_SIGNUM: PROC(OP1,OP2) RETURNS(BIT(1));
+ /**********************************************************************
+ *                                                                     *
+ * SIGNUM IS NESTED WITHIN PROCEDURE RUNS_GENERATOR, AND IS USED TO    *
+ * DETERMINE THE COLLATING RELATIONSHIP BETWEEN TWO PRIORITY/RECORD    *
+ * COMBINATIONS.  OP1 AND OP2 ARE SCALARS CONTAINING INDEXES INTO      *
+ * ARRAY P, WHICH IS CONTAINED IN PROCEDURE RUNS_GENERATOR AND IS      *
+ * GLOBAL TO THIS PROCEDURE.  SIGNUM WILL RETURN '1'B IF THE RECORD    *
+ * INDEXED BY OP1 IS GREATER THAN THE ONE INDEXED BY OP2.              *
+ *                                                                     *
+ **********************************************************************/
+   DCL (OP1,OP2) FIXED BIN(31,0);
+
+   SELECT;
+     WHEN(P.PRTY(OP1)<P.PRTY(OP2)) RETURN('0'B);
+     WHEN(P.PRTY(OP1)>P.PRTY(OP2)) RETURN('1'B);
+     OTHERWISE IF SIGNUM(P.PREC(OP1),P.PREC(OP2))=1
+       THEN RETURN('1'B);
+       ELSE RETURN('0'B);
+     END; /* SELECT */
+   END RUNS_SIGNUM;
+
+   END RUNS_GENERATOR;
+
+ SIGNUM: PROC(REC1,REC2) RETURNS(FIXED BIN(31,0));
+ /**********************************************************************
+ *                                                                     *
+ * THIS PROCEDURE IS CALLED TO DETERMINE THE COLLATING SEQUENCE OF TWO *
+ * RECORDS, REC1 AND REC2, ACCORDING TO THE SORT FIELDS AND SEQUENCE   *
+ * SPECIFICATIONS IN THE SYSIN DATA SET.  A NUMBER WILL BE RETURNED    *
+ * AS FOLLOWS:                                                         *
+ *                                                                     *
+ * -1 - REC1 < REC2                                                    *
+ *  0 - REC1 = REC2                                                    *
+ * +1 - REC1 > REC2                                                    *
+ *                                                                     *
+ **********************************************************************/
+   DCL (REC1,REC2) CHAR(*) VAR;
+   DCL (OFF,LEN) FIXED BIN(31,0);
+   DCL SEQ CHAR(1);
+
+   DO CURTOK=TOKHDR REPEAT NEXT_TOKEN WHILE(CURTOK^=NULL);
+     IF TYPE=NO_MORE_TOKENS
+       THEN LEAVE;
+     OFF=TOKSTR;
+     CURTOK=NEXT_TOKEN;
+     LEN=TOKSTR;
+     CURTOK=NEXT_TOKEN;
+     IF (OFF+LEN-1)>MIN(LENGTH(REC1),LENGTH(REC2))
+       THEN DO;
+         PUT SKIP
+           LIST('ERROR - SORT CONTROL FIELD EXCEEDS RECORD LENGTH');
+         SIGNAL ERROR;
+         END;
+     SEQ=TOKSTR;
+     IF SUBSTR(REC1,OFF,LEN)^=SUBSTR(REC2,OFF,LEN)
+       THEN IF SEQ='A'
+         THEN IF SUBSTR(REC1,OFF,LEN) > SUBSTR(REC2,OFF,LEN)
+           THEN RETURN(1);
+           ELSE RETURN(-1);
+         ELSE IF SUBSTR(REC2,OFF,LEN) > SUBSTR(REC1,OFF,LEN)
+           THEN RETURN(1);
+           ELSE RETURN(-1);
+     END;
+   RETURN(0); /* RECORDS ARE EQUAL */
+   END SIGNUM;
+
+
+   END PROG2;

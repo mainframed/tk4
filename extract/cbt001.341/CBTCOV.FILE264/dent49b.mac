@@ -1,0 +1,1133 @@
+ /* COPYRIGHT 1983 BY THOMAS GLEN SMITH */
+ DENT49B: PROC(P,RHPTR,SUBENT,RHHDRPT,SUBQ_HDR,SUBRTNES,DO_STACK)
+   RETURNS(PTR) RECURSIVE OPTIONS(REENTRANT);
+ /**********************************************************************
+ * DO_SELECT IS CALLED TO EXECUTE A SELECT STATEMENT.  P IS THE        *
+ * POINTER TO THE SELECT_HTEXT CONTROL BLOCK DESCRIBING THE PARSED     *
+ * SELECT STATEMENT TO BE EXECUTED.  DO_SELECT WILL RETURN THE POINTER *
+ * TO THE RECHDR CONTROL BLOCK CREATED AS A RESULT OF EXECUTING THE    *
+ * SELECT.                                                             *
+ **********************************************************************/
+   % DCL @PROCNAME CHAR;
+   % @PROCNAME='';
+   % INCLUDE DENTSUB;
+   % INCLUDE DENTSEL;
+   HALT;
+   DCL (PREFIX,SUFFIX) ENTRY(CHAR(*),CHAR(*))
+     RETURNS(FIXED BIN(15,0));
+   DCL CALCPRT ENTRY(DEC FLOAT(16))
+     RETURNS(CHAR(80) VAR);
+   DCL DO_STACK PTR;
+   DCL MISSING DEC FLOAT(16);
+   UNSPEC(MISSING)='1'B; /* SET MISSING VALUE */
+   DCL (D,FR,LASTFLD,LASTFROM,OLD_FROM,P,W,RETPTR) PTR;
+   DCL I FIXED BIN;
+   DCL CMD CHAR(256) VAR;
+
+   /* ALLOCATE AND STACK AN EXECUTION SELECT_HTEXT BLOCK */
+   ALLOCATE SELECT_HTEXT SET(D);
+   D->SUBQ_NEXT,D->SUBQ_PREV=NULL;
+   D->SUBQ_NUM=0;
+   D->TOKHDR,D->CURTOK=NULL;
+   D->SCANIX=0;
+   D->SELECT_FLAGS=P->SELECT_FLAGS;
+   D->SELECT_LIST_PTR,D->FROM_LIST_PTR,D->WHERE_PTR=NULL;
+   D->GROUP_BY_PTR,D->TO_PTR,D->TO_RHP=NULL;
+   D->ORDER_BY_PTR=P->ORDER_BY_PTR;
+   D->SELECT_SUMMARY_TYPE=P->SELECT_SUMMARY_TYPE;
+   D->DROP_LIST_PTR=P->DROP_LIST_PTR;
+   D->RENAME_LIST_PTR=P->RENAME_LIST_PTR;
+
+   /* NOW PUSH SELECT_HTEXT BLOCK ONTO STACK */
+   D->SUBQ_NEXT=DO_STACK;
+   DO_STACK=D;
+
+   /* NOW PREPARE ALL THE FROM DATA SETS */
+   IF P->FROM_LIST_PTR=NULL
+     THEN DO; /* SELECT FROM CURRENT DATA SET */
+       ALLOCATE FROM_FIELD SET(FR);
+       D->FROM_LIST_PTR=FR;
+       FR->FROM_NEXT_FIELD=NULL;
+       FR->FROM_RHP=RHPTR; /* POINT TO CURRENT DATA SET */
+       FR->FROM_NAME=RHNAME;
+       FR->SHORT_FROM_NAME='';
+       STRING(FR->FROM_FLAGS)='0'B;
+       CALL LOC_DBD(FR); /* GO LOCATE DATA BASE DEFINITION */
+       END;
+     ELSE DO;
+       D->FROM_LIST_PTR,LASTFROM=NULL;
+       DO OLD_FROM=P->FROM_LIST_PTR
+         REPEAT OLD_FROM->FROM_NEXT_FIELD
+         WHILE(OLD_FROM^=NULL);
+         ALLOCATE FROM_FIELD SET(FR);
+         FR->FROM_FIELD=OLD_FROM->FROM_FIELD;
+         CALL SINGLE_QUEUE(D->FROM_LIST_PTR,LASTFROM,FR);
+         CALL LOC_DB(FR); /* GO LOCATE DATA BASE */
+         CALL LOC_DBD(FR); /* GO LOCATE DATA BASE DEFINITION */
+         END;
+       END;
+
+   /* LOCATE AND EXECUTE ANY SUB-QUERIES IN THE SELECT LIST */
+   D->SELECT_LIST_PTR,LASTFLD=NULL;
+   CALL SET_LIST(P->SELECT_LIST_PTR,D->SELECT_LIST_PTR,LASTFLD);
+
+   D->WHERE_PTR=P->WHERE_PTR;
+   D->GROUP_BY_PTR=P->GROUP_BY_PTR;
+
+   /* NOW GO SET UP THE TO DATA SET */
+   D->TO_PTR=P->TO_PTR;
+   CALL SET_TO(D);
+
+   /* NOW GO SET UP THE DBD FOR THE TO- DATA SET */
+   IF D->SELECT_ALL_FIELDS
+     THEN CALL SET_TO_DBD_ALL(D); /* SELECT * */
+     ELSE CALL SET_TO_DBD(D);     /* SELECT <LIST> */
+
+   /* TURN ON TO-HEXMODE IF ANY FROM-DATASET HAS HEXMODE */
+   DO W=D->FROM_LIST_PTR REPEAT W->FROM_NEXT_FIELD WHILE(W^=NULL);
+     D->TO_RHP->HEXMODE=D->TO_RHP->HEXMODE×W->FROM_RHP->HEXMODE;
+     END;
+
+   /* NOW GO CHECK FOR EXPRESSION OPERATIONS INVOLVING CHAR STRINGS */
+   CALL CHAR_CHECK(D);
+
+   /* NOW CHECK FOR BLANKET SUMMARY PROCESSING */
+   IF D->SELECT_SUMMARY & (D->SELECT_LIST_PTR=NULL)
+     THEN CALL SUMMARY_SETUP(D);
+
+   IF D->GROUP_BY_PTR^=NULL
+     THEN DO;
+       DO G=D->GROUP_BY_PTR->GROUP_SPEC_PTR REPEAT G->ORDER_LIST_PTR
+         WHILE(G^=NULL);
+         DO S=D->SELECT_LIST_PTR REPEAT S->SELECT_NEXT_FIELD
+           WHILE(S^=NULL) UNTIL(S->SELECT_NAME=G->ORDER_NAME->TOKSTR);
+           END;
+         IF S=NULL
+           THEN DO;
+             MSGDATA='SELECT LIST MUST CONTAIN ALL GROUP-BY REFERENCES';
+             SIGNAL CONDITION(BADSTMT);
+             END;
+         END;
+       L=D->TO_RHP->BUFPTR->BUFLN;
+       ALLOCATE BUFSTR SET(D->GROUP_BY_PTR->GROUP_BUFPTR);
+       D->GROUP_BY_PTR->GROUP_BUFPTR->BUF='';
+       END;
+
+   /* NOW GO EXECUTE */
+   CALL RUN_SELECT(D);
+
+   IF D->ORDER_BY_PTR^=NULL &
+     ^(D->MERGE_FLAG × D->SET_FLAG × D->UPDATE_FLAG)
+     THEN CALL RUN_SORT(D->TO_RHP,SUBENT,RHHDRPT,SUBRTNES,D);
+       /* GO PROCESS ORDER-BY CLAUSE */
+
+   /* NOW DO RENAMES, IF ANY */
+   CALL RUN_RENAME(D);
+
+   /* NOW DO A TOP FOR TO DATA SET */
+   I=#CMD('TOP',D->TO_RHP,SUBENT,RHHDRPT);
+
+   /* NOW RESET CURRENT LINE POINTER FOR ALL FROM DATA SETS */
+   DO W=D->FROM_LIST_PTR REPEAT W->FROM_NEXT_FIELD WHILE(W^=NULL);
+     IF QNUM(W->FROM_RHP->RHNAME,'Q')>=0
+       THEN I=#CMD('END NOSAVE',W->FROM_RHP,SUBENT,RHHDRPT); /* TEMP */
+     END;
+
+   /* NOW UNSTACK AND FREE MEMORY FOR EXECUTION SELECT_HTEXT BLOCK */
+   RETPTR=D->TO_RHP;
+   DO_STACK=D->SUBQ_NEXT;
+   D->SUBQ_NEXT=NULL;
+   CALL CLEAN_HTEXT(RHPTR,SUBENT,RHHDRPT,SUBRTNES,D,'EXEC');
+
+   RETURN(RETPTR);
+
+ COPY_EXP_QUEUE: PROC(FROM,TO) RECURSIVE;
+ /**********************************************************************
+ * CALLED TO COPY A LIST OF TOKENS DESCRIBING A POLISH EXPRESSION.     *
+ * SUBQUERIES WILL BE RESOLVED AS THEY ARE ENCOUNTERED DURING THE      *
+ * COPYING PROCESS.                                                    *
+ **********************************************************************/
+   DCL (FROM,TO,F,T,LPTR) PTR;
+   DO F=FROM REPEAT F->NEXT_TOKEN WHILE(F^=NULL);
+     /* GO DOWN THE TOKEN QUEUE FOR THIS EXPRESSION */
+     IF SUBQUERY_TYPE(F)
+       THEN DO;
+         LPTR=SUBQUERY(F);
+         IF LPTR->SELECT_NEXT_FIELD^=NULL
+           THEN SIGNAL CONDITION(BADSTMT); /* NOT A <VALUE-QUERY> */
+         CALL COPY_EXP_QUEUE(LPTR->FIELD_EXP_HDR,TO);
+         CALL DELTOK(TO); /* GO DELETE NO_MORE_TOKENS TOKEN */
+         CALL DEL_LIST(LPTR); /* GO DELETE TEMPORARY LIST */
+         END;
+       ELSE TO=QUEUE(TO,COPYTOK(F));
+     END;
+   END COPY_EXP_QUEUE;
+
+ DISTINCT_CHECK: PROC(D) RETURNS(BIT(1));
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO DO DISTINCT CHECKING.  IF THE DISTINCT KEYWORD WAS NOT    *
+ * SPECIFIED ON THE SELECT SUBCOMMAND, DISTINCT_CHECK WILL             *
+ * IMMEDIATELY RETURN '1'B.  OTHERWISE, A COMPARISON WILL BE MADE      *
+ * BETWEEN FIELDS IN THE ADD-BUFFER AND THE LAST RECORD IN THE         *
+ * TO-DATA SET.  IF THE FIELDS MATCH, A '0'B WILL BE RETURNED.         *
+ * IF AN ORDER-BY CLAUSE WAS SPECIFIED, THE FIELDS NAMED IN THAT       *
+ * CLAUSE WILL BE COMPARED.  OTHERWISE, THE FIRST FIELD ENCOUNTERED    *
+ * IN THE TO-DATASET WILL BE COMPARED.                                 *
+ *                                                                     *
+ **********************************************************************/
+   DCL (A,B,C,D,E) PTR;
+   DCL (I,J) FIXED BIN(15,0);
+   IF ^D->SELECT_DISTINCT
+     THEN RETURN('1'B); /* CONSIDER IT DISTINCT */
+   IF D->TO_RHP->LSTHDR=D->TO_RHP->HDPTR
+     THEN RETURN('1'B); /* NO RECORD TO COMPARE TO */
+   A=ADDR(D->TO_RHP->LSTHDR->RECLEN); /* BUFFER FOR LAST RECORD */
+   B=D->TO_RHP->BUFPTR; /* BUFFER FOR RECORD TO BE ADDED */
+   IF D->ORDER_BY_PTR=NULL
+     THEN RETURN(0^=SIGNUM(D->TO_RHP->RHUSEHD,A,B));
+   /* NOW CHECK FIELDS OF ORDER-BY CLAUSE */
+   RETURN(DISTINCT_CHECK_SUB(ORDER_BY_PTR,D->TO_RHP->RHUSEHD,A,B));
+   END DISTINCT_CHECK;
+
+ DISTINCT_CHECK_SUB: PROC(OBPTR,USEHD,A,B) RETURNS(BIT(1));
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO DETERMINE WHETHER THE RECORDS IN BUFFERS POINTED TO BY    *
+ * A AND B ARE EQUAL IN COLLATING SEQUENCE ACCORDING TO THE            *
+ * ORDER_BY LIST POINTED TO BY OBPTR.  A '1'B WILL BE RETURNED IF      *
+ * THE BUFFERS ARE DISTINCT (DON'T MATCH).                             *
+ *                                                                     *
+ **********************************************************************/
+   DCL (OBPTR,USEHD,A,B,C,D,E) PTR;
+   DCL (I,J) FIXED BIN(15,0);
+   /* NOW CHECK FIELDS OF ORDER-BY CLAUSE */
+   DO E=OBPTR REPEAT E->ORDER_LIST_PTR WHILE(E^=NULL);
+     DO C=USEHD REPEAT C->RHNLINK WHILE(C^=NULL)
+       UNTIL(C->RHNNAME=E->ORDER_NAME->TOKSTR);
+       END;
+     IF C=NULL
+       THEN J=0; /* MATCH ON MISSING VALUES */
+       ELSE J=SIGNUM(C,A,B); /* COMPARE FIELDS */
+     IF J^=0
+       THEN RETURN('1'B); /* NEW RECORD IS DISTINCT */
+     END;
+   RETURN('0'B); /* NEW RECORD IS NOT DISTINCT */
+   END DISTINCT_CHECK_SUB;
+
+ RUN_EVAL: PROC(D,S,C) RETURNS(CHAR(256) VAR);
+ /**********************************************************************
+ *                                                                     *
+ * RUN_EVAL IS CALLED TO EVALUATE AN EXPRESSION POINTED TO BY THE      *
+ * SELECT_LIST_ELEMENT POINTED TO BY PARAMETER S.  D POINTS TO THE     *
+ * SELECT_HTEXT CONTROL BLOCK, AND C POINTS TO THE RHNAMESTR FROM      *
+ * WHICH A DESCRIPTION OF THE DESIRED OUTPUT FORMAT WILL BE EXTRACTED. *
+ *                                                                     *
+ **********************************************************************/
+   DCL (C,D,S) PTR;
+   RETURN(EVAL_COMMON(D,S,C,EVAL_ODD_FUNCTION));
+ EVAL_ODD_FUNCTION: PROC(MSG,PRMPTR,PARMCNT,OP) RETURNS(DEC FLOAT(16));
+   DCL MSG CHAR(80) VAR;
+   DCL PRMPTR PTR;
+   DCL PARMCNT FIXED BIN(15,0);
+   DCL OP(*) DEC FLOAT(16);
+   IF ^((PARMCNT=0 & PRMPTR->TOKSTR='COUNT') ×
+        (PARMCNT=1 & PRMPTR->TOKSTR^='COUNT'))
+     THEN DO;
+       MSG='SUMMARY FUNCTION NEEDS ONE OPERAND ONLY';
+       SIGNAL CONDITION(BADEXP);
+       END;
+   IF PARMCNT=1
+     THEN IF OP(1)=MISSING
+       THEN RETURN(1); /* DON'T PROCESS MISSING VALUES */
+   S->SELECT_COUNT=S->SELECT_COUNT+1;
+   SELECT(PRMPTR->TOKSTR);
+     WHEN('AVG') S->SELECT_BUCKET1=S->SELECT_BUCKET1+OP(1);
+     WHEN('COUNT');
+     WHEN('MAX')
+       IF UNSPEC(OP(1))^=UNSPEC(MISSING)
+         THEN IF UNSPEC(S->SELECT_BUCKET1)=UNSPEC(MISSING)
+           THEN S->SELECT_BUCKET1=OP(1);
+           ELSE S->SELECT_BUCKET1=MAX(S->SELECT_BUCKET1,OP(1));
+     WHEN('MIN')
+       IF UNSPEC(OP(1))^=UNSPEC(MISSING)
+         THEN IF UNSPEC(S->SELECT_BUCKET1)=UNSPEC(MISSING)
+           THEN S->SELECT_BUCKET1=OP(1);
+           ELSE S->SELECT_BUCKET1=MIN(S->SELECT_BUCKET1,OP(1));
+     WHEN('STD') DO;
+       S->SELECT_BUCKET1=S->SELECT_BUCKET1+ABS(OP(1))**2;
+       S->SELECT_BUCKET2=S->SELECT_BUCKET2+OP(1);
+       END;
+     WHEN('SUM') S->SELECT_BUCKET1=S->SELECT_BUCKET1+OP(1);
+     OTHERWISE;
+     END;
+   RETURN(1);
+   END EVAL_ODD_FUNCTION;
+   END RUN_EVAL;
+
+ RUN_MERGE: PROC(D);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN THE CURRENT SELECT IS A MERGE-TYPE OPERATION.  THIS IS  *
+ * ONE IN WHICH THE RECORDS FROM THE VARIOUS FROM-DATASETS ARE TO BE   *
+ * COMBINED BASED ON THE BY-SPECIFICATION.  IF NO BY-SPECIFICATION     *
+ * WAS GIVEN, THE FROM-DATA DATA SETS WILL MATCHED ONE-FOR-ONE.        *
+ *                                                                     *
+ **********************************************************************/
+   DCL (D,F,N) PTR;
+   DCL I FIXED BIN(15,0);
+   DCL EOFSW BIT(1) INIT('0'B);
+
+   DO EOFSW=RUN_NEXT(D) REPEAT RUN_NEXT(D) WHILE(^EOFSW);
+
+     /* FIRST FIND THE LOWEST IN COLLATING SEQUENCE */
+     N=NULL;
+     DO F=D->FROM_LIST_PTR REPEAT F->FROM_NEXT_FIELD WHILE(F^=NULL);
+       F->FROM_SKIP='0'B;
+       IF ^F->FROM_EOF
+         THEN DO;
+           IF N=NULL
+             THEN N=F;
+             ELSE DO;
+               I=RUN_SIGNUM(D,N,F); /* DETERMINE SEQUENCE */
+               IF I=1
+                 THEN N=F; /* WE HAVE A NEW LOWEST IN SEQUENCE */
+               END;
+           END;
+       END;
+     IF N=NULL
+       THEN LEAVE; /* JUST IN CASE - NO INFINITE LOOPS WANTED */
+
+     /* NOW TURN FROM_SKIP ON FOR ALL THAT DON'T MATCH N */
+     DO F=D->FROM_LIST_PTR REPEAT F->FROM_NEXT_FIELD WHILE(F^=NULL);
+       IF F^=N
+         THEN IF RUN_SIGNUM(D,N,F)^=0
+           THEN DO;
+             IF ^F->FROM_EOF & F->FROM_RECPTR->LSTPTR=F->FROM_RHP
+               THEN F->FROM_SKIP='1'B; /* AT FRONT OF DATA SET */
+               ELSE DO;
+                 CALL RUN_PREV_SUB(F); /* PRIOR RECORD */
+                 IF RUN_SIGNUM(D,N,F)^=0
+                   THEN DO;
+                     CALL RUN_NEXT_SUB(F);
+                     F->FROM_SKIP='1'B;
+                     END;
+                 END;
+             END;
+       END;
+
+     CALL RUN_PROCESS(D,'1'B); /* GO PROCESS RECORD */
+     END;
+
+   END RUN_MERGE;
+
+ RUN_NEXT: PROC(D) RETURNS(BIT(1));
+ /**********************************************************************
+ *                                                                     *
+ * CALLED AFTER THE CURRENT TO-RECORD HAS BEEN BUILT TO OBTAIN THE     *
+ * NEXT RECORD IN EACH FROM-DATA SET WHICH DOES NOT HAVE THE FROM_SKIP *
+ * FLAG ON.                                                            *
+ *                                                                     *
+ **********************************************************************/
+   DCL (D,F,N) PTR;
+   DCL I FIXED BIN(15,0);
+   DCL EOFSW BIT(1) INIT('1'B);
+
+   DO F=D->FROM_LIST_PTR REPEAT F->FROM_NEXT_FIELD WHILE(F^=NULL);
+     IF ^F->FROM_EOF
+       THEN DO;
+         EOFSW='0'B;
+         IF ^F->FROM_SKIP
+           THEN CALL RUN_NEXT_SUB(F); /* GET NEXT RECORD */
+         END;
+     F->FROM_SKIP='0'B;
+     END;
+   RETURN(EOFSW);
+
+   END RUN_NEXT;
+
+ RUN_NEXT_SUB: PROC(F);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED AFTER THE CURRENT TO-RECORD HAS BEEN BUILT TO OBTAIN THE     *
+ * NEXT RECORD IN EACH FROM-DATA SET WHICH DOES NOT HAVE THE FROM_SKIP *
+ * FLAG ON.                                                            *
+ *                                                                     *
+ **********************************************************************/
+   DCL (F,SAV) PTR;
+   DCL I FIXED BIN(15,0);
+
+   F->FROM_RECPTR=#SUCC(RHHDRPT,F->FROM_RHP,
+     F->FROM_RECPTR); /* GO GET NEXT RECORD */
+   IF F->FROM_RECPTR=F->FROM_RHP
+     THEN F->FROM_EOF='1'B;
+     ELSE DO;
+       SAV=F->FROM_RHP->RECPTR;
+       F->FROM_RHP->RECPTR=F->FROM_RECPTR;
+       I=#CMD('USE NOSYM',F->FROM_RHP,SUBENT,RHHDRPT);
+         /* GO SET VARIABLE OFFSETS AND LENGTHS FOR RECORD */
+       F->FROM_RHP->RECPTR=SAV;
+       END;
+
+   END RUN_NEXT_SUB;
+
+ RUN_PREV_SUB: PROC(F);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO OBTAIN THE PREVIOUS RECORD IN THE FROM-DATASET POINTED    *
+ * TO BY F.                                                            *
+ *                                                                     *
+ **********************************************************************/
+   DCL (F,SAV) PTR;
+   DCL I FIXED BIN(15,0);
+
+   F->FROM_RECPTR=#PRED(RHHDRPT,F->FROM_RHP,
+     F->FROM_RECPTR); /* GO GET PREV RECORD */
+   IF F->FROM_RECPTR=F->FROM_RHP
+     THEN F->FROM_EOF='1'B;
+     ELSE DO;
+       F->FROM_EOF='0'B;
+       SAV=F->FROM_RHP->RECPTR;
+       F->FROM_RHP->RECPTR=F->FROM_RECPTR;
+       I=#CMD('USE NOSYM',F->FROM_RHP,SUBENT,RHHDRPT);
+       /* GO SET VARIABLE OFFSETS AND LENGTHS FOR RECORD */
+       F->FROM_RHP->RECPTR=SAV;
+       END;
+
+   END RUN_PREV_SUB;
+
+ RUN_PROCESS: PROC(D,ADDSW);
+ /**********************************************************************
+ *                                                                     *
+ * RUN_PROCESS IS CALLED FOR EACH COMBINATION OF RECORDS IN THE FROM   *
+ * DATASETS.  IT WILL INVOKE WHERE-CLAUSE PROCESSING TO DETERMINE IF   *
+ * A RECORD SHOULD BE GENERATED IN THE TO-DATASET, AND WILL GENERATE   *
+ * THE RECORD IF WHERE-CLAUSE PROCESSING GIVES THE OK.                 *
+ *                                                                     *
+ * IF ADDSW & ^D->SELECT_SUMMARY, A NEW RECORD WILL BE ADDED TO THE    *
+ * TO-DATASET.  OTHERWISE, THE GENERATED RECORD WILL BE LEFT IN THE    *
+ * BUFFER FOR THE CALLER TO DISPOSE OF.                                *
+ *                                                                     *
+ **********************************************************************/
+   DCL (B,D,F,G,FLD,S,SAVPTR) PTR;
+   DCL ADDSW BIT(1);
+   DCL (I,SEQ) FIXED BIN(31,0);
+   DCL STR CHAR(256) VAR;
+
+   /* FIRST CONSTRUCT THE NEW RECORD */
+   B=D->TO_RHP->BUFPTR; /* GET POINTER TO BUF */
+   B->BUF=REPEAT(' ',B->BUFLN-1); /* FILL BUFFER WITH BLANKS */
+   DO FLD=D->TO_RHP->RHUSEHD REPEAT FLD->RHNLINK WHILE(FLD^=NULL);
+     IF D->SELECT_ALL_FIELDS
+       THEN DO;
+         STR=GETDATC(D,'',FLD->RHNNAME,NULL,G);
+         CALL RUN_BUF(B,FLD->RHNPOS,FLD->RHNLNG,
+           CONVERT_INTFC(STR,G,FLD),
+           FLD);
+         END;
+       ELSE DO;
+         DO S=D->SELECT_LIST_PTR REPEAT S->SELECT_NEXT_FIELD
+           WHILE(S^=NULL) UNTIL(FLD->RHNNAME=S->SELECT_NAME);
+           END;
+         IF S=NULL
+           THEN CALL RUN_BUF(B,FLD->RHNPOS,FLD->RHNLNG,'',FLD);
+           ELSE IF S->SELECT_SUM
+             THEN CALL RUN_BUF(B,FLD->RHNPOS,FLD->RHNLNG,'',FLD);
+             ELSE CALL RUN_BUF(B,FLD->RHNPOS,FLD->RHNLNG,
+               RUN_EVAL(D,S,FLD),FLD); /* DON'T DO STATS YET */
+         END;
+     END;
+
+   IF D->SELECT_SUMMARY
+     THEN IF WHERE_EVAL(D)
+       THEN CALL RUN_SUMMARY(D);
+       ELSE;
+     ELSE IF ADDSW
+       THEN IF WHERE_EVAL(D)
+         THEN IF DISTINCT_CHECK(D)
+           THEN DO;
+             IF D->FROM_LIST_PTR->FROM_NEXT_FIELD=NULL
+               THEN SEQ=D->FROM_LIST_PTR->FROM_RECPTR->RECSEQ;
+               ELSE SEQ=-1;
+             CALL #ADD(D->TO_RHP,SUBENT,D->TO_RHP->LSTHDR,
+               SAVPTR,SEQ,B->BUF,RHPPTR);
+             END;
+
+   END RUN_PROCESS;
+
+ RUN_RECURS: PROC(D,F) RECURSIVE;
+ /**********************************************************************
+ *                                                                     *
+ * RUN_RECURS IS CALLED, POSSIBLY RECURSIVELY, FOR EACH FROM DATA SET  *
+ * SPECIFIED IN THE FROM-CLAUSE.  ITS ACTION DEPENDS ON THE VALUE OF   *
+ * POINTER F, WHICH IS EITHER NULL, OR POINTS TO A FROM_FIELD CONTROL  *
+ * BLOCK.  IF F IS NULL, RUN_RECURS WILL CALL RUN_PROCESS.  IF F IS    *
+ * NOT NULL, RUN_RECURS WILL CALL ITSELF RECURSIVELY FOR EACH          *
+ * SUCCESSIVE RECORD IN THE DATA SET IDENTIFIED BY THE FROM_FIELD      *
+ * CONTROL BLOCK POINTED TO BY F, PASSING F->FROM_NEXT_FIELD AS        *
+ * F ARGUMENT.                                                         *
+ *                                                                     *
+ **********************************************************************/
+   DCL (D,F,SAV) PTR;
+   DCL I FIXED BIN(15,0);
+   IF F=NULL
+     THEN DO;
+       CALL RUN_PROCESS(D,'1'B);
+       RETURN;
+       END;
+   IF F->FROM_EOF
+     THEN DO;
+       F->FROM_EOF='0'B;
+       F->FROM_RECPTR=F->FROM_RHP->HDPTR; /* RESET TO BEGINNING */
+       END;
+   DO I=1 REPEAT I;
+     F->FROM_RECPTR=#SUCC(RHHDRPT,F->FROM_RHP,F->FROM_RECPTR);
+       /* GO GET NEXT RECORD */
+     IF F->FROM_RECPTR=F->FROM_RHP
+       THEN LEAVE;
+     SAV=F->FROM_RHP->RECPTR;
+     F->FROM_RHP->RECPTR=F->FROM_RECPTR;
+     I=#CMD('USE NOSYM',F->FROM_RHP,SUBENT,RHHDRPT);
+       /* GO SET VARIABLE OFFSETS AND LENGTHS FOR CURRENT RECORD */
+     F->FROM_RHP->RECPTR=SAV;
+     CALL RUN_RECURS(D,F->FROM_NEXT_FIELD); /* RECURSIVE CALL */
+     END;
+   F->FROM_EOF='1'B;
+   END RUN_RECURS;
+
+ RUN_RENAME: PROC(D);
+ /**********************************************************************
+ *                                                                     *
+ * RUN_RENAME IS CALLED WHEN THE EXECUTION SELECT_HTEXT CONTROL BLOCK  *
+ * HAS BEEN COMPLETELY PROCESSED (POINTED TO BY PTR D), AND EXECUTION  *
+ * OF THE SELECT HAS TAKEN PLACE.  IT WILL EXECUTE ANY RENAMES         *
+ * SPECIFIED.                                                          *
+ *                                                                     *
+ **********************************************************************/
+   DCL (D,F,R) PTR;
+   DO R=D->RENAME_LIST_PTR REPEAT R->RENAME_NEXT_PTR WHILE(R^=NULL);
+     DO F=D->TO_RHP->RHUSEHD REPEAT F->RHNLINK WHILE(F^=NULL)
+       UNTIL(F->RHNNAME=R->RENAME_OLD->TOKSTR);
+       END;
+     IF F^=NULL
+       THEN F->RHNNAME=R->RENAME_NEW->TOKSTR;
+     END;
+
+   END RUN_RENAME;
+
+ RUN_SELECT: PROC(D);
+ /**********************************************************************
+ *                                                                     *
+ * RUN_SELECT IS CALLED WHEN THE EXECUTION SELECT_HTEXT CONTROL BLOCK  *
+ * HAS BEEN COMPLETELY PROCESSED (POINTED TO BY PTR D).                *
+ * ALL DATABASES AND ALL DATABASE                                      *
+ * FIELDS, BOTH INPUT AND OUTPUT, HAVE BEEN DEFINED AND LOCATED.       *
+ *                                                                     *
+ *                                                                     *
+ **********************************************************************/
+   DCL D PTR;
+   SELECT;
+     WHEN(D->MERGE_FLAG)
+       CALL RUN_MERGE(D);  /* DO MERGE OPERATION */
+     WHEN(D->SET_FLAG)
+       CALL RUN_SET(D);    /* DO SET OPERATION */
+     WHEN(D->UPDATE_FLAG)
+       CALL RUN_UPDATE(D); /* DO UPDATE OPERATION */
+     OTHERWISE             /* DEFAULT TO RELATIONAL JOIN */
+      CALL RUN_RECURS(D,D->FROM_LIST_PTR); /* START THE RECURSION */
+     END; /* SELECT */
+
+   IF D->SELECT_SUMMARY
+     THEN CALL SUMMARY_PROCESS(D,D->TO_RHP->BUFPTR); /* PUT RECORD */
+
+   END RUN_SELECT;
+
+ RUN_SET: PROC(D);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED WHEN THE CURRENT SELECT IS A SET-TYPE OPERATION.  THIS IS    *
+ * ONE IN WHICH THE RECORDS FROM THE VARIOUS FROM-DATASETS ARE TO BE   *
+ * INTERLEAVED BASED ON THE BY-SPECIFICATION.  IF NO BY-SPECIFICATION  *
+ * WAS GIVEN, THE FROM-DATA DATA SETS WILL BE CONCATENATED, ONE AFTER  *
+ * THE OTHER.                                                          *
+ *                                                                     *
+ **********************************************************************/
+   DCL (D,F,N) PTR;
+   DCL I FIXED BIN(15,0);
+   DCL EOFSW BIT(1) INIT('0'B);
+
+   DO EOFSW=RUN_NEXT(D) REPEAT RUN_NEXT(D) WHILE(^EOFSW);
+     N=NULL;
+     DO F=D->FROM_LIST_PTR REPEAT F->FROM_NEXT_FIELD WHILE(F^=NULL);
+       IF ^F->FROM_EOF
+         THEN DO;
+           F->FROM_SKIP='0'B;
+           IF N=NULL
+             THEN N=F;
+             ELSE DO;
+               I=RUN_SIGNUM(D,N,F); /* GET SEQUENCE */
+               IF I=1
+                 THEN N=F; /* WE HAVE A NEW LOWEST IN SEQUENCE */
+               END;
+           END;
+       END;
+     IF N=NULL
+       THEN LEAVE; /* JUST IN CASE - DON'T WANT INFINITE LOOP */
+     N->FROM_SKIP='0'B;
+     /* NOW TURN ON SKIP FLAGS */
+     DO F=D->FROM_LIST_PTR REPEAT F->FROM_NEXT_FIELD WHILE(F^=NULL);
+       IF F^=N
+         THEN F->FROM_SKIP='1'B;
+       END;
+     CALL RUN_PROCESS(D,'1'B); /* GO PROCESS RECORD */
+     END;
+
+   END RUN_SET;
+
+ RUN_SIGNUM: PROC(D,A,B) RETURNS(FIXED BIN(15,0));
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO DETERMINE THE COLLATING RELATIONSHIP BETWEEN THE CURRENT  *
+ * RECORDS IN THE TWO FROM-DATASETS POINTED TO BY A AND B (A AND B     *
+ * POINT TO FROM_FIELD CONTROL BLOCKS), BASED ON THE BY-SPECIFICATION  *
+ * FOR THE CURRENT SELECT, THE SELECT_HTEXT CONTROL BLOCK FOR WHICH IS *
+ * POINTED TO BY D.  THE RETURNED VALUE IS AS FOLLOWS:                 *
+ *   A < B : RETURN(-1)                                                *
+ *   A = B : RETURN(0)                                                 *
+ *   A > B : RETURN(+1)                                                *
+ * IF THERE IS NO BY-SPECIFICATION, UNLESS ONE OF THE DATASETS IS AT   *
+ * EOF, 0 WILL BE RETURNED.  IF A IS AT EOF BUT NOT B, -1 WILL BE      *
+ * RETURNED.  IF B IS AT EOF BUT NOT A, 1 WILL BE RETURNED.  IF BOTH   *
+ * ARE AT EOF, 0 WILL BE RETURNED.                                     *
+ *                                                                     *
+ **********************************************************************/
+   DCL (A,B,C(2),D,E,F(2),G(2)) PTR;
+   DCL (DNAME(2),FNAME) CHAR(8);
+   DCL (I,J) FIXED BIN(15,0);
+   SELECT;
+     WHEN(A->FROM_EOF & B->FROM_EOF) RETURN(0);
+     WHEN(A->FROM_EOF) RETURN(-1);
+     WHEN(B->FROM_EOF) RETURN(1);
+     WHEN(D->ORDER_BY_PTR=NULL) RETURN(0);
+     OTHERWISE;
+     END; /* SELECT */
+   /* NEITHER AT EOF AND A BY-CLAUSE WAS SPECIFIED */
+   F(1)=A;
+   F(2)=B;
+   DNAME(1)=A->FROM_NAME;
+   DNAME(2)=B->FROM_NAME;
+   DO E=D->ORDER_BY_PTR REPEAT E->ORDER_LIST_PTR WHILE(E^=NULL);
+     FNAME=E->ORDER_NAME->TOKSTR;
+     DO I=1 TO 2;
+       G(I)=FIND_FIELD(D,DNAME(I),FNAME,F(I)); /* GO FIND FIELD */
+       END;
+     J=RUN_SIGNUM_SUB(F(1),G(1),F(2),G(2));
+       /* DETERMINE COLLATING SEQUENCE */
+     IF J^=0 /* DO FIELDS MATCH? */
+       THEN IF E->ORDER_ASCENDING
+         THEN RETURN(J);
+         ELSE RETURN(-J);
+
+     END;
+   RETURN(0); /* RECORDS MATCH */
+
+   END RUN_SIGNUM;
+
+ RUN_SIGNUM_SUB: PROC(F1,G1,F2,G2) RETURNS(FIXED BIN(15,0));
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO COMPARE TWO FIELDS.  G1 & G2 EACH POINTS TO THE RHNAMESTR *
+ * STRUCTURE FOR A FIELD.  F1 & F2 EACH POINTS TO THE FROM_FIELD       *
+ * STRUCTURE FOR A FIELD.  THE VALUES RETURNED ARE AS FOLLOWS:         *
+ *                                                                     *
+ *     F1 < F2 : -1                                                    *
+ *     F1 = F2 :  0                                                    *
+ *     F1 > F2 : +1                                                    *
+ *                                                                     *
+ * A MISSING FIELD ALWAYS COMPARES LOW.                                *
+ *                                                                     *
+ **********************************************************************/
+   DCL (F1,G1,F2,G2) PTR;
+   DCL (C1,C2) CHAR(256) VAR;
+   DCL (N1,N2) DEC FLOAT(16);
+   SELECT;
+     WHEN(G1=G2 & G1=NULL) RETURN(0);
+     WHEN(G1=NULL)         RETURN(-1);
+     WHEN(G2=NULL)         RETURN(+1);
+     OTHERWISE DO;  /* NEITHER FIELD IS MISSING */
+       C1=GETDATC_SUB(F1,G1,'');
+       C2=GETDATC_SUB(F2,G2,'');
+       RETURN(SIGNUM_COMMON(C1,C2,G1,G2));
+       END;
+     END; /* SELECT */
+   END RUN_SIGNUM_SUB;
+
+ RUN_SUMMARY: PROC(D);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED FROM RUN_PROCESS WHEN SELECT_SUMMARY FLAG IS ON AFTER ALL    *
+ * NON-STATISTIC FIELDS HAVE BEEN ASSEMBLED IN THE TO-DATA SET RECORD  *
+ * BUFFER.  IF THE GROUP-BY CLAUSE WAS SPECIFIED, A CONTROL BREAK WILL *
+ * BE CHECKED FOR, AND SUMMARY_PROCESS WILL BE CALLED IF SO.           *
+ * DETAIL PROCESSING FOR SUMMARY STATISTICS WILL THEN BE DONE.         *
+ *                                                                     *
+ **********************************************************************/
+   DCL (A,B,D,F,S) PTR;
+
+   B=D->TO_RHP->BUFPTR; /* POINTS TO POTENTIAL NEW RECORD */
+   IF D->GROUP_BY_PTR^=NULL
+     THEN DO; /* CHECK FOR A CONTROL BREAK */
+       A=D->GROUP_BY_PTR->GROUP_BUFPTR;
+       IF A->BUF=''
+         THEN A->BUF=B->BUF; /* INITIALIZE SEQUENCE CHECK BUFFER */
+         ELSE DO; /* DON'T DO FIRST TIME THROUGH */
+           IF DISTINCT_CHECK_SUB(D->GROUP_BY_PTR->GROUP_SPEC_PTR,
+             D->TO_RHP->RHUSEHD,A,B)
+             THEN DO; /* IT IS A CONTROL BREAK */
+               CALL SUMMARY_PROCESS(D,A);
+               A->BUF=B->BUF;
+               END;
+           END;
+       END;
+   /* NOW PERFORM SUMMARY DETAIL PROCESSING */
+   DO F=D->TO_RHP->RHUSEHD REPEAT F->RHNLINK WHILE(F^=NULL);
+     DO S=D->SELECT_LIST_PTR REPEAT S->SELECT_NEXT_FIELD
+       WHILE(S^=NULL) UNTIL(F->RHNNAME=S->SELECT_NAME);
+       END;
+     IF S^=NULL
+       THEN IF S->SELECT_SUM
+         THEN CALL RUN_BUF(B,F->RHNPOS,F->RHNLNG,
+           RUN_EVAL(D,S,F),F); /* DO STATS NOW */
+     END;
+   END RUN_SUMMARY;
+
+ RUN_UPDATE: PROC(D);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PROCESS AN UPDATE-TYPE SELECT OPERATION.  THAT IS ONE IN  *
+ * WHICH THE FIRST FROM-DATASET IS ASSUMED TO BE THE MASTER DATA SET,  *
+ * AND THE OTHER FROM-DATASETS ARE ASSUMED TO BE DETAIL TRANSACTION    *
+ * DATA SETS.  NOTE THAT THIS SUBROUTINE ASSUMES EACH RECORD IN THE    *
+ * FIRST FROM-DATASET WILL HAVE A UNIQUE COMBINATION OF BY-VALUES.     *
+ *                                                                     *
+ **********************************************************************/
+   DCL (D,F,N) PTR;
+   DCL (I,J,FOREVER) FIXED BIN(15,0);
+   DCL EOFSW BIT(1) INIT('0'B);
+
+   IF RUN_NEXT(D)
+     THEN RETURN; /* AT END-FILE ON ALL DATA SETS */
+   DO FOREVER=1 REPEAT FOREVER;
+     N=NULL;
+     /* FIND LOWEST IN SEQUENCE TO BECOME TEMPORARY MASTER RECORD */
+     DO F=D->FROM_LIST_PTR REPEAT F->FROM_NEXT_FIELD WHILE(F^=NULL);
+       IF ^F->FROM_EOF
+         THEN DO;
+           F->FROM_SKIP='0'B;
+           IF N=NULL
+             THEN N=F;
+             ELSE DO;
+               I=RUN_SIGNUM(D,N,F); /* DETERMINE SEQUENCE */
+               IF I=1
+                 THEN N=F; /* WE HAVE A NEW LOWEST IN SEQUENCE */
+               END;
+           END;
+       END;
+     IF N=NULL
+       THEN LEAVE; /* JUST IN CASE - NO INFINITE LOOPS WANTED */
+     IF RUN_UPDATE_SUB(D,N) /* GO PROCESS FOR THIS MASTER */
+       THEN LEAVE; /* GET OUT AT END-FILE ON ALL DATA SETS */
+     CALL RUN_NEXT_SUB(N); /* GET NEXT RECORD IN TEMPORARY MASTER */
+     END;
+
+   END RUN_UPDATE;
+
+ RUN_UPDATE_SUB: PROC(D,N) RETURNS(BIT(1));
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO PROCESS AN UPDATE-TYPE SELECT OPERATION FOR A GIVEN       *
+ * MASTER RECORD. RETURNS '1'B TO INDICATE END-OF-FILE ON ALL DATASETS.*
+ *                                                                     *
+ **********************************************************************/
+   DCL (D,F,N) PTR;
+   DCL (I,J,FOREVER) FIXED BIN(15,0);
+   DCL ADDSW BIT(1) INIT('1'B);
+
+   N->FROM_SKIP='0'B;
+   /* FIRST TURN ON FROM_SKIP FLAG FOR EVERYONE EXCEPT MASTER */
+   DO F=D->FROM_LIST_PTR REPEAT F->FROM_NEXT_FIELD WHILE(F^=NULL);
+     IF F^=N
+       THEN F->FROM_SKIP='1'B;
+     END;
+   /* NOW CREATE NEW OUTPUT RECORD JUST FROM MASTER */
+   CALL RUN_PROCESS(D,ADDSW);
+   ADDSW='0'B;
+
+   DO FOREVER=1 REPEAT FOREVER;
+     /* NOW TURN FROM_SKIP ON FOR ALL THAT DON'T MATCH N */
+     J=0; /* KEEP A COUNT OF MATCHING FROM-RECORDS */
+     DO F=D->FROM_LIST_PTR REPEAT F->FROM_NEXT_FIELD WHILE(F^=NULL);
+       F->FROM_SKIP='0'B; /* LETS RUN_SIGNUM WORK OK */
+       IF F^=N
+         THEN IF RUN_SIGNUM(D,N,F)^=0
+           THEN F->FROM_SKIP='1'B; /* DOESN'T MATCH */
+           ELSE J=J+1; /* ADD TO MATCH COUNT */
+       END;
+     IF J=0
+       THEN RETURN('0'B); /* ALL DONE WITH THIS MASTER */
+     N->FROM_SKIP='1'B; /* DON'T USE MASTER FOR UPDATE DATA */
+     CALL RUN_PROCESS(D,ADDSW); /* GO PROCESS RECORD */
+     CALL RUN_UPDATE_TRANSFER(D); /* ADD NEW INFO */
+     IF J=0
+       THEN RETURN('0'B); /* ALL DONE WITH THIS MASTER */
+     IF RUN_NEXT(D)
+       THEN RETURN('1'B); /* AT END-OF-FILE ON ALL DATA SETS */
+     END;
+
+   END RUN_UPDATE_SUB;
+
+ RUN_UPDATE_TRANSFER: PROC(D);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO COPY NON-MISSING FIELDS FROM THE RECORD BUFFER TO THE     *
+ * LAST RECORD IN THE TO-DATA SET.                                     *
+ *                                                                     *
+ **********************************************************************/
+   DCL (B,D,F,R) PTR;
+
+   B=D->TO_RHP->BUFPTR; /* GET POINTER TO BUF */
+   R=ADDR(D->TO_RHP->LSTHDR->RECLEN); /* PTR TO LAST RECORD BUF */
+   DO F=D->TO_RHP->RHUSEHD REPEAT F->RHNLINK WHILE(F^=NULL);
+     IF F->RHNPOS^=0 /* DON'T PROCESS FREE-FORM */
+       THEN IF LENGTH(B->BUF)>F->RHNPOS
+         THEN IF SUBSTR(B->BUF,F->RHNPOS,MIN(F->RHNLNG,
+           LENGTH(B->BUF)-F->RHNPOS+1))^=''
+           THEN CALL RUN_BUF(R,F->RHNPOS,F->RHNLNG,SUBSTR(B->BUF,
+             F->RHNPOS,MIN(F->RHNLNG,LENGTH(B->BUF)-F->RHNPOS+1)),F);
+     END;
+
+   END RUN_UPDATE_TRANSFER;
+
+ SET_LIST: PROC(P,D,LASTFLD) RECURSIVE;
+ /**********************************************************************
+ * CALLED TO PREPARE A SELECT_LIST FOR EXECUTION. IT SCANS THE LIST    *
+ * POINTED TO BY PARAMETER P.  IT COPIES THE SELECT_LIST POINTED TO BY *
+ * P TO D, RESOLVING ANY SUBQUERIES AS IT GOES ALONG.                  *
+ * PARAMETER LASTFLD SHOULD BE SET BY THE CALLER TO POINT TO THE       *
+ * SELECT_LIST_ELEMENT MOST RECENTLY ADDED TO D.  LASTFLD WILL BE      *
+ * UPDATED BY SET_LIST.                                                *
+ **********************************************************************/
+   DCL (D,P,S,T,LASTFLD,LASTEXP,RHP,TOK,NEW,LIST,LPTR,DEL) PTR;
+   DO T=P REPEAT T->SELECT_NEXT_FIELD WHILE(T^=NULL);
+     LIST=LIST_QUERY_TYPE(T);
+     IF LIST^=NULL
+       THEN DO; /* PROCESS SUBQUERY LIST */
+         LPTR=SUBQUERY(LIST);
+         CALL SET_LIST(LPTR,D,LASTFLD);
+         CALL DEL_LIST(LPTR);
+         END;
+       ELSE DO; /* COPY OVER A SINGLE EXPRESSION */
+         ALLOCATE SELECT_LIST_ELEMENT SET(SELFPTR);
+         SELFPTR->SELECT_LIST_ELEMENT=T->SELECT_LIST_ELEMENT;
+         FIELD_EXP_HDR=NULL;
+         CALL SINGLE_QUEUE(D,LASTFLD,SELFPTR);
+         CALL COPY_EXP_QUEUE(T->FIELD_EXP_HDR,FIELD_EXP_HDR);
+         END;
+     END;
+   END SET_LIST;
+
+ SET_TO: PROC(D);
+ /**********************************************************************
+ * THIS SUBROUTINE IS CALLED TO SET UP THE TO DATA SET.  IT WILL SEARCH*
+ * ALL OF THE CURRENTLY EDITED DATA SETS FOR A MATCH TO THE SPECIFIED  *
+ * NAME AND WILL SET D->TO_RHP TO POINT TO THE RECHDR OF THE FOUND     *
+ * DATA SET, AND RHUSEHD WILL BE COMPARED TO THE SELECT LIST.          *
+ *      IF THE SPECIFIED NAME IS NOT FOUND, SET_TO WILL DEFINE A NEW   *
+ * VIRTUAL DATA SET TO BE THE 'TO' DATA SET.                           *
+ **********************************************************************/
+   DCL (D,PARPTR,SAVPTR,TRH) PTR;
+   DCL 1 PARSTR UNALIGNED,
+     2 PARIX FIXED BIN(15,0),
+     2 PAROCK BIT(16),
+     2 PARQCK BIT(16),
+     2 PARY(16) CHAR(256) VAR;
+   DCL CMDINDX FIXED BIN(15,0) INIT(1);
+   TRH=NULL;
+   IF D->TO_PTR^=NULL
+     THEN DO TRH=NXTRHEL REPEAT TRH->RHNXT WHILE(TRH^=NULL)
+       UNTIL(TRH->RHNAME=D->TO_PTR->TOKSTR);
+       END;
+   IF TRH=NULL
+     THEN DO; /* TO-CLAUSE WAS OMITTED */
+       PARPTR=ADDR(PARSTR);
+       PARY(*)='';
+       PARY(4)='SUBCALL';
+       SAVPTR=RHPTR;
+       CALL #DENT(CMDINDX,PARPTR,RHPTR,SUBENT,RHHDRPT);
+       TRH,D->TO_RHP=RHPTR;
+       RHPTR=SAVPTR;
+       IF D->TO_PTR^=NULL
+         THEN TRH->RHNAME=D->TO_PTR->TOKSTR;
+         ELSE TRH->RHNAME=QNUMSTR; /* MAKE IT TEMPORARY */
+       END;
+     ELSE D->TO_RHP=TRH;
+   END SET_TO;
+
+ SET_TO_DBD: PROC(D);
+ /**********************************************************************
+ * SET_TO_DBD IS CALLED WHEN THE TO- DATA SET HAS BEEN ESTABLISHED.    *
+ * IT WILL ALTER THE DATA-BASE DEFINITION FOR THE TO- DATA SET SO THAT *
+ * ALL FIELD NAMES IN THE SELECT CLAUSE ARE DEFINED.  SET_TO_DBD       *
+ * IS CALLED WHEN THE SELECT-CLAUSE CONSISTS OF A LIST OF ONE OR MORE  *
+ * NAMES, AND SET_TO_DBD_ALL IS CALLED  WHEN THE SELECT-CLAUSE IS      *
+ * SIMPLY AN ASTERISK (*).                                             *
+ **********************************************************************/
+   DCL (D,F,G,H,S,T,LT,FR) PTR;
+   DCL EXPNO FIXED BIN(31,0);
+
+   /* FIRST, SET THE FIELD NAMES FOR ALL SELECTED FIELDS */
+   EXPNO=0;
+   DO S=D->SELECT_LIST_PTR REPEAT S->SELECT_NEXT_FIELD WHILE(S^=NULL);
+     S->SELECT_EXP='1'B; /* DEFAULT TO EXPRESSION REFERENCE */
+     IF S->FIELD_EXP_HDR=NULL
+       THEN DO;
+         MSGDATA='INVALID SELECT FIELD';
+         SIGNAL ERROR;
+         END;
+       ELSE IF S->FIELD_EXP_HDR->TYPE=NO_MORE_TOKENS
+         THEN DO;
+           MSGDATA='INVALID SELECT FIELD';
+           SIGNAL ERROR;
+           END;
+         ELSE IF S->FIELD_EXP_HDR->TYPE=OPERAND
+           THEN DO; /* IT MAY BE SIMPLE OPERAND REFERENCE */
+             T=S->FIELD_EXP_HDR;
+             IF T->NEXT_TOKEN=NULL
+               THEN S->SELECT_EXP='0'B; /* IT IS SIMPLE REFERENCE */
+               ELSE IF T->NEXT_TOKEN->TOKSTR='.'
+                 THEN IF T->NEXT_TOKEN->NEXT_TOKEN^=NULL
+                   THEN IF T->NEXT_TOKEN->NEXT_TOKEN->TYPE=OPERAND
+                     THEN IF T->NEXT_TOKEN->NEXT_TOKEN->NEXT_TOKEN=NULL
+                       THEN DO;
+                         S->SELECT_EXP='0'B; /* SIMPLE REF */
+                         T=T->NEXT_TOKEN->NEXT_TOKEN;
+                         END;
+             END;
+     IF S->SELECT_EXP='0'B
+       THEN S->SELECT_NAME=T->TOKSTR; /* SIMPLE REFERENCE */
+       ELSE S->SELECT_NAME=EXPNEXT(S,EXPNO);/* EXPRESSION REFERENCE */
+     END;
+
+   /* NOW ESTABLISH THE FIELD OFFSET AND LENGTH SPECS */
+   DO S=D->SELECT_LIST_PTR REPEAT S->SELECT_NEXT_FIELD WHILE(S^=NULL);
+     G=NULL;
+     DO F=D->TO_RHP->RHUSEHD REPEAT F->RHNLINK WHILE(F^=NULL)
+       UNTIL(F->RHNNAME = S->SELECT_NAME);
+       G=F;
+       END;
+     IF F=NULL
+       THEN DO; /* WE MUST ESTABLISH A NEW FIELD ELEMENT */
+         T=S->FIELD_EXP_HDR;
+         FR=NULL;
+         IF T->TYPE=OPERAND
+           THEN IF T->NEXT_TOKEN=NULL
+             THEN H=FIND_FIELD(D,'',S->SELECT_NAME,FR);
+             ELSE IF T->NEXT_TOKEN->TOKSTR='.'
+               THEN H=FIND_FIELD(D,T->TOKSTR,S->SELECT_NAME,FR);
+               ELSE H=NULL;
+           ELSE H=NULL;
+         CALL SET_FIELD(D,G,H,S->SELECT_NAME,S);
+           /* GO SET UP A NEW FIELD ELEMENT - G IS POINTER TO
+           PRIOR FIELD ELEMENT, H IS POINTER TO THE FROM- FIELD
+           ELEMENT, AND S->SELECT_NAME IS NAME OF TO- FIELD */
+         END;
+     END;
+
+   END SET_TO_DBD;
+
+ SET_TO_DBD_ALL: PROC(D);
+ /**********************************************************************
+ * CALLED WHEN THE SELECT-CLAUSE CONSISTS OF A SINGLE ASTERISK.  AT    *
+ * THIS POINT, THE TO- DATA SET HAS BEEN ESTABLISHED.  IT WILL ALTER   *
+ * THE DATA-BASE DEFINITION FOR THE TO- DATA SET SO THAT ALL FIELD     *
+ * NAMES IN ALL FROM- DATA SETS ARE DEFINED AS TO- FIELDS.             *
+ **********************************************************************/
+   DCL (D,E,F,FF,FFF,LLL) PTR;
+   DO F=D->FROM_LIST_PTR REPEAT F->FROM_NEXT_FIELD WHILE(F^=NULL);
+     DO FF=F->FROM_RHP->RHUSEHD REPEAT FF->RHNLINK WHILE(FF^=NULL);
+       LLL=NULL;
+       DO FFF=D->TO_RHP->RHUSEHD REPEAT FFF->RHNLINK WHILE(FFF^=NULL)
+         UNTIL(FFF->RHNNAME=FF->RHNNAME);
+         LLL=FFF;
+         END;
+       IF FFF=NULL
+         THEN DO; /* FIELD NAME IS NOT DEFINED IN TO-DBD YET */
+           IF D->DROP_LIST_PTR=NULL
+             THEN E=NULL;
+             ELSE DO E=D->DROP_LIST_PTR REPEAT E->SELECT_NEXT_FIELD
+               WHILE(E^=NULL)
+               UNTIL(E->FIELD_EXP_HDR->TOKSTR=FF->RHNNAME);
+               END;
+           IF E=NULL
+             THEN CALL SET_FIELD(D,LLL,FF,FF->RHNNAME,NULL);
+           END;
+       END;
+     END;
+   END SET_TO_DBD_ALL;
+
+ SUBQUERY: PROC(SUBQ_TOKEN) RETURNS(PTR);
+ /**********************************************************************
+ * CALLED WHENEVER A SUBQUERY IS ENCOUNTERED IN AN EXPRESSION.  IT     *
+ * WILL -                                                              *
+ *   CALL DO_SELECT TO EXECUTE THE SUBQUERY,                           *
+ *   CALL DENT49A TO PARSE THE RESULTANT TEXT,                         *
+ *   CALL SELECT_LIST TO CREATE A SELECT_LIST,                         *
+ *   AND WILL RETURN A SELECT_LIST_PTR.                                *
+ **********************************************************************/
+   DCL (SUBQ_TOKEN,HTP,RHP,MYPTR,LPTR) PTR;
+   DCL I FIXED BIN(31,0);
+   DCL CMDDATA CHAR(1024) VAR;
+   DCL 1 MAINPARM,
+     2 MTOKHDR PTR,
+     2 MCURTOK PTR,
+     2 MSCANIX FIXED BIN(15,0);
+   I=SUBSTR(SUBQ_TOKEN->TOKSTR,7); /* GET SUBQUERY NUMBER */
+   DO HTP=SUBQ_FIRST REPEAT HTP->SUBQ_NEXT WHILE(HTP^=NULL)
+     UNTIL(HTP->SUBQ_NUM^=I);
+     END;
+   IF HTP=NULL
+     THEN DO;
+       MSGDATA='INVALID REFERENCE = '××SUBQ_TOKEN->TOKSTR;
+       SIGNAL CONDITION(BADSTMT);
+       END;
+   RHP=DO_SELECT(HTP,RHPTR,SUBENT,RHHDRPT,SUBQ_HDR,SUBRTNES,DO_STACK);
+     /* GO EXECUTE SELECT */
+   IF RHP=NULL
+     THEN RETURN(NULL);
+   CMDDATA='';
+   MYPTR=NULL;
+   /* NOW RAVEL INTO A SINGLE COMMAND LINE */
+   DO MYPTR=#SUCC(RHHDRPT,RHP,MYPTR) REPEAT #SUCC(RHHDRPT,RHP,MYPTR)
+     WHILE(MYPTR^=HDPTR);
+     CMDDATA=CMDDATA××MYPTR->RECSTR;
+     END;
+   /* NOW CALL DENT49A TO PARSE */
+   MTOKHDR,MCURTOK=NULL;
+   MSCANIX=1;
+   CALL PARSE_SELECT(CMDDATA,MSGDATA,RHRC,SUBQ_HDR,SUBRTNES,OPERATORS,
+     KEYWORDS,SPCHARS,PRECEDENCE,MAINPARM);
+   /* NOW GO PROCESS THE SELECT_LIST */
+   MCURTOK=MTOKHDR;
+   MSCANIX=1;
+   LPTR=NULL;
+   CALL SELECT_LIST(LPTR,CMDDATA,MAINPARM);
+   RETURN(LPTR);
+   END SUBQUERY;
+
+ SUMMARY_PROCESS: PROC(D,B);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO COMPLETE THE PROCESSING OF SUMMARY STATISTICS FOR A       *
+ * SELECT.                                                             *
+ *                                                                     *
+ **********************************************************************/
+   DCL (B,D,F,FLD,S,SAVPTR) PTR;
+   DCL (I,SEQ) FIXED BIN(31,0);
+
+   DO FLD=D->TO_RHP->RHUSEHD REPEAT FLD->RHNLINK WHILE(FLD^=NULL);
+     DO S=D->SELECT_LIST_PTR REPEAT S->SELECT_NEXT_FIELD
+       WHILE(S^=NULL) UNTIL(FLD->RHNNAME=S->SELECT_NAME);
+       END;
+     IF S^=NULL
+       THEN IF S->SELECT_SUM
+         THEN DO;
+           DO F=S->FIELD_EXP_HDR REPEAT F->NEXT_TOKEN
+             WHILE(F->NEXT_TOKEN^=NULL);
+             END;
+           IF S->SELECT_COUNT=0
+             THEN S->SELECT_BUCKET1=MISSING;
+             ELSE SELECT(F->TOKSTR);
+               WHEN('AVG')
+                 S->SELECT_BUCKET1=S->SELECT_BUCKET1/S->SELECT_COUNT;
+               WHEN('COUNT')
+                 S->SELECT_BUCKET1=S->SELECT_COUNT;
+               WHEN('MAX','MIN');
+               WHEN('STD')
+                 IF S->SELECT_COUNT=1
+                   THEN S->SELECT_BUCKET1=MISSING;
+                   ELSE S->SELECT_BUCKET1=
+                     SQRT(
+                       ABS(
+                         (S->SELECT_BUCKET1-S->SELECT_BUCKET2**2/
+                         S->SELECT_COUNT)/(S->SELECT_COUNT-1)
+                       )
+                     );
+               OTHERWISE; /* SUM */
+               END;
+           CALL RUN_BUF(B,FLD->RHNPOS,FLD->RHNLNG,
+             CALCPRT(S->SELECT_BUCKET1),FLD); /* GO STORE IN BUF */
+           S->SELECT_COUNT,S->SELECT_BUCKET1,S->SELECT_BUCKET2=MISSING;
+           END;
+     END;
+   SEQ=-1;
+   CALL #ADD(D->TO_RHP,SUBENT,D->TO_RHP->LSTHDR,SAVPTR,SEQ,
+     B->BUF,RHPPTR);
+   END SUMMARY_PROCESS;
+
+ SUMMARY_SETUP: PROC(D);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED BEFORE A SELECT IS EXECUTED TO SETUP FOR BLANKET SUMMARY     *
+ * PROCESSING. THE TO-DBD SHOULD BE SETUP BEFORE THIS SUBROUTINE IS    *
+ * CALLED.                                                             *
+ *                                                                     *
+ **********************************************************************/
+   DCL (D,HEAD,LAST,LASTFLD,R,S,T,U) PTR;
+   DCL EXPNO FIXED BIN(31,0) INIT(0);
+
+   LASTFLD=NULL;
+   DO R=D->TO_RHP->RHUSEHD REPEAT R->RHNLINK WHILE(R^=NULL);
+     IF R->RHNTYPE^=2
+       THEN DO; /* PROCESS ALL EXCEPT CHARACTER */
+         ALLOCATE SELECT_LIST_ELEMENT SET(S);
+         CALL SINGLE_QUEUE(D->SELECT_LIST_PTR,LASTFLD,S);
+         HEAD,LAST=NULL;
+         CALL SUMMARY_SETUP_Q(HEAD,LAST,3,1,'(');
+         CALL SUMMARY_SETUP_Q(HEAD,LAST,0,0,R->RHNNAME);
+         CALL SUMMARY_SETUP_Q(HEAD,LAST,3,2,')');
+         CALL SUMMARY_SETUP_Q(HEAD,LAST,8,0,D->SELECT_SUMMARY_TYPE);
+         S->FIELD_EXP_HDR=HEAD;
+         S->SELECT_NAME=R->RHNNAME;
+         STRING(S->SELECT_ELEMENT_FLAGS)='0'B;
+         S->SELECT_EXP,S->SELECT_SUM='1'B;
+         S->SELECT_ID=0;
+         S->SELECT_BUCKET1,S->SELECT_BUCKET2,S->SELECT_COUNT=0;
+         END;
+     END;
+
+   END SUMMARY_SETUP;
+
+ SUMMARY_SETUP_Q: PROC(HEAD,LAST,PTYPE,PSUBTYPE,PTOKSTR);
+ /**********************************************************************
+ *                                                                     *
+ * CALLED TO CREATE A NEW TOKEN STRUCTURE AND ADD TO TOKEN QUEUE       *
+ * POINTED TO BY HEAD.  LAST POINTS TO LAST TOKEN CURRENTLY ON QUEUE.  *
+ *                                                                     *
+ **********************************************************************/
+   DCL (HEAD,LAST,CURRENT) PTR;
+   DCL (PTYPE,PSUBTYPE) FIXED BIN(15,0);
+   DCL PTOKSTR CHAR(*) VAR;
+   ALLOCATE TOKEN SET(CURRENT);
+   CURRENT->PRIOR_TOKEN=LAST;
+   IF LAST=NULL
+     THEN HEAD=CURRENT;
+     ELSE LAST->NEXT_TOKEN=CURRENT;
+   LAST=CURRENT;
+   CURRENT->NEXT_TOKEN=NULL;
+   CURRENT->ELIX=0;
+   CURRENT->TYPE=PTYPE;
+   CURRENT->SUBTYPE=PSUBTYPE;
+   CURRENT->TOKSTR=PTOKSTR;
+   END SUMMARY_SETUP_Q;
+
+   END DENT49B;

@@ -1,0 +1,179 @@
+July 31 2008
+
+TTY's (a.k.a. Teletype ASR-33, 270x/TELE2, 3767/TWX[sic]) are well-supported by
+MVS 3.8 and VM/370; when properly configured both MVS and VM will condescend to
+speak to these machines directly in ASCII.  The TTY terminal user connects
+initially to VM/370 and uses the DIAL command if desired to connect to MVS TSO,
+or a LOGON command to use VM/CMS.
+
+In Feb. 2007 I released a Hercules 2703 driver enhancement along with
+procedures for accessing TSO in TTY mode via TCAM
+(see http://www.lightlink.com/mhp/2703/ ).  At that time a problem existed
+(system "panic" in VM/370) which precluded using TTY's at all on VM, let alone
+to connect to an MVS guest.
+
+Below please find:
+   1) an apparent fix for the VM nucleus crash
+   2) procedures for defining the virtual 270x's to VM
+   3) modification procedures to generate TCAM to run under VM
+   4) first, a "screen shot" from my system with everything working
+
+These procedures were tested using the following package versions:
+ - Hercules 3.04.1
+ - MVS turnkey release 4 (beta)
+ - VM 5-pack (VMDIST.zip)
+ - My Hercules 270x/async patch (see http://www.lightlink.com/mhp/2703/ )
+
+73 de KA1RBI
+
+~~~~~~~~~~~~~~~ [obnoxious chars removed using 'strings'] ~~~~~~~~~~~~~~~
+q prt
+OWNERID  FILE CLASS RECDS  CPY HOLD
+OPERATOR 0027 T CON 000081  01 NONE
+OPERATOR 0036 T CON 000025  01 NONE
+OPERATOR 0044 T CON 000023  01 NONE
+logoff hold
+CONNECT= 00:02:00 VIRTCPU= 000:00.01 TOTCPU= 000:00.22
+LOGOFF AT 15:36:52 GMT SUNDAY 07/27/08
+VM/370 ONLINE
+d mvs
+DIALED TO MVS      020
+logon ibmuser
+IKJ56455I IBMUSER LOGON IN PROGRESS AT 16:37:02 ON JULY 27, 1908
+IKJ56951I NO BROADCAST MESSAGES
+READY
+rpf
+RPF: NO 3270 TERMINAL, RPF INOPERATIVE
+READY
+logoff
+IKJ56470I IBMUSER LOGGED OFF TSO AT 16:37:06 ON JULY 27, 1908
+DROP FROM MVS      020
+VM/370 ONLINE
+logoff
+LOGOFF AT 15:37:08 GMT SUNDAY 07/27/08
+Connection closed by foreign host.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+1. VM/370 NUCLEUS CHANGES 
+
+The VM abend was apparently caused by code which attempted to FREE the null
+pointer.  I added code in DMKCNS which seems to fix this problem, as follows
+
+--- DMKCNS.OLD  2008-07-25 09:52:46.818970808 -0400
++++ DMKCNS.NEW  2008-07-25 09:52:43.369495208 -0400
+@@ -1768,6 +1768,11 @@
+          BR    R9             RETURN TO CALLER                 @V200820
+          SPACE 2
+ CNSRETN  EQU   *              RETURN FINISHED TASK TO DMKQCNET @V200820
++         LTR   R6,R6          IS PTR NULL ?                MHP
++         BNZ   CNSRTN1        NO- CONTINUE AS BEFORE       MHP
++         ST    R6,RDEVCON     YES - STORE 0 IN CHAIN PTR   MHP
++         BR    R7             AND RETURN                   MHP
++CNSRTN1  EQU   *                                           MHP
+          L     R15,CONPNT     REMOVE TOP CONTASK FROM CHAIN    @V200820
+          ST    R15,RDEVCON         . . .                       @V200820
+          SLR   R15,R15                                         @V200820
+
+In addition to the above patch, you *may* need to also disable the "free trap"
+which was configured into VM in file OPTIONS COPY as part of modification
+HRC035DK:
+
+&FRETRAP SETB  0              DEFAULT - DO NOT INCLUDE THE     HRC035DK
+*                             CP 'FRET' TRAP CODE              HRC035DK
+*FRETRAP SETB  1              INCLUDE CP 'FRET' TRAP CODE      HRC035DK
+         SPACE 2                                               HRC035DK
+
+After applying the above changes of course, the VM/370 nucleus will need to be
+regenerated/re-IPL'ed.
+
+
+2. VM DIRECTORY FOR MVS VIRTUAL MACHINE
+
+I added the following SPECIAL's in the MVS machine's VM/370 directory entry:
+
+SPECIAL 020 2701 TELE
+SPECIAL 021 2701 TELE
+SPECIAL 022 2701 TELE
+
+
+3. TCAM GENERATION PROCESS
+
+TCAM has an option to enable running under VM/370.  Special processing is
+needed for TCAM because it uses dynamically modified channel programs and so
+must advise the VM/370 nucleus (using DIAGNOSE) each time it dynamically
+modifies a CCW.
+
+When you define the TTY lines to TCAM you submit stage I text to the assembler
+as in the following example:
+
+         LINEGRP TERM=3335,DDNAME=LTTYA,LINENO=03,                     +
+               DIAL=YES,UNITNO=3
+TCAM     TSOMCP UNITSIZ=255
+         END
+
+In the distribution included with my 270x patch is a JCL file 'tcamstg12.txt'
+which contains the above code and fully automates the TCAM installation
+process.  You'll need to split this into two separate jobs (apparently there
+is no way to automate this at stage I?): a) submit the above stage I code to
+the assembler; b) modify the resulting stage II code and submit your modified
+stage II; as follows:
+
+3.1 Split the job file TCAMSTG12.TXT into two files, place the first step (ASM)
+in the first file, and the second two steps (ASM2 and LKED) into the second
+file.  Of course, both will need a JOB card.
+
+3.2 In the first job (step ASM) change the SYSPUNCH to SYSOUT=B.  Submit.
+Look for the Stage II assembly code to appear in your punch spool file
+(SYSPUNCH).  You may need to issue a "$SPUN1" command...
+
+3.3 In the second job, change the SYSIN to //SYSIN DD * .  Paste the Stage II
+code that was punched above immediately after the SYSIN card, before the LKED
+step.  In the INTRO macro, add the parameter "VM=YES" as follows:
+Change the line
+               STARTUP=C,THRESH=(255,1,1,1)
+to
+               STARTUP=C,THRESH=(255,1,1,1),VM=YES
+Your file should now look something like this excerpt:
+//SYSGO    DD  DSNAME=&LOADSET,UNIT=SYSDA,SPACE=(80,(200,50)),
+//             DISP=(MOD,PASS)
+//SYSIN DD    *
+TCAM CSECT
+         INTRO ENVIRON=TSO,KEYLEN=255,LNUNITS=18,CIB=2,  .................
+               ABEFMT=(SIB,RVT,DCT,LGB,DCB,DEB,SCB,PLCB,LCB,      .........
+               QCB,OPT,TTE),                           @OY16449   ..........
+               FEATURE=(,,,,NO3705),                                ......
+               BRACKET=NO,                                 ................
+               CROSSRF=0,TRACE=0,LINETYP=STSP,                 .........
+               DTRACE=0,OLTEST=0,PROGID=TCAM,         ........................
+               STARTUP=C,THRESH=(255,1,1,1),VM=YES
+         LTR   15,15
+         ...
+         ...
+/*
+//*
+//LKED   EXEC PGM=IEWL.....
+
+Submit.  The result should be the creation of IEDQTCAM in LINKLIB.  Check both
+jobs to verify MAXCC=0.
+
+NOTE: The method of having two separate TCAM setup jobs is the same as used by
+the original OS/360 TCAM setup
+(for example, see http://www.conmicro.com/hercos360/tsotcam.html#11.4 )
+
+3.4 In my testing, after installing the new TCAM with VM=YES, it still didn't
+seem to work.  It was late, so I shut down for the night.  The next day, after
+a fresh IPL of Herc, VM/370, MVS, and TCAM, everything seemed to work fine...
+Suspect the MVS re-IPL was the secret.
+
+NOTES
+
+1. As of Jul. 2008, TTY works OK in VM with CP and TSO, but CMS isn't working.
+I get unceremoniously dumped back to CP after receiving the "CMS HRC SYSTEM -
+MAY 2, 2006" prompt (and pressing enter, if AUTOCR is not set).   I will be
+doing further testing...
+
+2. The reason for the uncertainty in the free trap code was that I disabled it
+first; and never tested to see if the DMKCNS patch alone was sufficient, or
+whether both mods are needed.  I do seem to recall also getting a lot of VM
+abends trying to use the DIAL command from a 3270, but instead now VTAM is
+dumping core.

@@ -1,0 +1,428 @@
+DQAW     TITLE 'IEDQAW - TCAM TRANSLATION ROUTINE.'
+IEDQAW   CSECT
+*C598000,626000                                                  S22029
+*D618000-622000                                                  S22029
+*A400000,489200,734000                                           A42388
+*A 418600-419200                                                 S22025
+*C 485000-486000,650000-652000,654000-658000,686000-692000       S22025
+*C484000-488000,714000-716000                                    S22025
+*A544000,724000                                                  M2313
+*D 662000,670000-672000,694000-700000                            S22025
+*C500000,502000,002000                                           S21903
+*
+*
+***********************************************************************
+*                                                                     *
+*STATUS -- CHANGE LEVEL                                               *
+*                                                                     *
+*FUNCTION -- INITIALIZES THE TRANSLATE TABLE ADDRESS AND TRANSLATES   *
+*   DATA IN THE BUFFER.                                               *
+*                                                                     *
+*   IF ENTRY TO THE ROUTINE IS FROM EXPANSION OF THE CODE MACRO,      *
+*   THE TRANSLATE TABLE MUST BE FOUND.  IF THE TABLE ADDRESS IS IN    *
+*   THE PARAMETER LIST,  IT IS LOADED FROM THERE.  IF IT IS IN THE    *
+*   DCB,  THE ADDRESS OF THE DCB IS ACCESSED FROM THE LCB             *
+*   (LCBDCBPT) AND THE ADDRESS OF THE TABLE IS LOADED FROM THE DCB    *
+*   (DCBTRANS).                                                       *
+*                                                                     *
+*   THE FORMAT OF THE TRANSLATE TABLE IS (1) A ONE-WORD FIELD         *
+*   CONSISTING OF A STATUS BYTE PLUS THE ADDRESS OF THE OUTPUT        *
+*   TRANSLATE TABLE; (2) THE INPUT TRANSLATE TABLE (256 BYTES);       *
+*   AND (3) THE OUTPUT TRANSLATE TABLE (256 BYTES).  THE LCB STATUS   *
+*   FIELD (LCBSTATE) IS TESTED TO DETERMINE IF THE LINE IS SENDING    *
+*   OR RECEIVING.  IF RECEIVING,  THE ADDRESS OF THE INPUT TRANS-     *
+*   LATE TABLE IS SET;  IF SENDING,  THE ADDRESS OF THE OUTPUT        *
+*   TRANSLATE TABLE.  THE ADDRESS IS THEN STORED INTO THE SCB         *
+*   (SCBTRANS) AND THE OFFSET TO THE ADDRESS OF THE TRANSLATE         *
+*   ROUTINE IN THE MESSAGE HANDLER VCON TABLE IS STORED INTO THE      *
+*   SCB (SCBAWOFF) AS WELL.                                           *
+*                                                                     *
+*   IF ENTRY TO THE ROUTINE IS FROM EXPANSION OF A DELIMITER MACRO    *
+*   (INBUF,  INMSG,  OUTBUF OR OUTMSG) VIA THE TRANSLATION TEST       *
+*   ROUTINE OR FROM THE START MH ROUTINE,  SCBTRANS WILL HAVE BEEN    *
+*   INITIALIZED,  AND THE ADDRESS OF THE TRANSLATE TABLE IS LOADED    *
+*   FROM THAT FIELD.                                                  *
+*                                                                     *
+*   IF ENTRY IS FROM EXPANSION OF THE INMSG OR OUTMSG MACRO VIA THE   *
+*   TRANSLATION TEST ROUTINE,  A 'TRANSLATED' FLAG IS SET IN THE      *
+*   BUFFER RECB TIC FIELD (PRFTIC+3).                                 *
+*                                                                     *
+*   THE BUFFER PREFIX DATA SIZE FIELD (PRFSIZE) IS LOADED AND THE     *
+*   LCB RESERVE CHARACTER COUNT (LCBISZE) IS SUBTRACTED FROM IT.      *
+*   (RESERVE CHARACTERS ARE NOT TRANSLATED.)  THE RESERVE CHARACTER   *
+*   COUNT IS PASSED TO THE ADDRESS FINDER ROUTINE WITH REGISTER 1     *
+*   SET TO ZERO TO REQUEST END-OF-UNIT UPDATING.  THE ADDRESS         *
+*   RETURNED IS THE STARTING ADDRESS FOR THE FIRST TRANSLATION.       *
+*   THE END-OF-UNIT ADDRESS RETURNED IS DECREMENTED BY THE STARTING   *
+*   ADDRESS TO GET THE LENGTH OF DATA IN THE FIRST UNIT.  THIS        *
+*   LENGTH IS COMPARED WITH THE TOTAL LENGTH OF DATA.  IF THE TOTAL   *
+*   LENGTH IS EQUAL OR SMALLER,  DATA ENDS IN THE FIRST UNIT.  A      *
+*   BRANCH IS TAKEN TO LABEL TRANS2,  WHERE FINAL TRANSLATION IS      *
+*   PERFORMED USING THE TOTAL LENGTH OF DATA AS THE LENGTH AND        *
+*   RETURN IS MADE TO THE CALLER.                                     *
+*                                                                     *
+*   IF DATA DOES NOT END IN THE FIRST UNIT,  THE TOTAL LENGTH OF      *
+*   DATA IS DECREMENTED BY THE LENGTH OF DATA IN THE UNIT AND THE     *
+*   WHOLE UNIT IS TRANSLATED.                                         *
+*                                                                     *
+*   THE ADDRESS OF THE NEXT UNIT IS ACCESSED FROM THE TIC FIELD OF    *
+*   THE PREVIOUS UNIT AND THE STARTING ADDRESS IS SET AT THE START    *
+*   OF DATA (PAST THE RECB) IN THE UNIT.  THE TOTAL LENGTH OF DATA    *
+*   REMAINING IS COMPARED WITH THE KEY LENGTH (AVTKEYLE).  IF THE     *
+*   TOTAL LENGTH IS EQUAL OR SMALLER,  DATA ENDS IN THIS UNIT.  THE   *
+*   FINAL TRANSLATION IS PERFORMED AND RETURN IS MADE TO THE          *
+*   CALLER.                                                           *
+*                                                                     *
+*   IF DATA DOES NOT END IN THIS UNIT,  THE TOTAL LENGTH IS DECRE-    *
+*   MENTED BY THE KEY LENGTH AND THE WHOLE UNIT IS TRANSLATED.  THE   *
+*   ROUTINE GETS THE ADDRESS OF THE NEXT UNIT AND PROCEEDS AS         *
+*   ABOVE.                                                            *
+*                                                                     *
+*ENTRY POINTS --                                                      *
+*       'IEDQAW' TO TRANSLATE A BUFFER.  CALLING SEQUENCE FROM        *
+*   USER INTERFACE,  TRANSLATION TEST ROUTINE OR START MH ROUTINE     *
+*   IS:                                                               *
+*                                                                     *
+*        L     R12,AVTMSGS-1            GET ADDR OF VCON TABLE        *
+*        IC    R15,AVTEZERO(,R1)        GET INDEX TO ROUTINE ADDR     *
+*        L     R12,AVTEZERO(R12,R15)    GET ROUTINE ADDRESS           *
+*        BR    R12                      EXIT TO ROUTINE               *
+*                                                                     *
+*INPUT --                                                             *
+*   REGISTER 1 - THE ADDRESS OF A PARAMETER LIST.  PARAMETER LIST     *
+*   FORMAT IS:                                                        *
+*                                                                     *
+*        *********************************                            *
+*        *       * PARAM *       *       *                            *
+*        * INDEX * LIST  *       *STATUS *                            *
+*        *       * LNGTH *       *       *                            *
+*        *********************************                            *
+*        *          ADDRESS OF           *                            *
+*        *        TRANSLATE TABLE        *                            *
+*        *          (OPTIONAL)           *                            *
+*        *********************************                            *
+*                                                                     *
+*   STATUS BITS:                                                      *
+*                                                                     *
+*   BIT 0      ON   TRANSLATE TABLE ADDRESS IN DCB                    *
+*              OFF  TRANSLATE TABLE ADDRESS IN PARAMETER LIST         *
+*                                                                     *
+*   BIT 1      ON   NON-STANDARD TABLE                                *
+*              OFF  STANDARD TABLE                                    *
+*                                                                     *
+*   BITS 2,3   00   ENTRY FROM CODE MACRO                             *
+*              01   ENTRY FROM INMSG OR OUTMSG MACRO                  *
+*              10   ENTRY FROM INBUF OR OUTBUF MACRO                  *
+*                                                                     *
+*   REGISTER 3 - ADDRESS OF THE SCB.                                  *
+*                                                                     *
+*   REGISTER 4 - ADDRESS OF THE LCB.                                  *
+*                                                                     *
+*   REGISTER 6 - ADDRESS OF THE BUFFER.                               *
+*                                                                     *
+*   REGISTER 9 - ADDRESS OF THE AVT.                                  *
+*                                                                     *
+*   REGISTER 12 - ENTRY POINT ADDRESS AND BASE REGISTER.              *
+*                                                                     *
+*   SCB TRANSLATE TABLE ADDRESS FIELD (SCBTRANS) - IF ENTRY IS FROM   *
+*   START MH ROUTINE OR TRANSLATION TEST ROUTINE,  THE ADDRESS OF     *
+*   THE TRANSLATE TABLE.                                              *
+*                                                                     *
+*   SCB TRANSLATION ROUTINE INDEX (SCBAWOFF) - IF ENTRY IS FROM       *
+*   START MH ROUTINE OR TRANSLATION TEST ROUTINE,  THE OFFSET IN      *
+*   THE MESSAGE HANDLER VCON TABLE TO THE ADDRESS OF THE TRANSLA-     *
+*   TION ROUTINE.                                                     *
+*                                                                     *
+*OUTPUT --                                                            *
+*   BUFFER WITH ALL DATA TRANSLATED.                                  *
+*                                                                     *
+*   SCB TRANSLATE TABLE ADDRESS FIELD (SCBTRANS) - IF ENTRY IS FROM   *
+*   EXPANSION OF A CODE MACRO,  THE ADDRESS OF THE TRANSLATE TABLE.   *
+*                                                                     *
+*   SCB TRANSLATION ROUTINE INDEX (SCBAWOFF) - IF ENTRY IS FROM       *
+*   EXPANSION OF A CODE MACRO,  THE OFFSET IN THE MESSAGE HANDLER     *
+*   VCON TABLE TO THE ADDRESS OF THE TRANSLATION ROUTINE.             *
+*                                                                     *
+*EXTERNAL REFERENCES --                                               *
+*                                                                     *
+*    'IEDQA3' - TRANSLATE LIST MODULE TO DETERMINE PROPER TRANSLATE
+*               TABLE TO BE USED.
+*                                                                     *
+*   AVT - ADDRESS VECTOR TABLE.                                       *
+*                                                                     *
+*   DCB - DATA CONTROL BLOCK.                                         *
+*                                                                     *
+*   LCB - LINE CONTROL BLOCK.                                         *
+*                                                                     *
+*   SCB - STATION CONTROL BLOCK.                                      *
+*                                                                     *
+*   CURRENT BUFFER.                                                   *
+*                                                                     *
+*   TRANSLATION TABLE.                                                *
+*                                                                     *
+*EXITS,  NORMAL -- ENTRY IS FROM THE EXPANSION OF A CODE MACRO.       *
+*   DATA IN THE BUFFER IS TRANSLATED.  THE SCB TRANSLATE TABLE        *
+*   ADDRESS FIELD (SCBTRANS) CONTAINS THE ADDRESS OF THE TRANSLATE    *
+*   TABLE.  THE SCB TRANSLATION ROUTINE INDEX (SCBAWOFF) CONTAINS     *
+*   THE OFFSET IN THE MESSAGE HANDLER VCON TABLE TO THE ADDRESS OF    *
+*   THE TRANSLATION ROUTINE.  A 'TRANSLATED' BIT IS SET IN THE        *
+*   BUFFER RECB TIC FIELD (PRFTIC+3).                                 *
+*                                                                     *
+*   ENTRY IS FROM THE START MH ROUTINE OR FROM THE EXPANSION OF AN    *
+*   INBUF OR OUTBUF MACRO VIA THE TRANSLATION  TEST ROUTINE.  DATA    *
+*   IN THE BUFFER IS TRANSLATED.  A 'TRANSLATED' BIT IS SET IN THE    *
+*   BUFFER RECB TIC FIELD (PRFTIC+3).                                 *
+*                                                                     *
+*   ENTRY IS FROM THE EXPANSION OF AN INMSG OR OUTMSG MACRO VIA THE   *
+*   TRANSLATION TEST ROUTINE.  DATA IN THE BUFFER IS TRANSLATED.      *
+*                                                                     *
+*EXITS,  ERROR -- N/A.                                                *
+*                                                                     *
+*TABLES/WORK AREAS -- N/A.                                            *
+*                                                                     *
+*ATTRIBUTES -- SERIALLY REUSABLE,  REFRESHABLE,  ENABLED,             *
+*   RESIDENT,  PROBLEM PROGRAM MODE.                                  *
+*                                                                     *
+*NOTES -- THE OPERATION OF THIS MODULE DOES NOT DEPEND UPON AN        *
+*   INTERNAL REPRESENTATION OF THE EXTERNAL CHARACTER SET.            *
+*                                                                     *
+***********************************************************************
+         EJECT
+********* REGISTER EQUATES *********
+         SPACE
+R0       EQU   0
+RKEY     EQU   0                        KEYLENGTH
+         SPACE
+R1       EQU   1                        PARAMETER LIST
+         SPACE
+RWORK    EQU   2                        WORK
+RRH      EQU   2                        RH BASE REGISTER       @YM07019
+         SPACE
+RSCB     EQU   3                        ADDRESS OF SCB
+         SPACE
+RLCB     EQU   4                        BASE OF LCB
+RUNIT    EQU   4                        ADDRESS OF CURRENT UNIT
+         SPACE
+RSCAN    EQU   5                        ADDR OF START OF TRANSLATIO
+         SPACE
+RPREFIX  EQU   6                        BASE OF BUFFER
+R7       EQU   7                        TEMPORARY STORAGE        A42388
+         SPACE
+RTBL     EQU   8                        ADDRESS OF TRANSLATE TABLE
+         SPACE
+RAVT     EQU   9                        BASE OF AVT
+         SPACE
+RDCB     EQU   10                       BASE OF DCB
+RSIZE    EQU   10                       SIZE OF DATA
+         SPACE
+REX      EQU   11                       EXECUTE REGISTER
+         SPACE 1                                                 S22025
+REOUAD   EQU   11                       ADDR OF CURRENT EOU      S22025
+         SPACE
+RBASE    EQU   12                       BASE OF ROUTINE
+         SPACE
+R13      EQU   13                       SAVE AREA
+R14      EQU   14
+R15      EQU   15                       ENTRY AND RETURN CODE
+         SPACE
+*********PARAMETER LIST OFFSET *********
+         SPACE
+STATOFF  EQU   3                        OFFSET TO STATUS BYTE
+TABOFF   EQU   4                        OFFSET TO TRANS TABLE ADDR
+         SPACE
+BUF      EQU   X'20'                    ENTRY FROM INBUF/OUTBUF
+LISTFLAG EQU   X'80'                    TRANSLATE LIST FLAG
+         SPACE
+********* MISCELLANEOUS EQUATES *********
+         SPACE
+ONE      EQU   1                        DUMMY LENGTH FOR EXECUTED
+*                                         MOVE INSTRUCTION
+FOUR     EQU   4                        OFFSET TO INPUT TRANS TABLE
+FMHLNG   EQU   0                        OFFSET TO LENGTH OF    @YM07019
+*                                       FORMATTED HEADER IN    @YM07019
+*                                       FORMATTED HEADER       @YM07019
+         EJECT
+         USING IEDQAVTD,RAVT            ESTABLISH ADDRESSABILITY
+         USING IEDQSCB,RSCB
+         USING IEDQAW,RBASE             ESTABLISH ADDRESSABILITY
+         USING IEDQPRF,RPREFIX          ESTABLISH ADDRESSABILITY
+         USING IEDQLCB,RLCB             ESTABLISH ADDRESSABILITY
+*
+IEDQAW01 EQU   *
+IEDQAW   IEDHJN TRANSLAT                MODULE ID                S22025
+         SR    R0,R0                    IS THIS A
+         CH    R0,PRFSIZE                 ZERO-LENGTH BUFFER
+         BE    EXIT                     YES, EXIT IMMEDIATELY
+         TM    LCBSTAT1,LCBSENDN        IS SEND BIT ON?          A42388
+         BZ    CONTINUE                 IF NOT SENDING, CONTINUE A42388
+         L     R7,SCBDESTQ-1            LOAD QCB ADDRESS         A42388
+         TM    QCBFLAG-IEDQQCB(R7),QCBPROC PROCESS ENTRY BIT ON? A42388
+         BO    EXIT                     YES, EXIT FROM ROUTINE   A42388
+CONTINUE EQU   *                                                 A42388
+         SPACE
+         TM    SCBSTATE,SCBCODE         IS ENTRY FROM STARTMH
+         BO    SELTABLE                 YES, GO SELECT TABLE
+         SPACE
+         TM    STATOFF(R1),BUF          IS CODE MACRO IN HEADER
+         BO    SELTABLE                 NO, GO SELECT TABLE
+         SPACE
+         TM    LCBTSOB,LCBTSBUF         IS THIS A TSO BUFFER    S21903
+         BO    SETCODE                  YES,SAVE CODE PARM LIST S21903
+         SPACE
+         CLC   PRFSCAN,PRFSIZE          WILL NEXT BUFFER HIT CODE
+         BH    SELTABLE                 YES, GO SELECT TABLE
+         SPACE
+SETCODE  EQU   *
+         OI    SCBSTATE,SCBCODE         NO, SET TO TRANSLATE ALL
+         IC    R0,SCBTRANS-1              SUBSEQUENT BUFFERS
+         ST    R1,SCBTRANS-1            SAVE CODE PARAMETER LIST
+         STC   R0,SCBTRANS-1              IN SCB
+         SPACE
+SELTABLE EQU   *
+         TM    STATOFF(R1),AVTE80       IS TABLE IN DCB
+         BO    DCBINFO                  YES, GET ITS ADDRESS
+*
+         L     RTBL,TABOFF(,R1)         PICK UP TABLE ADDRESS
+         B     TRANCHK                  GO GET PROPER TABLE
+         SPACE
+DCBINFO  EQU   *
+         L     RDCB,LCBDCBPT            PICK UP ADDRESS OF DCB
+         USING IHADCB,RDCB              ESTABLISH ADDRESSABILITY
+         L     RTBL,DCBTRANS-1          PICK UP ADDR OF TABLE
+         CLI   PRFPRI,PRIAPBFR          RECV APPL PROG MH        M2313
+         BE    EXIT                     BRANCH IF YES SINCE THEREM2313
+*                                       IS NO TRANSLATE TABLE    M2313
+         SPACE
+TRANCHK  EQU   *
+         TM    AVTEZERO(RTBL),LISTFLAG  IS THIS A LIST
+         BZ    RTTBL                    NO, GO SELECT TABLE
+         SPACE
+         LR    R0,RBASE                 SAVE BASE(IEDQA3 RESTORES)
+         L     RBASE,AVTA3TL            ADDR OF LIST MODULE
+         BALR  R14,RBASE                LINKAGE
+         SPACE
+         B     EXIT                     +0 RETURN FROM LIST
+         B     TRANS                    +4 RETURN FROM LIST
+*        B     RTTBL                    +8 RETURN FROM LIST
+         EJECT
+RTTBL    EQU   *
+         L     RWORK,AVTEZERO(,RTBL)    PICK UP 1ST WORD OF TABLE
+         LTR   RWORK,RWORK              IS IT ZEROES
+         BZ    EXIT                     YES, EBCDIC, EXIT NOW
+         SPACE
+         TM    LCBSTAT1,LCBSENDN        IS LINE RECEIVING
+         BNO   INTBL                    YES, GET INPUT TABLE ADDR
+         SPACE
+         LR    RTBL,RWORK               POINT TO OUTPUT TABLE
+         B     TRANS                    GO TRANSLATE
+         SPACE
+INTBL    EQU   *
+         LA    RTBL,FOUR(,RTBL)         POINT TO INPUT TABLE
+         TM    PRFSTAT1,PRFCNCLN        IS CANCEL BIT ON
+         BNO   TRANS                    NO, START AT 1ST DATA BYTE
+         SPACE
+         TM    PRFSTAT1,PRFTSMSG       TIME SHARING MESSAGE      S22029
+         BO    TRANS                    YES. START AT 1ST DATA BYTE TSO
+         SPACE
+         LH    RSCAN,PRFSCAN            SET TO START
+         N     RSCAN,AVTCLRHI             TRANSLATE AT EOB
+         B     SETSIZE                  PROCEED TO GET DATA LENGTH
+         SPACE
+TRANS    EQU   *
+         SR    RSCAN,RSCAN              (CLEAR FOR INSERT)
+         IC    RSCAN,LCBISZE            GET NO. OF IDLES
+         SPACE
+         LA    RSCAN,AVTTXTSZ(,RSCAN)  GET TEXT PREFIX SIZE      S22029
+         TM    PRFSTAT1,PRFNHDRN        IS IT HEADER PREFIX
+         BO    SNAPROC                  NO, COUNT IS RIGHT     @YM07019
+         SPACE
+         LA    RSCAN,AVTHDRSZ-AVTTXTSZ(,RSCAN) YES, ADD EXTRA
+         SPACE
+SNAPROC  EQU   *                                               @YM07019
+         CLI   LCBFLAG1,LCBPLCB         PLCB                   @YM07019
+         BNE   SETSIZE                  BR NO                  @YM07019
+         TM    LCBSTAT5,LCBLUNIT        LU                     @YM07019
+         BNO   SETSIZE                  BR NO                  @YM07019
+         LA    RRH,PRF1LEN              LEN OF NEGATIVE PRF    @YM07019
+         LNR   RRH,RRH                  MAKE IT MINUS          @YM07019
+         AR    RRH,RPREFIX              SET RH BASE REG        @YM07019
+         USING IEDRH,RRH                RH ADDRESSABILITY      @YM07019
+         TM    TRHBYTE0,TRHDFC+TRHNC    DFC,NC,OR SC           @YM07019
+         BNZ   EXIT                     BR YES                 @YM07019
+         TM    TRHBYTE0,TRHSDI          SENSE INCLUDED         @YM07019
+         BNO   CHECKFI                  BR NO                  @YM07019
+*                                       BUMP PAST SENSE        @YM07019
+         LA    RSCAN,L'SNSSYSTM+L'SNSUSER(,RSCAN)              @YM07019
+         B     SETSIZE                  GO GET DATA LENGTH     @YM07019
+CHECKFI  EQU   *                                               @YM07019
+         TM    TRHBYTE0,TRHFI           FORMATTED HEADER       @YM07019
+         BNO   SETSIZE                  BR NO                  @YM07019
+*                                       GET ADDR OF FMH        @YM07019
+         LA    RWORK,AVTUMALN(RSCAN,RPREFIX)                   @YM07019
+         SR    RSIZE,RSIZE              CLEAR REG              @YM07019
+         IC    RSIZE,FMHLNG(,RWORK)     LENGTH OF FMH          @YM07019
+         AR    RSCAN,RSIZE              BUMP PAST FMH          @YM07019
+SETSIZE  EQU   *
+         LH    RSIZE,PRFSIZE            GET SIZE OF BUFFER
+         N     RSIZE,AVTCLRHI
+         SR    RSIZE,RSCAN              SUBTRACT DATA NOT
+*                                         TO BE TRANSLATED
+         BZ    EXIT                     BR NO DATA TO TRANSLATE  S22025
+         LR    RWORK,RPREFIX            LOAD PREFIX IN REG       S22025
+         LH    REX,AVTKEYLE             LOAD KEY LENGTH IN REG   S22025
+         B     ENTERLOP                 GET ADDR OF SCAN POINTER S22025
+ADDRLOOP EQU   *                                                 S22025
+         L     RWORK,PRFTIC-IEDQPRF(,RWORK) POINT TO NEXT UNIT   S22025
+         SR    RSCAN,REX                SUBT NO OF BYTES PASSED  S22025
+ENTERLOP EQU   *                                                 S22025
+         CR    RSCAN,REX                IS ITEM IN THIS UNIT     S22025
+         BNL   ADDRLOOP                 NO, TEST NEXT UNIT       S22025
+         SR    REX,RSCAN                GET DATA COUNT IN UNIT   S22025
+         LA    RSCAN,AVTUMALN(RSCAN,RWORK)    YES, UNIT ADDR     S22025
+TRANS1   EQU   *                                                 S22025
+         SPACE
+         CR    RSIZE,REX                DOES DATA END IN THIS UNIT
+         BNH   TRANS2                   YES, TRANSLATE & EXIT
+         SPACE
+         SPACE
+         SR    RSIZE,REX                COMPUTE DATA LEFT
+         BCTR  REX,AVTEZERO             DECREMENT FOR EXECUTE
+         EX    REX,CODEX                TRANSLATE DATA
+         SPACE
+         L     RWORK,PRFTIC-IEDQPRF(,RWORK)  POINT TO NEXT UNIT  S22025
+         LA    RSCAN,AVTUMALN(,RWORK)   GET START OF DATA ADDR   S22025
+         LH    REX,AVTKEYLE            GGET UNIT LENGTH          S22025
+         B     TRANS1                   RETURN TO TRANSLATE NEXT S22025
+         SPACE
+TRANS2   EQU   *
+         BCTR  RSIZE,AVTEZERO           DECREMENT FOR EXECUTE
+         EX    RSIZE,CODEX              TRANSLATE DATA
+         SPACE
+EXIT     EQU   *
+         L     RBASE,AVTUI              GET RET INTERFACE ADDR   S22025
+         B     FOUR(RBASE)              RETURN TO CALLER         S22025
+         SPACE
+********* EXECUTED INSTRUCTION *********
+         SPACE
+CODEX    TR    AVTEZERO(ONE,RSCAN),AVTEZERO(RTBL)
+         EJECT
+         TPRIOR                                                  M2313
+         EJECT
+********* DSECTS *********
+         SPACE
+         TAVTD
+         TQCBD
+         EJECT
+         DCBD  DSORG=TX
+         EJECT
+         TLCBD
+         EJECT
+         TPRFD
+         EJECT
+         TRHD                                                  @YM07019
+         EJECT
+         TSCBD
+         EJECT
+         TSNSD                                                 @YM07019
+         EJECT
+      END

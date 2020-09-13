@@ -1,0 +1,433 @@
+*  THIS ROUTINE IS A USER WRITTEN ROUTINE TO REPLACE THE STANDARD
+*  IBM ENQ-DEQ MODULE.
+*  THE USER MUST PASS OVER THE FOLLOWING PARAMETERS :
+*
+*       1. A FOUR BYTE RECORD IDENTIFIER.
+*       2. AN INDICATOR TO SAY WHETHER ENQUEUEING, DEQUEVEING, OR
+*          PURGEING (IEFACTRT) IS REQUIRED. VALUES 1,2,3 RESPECTIVELY.
+*       3. THE ADDRESS OF AN ECB.
+*
+*  THE ROUTINE CHECKS TO SEE IF THE RECORD IS ALREADY ENQUEUED.
+*  IF SO THEN THE ECB THAT THE USER PASSES OVER IS NOT SET COMPLETE
+*  AND SO HE MUST WAIT. THE QEL SET UP IS QUEUED TO A SUBQUEUE OF
+*  REQUESTS ALREADY WAITING FOR THE RESOURCE.
+*  IF THE FREE QUEUE IS EMPTY IT ISSUES A GETMAIN TO ENLARGE THE QUEUE.
+*  ONCE THIS CORE IS GOTTEN IT REMAINS AS PART OF THE QUEUE.
+*
+*  THE FORMAT OF THE QUEUE ELEMENT IS AS FOLLOWS
+*
+*        *****************
+*        * 0             *    NOTES
+*        * RECORD IDENT  *   *******
+*        *               *
+*        *****************    1. THE RECORD IDENTIFIER IS IN THE FORMAT
+*        * 4  * 5        *       TTRF (TRACK TRACK RECORD FILE).
+*        *PART* ADD OF   *       THE ONE BYTE FILE INDICATOR VARIES
+*        * ID *      ECB *       FROM 01 TO FF ALLOWING 255 FILES.
+*        *****************
+*        * 8     * A     *       2. THE PARTITION IDENTIFIER IS USED BY
+*        * NEXT  *  NEXT  *        THE ROUTINE TO PURGE ALL REQUESTS
+*        *  QEL  *   ECB *         BY THE TASK THAT HAS ENDED.
+*        *****************
+*
+*
+*
+*   THE FORMAT OF THE QUEUE CONTROL BLOCKS IS AS FOLLOWS
+*
+*        ***************************************
+*        * 0         * 4        * 8    * 10    *
+*        * ZEROES    * LAST QEL * 1ST  * NO OF *
+*        *           *          *  QEL *  QELS *
+*        ***************************************
+*
+* USE OF THE ROUTINE IS FACILITATED BY USE OF THE ZENQ AND ZDEQ MACROS:
+*
+*        ZENQ  RESOURCE,ECB
+*
+*        ZDEQ  RESOURCE
+*
+*  IF A USER ATTEMPTS TO DEQUEUE A RESOURCE THAT HE HAS NOT ENQUEUED
+*  THEN THE JOB ABENDS WITH A U0530 ABEND CODE.
+*
+*
+         EJECT
+IGC254   CSECT
+         REGS
+         BALR  R12,R0
+         USING *,R12
+         B     *+12                 BRANCH AROUND CONSTANT
+         DC    C'BSCENQDQ'
+         EJECT
+* SET REGISTERS 6,7,8 TO POINT TO PARAMETERS
+         LM    R6,R8,0(R1)
+         SPACE
+* TEST FOR ENQ, DEQ OR PURGE
+         CLI   0(R7),C'2'
+         BL    ENQRTN         ENQUEUE
+         BH    PURGERTN       PURGE
+         EJECT
+* THIS IS THE DEQUEUEING ROUTINE
+         CLI   REQQCB+11,X'00'    ANYTHING ON QUEUE?
+         BE    ABENDQ         NO ABEND
+         LH    R2,REQQCB+8
+         A     R2,=A(FIRSTQEL)
+         LA    R4,REQQCB      R4 - REQUEST QCB
+         LA    R5,FREEQCB     R5 - FREEQCB
+         L     R3,FREEQCB+4   R3 - LAST ELEMENT ON FREE QUEUE
+         LA    R7,CLEAR
+DEQFIND  EQU   *
+         CLC   0(4,R2),0(R6)  IS THIS THE CORRECT ELEMENT
+         BE    DEQUEUE        YES TEST FOR SUBQUEUE
+         CLC   8(2,R2),FFFF      ANY MORE ON QUEUE
+         BE    ABENDQ         NO ABEND
+         LH    R2,8(R2)       LOAD DISPLACEMENT OF NEXT IN QUEUE
+         A     R2,=A(FIRSTQEL)     ADD ON START OF QUEUE
+         B     DEQFIND             TEST THIS ONE
+DEQUEUE  EQU   *
+         CLC   10(2,R2),FFFE       IS THERE AN ELEMENT ON THE WAIT Q
+         BNL   PRECOMON            NO
+         LH    R10,10(R2)          PUT DISPLACEMENT IN R10
+         A     R10,=A(FIRSTQEL)    ADD TO START OF QUEUE
+         XC    4(1,R10),4(R10)    CLEAR FIRST BYTE
+         L     R8,4(R10)          R8 POINTS TO ECB
+         LA    R11,POSTE          RETURN TO POSTER AFTER COMMON
+         B     COMMON
+PRECOMON EQU   *
+         LA    R11,RETURNER
+         EJECT
+*  THE NEXT ROUTINE TAKES AN ELEMENT OFF ONE QUEUE AND PLACES IT
+*  ON THE OTHER, THUS THE LOGIC IS COMMON TO BOTH ENQUEUEING AND
+*  DEQUEUEING
+*
+COMMON   EQU   *
+         LR    R10,R4
+         LH    R9,8(R10)           LOAD DISPLACEMENT OF NEXT
+         A     R9,=A(FIRSTQEL)     ADD START OF QUEUE
+         CR    R9,R2               RIGHT ONE?
+         BE    FOUND               YES
+         LR    R10,R9              NO R10 NOW POINTS TO NEXT IN Q
+         B     COMMON+2            TRY AGAIN
+FOUND    EQU   *
+         MVC   8(2,R10),8(R2)    TAKE IT OFF THE QUEUE
+         CLC   8(2,R2),FFFF        WAS ELEMENT LAST ON Q
+         BNE   *+8                 NO
+         ST    R10,4(R4)           YES SO RESET POINTER IN QCB
+         LH    R9,10(R4)           R9 = NO ON Q
+         BCT   R9,*+4              SUBTRACT 1
+         STH   R9,10(R4)           STORE NEW VALUE
+*  THE ABOVE LOGIC TOOK THE ELEMENT OFF THE ONE QUEUE, THE
+*  FOLLOWING PLACES IT ON THE OTHER QUEUE.
+HALFCOMN L     R9,4(R5)            R9 POINTS TO LAST ON Q
+         MVC   0(12,R2),0(R7)
+         LR    R10,R2
+         S     R10,=A(FIRSTQEL)    GET DISPLACEMENT
+SUBQ     STH   R10,8(R9)           ENQUEUE NEW ELEMENT
+         ST    R2,4(R5)           NEW LAST ELEMENT
+         LH    R9,10(R5)
+         LA    R9,1(R9)            INCREASE NO. ON QUEUE
+         STH   R9,10(R5)
+         BR    R11
+*                             *
+*   END OF COMMON ROUTINE     *
+*                             *
+         EJECT
+*  THIS IS THE ENQUEUEING ROUTINE
+ENQRTN   EQU   *
+         LA    R3,REQQCB           R3 POINTS TO START OF REQUEST Q
+         LA    R4,FREEQCB
+         LA    R5,REQQCB
+*
+*  THE FOLLOWING LOGIC GETS THE TCB IDENTITY WHICH IS USED
+*  BY IEFACTRT AT STEP END TO PURGE ALL OUTSTANDING ENQ'S
+*
+         L     R9,16               CVT POINTER
+         L     R9,0(R9)            TCB WORDS
+         L     R9,4(R9)            CURRENT TCB
+*
+*  BUILD NEW ELEMENT
+*
+         MVC   NEWREQST,0(R6)      REQUEST
+         ST    R8,NEWECB           STORE ADDRESS OF ECB
+         MVC   NEWTCBID,112(R9)    TCB IDENTITY
+ENQFIND  EQU   *
+         CLC   0(4,R3),0(R6)       IS THE REQUEST ALREADY QUEUED
+         BE    ENQFOUND            YES
+         CLC   8(2,R3),FFFF        END OF QUEUE
+         BE    NOTFOUND            YES SO REQUEST NOT PREVIOUSLY ENQ'D
+         LH    R3,8(R3)            NO GET DISPLACEMENT OF NEXT IN Q
+         A     R3,=A(FIRSTQEL)     ADD ADDRESS OF START
+         B     ENQFIND             TRY AGAIN
+         EJECT
+*
+*  THE REQUEST HAS ALREADY BEEN ENQ'D AND SO A SUBQUEUE MUST BE SET UP
+*
+ENQFOUND EQU   *
+         MVI   0(R8),X'00'          CLEAR ECB READY FOR USER'S WAIT
+         CLC   10(2,R3),FFFE       IS THERE ALREADY A SUBQUEUE
+         BNL   NOSUBQ              NO
+         LH    R3,10(R3)           YES SO GO ALONG...
+         A     R3,=A(FIRSTQEL)     ...THE ECB SUBQUEUE
+         B     ENQFOUND
+NOSUBQ   EQU   *
+         CLI   FREEQCB+11,X'00'       ANY FREE ELEMENTS
+         BNE   *+8                 YES
+         BAL   R8,GETMORE          NO SO ISSUE A GETMAIN
+         MVC   10(2,R3),FREEQCB+8  PUT INTO SUBQUEUE
+         MVI   NEWELMT+11,X'FF'   MAKE NEW ONE LAST ON SUBQUEUE
+         LA    R7,NEWELMT
+         LH    R2,FREEQCB+8        DISPLACEMENT OF FIRST ELEMENT
+         A     R2,=A(FIRSTQEL)     START OF TABLE
+         B     PRECOMON           ENQUEUE IT
+         EJECT
+*
+*  IF THE REQUEST HAS NO PREDECESSOR THEN IT IS JUST A STRAIGHTFORWARD
+*   ENQUEUE
+*
+NOTFOUND EQU   *
+         MVI   0(R8),X'40'          POST THE ECB COMPLETE
+         CLI   FREEQCB+11,X'00'       ANY FREE ELEMENTS
+         BNE   *+8                 YES
+         BAL   R8,GETMORE          NO GET MORE SPACE
+         LH    R2,FREEQCB+8
+         A     R2,=A(FIRSTQEL)
+         LA    R7,NEWELMT
+         B     PRECOMON
+         EJECT
+*
+* THIS ROUTINE ISSUES A GETMAIN FOR 24 BYTES (TWO QEL'S) AND PUTS
+*  THEM ON THE FREE QUEUE. ONCE ON THE QUEUE THEY REMAIN AS A
+*  PERMANENT PART OF THE ROUTINE.
+*
+GETMORE  EQU  *
+         GETMAIN R,LV=24,SP=255    GET SPACE
+*
+         LR    R2,R1               R2 POINTS TO 1ST AREA
+         LA    R7,CLEAR
+         LA    R5,FREEQCB
+         BAL   R11,HALFCOMN        PUT IT ON FREE QUEUE
+         LA    R2,12(R2)            R2 POINTS TO 2ND AREA
+         BAL   R11,HALFCOMN        PUT IT ON FREE QUEUE
+         LA    R5,REQQCB
+         BR    R8                  RETURN
+         EJECT
+*
+*  THIS IS THE PURGE ROUTINE WHICH IS USED BY IEFACTRT TO PURGE
+*   ANY OUTSTANDING ENQUEUES AT STEP END
+*
+PURGERTN EQU   *
+         LA    R4,REQQCB
+         LA    R5,FREEQCB
+         LA    R2,REQQCB
+         LA    R7,CLEAR
+         L     R6,16               CVT POINTER
+         L     R6,0(R6)            TCB WORDS
+         L     R6,4(R6)            CURRENT TCB
+         LH    R3,8(R2)           R3 POINTS TO NEXT ON QUEUE
+PURGELWP CH    R3,FFFF             ANY MORE ON THE QUEUE
+         BE    RETURNER            NO SO RETURN
+         A     R3,=A(FIRSTQEL)     ADD TO START OF TABLE
+         LR    R2,R3
+         LH    R3,8(R2)           R3 NOW POINTS TO NEXT IN QUEUE
+         CLC   4(1,R2),112(R6)     SAME TCB IDENTITY
+         BNE   PURGELWP            NO GET NEXT ONE
+         CLC   10(2,R2),FFFF      IS THERE A SUBQUEUE
+         BE    NOSUBQU            NO
+         LA    R8,REQQCB
+SUBLWP   EQU   *
+         CLC   8(2,R8),FFFF       LAST OF MAIN QUEUE?
+         BE    NOSUBQU            YES SO THERE ISN'T ANY SUBQUEUE
+         CLC   0(4,R8),0(R2)      SAME REQUEST?
+         BE    FIRSTEST             YES SO DO ALONG SUBQUEUE
+         LH    R8,8(R8)           NO SO GO ALONG ...
+         A     R8,=A(FIRSTQEL)    ... MAIN QUEUE
+         B     SUBLWP
+FIRSTEST EQU   *
+         CR    R2,R8               SAME REQUEST?
+         BE    POSTER              YES EO POST NEXT ON SUBQUEUE
+SUBQU    EQU   *
+         CLC   10(2,R8),FFFE      IS THIS REQUEST ON A SUBQUEUE?
+         BNL   NOSUBQU            NO, OR IF IT IS IT'S THE LAST ONE
+         LH    R9,10(R8)          GET NEXT ON SUBQ
+         A     R9,=A(FIRSTQEL)    ADD START OF Q
+         CR    R9,R2              DOES THIS ONE POINT TO THE 'PURGAND'
+         BE    DESUBQ             YES SO TAKE IT OFF THE SUBQUEUE
+         LR    R8,R9              NO SO POINT R8 TO THE NEXT ...
+         B     SUBQU              ... AND TRY AGAIN
+DESUBQ   EQU   *
+         MVC   10(2,R8),10(R2)    TAKE IT OFF THE SUBQUEUE
+POSTER   EQU   *
+         CLC   10(2,R2),FFFE        ANY REQUEST BELOW IT ON SUBQ?
+         BE    NOSUBQU              NO SO NO NEED TO POST IT
+         LH    R9,10(R2)            R9 = DISPLACEMENT OF NEXET ON SUBQ
+         A     R9,=A(FIRSTQEL)      ADD TO START OF QUEUE
+         XC    4(1,R9),4(R9)      CLEAR FIRST BYTE
+         L    R9,4(R9)              R9 POINTS TO ECB
+         POST  (R9)
+NOSUBQU  EQU   *
+         LA    R11,PURGELWP        COME BACK TO PURGELWP
+         B     COMMON              DEQUEUE IT
+         EJECT
+POSTE    EQU   *
+         POST  (R8)
+RETURNER EQU   *
+         MVC   0(12,R7),CLEAR
+         BR    R14
+         SPACE
+ABENDQ   EQU   *
+         ABEND 530,DUMP
+         EJECT
+* QUEUE CONTROL BLOCK FOR THE REQUEST QUEUE
+         DS    0F
+REQQCB   DC    4X'00'
+         DC    X'FF'              DUMMY TCB IDENTITY
+         DC    AL3(REQQCB)  NO ELEMENTS
+         DC    X'FFFF'
+         DC    Y(0)
+         SPACE
+* QUEUE CONTROL BLOCK FOR THE FREE QUEUE
+FREEQCB  DC    4X'00'
+         DC    X'FF'              DUMMY TCB IDENTITY
+         DC    AL3(LASTQEL)
+FIRSTADD DC    AL2(0)
+         DC    Y(30)
+         EJECT
+*
+* FREE QUEUE AS ORIGINALLY SET UP
+*
+         CNOP  0,4
+FIRSTQEL DC    4C' '               1
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               2
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               3
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               4
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               5
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               6
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               7
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               8
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               9
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               10
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               11
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               12
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               13
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               14
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               15
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               16
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               17
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               18
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               19
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               20
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               21
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               22
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               23
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               24
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               25
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               26
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               27
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               28
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+         DC    4C' '               29
+         DC    A(0)
+         DC    AL2(*-FIRSTADD)
+         DC    X'FFFF'
+LASTQEL  DC    4C' '               30
+         DC    A(0)
+         DC    X'FFFF'
+         DC    X'FFFF'
+         EJECT
+* MISCELLANEOUS WORK FIELDS AND CONSTANTS
+CLEAR    DS    0CL12
+         DC    4X'00'
+         DC    X'FF'
+         DC    3X'00'
+FFFF     DC    X'FFFF'
+FFFE     DC    X'FFFE'
+NEWELMT  DS    0CL12
+NEWREQST DS    CL4
+NEWTCBID DS    CL1
+         ORG   NEWTCBID
+NEWECB   DS    CL4
+         DC    X'FFFFFFFE'
+         LTORG
+         END

@@ -1,0 +1,1176 @@
+*          DATA SET MAPDISK0   AT LEVEL 004 AS OF 04/19/83
+*          DATA SET MAPDISK0   AT LEVEL 002 AS OF 05/24/78
+*          DATA SET FASTMAP0   AT LEVEL 001 AS OF 11/09/77
+FAST TITLE '                 FASTMAP0 -- FASTDISK'
+* FASTMAP IS A HIGH PERFORMANCE DASD ALLOCATION MAPPING PROGRAM
+*
+* FASTDISK IS THE MAIN ROUTINE (AND EP) FOR FASTMAP.  THE
+* COMPONENT ROUTINES FOR FASTMAP ARE:
+*        FASTDISK - MAIN ROUTINE & VTOC READ; CONTAINS THE DCB
+*                   & OTHER I/O CONTROL BLKS FOR PDS & VTOC READING
+*        FORMAT   - FORMATS & OUTPUTS LISTING
+*        PDSREAD  - DETERMINES PDS DIR BLK ALLOCATION
+*        SORTIT   - SORTS THE DSCB INTO COLLATING SEQ.
+*        ZTIME    - COMPUTES CURRENT TIME & DATE FOR LISTING
+*        PRNT     - HANDLES SYSPRINT FORMATTING & I/O
+*
+* FASTDISK, F.G.ROSS, 1/10/73
+*
+* FASTMAP0, GENE CZARCINSKI, 06SEP73
+*           GENE CZARCINSKI, 20MAY74, TSO SUPPORT.
+*           KEN TRUE  2 MAY 77..LOGGING SUPPORT  (FCI)
+*                    14 FEB 78..MSS DYNAMIC ALLOCATION SUPPORT (FCI)
+*
+* SUPPORTS: 2301,2302,2303,2311,2314,2321   (FCI 3330,3330-1,3350)
+*
+* MODS- KEN TRUE - INTEL- 15MAR83 - ADDED 3380 AND UCB LOOKUP FIX INTEL
+*       KEN TRUE - INTEL- 19APR83 - CHGD #SIZE TO 256K, 584K FOR 3380S
+*
+* NOTE -
+*   1. THE SPECIAL SVC (&SVC ASSEMBLY PARAM) IS USED TO MODIFY SQS
+*      (PROTECTED CORE).  IT MUST LOAD R0-R14 AND EXECUTE THE
+*      INSTRUCTION POINTED TO BY R15.  IT IS USED BY FASTMAP TO
+*      CHANGE UCB POINTERS IN THE TIOT AND BY PDSREAD TO CHANGE
+*      DASD EXTENTS IN THE DEB.
+*   2. THE '&OPENMOD' ASSEMBLY PARAM IN FORMAT AND PRNT IS USED
+*      TO INCLUDE/EXCLUDE GSFC LOCAL CODE FOR FORMATTING AND
+*      OUTPUTTING SPECIAL 'USE INFO'.
+*   3. THE EXEC PARMS SUPPORTED ARE:
+*          PDS/NOPDS (DEFAULT NOPDS) FOR PDS DIRECTORY BLK CNT
+*          EXT/NOEXT (DEFAULT NOEXT) FOR LISTING OF EXTENTS WITH DS.
+*          DUMP (DEFAULT NODUMP) FOR A ABEND 1,DUMP AT END OF EXEC
+*          LOG/NOLOG (DEFAULT NOLOG) FOR LOGGING TO DSNLOG DD    LOGMOD
+*          MSS/NOMSS (DEFAULT NOMSS) DYNAM ALLOC MSSVOLS         MSSMOD
+*   4. IF DYNAMIC DD CODE IS INCLUDED (&SVC), THE DEVICES/VOLUMES
+*      TO BE PROCESSED CAN BE SPECIFIED IN THE PARM -
+*      (DISK,DRUM,CELL,2301,2302,2303,2311,2314,2321)  OR
+*      'ALL' MAY BE SPECIFIED TO MAP ALL OF THE ABOVE DEVICES
+*      (ANY ONLINE).  SPECIFIC VOLUMES MAY BE SPECIFIED BY USING
+*      SER=(AA,BB) WHERE "AA" AND "BB" ARE 1-6 CHAR VOLUME SERIAL
+*      NUMBERS.  UPTO 12 CAN BE SPECIFIED PER EXECUTION.  IF ONLY
+*      ONE IS SPECIFIED, THE PARENS CAN BE OMITTED.
+*   5. FEATURES AND DIFFERENCE WITH PREVIOUS MAPDISKS -
+*          F1-F6 DSCBS PROCESSED
+*          SHARED/SPLIT SPACE REPORTED
+*          PDS BLK COUNT HANDLED UP TO 32K
+*          2321 PROCESSING HANDLED
+*          RECFM=VBA FOR PRINTED OUTPUT
+*          VARIABLE DYNAMIC CORE USED FOR WORKAREAS
+*          WTO/WTP MSGS ISSUED FOR CORE MANAGEMENT ERRORS
+*   6. TO REDUCE REGION REQUIRED FOR RUNNING, BUFNO=1 CAN BE USED
+*      FOR SYSPRINT BUT IT DOES DEGRADE PERFORMANCE.
+*   7. IF THE VOLUMES TO BE MAPPED ARE SPECIFIED IN THE EXEC PARM,
+*      THEN A SYSUT1 DD STATEMENT IS REQUIRED.  IT MAY POINT AT
+*      ANY DEVICE BUT A GOOD ONE TO USE IS:
+*        //SYSUT1 DD DISP=SHR,VOL=REF=SYS1.SVCLIB
+*   8. THE STANDARD WAY (AND IF &SVC IS NOT USED, THE ONLY WAY)
+*      TO SPECIFY THE VOLUMES TO BE MAPPED IS TO INCLUDE A DD STMT
+*      POINTING AT EACH VOLUME TO BE PROCESSED.  IF ANY DYNAMIC DD
+*      PARMS ARE SPECIFIED, THEN DD STATEMENTS ARE IGNORED.  OTHERWISE,
+*      A MAP IS GENERATED FOR EACH DD.  DUMMY DDS AND CERTAIN DDNAMES
+*   9. THE PARMS NOSCR/SCR HAVE BEEN ADDED TO INHIBIT OR ALLOW
+*      (RESPECTIVELY) MAPPING OF VOLUMES WITH THE 'STORAGE' ATTRIBUTE
+*      (AS OPPSOE TO PRIVATE OR PUBLIC).  THIS PARM IS ONLY VALID
+*      IF THE DYNAMIC DD PROCESSING IS IN EFFECT ... SER= WILL
+*      OVERRIDE THE EFFECT OF THIS PARM IN ALLOWING MAPPING.
+*  10. IF FASTMAP IS RUN IN THE TSO FOREGROUND, ONLY THE DASD
+*      VOLUME POINTED TO BY 'SYSUT1' WILL BE MAPPED.  THIS
+*      OVERRIDES ALL OTHER PARMS OR CONDITIONS.  THE DATACELL
+*      (2321) IS NOT SUPPORTED IN THE FOREGROUND.
+ EJECT
+         MACRO
+&N       PRNT  &A,&OP=,&LEN=0
+&N       LA    R1,&A                   LINE ADDRESS
+         LA    R0,&OP                  OPERATION CODE
+         L     R15,=V(PRNT)
+         BALR  R14,R15
+         DC    YL1(&LEN,0)             LINE LENGTH
+         MEND
+         MACRO
+&L       DMSG  &A,&B
+&L       TM    DEVSW,&A
+         BZ    *+14
+         MVC   0(5,R1),=C&B
+         LA    R1,5(R1)
+         MEND
+          MACRO
+&NAME     SUPVR &BASE=10
+&NAME     BALR  &BASE,0
+          USING *,&BASE
+          STM   13,1,SAVETWO SAVE REGS
+*         MODESET KEY=ZERO
+          MODESET KEY=ZERO
+          SPACE 1
+          LM    13,1,SAVETWO   RESTORE REGS
+          BALR  13,1  GO TO SUPER CODE
+          SPACE 1
+*         MODESET KEY=NZERO
+          MODESET KEY=NZERO
+          LM    13,1,SAVETWO  RESTORE REGS
+          BR    14    RETURN
+          SPACE 1
+          DS     0F
+SAVETWO   DC    5F'0'
+          DROP  &BASE
+          MEND
+         LCLA  &SVC
+         LCLB  &EXT,&PDS,&SCR
+         LCLC  &LOGMOD,&MSSMOD
+&SVC     SETA  0   FCI       SVC #;  IF ZERO, DYNAMIC DD CODE OMITTED
+&PDS     SETB  1   FCI                 DEFAULT FOR PROCESS PDS
+&EXT     SETB  1   FCI                 DEFAULT TO LIST EXTENTS
+&SCR     SETB  0                       DEFAULT--NO STORAGE VOLS
+&LOGMOD  SETC  'Y'           ='Y' IF LOG DESIRED..'N' IF NOT
+&MSSMOD  SETC  'Y'           ='Y' IF MSS ALLOC DESIRED           MSSMOD
+ EJECT
+FASTMAP0 START 0
+         ENTRY FASTDISK
+*
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11            SECONDARY PGM (DATA) BASE REGISTER
+R12      EQU   12            PGM BASE REGISTER
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+T2301    EQU   B'10000000'
+T2302    EQU   B'01000000'
+T2303    EQU   B'00100000'
+T2311    EQU   B'00010000'
+T2314    EQU   B'00001000'
+T2321    EQU   B'00000100'
+TSCR     EQU   B'00000010'
+TSER     EQU   B'00000001'
+DOLOG    EQU   B'10000000'             LOG                     LOGMOD
+DOMSS    EQU   B'01000000'             MSS ALLOC MODE  RQED    MSSMOD
+PROCMSS  EQU   B'00100000'             MSS MODE IN PROGRESS    MSSMOD
+ITS2321  EQU   B'00010000'             2321
+DODEBUG  EQU   B'00001000'             DEBUG
+DOEXTS   EQU   B'00000100'             EXT
+DODUMP   EQU   B'00000010'             DUMP
+DOPDS    EQU   B'00000001'             PDS
+ EJECT
+FASTDISK SAVE  (14,12),,*
+         LR    R12,R15                 INIT BASE REG
+         USING FASTDISK,R12
+         LA    R15,SAVEAREA            INIT SAVE AREA
+         ST    R13,4(R15)
+         ST    R15,8(R13)
+         LR    R13,R15
+         LA    R11,TEMP                INIT SECONDARY BASE REG
+         USING TEMP,R11
+* PROCESS THE EXEC PARM
+         L     R1,0(R1)
+         LH    R15,0(R1)
+         LTR   R2,R15
+         BNP   PEND
+         LA    R15,2(R1,R15)
+         LA    R1,2(R1)
+         BCTR  R2,0                    FOR THE 'EX' INSTR.
+         L     R3,=A(TRTBL)
+         EX    R2,*+8
+         B     *+10
+         TR    0(0,R1),0(R3)
+PLOOP    CR    R1,R15                  END OF STRING?
+         BNL   PEND                    YES...DONE
+         CLI   0(R1),C','              COMMA
+         BNE   *+12                    NO
+         LA    R1,1(R1)                SKIP COMMA
+         B     PLOOP
+         CLC   =C'PDS',0(R1)
+         BE    P01A
+         CLC   =C'NOPDS',0(R1)
+         BE    P01B
+         CLC   0(4,R1),=C'DUMP,'
+         BE    P02
+         CLC   0(5,R1),=C'DEBUG,'
+         BE    P02A
+         AIF   ('&LOGMOD' NE 'Y').FSKP1                          LOGMOD
+         CLC   0(3,R1),=C'LOG,'                                  LOGMOD
+         BE    FP02A
+         CLC   0(5,R1),=C'NOLOG,'                                LOGMOD
+         BE    FP02B
+.FSKP1   ANOP
+         AIF   ('&MSSMOD' NE 'Y').MSKP1
+         CLC   0(3,R1),=C'MSS,'                                  MSSMOD
+         BE    FP02C                                             MSSMOD
+         CLC   0(5,R1),=C'NOMSS,'                                MSSMOD
+         BE    FP02D                                             MSSMOD
+.MSKP1   ANOP
+         AIF   (&SVC EQ 0).SKIP1
+         CLC   0(4,R1),=C'2301,'
+         BE    P03A
+         CLC   0(4,R1),=C'2302,'
+         BE    P03B
+         CLC   0(4,R1),=C'2303,'
+         BE    P03C
+         CLC   0(4,R1),=C'2311,'
+         BE    P03D
+         CLC   0(4,R1),=C'2314,'
+         BE    P03E
+         CLC   0(4,R1),=C'2321,'
+         BE    P03F
+         CLC   =C'DRUM',0(R1)
+         BE    P03G
+         CLC   =C'DISK',0(R1)
+         BE    P03H
+         CLC   =C'CELL',0(R1)
+         BE    P03F
+         CLC   =C'ALL',0(R1)
+         BE    P03I
+         CLC   0(3,R1),=C'SCR,'
+         BE    P03J
+         CLC   0(5,R1),=C'NOSCR,'
+         BE    P03K
+         CLC   =C'SER=',0(R1)
+         BE    P04
+.SKIP1   ANOP
+         CLC   0(3,R1),=C'EXT,'
+         BE    P05A
+         CLC   0(5,R1),=C'NOEXT,'
+         BE    P05B
+         B     PEND
+P01A     OI    SW,DOPDS                SET TO PROCESS PDS
+P00A     LA    R1,3(R1)
+         B     PLOOP
+P01B     NI    SW,255-DOPDS            SET TO NOT PROCESS PDS
+P00B     LA    R1,5(R1)
+         B     PLOOP
+P02      OI    SW,DODUMP               SET FOR DUMP.
+         LA    R1,4(R1)
+         B     PLOOP
+P02A     OI    SW,DODEBUG              SET FOR DEBUG.
+         LA    R1,5(R1)
+         B     PLOOP
+         AIF   ('&LOGMOD' NE 'Y').FSKP2
+FP02A    OI    SW,DOLOG                SET FOR LOGGING MODE      LOGMOD
+         LA    R1,3(R1)                                          LOGMOD
+         B     PLOOP                                             LOGMOD
+FP02B    NI    SW,255-DOLOG            SET FOR NO LOGGING        LOGMOD
+         LA    R1,3(R1)                                          LOGMOD
+         B     PLOOP                                             LOGMOD
+.FSKP2   ANOP
+         AIF   ('&MSSMOD' NE 'Y').MSKP2
+FP02C    OI    SW,DOMSS                SET FOR MSS ALLOC MODE    MSSMOD
+         LA    R1,3(R1)                                          MSSMOD
+         B     PLOOP                                             MSSMOD
+FP02D    NI    SW,255-DOMSS            SET FOR NO MSS ALLOC      MSSMOD
+         LA    R1,3(R1)                                          MSSMOD
+         B     PLOOP                                             MSSMOD
+.MSKP2   ANOP
+         AIF   (&SVC EQ 0).SKIP2
+P03      LA    R1,4(R1)
+         B     PLOOP
+P03A     OI    DEVSW,T2301
+         B     P03
+P03B     OI    DEVSW,T2302
+         B     P03
+P03C     OI    DEVSW,T2303
+         B     P03
+P03D     OI    DEVSW,T2311
+         B     P03
+P03E     OI    DEVSW,T2314
+         B     P03
+P03F     OI    DEVSW,T2321
+         B     P03
+P03G     OI    DEVSW,T2301+T2303
+         B     P03
+P03H     OI    DEVSW,T2302+T2311+T2314
+         B     P03
+P03I     OI    DEVSW,T2301+T2302+T2303+T2311+T2314+T2321
+         LA    R1,3(R1)
+         B     PLOOP
+P03J     OI    DEVSW,TSCR              FLAG PROCESS STORAGE VOLS
+         B     P00A
+P03K     NI    DEVSW,255-TSCR          FLAG NO PROCESS STORAGE VOLS
+         B     P00B
+P04      LA    R1,4(R1)
+         OI    DEVSW,TSER
+         MVI   VOLSER,C' '             CLEAR IN CASE OF
+         MVC   VOLSER+1(71),VOLSER     DOUBLE SPECIFICATION
+         CR    R1,R15
+         BH    PEND
+         LA    R2,VOLSER
+         LA    R3,1
+         CLI   0(R1),C'('
+         BNE   *+12
+         LA    R3,12
+         LA    R1,1(R1)
+P04A     LR    R14,R1
+P04B     CR    R14,R15
+         BH    P04C
+         CLI   0(R14),C','
+         BE    P04C
+         CLI   0(R14),C')'
+         BE    P04C
+         LA    R14,1(R14)
+         B     P04B
+P04C     LR    R4,R14
+         LA    R5,5
+         SR    R4,R1
+         BNP   P04D
+         BCTR  R4,0
+         CR    R4,R5
+         BNH   *+6
+         LR    R4,R5
+         EX    R4,P04MVC
+         LA    R2,6(R2)
+P04D     LR    R1,R14
+         CR    R1,R15
+         BH    PEND
+         CLI   0(R1),C')'
+         BNE   *+12
+         LA    R1,1(R1)
+         B     PLOOP
+         LA    R1,1(R1)
+         CR    R1,R15
+         BH    PEND
+         BCT   R3,P04A
+         B     PLOOP
+P04MVC   MVC   0(0,R2),0(R1)
+.SKIP2   ANOP
+P05A     OI    SW,DOEXTS
+         B     P00A
+P05B     NI    SW,255-DOEXTS
+         B     P00B
+*
+PEND     XR    R1,R1                   CLEAR FOR PDS.
+         TM    SW,DOPDS                PDS?
+         BO    *+8                     YES.
+         LA    R1,255                  FLAG NOPDS
+         L     R15,=V(INITPRNT)        INITIALIZE THE PRNT ROUTINE
+         BALR  R14,R15
+         AIF   ('&LOGMOD' NE 'Y').SKIPL1
+         TM    SW,DOLOG                CHECK FOR LOGGING      LOGMOD
+         BNO   FNOLOG1
+         L     R15,=V(INITLOG)         LOAD ADDRESS OF INIT ROUTINE
+         BALR  R14,R15                 AND LINK TO ROUTINE TO OPEN LOG
+FNOLOG1  DS    0H
+.SKIPL1  ANOP
+* INIT DYNAMIC AREA AND PNTRS
+         GETMAIN VU,LA=#SIZE,A=#ADR
+         LM    R14,R15,#ADR            ADRS/SIZE
+         S     R15,#FREE+4             MINUS 4K FOR OS.
+         ST    R15,#ADR+4              SAVE NEW LENGTH
+         LA    R14,0(R15,R14)          A(NEW TOP)
+         ST    R14,#FREE               FOR FREEMAIN
+         ST    R14,#LIMIT              TOP OF DYNAMIC CORE
+         FREEMAIN V,A=#FREE            TO GIVE SOME BACK
+         L     R14,#ADR+4              LENGTH
+         L     R15,#ADR                A(BOTTOM)
+         ST    R15,#CCW                A(WORK AREA/CHAN PROGS)
+         LA    R15,2048(R15)           2048 BYTE WORK AREA
+         C     R14,=A(50*1024)         LARGE OR SMALL?
+         BL    *+8                     SMALL--USE 2048
+         LA    R15,2048(R15)           LARGE--USE 4096
+         ST    R15,#AREA               A(TOP WORK/BOTTOM DSCB)
+         ST    R15,DVTOC+12            FOR THE OBTAIN
+         ST    R15,#COREMAX            INIT FOR MAX USED
+         TM    SW,DODEBUG+DODUMP       DUMP OR DEBUG?
+         BZ    NOCLEAR                 NO...DO NOT CLEAR CORE
+         L     R14,#ADR                YES, CLEAR CORE
+         L     R15,#ADR
+         LA    R15,256(R15)
+CLRCORE  C     R15,#LIMIT              DONE?
+         BNL   NOCLEAR                 YES.
+         XC    0(256,R14),0(R14)
+         LR    R14,R15
+         LA    R15,256(R15)
+         B     CLRCORE
+* FIND ADDR OF TIOT
+NOCLEAR  L     R1,16                   A(CVT)
+         MVC   ALOOKUP,40(R1)          SAVE A(UCB LOOKUP TABLE)
+         L     R1,0(R1)                A(NEW/OLD BOX)
+         L     R1,4(R1)                A(MY TCB)
+         TM    148(R1),X'80'           IS IT TSO FOREGRND?
+         BO    TSOA1                   YES.
+         L     R1,12(R1)               A(TIOT)
+         LA    R1,24(R1)               SKIP OVER JOBNAMES
+         AIF   (&SVC EQ 0).SKIP3
+         TM    DEVSW,T2301+T2302+T2303+T2311+T2314+T2321
+         BNZ   *+8                     ONE OR MORE DEVICES WERE SPEC.
+         NI    DEVSW,255-TSCR          NO DEV SPEC., FORCE SCR OFF
+         TM    DEVSW,X'FF'
+         BZ    REDO
+         XR    R15,R15                 CLEAR WORK REG
+INITA1   CLC   HOOOS,0(R1)             END OF TIOT?
+         BE    UERROR                  YES ??
+         IC    R15,0(R1)               GET LENGTH OF ENTRY
+         CLC   CSYSUT1,4(R1)           OUR DYNAMIC DD?
+         BE    INITA2                  YES..WE FOUND IT.
+         AR    R1,R15                  NO..KEEP LOOKING
+         B     INITA1
+INITA2   LA    R1,4(R1)
+         LH    R15,14(R1)
+         LTR   R15,R15
+         BZ    UERROR                  SYSUT1 IS DUMMY
+         ST    R1,TIOTSAV              SAVE A(OUR DD ENTRY)
+         MVC   DCB+40(8),CSYSUT1       INIT DDNAME
+.SKIP3   ANOP
+         B     REDO
+*
+*
+TSOA1    MVI   TSO,255
+         MVI   DEVSW,0
+         NI    SW,255-DOPDS     NOPDS IF TSO.
+         L     R1,12(0,R1)      A(TIOT)
+         LA    R1,24(0,R1)      SKIP OVER JOBNAMES.
+         XR    R15,R15
+TSOA2    CLC   HOOOS,0(R1)
+         BE    UERROR
+         IC    R15,0(0,R1)
+         CLC   CSYSUT1,4(R1)
+         BE    TSOA3
+         AR    R1,R15
+         B     TSOA2
+TSOA3    LA    R1,4(0,R1)
+         SR    R15,R15          CLEAR FOR ICM                     INTEL
+         ICM   R15,B'0011',14(R1)   GET UCB ADDRESS               INTEL
+         LTR   R15,R15
+         BZ    UERROR
+         STCM  R15,B'0011',AUCB                                   INTEL
+         ST    R1,TIOTSAV
+         MVC   DCB+40(8),CSYSUT1
+         NI    SW,255-ITS2321
+         CLI   2(R15),X'FF'     IS THIS A UCB?
+         BNE   UERROR             NO.
+         CLI   18(R15),X'20'      IS IT DASD?
+         BNE   UERROR             NO.
+         CLI   19(R15),X'05'      IS IT A 2321?
+         BE    UERROR             YES.
+         MVC   TEMP(2),36(R15)    SAVE TT OF VTOC.
+         MVC   VOL,28(R15)
+         B     OBTAIN
+ EJECT
+REDO     NI    SW,255-ITS2321          CLEAR SWITCHES FOR RUN
+         AIF   (&SVC EQ 0).SKIP4
+         TM    DEVSW,X'FF'
+         BZ    LOOPTIOT
+         L     R15,ALOOKUP             A(LOOKUP TABLE)
+         SR    R14,R14                                            INTEL
+         ICM   R14,B'0011',AUCB+2      GET UCB ADDRESS            INTEL
+         LTR   R14,R14                 FIRST TIME?
+         BZ    UT01A                   YES.
+         CLI   19(R14),X'05'           NO, OLD=2321?
+         BNE   UT01                    NO.
+UT00     SR    R1,R1                   YES, UPDATE FOR SUBUCB     INTEL
+         ICM   R1,B'0011',AUCB                                    INTEL
+         CLI   1(R1),9                 DONE?
+         BE    UT01                    YES.
+         LA    R1,16(R1)               NO, BUMP TO NEXT.
+UT00A    STCM  R1,B'0011',AUCB                                    INTEL
+         TM    3(R1),X'80'             ONLINE?
+         BZ    UT00                    NO.
+         TM    3(R1),X'C0'             PENDING OFFLINE?
+         BO    UT00                    YES, SKIP.
+         TM    DEVSW,T2321
+         BO    UT00X
+         TM    DEVSW,TSER
+         BZ    UT00
+         LA    R2,12
+         LA    R3,VOLSER
+UT00B    CLI   0(R3),C' '
+         BE    *+14
+         CLC   0(6,R3),4(R1)
+         BE    UT00X
+         LA    R3,6(R3)
+         BCT   R2,UT00B
+         B     UT00
+UT00X    OI    SW,ITS2321              FLAG 2321 TO BE PROCESSED
+         B     UT03
+UT01     LA    R15,2(R15)              NEXT ENTRY IN TABLE.
+UT01A    SR    R14,R14                                            INTEL
+         ICM   R14,B'0011',0(R15)      A(UCB)                     INTEL
+         LTR   R14,R14                 CHECK TYPE.
+         BZ    UT01                    DUMMY
+         CLC   =X'FFFF',0(R15)         END OF UCBTAB              INTEL
+         BE    ALDON                   FINISHED.                  INTEL
+         CLI   18(R14),X'20'           DASD?
+         BNE   UT01                    NO.
+         CH    R14,AUCB                IF LOW...2 CH SWITCH
+         BNH   UT01
+         TM    3(R14),X'80'            ONLINE?
+         BZ    UT01                    NO.
+         TM    3(R14),X'C0'            PENDING OFFLINE?
+         BO    UT01                    YES
+         XR    R1,R1                   CHECK IF THIS TYPE PROCESSED
+         IC    R1,19(R14)
+         IC    R0,DEVSW2(R1)
+         STC   R0,*+5
+         TM    DEVSW,0
+         BO    UT02                    YES-PROCESS
+         TM    DEVSW,TSER
+         BZ    UT01
+         CLI   19(R14),X'05'           2321?
+         BNE   UT01C                   NO.
+         LA    R1,56(R14)
+         MVC   UNIT,13(R14)
+         B     UT00A
+UT01C    LA    R2,12
+         LA    R3,VOLSER
+UT01D    CLI   0(R3),C' '
+         BE    *+14
+         CLC   0(6,R3),28(R14)
+         BE    UT01E
+         LA    R3,6(R3)
+         BCT   R2,UT01D
+         B     UT01
+UT01E    MVI   0(R3),C' '
+         B     UT02B
+UT02     CLI   19(R14),X'05'           2321?
+         BE    UT02B                   YES.
+         TM    DEVSW,TSCR              NO, CHECK IF STORAGE?
+         BO    UT02B                   PROCESS STORAGE.
+         TM    34(R14),X'04'           IS THIS A STORAGE VOL?
+         BO    UT01C                   YES, TRY FOR 'SER=' PROC.
+UT02B    ST    R15,ALOOKUP
+         STCM  R14,B'0011',AUCB                                   INTEL
+         STCM  R14,B'0011',AUCB+2                                 INTEL
+         CLI   19(R14),X'05'           2321?
+         BNE   UT03                    NO.
+         LA    R1,56(R14)
+         STCM  R1,B'0011',AUCB                                    INTEL
+         MVC   UNIT,13(R14)
+         TM    3(R1),X'80'             BIN ONLINE?
+         BZ    UT00                    NO.
+         TM    3(R1),X'C0'             PENDING OFFLINE?
+         BO    UT00                    YES.
+         OI    SW,ITS2321              YES, PROCESS
+UT03      LA     R1,$DOIT
+          BAL    R14,SUPER
+          B      $OVER
+$DOIT     L     R2,TIOTSAV
+         LA    R2,14(R2)               A(SPACE FOR A(UCB) IN TIOT)
+         LA    R3,AUCB
+$MVC     MVC   0(2,R2),0(R3)           **MOVE A(UCB) TO TIOT**
+          BR     R13
+$OVER    SR    R4,R4                                              INTEL
+         ICM   R4,B'0011',AUCB                                    INTEL
+         TM    SW,ITS2321              2321?
+         BZ    START2                  NO, REG DASD
+         LR    R14,R4                  YES, 2321
+         B     START3
+.SKIP4   ANOP
+*
+LOOPTIOT LA    R5,DDTABLE              A(LIST OF SKIP DDNAMES)
+         CLC   HOOOS,0(R1)             END OF TIOT?
+         BE    ALDON
+         XR    R9,R9                   GET LENGTH OF THIS ENTRY
+         IC    R9,0(R1)                LENGTH OF THIS ENTRY
+DDCHK    CLC   4(8,R1),0(R5)
+         BE    INCR                    THIS IS A SKIP DDNAME
+          CLC    4(4,R1),SYSCTLG   BYPASS MVS SYSCTLG ENTRY
+          BE     INCR              BR IF YES
+         LA    R5,8(R5)                BUMP TO NEXT SKIP-NAME
+         CLI   0(R5),0                 END OF EXCLUDE DDS YET?
+         BE    START
+         B     DDCHK
+INCR     AR    R1,R9                   A(NEXT ENTRY)
+         B     LOOPTIOT
+*
+START    MVC   DCB+40(8),4(R1)         MOVE DDNAME TO DCB
+         LA    R3,4(R1)                SAVE A(TIOT)
+         ST    R3,TIOTSAV
+         SR    R4,R4                                              INTEL
+         ICM   R4,B'0011',18(R1)       A(UCB)                     INTEL
+         LTR   R4,R4                   DUMMY DD?
+         BZ    SKIPIT                  YES, IGNORE IT.
+         STCM  R4,B'0011',AUCB         SAVE IT.                   INTEL
+* SCAN UCBS TO DETERMINE IF THIS IS A 2321
+         L     R15,ALOOKUP
+CHKUCB   SR    R14,R14                 A(UCB)                     INTEL
+         ICM   R14,B'0011',0(R15)      A(UCB)                     INTEL
+         LTR   R14,R14
+         BZ    CHKUCBC                 DUMMY ENTRY
+         BM    SKIPIT                  ENTRY NOT FOUND ???
+         CLI   18(R14),X'20'           DASD?
+         BE    *+10                    YES, CONTINUE
+         CR    R14,R4                  IS THIS OURS?
+         BE    SKIPIT                  YES, THEN IGNORE IT.
+         CLI   19(R14),X'05'           2321?
+         BNE   CHKUCBD                 NO, CONTINUE
+         MVC   UNIT,13(R14)            SAVE UNIT 'NAME'
+         LA    R14,56(R14)             YES, SCAN SUB UCBS
+         LA    R1,10
+CHKUCBA  CR    R4,R14                  OURS?
+         BNE   CHKUCBB                 NO.
+         TM    3(R14),X'80'            ONLINE?
+         BZ    SKIPIT                  NO, SKIP
+         OI    SW,ITS2321              YES, PROCESS IT.
+START3   MVC   TEMP(2),12(R14)         SAVE (TT OF VTOC)
+         MVC   VOL,4(R14)
+         B     OBTAIN
+CHKUCBB  LA    R14,16(R14)             CONTINUE SCAN OF SUB UCBS
+         BCT   R1,CHKUCBA
+CHKUCBC  LA    R15,2(R15)              BUMP LOOKUP TBL
+         B     CHKUCB                  LOOP
+CHKUCBD  CR    R4,R14                  OUR DASD (NOT 2321)?
+         BNE   CHKUCBC                 NO, LOOP
+START2   MVC   TEMP(2),24(R4)          SAVE (TT ADRS OF VTOC)
+         MVC   VOL,28(R4)              MOVE IN VOL-SER
+OBTAIN   OBTAIN DVTOC
+          LTR   R15,R15   GOOD RETURN
+          BZ    OBTOK     BR IF YES
+          DC    H'0'
+OBTOK      DS    0H
+* CREATE JFCB...DON'T NEED ONE FROM THE JOB QUEUE
+         XC    JFCBA(176),JFCBA
+         MVC   JFCBA(44),DSN
+         MVC   JFCBA+118(6),VOL
+         OI    JFCBA+52,X'08'           SET SO NO RETURN
+         OPEN  (DCB,INPUT),TYPE=J
+         TM    DCB+48,X'10'            OPEN SUCCESSFUL?
+         BO    OPENOK                  OPEN OK.
+UERROR   PRNT  MSG4,OP=28,LEN=MSG4L
+         WTO   'FASTMAP - UTILITY FILE OPEN ERROR ***',                +
+               ROUTCDE=11,DESC=7
+         B     ABORT
+ EJECT
+* SET UP DEVICE CHARACTERISTIC FOR RUN
+*        (USE INFO & FORMAT 4 DSCB 'OBTAIN'ED)
+OPENOK   XC    BB,BB                   CLEAR THE BIN NO.
+         L     R15,DVTOC+12            A(INPUT AREA)
+         MVC   END,1(R15)              SAVE ADRS OF LAST FORMAT 1
+         CLC   END,56(R15)             START OF F6
+         BH    *+10
+         MVC   END,56(R15)
+         MVC   TRKS,20(R15)            TRKS/CYL
+         TM    SW,ITS2321              2321?
+         BO    NO2301                  YES, THEN NOT 2301
+         SR    R1,R1                                              INTEL
+         ICM   R1,B'0011',AUCB         GET A(UCB)                 INTEL
+         CLI   19(R1),X'02'            IS IT A 2301?
+         BNE   NO2301
+         MVI   TRKS+1,200              200 TRKS/CYL ON 2301
+NO2301   MVC   PDS,31(R15)             DIRECTORY BLKS/TRK
+         MVC   DSCB+1(1),30(R15)       DSCBS/TRK
+         TM    SW,ITS2321              2321?
+         BZ    NO2321                  NO
+         SR    R1,R1                                              INTEL
+         ICM   R1,B'0011',AUCB         YES, INIT AND GET CCHH VTOCINTEL
+         MVC   BB,0(R1)
+         LH    R5,TEMP                 TT OF VTOC
+         XR    R4,R4
+         LA    R6,1000                 TRACKS/SUBCELL
+         DR    R4,R6
+         STC   R5,CC                   SUBCELL
+         LR    R5,R4
+         XR    R4,R4
+         LA    R6,100                  TRACKS/STRIP
+         DR    R4,R6
+         STC   R5,CC+1                 STRIP
+         LR    R5,R4
+         XR    R4,R4
+         LA    R6,20                   TRACKS/CYL
+         DR    R4,R6
+         STC   R5,HH                   CYL
+         STC   R4,HH+1                 TRK
+         B     READVTOC
+NO2321   LH    R5,TEMP                 TRK START OF VTOC
+         XR    R4,R4                   SETUP TO FIND CYL ADDR
+         LH    R6,TRKS                 GET NO. OF CC & HH FOR VTOC
+         DR    R4,R6                   TO GET THE CCHH
+         STH   R4,HH                   TRK ADDRESS
+         STH   R5,CC                   CYL ADDRESS
+* CCHHR IS THE START OF THE VTOC
+* END IS THE LAST FORMAT ONE (ACTIVE) DSCB IN THE VTOC
+ EJECT
+* BUILD AND EXECUTE A CHANNEL PROGRAM TO READ IN THE VTOC
+*        (ONE TRACK AT A TIME)
+READVTOC XC    MBB(8),MBB              CLEAR THE MBBCCHHR IN THE IOB
+         L     R4,#AREA                INPUT AREA
+         USING AREASECT,R4
+         L     R3,#CCW                 CHANNEL PGM AREA
+         ST    R3,IOB+16
+         XR    R6,R6                   INIT FOR CHAINING CORE BLKS
+         MVC   0(16,R3),CCWSHA         SEARCH (SHA & TIC)
+         LA    R15,MBB+3
+         ST    R15,0(R3)
+         MVI   0(R3),@SHA
+         ST    R3,8(R3)
+         MVI   8(R3),@TIC
+*
+EXCPLOOP L     R3,#CCW
+         LA    R3,16(R3)               START OF READ CCWS
+         MVC   MBB+1(6),BB             INIT THE IOB FOR THIS TRACK
+         LA    R10,1                   SET 'R' TO 1
+         LR    R5,R4                   SAVE FOR CCHH SCAN
+*
+CCWLOOP  MVC   0(8,R3),CCWKD           BUILD THE READ CCW
+         C     R4,#LIMIT
+         BL    CCWLOOP1
+         MVC   MSG5+3(6),=CL6'DSCB'
+         PRNT  MSG5,OP=28,LEN=MSG5L
+         B     ABORT
+CCWLOOP1 LA    R15,DATAA               A(DSCB INPUT AREA)
+         ST    R15,0(R3)
+         MVI   0(R3),@KD
+         LA    R3,8(R3)                UPDATE CCW PNTR
+         C     R3,#AREA
+         BL    CCWLOOP2
+         MVC   MSG5+3(6),=CL6'CCW '
+         PRNT  MSG5,OP=28,LEN=MSG5L
+         B     ABORT
+CCWLOOP2 XC    RES,RES
+         STC   R10,R                   SET CCHHR FOR CORE BLK
+         MVC   CCHHR,CC
+         ST    R6,PFWD                 UPDATE CORE BLK LINKS
+         LR    R6,R4                   UPDATE FOR NEXT BLK
+         LA    R15,AREALEN(R4)
+         ST    R15,PBCK
+         LR    R4,R15                  UPDATE AREA PNTR
+         LA    R10,1(R10)              BUMP 'R' COUNT
+         CH    R10,DSCB                END OF TRACK?
+         BNH   CCWLOOP                 NO, LOOP
+*
+CCWDONE  TM    SW,ITS2321              2321?
+         BZ    NO2321A                 NO.
+         CLI   HH+1,20                 TRK/CYL
+         BNL   *+20
+         IC    R15,HH+1
+         LA    R15,1(R15)
+         STC   R15,HH+1
+         B     EXCP
+         MVI   HH+1,0
+         CLI   HH,5                    CYL/STRIP
+         BNL   *+20
+         IC    R15,HH
+         LA    R15,1(R15)
+         STC   R15,HH
+         B     EXCP
+         MVI   HH,0
+         CLI   CC+1,10                 STRIP/SUBCELL
+         BNL   *+20
+         IC    R15,CC+1
+         LA    R15,1(R15)
+         STC   R15,CC+1
+         B     EXCP
+         MVI   CC+1,0
+         IC    R15,CC
+         LA    R15,1(R15)              JUST INCRAMENT SUBCELL
+         STC   R15,CC
+         B     EXCP
+NO2321A  LH    R15,HH                  UPDATE CCHH
+         LA    R15,1(R15)
+         CH    R15,TRKS
+         BNE   *+18
+         LH    R14,CC
+         LA    R14,1(R14)
+         STH   R14,CC
+         XR    R15,R15
+         STH   R15,HH
+*
+EXCP     SH    R3,=H'4'                BACKUP AND
+         NI    0(R3),255-@CC           TURN OFF CMD CHAINING
+         XC    ECB,ECB
+         EXCP  IOB
+         WAIT  ECB=ECB
+         CLI   ECB,X'7F'               READ OK?
+         BE    EXCP1                   YES
+*
+         IC    R1,ECB                  CC
+         STC   R1,MSG7A+1
+         SRL   R1,4
+         STC   R1,MSG7A
+         NC    MSG7A,HEXCON1
+         TR    MSG7A,HEXCON2
+         UNPK  MSG7B(3),IOB+2(2)       SENSE
+         IC    R1,IOB+3
+         STC   R1,MSG7B+3
+         NC    MSG7B,HEXCON1
+         TR    MSG7B,HEXCON2
+         UNPK  MSG7C(13),IOB+9(7)      CSW
+         IC    R1,IOB+15
+         STC   R1,MSG7C+13
+         NC    MSG7C,HEXCON1
+         TR    MSG7C,HEXCON2
+         UNPK  MSG7D(11),MBB+1(6)
+         IC    R1,MBB+6
+         STC   R1,MSG7D+11
+         NC    MSG7D,HEXCON1
+         TR    MSG7D,HEXCON2
+         PRNT  MSG7,OP=28,LEN=MSG7L
+         WTO   'FASTMAP - VTOC I/O ERROR ***',                         +
+               ROUTCDE=11,DESC=7
+         MVC   MSG6V,VOL
+         PRNT  MSG6,OP=20,LEN=MSG6L
+         MVI   RETCODE+1,16
+  DC  X'0000'
+         TM    SW,DODEBUG
+         BO    ABEND13
+         B     CLOSEDCB
+*
+* SCAN DSCBS TO GET CCHH OF LAST VALID/USED DSCB
+EXCP1    LR    R15,R4                  SAVE
+         LR    R4,R5
+EXCP2    CR    R4,R15
+         BNL   EXCP3
+         CLI   DATAA+44,C'4'           SKIP F4
+         BE    EXCP2A
+         CLC   END(4),DATAA+135
+         BNL   *+10
+         MVC   END,DATAA+135
+EXCP2A   LA    R4,AREALEN(R4)
+         B     EXCP2
+EXCP3    LR    R4,R15                  RESTORE
+         CLC   CC(4),END               DONE?
+         BNH   EXCPLOOP
+*
+         C     R4,#COREMAX
+         BNH   *+8
+         ST    R4,#COREMAX
+         ST    R4,#TOP
+         SH    R4,=Y(AREALEN)          BACKUP AND
+         XC    PBCK,PBCK               CLEAR LAST LINK.
+         DROP  R4
+ EJECT
+* DETERMINE THE PDS BLKS USED AND ALLOCATED
+         TM    SW,X'01'                PROCESS PDS?
+         BZ    NOPDS                   NO.
+         L     R3,#CCW                 A(CCW AREA)
+         L     R1,#AREA                A(DSCBS)
+         ST    R1,TEMP
+         IC    R1,PDS
+         STC   R1,TEMP
+         L     R0,TEMP
+         LA    R1,IOB                  A(IOB) FOR READING
+         ST    R1,TEMP
+         IC    R1,TRKS+1
+         STC   R1,TEMP
+         TM    SW,ITS2321              2321?
+         BZ    *+8                     NO
+         MVI   TEMP,255                YES, FLAG
+         L     R1,TEMP
+         L     R15,=V(PDSREAD)
+         BALR  R14,R15
+* SORT BY DSNAME (CREAT TABLE OF SORTED POINTERS)
+NOPDS    L     R0,#TOP                 A(BOTTOM SORTED PNTRS)
+         ST    R0,#SORTAB              SAVE
+         L     R1,#AREA                A(DSCB AREAS)
+         L     R2,#LIMIT               A(MAX CORE)
+         L     R15,=V(SORTIT)
+         BALR  R14,R15
+         LA    R15,4(R15)              GET NEW 'TOP' FROM 'LAST USED'
+         ST    R15,#TOP                SAVE NEW TOP.
+         C     R15,#COREMAX
+         BNH   *+8
+         ST    R15,#COREMAX
+         C     R15,#LIMIT              CORE EXCEEDED?
+         BL    NOERR1                  NO.
+         MVC   MSG5+3(6),=CL6'SORT'
+         PRNT  MSG5,OP=28,LEN=MSG5L
+         B     ABORT
+* INPUT TO THE FORMAT ROUTINE:
+*        R0 = AL1(# TRKS/CYL),AL3(DATA CHAIN)
+*        R1 = AL1(#DSCBS/TRK),AL3(TIOT ENTRY)
+NOERR1   MVC   TIOTSAV(1),DSCB+1
+         L     R1,TIOTSAV
+         MVC   #SORTAB(1),TRKS+1
+         L     R0,#SORTAB
+         LA    R2,#CCW                 TO GIVE FORMAT CORE PARMS
+         TM    SW,X'04'                EXT?
+         BO    *+8                     YES.
+         O     R2,=X'80000000'         NO.
+         XR    R3,R3                   CLEAR
+         TM    SW,ITS2321              2321?
+         BZ    *+8                     NO.
+         LA    R3,UNIT                 YES, SET R3 TO UNIT NAME
+         AIF   ('&MSSMOD' NE 'Y').M$3                            MSSMOD
+         LA    R4,MSVGP                LOAD R4 WITH PTR TO MSVGP MSSMOD
+.M$3     ANOP                                                    MSSMOD
+         L     R15,=V(FORMAT)
+         BALR  R14,R15
+         LTR   R15,R15                 CHECK RC
+         BZ    NOERR2
+         MVC   MSG5+3(6),=CL6'FORMAT'
+         PRNT  MSG5,OP=28,LEN=MSG5L
+         B     ABORT
+NOERR2   L     R15,#TOP                PROCESS NEW TOP
+         C     R15,#COREMAX
+         BNH   *+8
+         ST    R15,#COREMAX
+*
+CLOSEDCB CLOSE DCB
+         CLI   TSO,0
+         BNE   ALDON
+         AIF   (&SVC EQ 0).SKIP8
+         TM    DEVSW,X'FF'
+         BNZ   REDO
+.SKIP8   ANOP
+SKIPIT   DS    0H
+         AIF   ('&MSSMOD' NE 'Y').M$2                            MSSMOD
+         TM    SW,DOMSS+PROCMSS  SET TO DO MSS AND STARTED?      MSSMOD
+         BO    ALDON             YES-> GO INVOKE MORE MSS VOLS   MSSMOD
+*                                NO ->  CONTINUE WITH LOOP TIOT  MSSMOD
+.M$2     ANOP                                                    MSSMOD
+         L     R4,TIOTSAV              GET LAST TIOT ADDRESS
+         LA    R4,0(R4)                CLEAR TOP BYTE
+         SH    R4,=H'4'                BACK UP
+         XR    R1,R1
+         IC    R1,0(R4)                GET LENGTH OF ENTRY
+         AR    R1,R4                   GET NEW ENTRY ADDRESS
+         B     REDO
+ EJECT
+ALDON    DS    0H                      OUTPUT END MESSAGES
+         AIF   ('&MSSMOD' NE 'Y').M$1                            MSSMOD
+         TM    SW,DOMSS       SEE IF MSS SUPPORT REQUESTED       MSSMOD
+         BZ    $NOMSS               NO->JUST EXIT                MSSMOD
+         L     R15,=V(MSSALLOC)    YES-> INVOKE PGM TO ALLOC VOL MSSMOD
+         BALR  R14,R15                                           MSSMOD
+         LTR   R15,R15             ANY TIOT ADDRESS RETURNED?    MSSMOD
+         BZ    $NOMSS               NO-> END OF VOLUMES          MSSMOD
+         MVC   MSVGP,0(R1)         YES->  SAVE MSVGP FOR FORMAT  MSSMOD
+         NI    SW,255-ITS2321      TURN OFF 2321 FLAG            MSSMOD
+         OI    SW,PROCMSS          TURN ON  NOW PROCESSING MSS   MSSMOD
+         LR    R1,R15              TRANSFER TIOT ADDR TO R1      MSSMOD
+         B     START               GO LOOP THRU                  MSSMOD
+$NOMSS   DS    0H                                                MSSMOD
+.M$1     ANOP                                                    MSSMOD
+         PRNT  0,OP=4                  OUTPUT END MESSAGES
+         L     R14,#ADR+4
+         SRL   R14,10
+         CVD   R14,TEMP
+         OI    TEMP+7,X'0F'
+         UNPK  MSG1A,TEMP
+         L     R15,#COREMAX
+         S     R15,#ADR
+         LA    R15,1023(R15)           ROUND UP.
+         SRL   R15,10
+         CVD   R15,TEMP
+         OI    TEMP+7,X'0F'
+         UNPK  MSG1U,TEMP
+         SR    R14,R15
+         CVD   R14,TEMP
+         OI    TEMP+7,X'0F'
+         UNPK  MSG3A,TEMP
+         PRNT  MSG1,OP=20,LEN=MSG1L
+         PRNT  MSG3,OP=20,LEN=MSG3L
+         LA    R1,MSG2A
+         TM    SW,DODUMP
+         BZ    *+14
+         MVC   0(5,R1),=C'DUMP,'
+         LA    R1,5(R1)
+         TM    SW,DODEBUG
+         BZ    *+14
+         MVC   0(6,R1),=C'DEBUG,'
+         LA    R1,6(R1)
+         CLI   TSO,0
+         BE    *+14
+         MVC   0(4,R1),=C'TSO,'
+         LA    R1,4(R1)
+         MVC   0(4,R1),=C'EXT,'
+         TM    SW,X'04'
+         BO    *+14
+         MVC   0(6,R1),=C'NOEXT,'
+         LA    R1,2(R1)
+         LA    R1,4(R1)
+         AIF   ('&LOGMOD' NE 'Y').FSKP3
+         MVC   0(4,R1),=C'LOG,'                                  LOGMOD
+         TM    SW,DOLOG                                          LOGMOD
+         BO    *+14                                              LOGMOD
+         MVC   0(6,R1),=C'NOLOG,'                                LOGMOD
+         LA    R1,2(R1)                                          LOGMOD
+         LA    R1,4(R1)                                          LOGMOD
+.FSKP3   ANOP
+         AIF   ('&MSSMOD' NE 'Y').MSKP3
+         MVC   0(4,R1),=C'MSS,'                                  MSSMOD
+         TM    SW,DOMSS                                          MSSMOD
+         BO    *+14                                              MSSMOD
+         MVC   0(6,R1),=C'NOMSS,'                                MSSMOD
+         LA    R1,2(R1)                                          MSSMOD
+         LA    R1,4(R1)                                          MSSMOD
+.MSKP3   ANOP
+         AIF   (&SVC EQ 0).SKIP8A
+         TM    DEVSW,T2301+T2302+T2303+T2311+T2314+T2321
+         BZ    XSKIP
+         MVC   0(4,R1),=C'SCR,'
+         TM    DEVSW,TSCR
+         BO    *+14
+         MVC   0(6,R1),=C'NOSCR,'
+         LA    R1,2(R1)
+         LA    R1,4(R1)
+         DMSG  T2301,'2301,'
+         DMSG  T2302,'2302,'
+         DMSG  T2303,'2303,'
+         DMSG  T2311,'2311,'
+         DMSG  T2314,'2314,'
+         DMSG  T2321,'2321,'
+XSKIP    TM    DEVSW,TSER
+         BZ    *+14
+         MVC   0(4,R1),=C'SER,'
+         LA    R1,4(R1)
+.SKIP8A  ANOP
+         MVC   0(3,R1),=C'PDS'
+         TM    SW,X'01'
+         BO    *+10
+         MVC   0(5,R1),=C'NOPDS'
+         PRNT  MSG2,OP=20,LEN=MSG2L
+ EJECT
+         TM    SW,X'02'                DUMP?
+         BZ    NODUMP                  NO.
+         ABEND 1,DUMP                  YES.
+NODUMP   L     R15,=V(TERMPRNT)        CLOSE OUT THE PRINT S/R
+         BALR  R14,R15
+         AIF   ('&LOGMOD' NE 'Y').SKIPL2
+         TM    SW,DOLOG                CHECK FOR LOGGING      LOGMOD
+         BNO   NOLOGCLS
+         L     R15,=V(TERMLOG)         LOAD ADDRESS OF ROUTINE TO
+         BALR  R14,R15                  TO CLOSE LOG AND LINK TO IT
+NOLOGCLS EQU   *
+.SKIPL2  ANOP
+         FREEMAIN V,A=#ADR
+         L     R13,4(R13)              RESTORE REGS & RETURN
+         LH    R15,RETCODE
+         RETURN (14,12),T,RC=(15)
+*
+*
+*
+ABORT    MVC   MSG6V,VOL
+         PRNT  MSG6,OP=20,LEN=MSG6L
+         TM    SW,DODEBUG              DEBUG?
+         BZ    ABORT1                  NO.
+ABEND13  ABEND 13,DUMP                 YES, GIVE A CORE DUMP.
+ABORT1   MVI   RETCODE+1,16            RC=16
+         B     ALDON
+SUPER  SUPVR
+ EJECT
+TEMP     DC    D'0'
+* CONSTANTS, ETC. FOR CHANNEL PROGRAM
+CCWSHA   CCW   @SHA,0,@CC,4            SEARCH HOME ADDRESS
+CCWTIC   CCW   @TIC,0,@CC,0            TRANSFER IN CHANNEL
+CCWKD    CCW   @KD,0,@CC+@SLI,140      READ: KEY,DATA; LEN=140
+*
+@CC      EQU   X'40'
+@SLI     EQU   X'20'
+@SHA     EQU   X'39'
+@TIC     EQU   X'08'
+@KD      EQU   X'0E'
+*
+SAVEAREA DC    18F'0'
+#SIZE    DC    A(256*1024,576*1024)    FOR CORE MANAGEMENT  INTEL
+#ADR     DC    A(0,0)
+#FREE    DC    A(0,4096)
+*
+#SORTAB  DC    A(0)                    A(START OF SORTED PNTRS)
+#AREA    DC    A(0)                    A(TOP WORK/BOTTOM DSCB)
+#COREMAX DC    A(0)                    A(MAX CORE EVER USED)
+#CCW     DC    A(0)                    A(BOTTOM WORK AREA)
+#TOP     DC    A(0)                    A(CURRENT TOP OF AREA)
+#LIMIT   DC    A(0)                    A(MAX DYNAMIC CORE)
+*
+DDTABLE  DC    0F'0'                   NAMES OF SKIP DDS
+         DC    CL8'SYSPRINT'
+         DC    CL8'SYSABEND'
+         DC    CL8'SYSUDUMP'
+         AIF   ('&LOGMOD' NE 'Y').SKIPL3                         LOGMOD
+         DC    CL8'DSNLOG'                                       LOGMOD
+.SKIPL3  ANOP                                                    LOGMOD
+         AIF   ('&MSSMOD' NE 'Y').SKIPL3M                        MSSMOD
+         DC    CL8'MSSVOLS'                                      MSSMOD
+.SKIPL3M ANOP                                                    MSSMOD
+         DC    CL8'JOBLIB'
+         DC    CL8'STEPLIB'
+         DC    CL8'PGM=*.DD'
+         DC    CL8' '                  CONCAT. DDS
+CSYSUT1  DC    CL8'SYSUT1'             FOR COMPATABILITY WITH MAPDASD
+         DC   4CL8' '                  **SPARES**
+         AIF  ('&MSSMOD' NE 'Y').M$4                             MSSMOD
+MSVGP    DC    CL8' '                                            MSSMOD
+.M$4     ANOP                                                    MSSMOD
+HOOOS    DC    F'0'                    ZEROS...END OF TABLE
+SYSCTLG  DC     C'SYS0'
+TIOTSAV  DC    A(0)
+ALOOKUP  DC    A(0)                    A(UCB LOOKUP TABLE)
+TRKS     DC    H'0'                    TRKS/CYL
+DSCB     DC    H'0'                    DSCBS/TRK
+AUCB     DC    Y(0,0)                  A(UCB)
+*
+RETCODE  DC    Y(0)                    RETURN CODE.
+BB       DC    H'0'                    CURRENT BBCCHHR
+CC       DC    H'0'
+HH       DC    H'0'
+R        DC    HL1'0'
+PDS      DC    HL1'0'                  PDS BLKS/TRK
+SW       DC    B'00000&EXT.0&PDS' -    RUN SWITCHES.
+TSO      DC    X'00'
+END      DC    XL5'0'                  CCHHR OF LAST FORMAT 1
+DEVSW    DC    B'000000&SCR.0' -            DEVICE TYPE SWITCHES
+          AIF    (&SVC EQ 0).SKIP9
+DEVSW2   DC    AL1(0,T2311,T2301,T2303,T2302,T2321,0,0,T2314,0)
+VOLSER   DC    12CL6' '                FOR SER=...
+.SKIP9    ANOP
+HEXCON1  DC    14X'0F'
+HEXCON2  DC    C'0123456789ABCDEF'
+*
+         DC    0D'0'
+         LTORG
+ EJECT
+* I/O, ETC. CONTROL BLOCKS
+ECB      DC    F'0'
+IOB      DC    X'42',AL3(0),AL1(0),AL3(ECB)
+         DC    F'0',F'0'
+TERM     DC    AL1(0),AL3(0),AL1(0),AL3(DCB)
+         DC    2F'0'
+MBB      DC    XL7'00',X'00'
+*
+DCB      DCB   MACRF=E,EXLST=EXIT,DDNAME=@,IOBAD=IOB
+EXIT     DC    0F'0',X'07',AL3(JFCBA),X'89',AL3(0)
+JFCB     DC    44F'0'
+JFCBA     DC     44F'0'
+*
+DVTOC    CAMLST SEARCH,DSN,VOL,JFCB
+DSN      DC    44X'04'
+VOL      DC    CL6' '
+*
+UNIT     DC    CL3' '                  FOR SAVING 2321 UNITNAME
+* MESSAGES
+MSG1     DC    C'*** DYNAMIC CORE -- '
+MSG1A    DC    C'000',C'K BYTES ALLOCATED WITH '
+MSG1U    DC    C'000',C'K BYTES USED ***'
+MSG1L    EQU   *-MSG1
+MSG2     DC    C'*** RUN PARMS -- '
+MSG2A    DC    CL50' '
+MSG2L    EQU   *-MSG2
+MSG3     DC    C'*** REGION SIZE MAY BE REDUCED BY '
+MSG3A    DC    C'000',C'K BYTES ***'
+MSG3L    EQU   *-MSG3
+MSG4     DC    C'** UTILITY FILE OPEN ERROR'
+MSG4L    EQU   *-MSG4
+MSG5     DC    C'** XXXXXX DYNAMIC CORE EXCEEDED **'
+MSG5L    EQU   *-MSG5
+MSG6     DC    C'      EXECUTION ABORTED PROCESSING VOL=SER='
+MSG6V    DC    CL6' '
+MSG6L    EQU   *-MSG6
+MSG7     DC    C'**  VTOC I/O ERROR,  ECB='
+MSG7A    DC    CL2' ',C',  SENSE='
+MSG7B    DC    CL4' ',C',  CSW='
+MSG7C    DC    CL14' ',C',  BBCCHH='
+MSG7D    DC    CL12' '
+MSG7L    EQU   *-MSG7
+*
+TRTBL    DC    74C' ',C'Ö.<(+×&&',9C' ',C'!$*);^-/',9C' '
+         DC    C',%_>?',10C' ',C':#@''="',C' ',C'ABCDEFGHI',7C' '
+         DC    C'JKLMNOPQR',8C' ',C'STUVWXYZ',23C' ',C'ABCDEFGHI'
+         DC    7C' ',C'JKLMNOPQR',8C' ',C'STUVWXYZ',6C' '
+         DC    C'0123456789',6C' '
+* WORK AREA (DYNAMIC CORE) DEFINITIONS
+AREASECT DSECT
+PFWD     DS    F
+PBCK     DS    F
+CCHHR    DS    CL5                     FOR THIS DSCB
+RES      DS    CL3                     FLAGS
+DATAA    DS    CL140                   DSCB
+BLKALOC  DS    H                       DIRECTORY BLKS ALLOCATED
+BLKUSED  DS    H                       DIRECTORY BLKS USED
+AREALEN  EQU   160                     CORE BLOCK LENGTH
+*
+         END   FASTDISK

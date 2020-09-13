@@ -1,0 +1,1056 @@
+CNX      TITLE 'RACF EXIT ICHCNX00 - COMMAND-PROCESSING ROUTINE'
+***********************************************************************
+*    NAME:        RACF EXIT ICHCNX00   *TEST*         DATE: 09/25/80  *
+*    PURPOSE:                                                         *
+*        THIS EXIT WILL PROCESS THE "ADDSD/ALTDSD/DELDSD" COMMANDS.   *
+*        THE BASIC LOGIC WILL ALLOW COMMANDS TO THE USER'S OWN        *
+*        DATASETS,  WILL ALLOW "ADDSD" TO GROUP DATASETS IF THE       *
+*        USER HAS "CREATE" GROUP AUTHORITY, WILL ALLOW "ALTDSD/DELDSD"*
+*        TO GROUP DATASETS IF THE USER HAS "ALTER" AUTHORITY TO THE   *
+*        DATASET.  THE EXIT PROVIDES DYNAMIC WTO/GTF TRACING.         *
+*        THE EXIT PROVIDES THE NAMING CONVENTION LOGIC NECESSARY FOR  *
+*        EXTRACTING GROUP NAMES FROM THE 2ND QUALIFIER.  THE EXIT     *
+*        SUPPORTS DRIVER PROGRAM LINKAGE FOR TESTING WITHOUT          *
+*        "STANDALONE" COMPUTER TIME.                                  *
+*    USAGE:                                                           *
+*        TO PROTECT AN EXISTING GROUP DATASET THAT HAS A MODEL.       *
+*        1. ADDSD SET    - TO TURN ON THE BIT IN THE DSCB.            *
+*        2. DELDSD NOSET - TO DELETE THE RACF DATASET PROFILE.        *
+*                                                                     *
+*        TO UNPROTECT AN EXISTING GROUP DATASET THAT HAS A MODEL.     *
+*        1. ADDSD NOSET  - TO MAKE A RACF DATASET PROFILE.            *
+*        2. DELDSD SET   - TO TURN OFF THE BIT IN THE DSCB AND        *
+*                          TO DELETE THE RACF DATASET PROFILE.        *
+*                                                                     *
+*        TO BUILD A GROUP DATASET MODEL.                              *
+*        1. ADDSD NOSET  - TO MAKE A RACF DATASET PROFILE.            *
+*                                                                     *
+*        TO BUILD A USER DATASET MODEL.                               *
+*        1. ADDSD NOSET  - TO MAKE A RACF DATASET PROFILE.            *
+*                                                                     *
+*    TRACING:                                                         *
+*        1. THE CLASS NAME "OPTA" IS DEFINED IN THE CLASS NAME        *
+*           AS BIT POSITION 31.                                       *
+*        2. THE COMMAND " SETROPTS AUDIT OPTA " WILL CONTROL THE      *
+*           USE OF GTF TRACING.                                       *
+*        3. THE INSTRUCTION USED TO TEST FOR GTF TRACING IS:          *
+*                    TM   RCVTCAUD+3,X'01'                            *
+*        4. THE COMMAND " SETROPTS STATISTICS OPTA " WILL CONTROL THE *
+*           USE OF WTO TRACING.                                       *
+*        5. THE INSTRUCTION USED TO TEST FOR WTO TRACING IS:          *
+*                    TM   RCVTCSTA+3,X'01'                            *
+*        6. SMF180 RECORDS ARE WRITTEN.                               *
+*                                                                     *
+*    TESTING:                                                         *
+*        1. A DRIVER IS USED TO CALL THIS ROUTINE.                    *
+*        2. THE DRIVED WILL PASS THE PROPER PARM LIST.                *
+*        3. THE PARM LIST FIRST ENTRY IS NORMALLY THE NUMER OF        *
+*           WORDS IN THE PARM LIST.                                   *
+*           A. IF THE FIRST BYTE OF THE FIRST WORD IS X'FF' THEN      *
+*              THE FIRST WORD CONTAIN A PSEUDO CVT ADDRESS.           *
+*           B. IF THE FIRST BYTE OF THE FIRST WORD IS NOT X'FF'       *
+*              THEN PROCEED AS NORMAL.                                *
+*        4. AFTER TESTING THE FIRST WORD, EITHER THE REAL CVT ADDRESS *
+*           OR A PSEUDO CVT ADDRESS PASSED BY THE DRIVER IS STORED    *
+*           AND LATER USED FOR ALL CONTROL BLOCK PROCESSING.          *
+*        5. THIS TECHNIQUE ALLOWS FOR PASSING (CVT, RCVT, ASCB, ASXB, *
+*           ACEE).                                                    *
+*                                                                     *
+*_____________________________________________________________________*
+*           CHANGE LOG:                                               *
+*_____________________________________________________________________*
+*   07/18/80 - SUPPORT FOR RACF PROTECTION OF PASSWORD DATASET.       *
+*   07/30/80 - SMF180 RECORD DSN LENGTH PROBLEM FIXED,                *
+*            - RACINIT "CREATE" SP=255 CHANGE, "DELETE" ADDED.        *
+*   09/25/80 - ADDED PERMIT COMMAND AUTHORITY CHECKING.               *
+*   01/10/81 - MADE CHANGE TO ALLOW PERMIT FOR SPECIAL DATASET        *
+*              WITHOUT CHECKING OWNER IN THIS EXIT.                   *
+*                                                                     *
+*                                                                     *
+*                                                                     *
+*                                                                     *
+*                                                                     *
+***********************************************************************
+         EJECT
+***********************************************************************
+*        SETUP SAVEAREA AND SAVE CALLER'S REGS
+***********************************************************************
+ICHCNX00 CSECT
+         USING ICHCNX00,R15
+         B     ICHCNX                     BRANCH AROUND I.D.
+         DC    C'ICHCNX00'                CSECT NAME
+         DC    C'&SYSDATE'                ASSEMBLY DATE
+         DC    C'&SYSTIME'                ASSEMBLY TIME
+         USING SAVEAREA,R13
+ICHCNX   STM   R14,R12,SAVER14            SAVE REGS
+         LR    R11,R15                    SET UP BASE REGISTER
+         LA    R12,2048(0,R11)            SET UP BASE REGISTER
+         LA    R12,2048(0,R12)            SET UP BASE REGISTER
+         USING ICHCNX00,R11
+         USING ICHCNX00+4096,R12
+         USING RCVT,R1
+         DROP  R15
+         LR    R10,R1                     SETUP PARAMETER REGISTER
+         USING NX00PARM,R10               ADDRESSABILITY
+         L     R1,NX00FUNC                ADDRESS OF FUNCTION
+         CLI   0(R1),X'03'                IS IT ADDSD COMMAND
+         BE    PROCESS                    YES,
+         CLI   0(R1),X'05'                IS IT DELDSD COMMAND
+         BE    PROCESS                    YES,
+         CLI   0(R1),X'07'                IS IT PERMIT COMMAND
+         BNE   GOAWAY                     NO,
+         L     R1,NX00CLAS                ADDRESS OF CLASS NAME
+         CLC   0(8,R1),=CL8'DATASET'      DATASET CLASS
+         BE    PROCESS                    YES,
+GOAWAY   LM    R14,R12,SAVER14            RESTORE REGS
+         SR    R15,R15                    CLEAR REG 15.
+         BR    R14                        GET OUT FAST
+         EJECT
+PROCESS  DS    0H
+         GETMAIN R,LV=WORKSIZE,SP=0       GET SAVEAREA + WORKAREA
+         ST    R1,SAVENEW-SAVEAREA(,R13)  FORWARD POINTER TO OLD AREA
+         ST    R13,SAVEOLD-SAVEAREA(,R1)  BACKWARD POINTER TO NEW AREA
+         LR    R13,R1                     SETUP SAVEAREA POINTER
+         XC    SMFRD180(L'SMF180SZ),SMFRD180 CLEAR SMF AREA
+         MVC   SMF180LN,=AL2(L'SMF180SZ)  SIZE OF RECORD
+         MVC   SMF180SG,=AL2(0)           SIZE OF SEGMENTS
+         MVI   SMF180SF,X'02'             VS2 SYSTEM
+         MVI   SMF180TP,180               RECORD TYPE
+         L     R1,16(0,0)                 CVT ADDRESS
+         L     R1,196(0,R1)               ADDRESS OF SMCA
+         LTR   R1,R1                      TEST FOR SMF
+         BZ    NOSMF                      SMF NOT ACTIVE FAIL REQUEST
+         MVC   SMF180ID,16(R1)            SYSTEM ID
+         TIME  BIN                        TIME MACRO
+         STM   0,1,SMF180TM             TIME AND DATE
+         EJECT
+***********************************************************************
+*        SET UP CVT ADDRESS
+***********************************************************************
+         MVC   CVTADR,X'10'               CVT ADDRESS
+         CLI   0(R10),X'FF'               DRIVER CALLING
+         BNE   CVTOK                      NO, USE REAL CVT ADDRESS
+         MVC   CVTADR+1(3),1(R10)         USE PASSED CVT ADDRESS
+CVTOK    DS    0H
+         SPACE
+         L     R1,CVTADR                  CVT ADDRESS
+         L     R1,0(,R1)                  CVTTCBP
+         L     R1,12(,R1)                 CURRENT ASCB
+ASCBJBNI ICM   R2,7,172+1(R1)             ASCBJBNS
+         BNZ   *+4+4                      IF NOT ZERO WE GOT JOBNAME
+ASCBJBNS ICM   R2,7,176+1(R1)             ASCBJBNS
+         MVC   JOBNAME,0(R2)              SAVE THE JOBNAME
+         SPACE
+         L     R1,108(,R1)                ASXB ADDRESS
+         L     R2,200(,R1)                ACEE ADDRESS
+         LTR   R2,R2                      TEST ADDRESS
+         BZ    NOACEE                     NO ACEE
+         ST    R2,ACEEADR                 SAVE ACEE ADDRESS
+         USING ACEE,R2                    ADDRESSABILITY
+         MVC   GROUPL,ACEEGRPL            SAVE GROUP NAME & LENGTH
+         MVC   USERL,ACEEUSRL             SAVE USERID & LENGTH
+         MVC   FLAG1,ACEEFLG1             SAVE FLAG1
+         MVC   TERMID,ACEETRID            SAVE TERMINAL ID
+         XC    GRPAUTH,GRPAUTH            CLEAR GROUP AUTHORITY
+         L     R3,ACEEIEP                 USER PARMS ADDRESS
+         USING IEPDSECT,R3                ADDRESSABILITY
+         LTR   R3,R3                      TEST
+         BZ    *+10                       NO PARMS
+         MVC   GRPAUTH,IEPAUTH            SAVE GROUP AUTHORITY
+         DROP  R2,R3
+         SPACE
+         LM    R1,R9,4(R10)               PICK UP PARMS
+         MVC   FUNCTION,0(R1)             SAVE FUNCTION
+         MVC   REQAUTH,0(R2)              SAVE RQUESTED AUTH
+         MVC   RESNAME,0(R3)              SAVE RESOURCE NAME
+         XC    OLDNAME,OLDNAME            CLEAR OLD RESOURCE NAME
+         XC    VOLSERL,VOLSERL            CLEAR VOLSER
+         XC    OVOLSER,OVOLSER            CLEAR OLD VOLSER
+         XC    CLASNAME,CLASNAME          CLEAR CLASS NAME
+         XC    QUALFIER,QUALFIER          CLEAR QUALIFIER
+         XC    TYPE,TYPE                  CLEAR DATASET TYPE
+         LTR   R4,R4                      TEST FOR OLD NAME
+         BZ    *+10                       NONE
+         MVC   OLDNAME,0(R4)              SAVE OLD RESOURCE NAME
+         LTR   R5,R5                      TEST FOR VOLSER
+         BZ    *+10                       NONE
+         MVC   VOLSERL,0(R5)              SAVE VOLSER & LENGTH
+         LTR   R6,R6                      TEST FOR OLD VOLSER
+         BZ    *+10                       NONE
+         MVC   OVOLSER,0(R6)              SAVE OLD VOLSER
+         MVC   CLASNAME,0(R7)             SAVE CLASS NAME
+         LTR   R8,R8                      TEST FOR QUALIFIER
+         BZ    *+10                       NONE
+         MVC   QUALFIER,0(R8)             SAVE QUALIFIER
+         LTR   R9,R9                      TEST FOR DS TYPE
+         BZ    *+10                       NONE
+         MVC   TYPE,0(R9)                 SAVE TYPE
+         EJECT
+         MVC   SMF180JB,JOBNAME           JOBNAME TO SMF
+         MVC   SMF180FN,FUNCTION          FUNCTION FOR SMF RECORD
+         L     R1,ACEEADR                 ACEE TO SMF
+         MVC   SMF180EE(100),0(R1)        ACEE TO SMF
+         MVC   SMF180E1,GRPAUTH           MOVE AUTH INTO SMF RECORD
+         MVC   SMF180CL,CLASNAME          CLASSNAME TO SMF
+         MVC   SMF180RS,RESNAME+1         RESOURCE NAME TO SMF
+         OI    SMF180F1,SMFFG1CM          INDICATE "COMMAND" SMF RECORD
+         MVI   SMF180F2,SMFFG2ER          PRESET TO COMMAND ERROR
+         MVC   SMF180VL,VOLSERL+1         VOLSER TO SMF
+         CLI   VOLSERL,X'00'              VOLSER GIVEN?
+         BNE   NOLOCATE                   YES, USE IT
+         CLI   FUNCTION+1,X'02'           FUNCTION "NOSET" ?
+         BE    NOLOCATE                   YES, CONTINUE
+         CLI   FUNCTION,X'07'             FUNCTION "PERMIT" ?
+         BE    NOLOCATE                   YES, CONTINUE
+***********************************************************************
+*        DOING ADDSD/DELDSD "SET" WITHOUT THE VOLSER
+*        GO GET THE VOLSER FOR THE SMF180 RECORD.
+***********************************************************************
+         SPACE
+         BAL   R14,DOLOCATE               NO,  THEN DO LOCATE
+         SPACE
+NOLOCATE DS    0H
+***********************************************************************
+*        SET UP DESIRED RETURN CODE AS FOLLOWS:
+*        (R15)=8 IF RACF IS ACTIVE AND HIGH LEVEL INDEX = USERID:
+*                THIS IS THE SO CALLED FAST PATH.
+*        (R15)=8 IF RACF IS NOT ACTIVE AND ISSUE A WTO.
+***********************************************************************
+         L     R1,CVTADR                  GET CVT ADDRESS
+         ICM   R1,7,992+1(R1)             GET CVTRAC ADDRESS
+         TM    53(R1),X'80'               IS RACF ACTIVE
+         BNZ   NORACF                     NO
+         TM    153(R1),X'80'              HAS RVARY INACT BEEN ISSUED
+         BNZ   NORACF                     BRANCH IF RVARY WAS ISSUED
+         EJECT
+***********************************************************************
+*        GENERATE A GTF USER RECORD OF THE RACHECK PARAMETERS
+***********************************************************************
+RACFUP   DS    0H                     RACF IS UP - CHECK FOR FAST PATH
+         L     R1,CVTADR                  GET CVT ADDRESS
+         ICM   R1,7,992+1(R1)             GET CVTRAC ADDRESS
+         TM    RCVTCAUD+3,X'01'           TEST BIT POS 31. OPTA
+         BNO   NOGTF01                    NOT ON, BYPASS GTF
+         XC    GTFREC01,GTFREC01          CLEAN OUT THE RECORD
+         MVC   GTFJOBNM,JOBNAME           JOBNAME TO GTF RECORD
+         MVC   GTFFLAG1,FLAG1             FLAG1 TO GTF RECORD
+         MVC   GTFUSRID,USERID            USERID TO GTF RECORD
+         MVC   GTFGROUP,GROUP             GROUP TO GTF RECORD
+         MVC   GTFGAUTH,GRPAUTH           GROUP AUTH TO GTF RECORD
+         MVC   GTFFUNC,FUNCTION           FUNCTION TO GTF RECORD
+         MVC   GTFRNAM,RESNAME            RESNAME TO GTF RECORD
+         MVC   GTFQUAL,QUALFIER           QUALIFIER TO GTF RECORD
+         MVC   GTFLIST(GTFLISTL),GTFPROTO MOVE IN PROTOTYPE LIST
+         LA    R0,GTFREC01                ADD OF GTF USER RECORD
+         GTRACE DATA=(R0),ID=1,PAGEIN=YES,MF=(E,GTFLIST)
+NOGTF01  DS    0H
+***********************************************************************
+*        WTO THE JOBNAME, GROUP, USERID, FUNCTION, AUTHORITY ETC.
+***********************************************************************
+         L     R1,CVTADR                  GET CVT ADDRESS
+         ICM   R1,7,992+1(R1)             GET CVTRAC ADDRESS
+         TM    RCVTCSTA+3,X'01'           TEST BIT POS 31. OPTA
+         BNO   NOWTO01                    NOT ON, BYPASS WTO
+         MVC   WTOLIST(WTOLISTL),WTOPROTO INITIALIZE WTO AREA
+         MVC   MSG1(MSG1LGTH),MSG1PRTO    INITIALIZE MESSAGE
+         MVC   MSG1JOBN,JOBNAME           MOVE IN THE JOBNAME
+         MVC   MSG1GRPN,GROUP             MOVE IN THE GROUP NAME
+         MVC   MSG1USRN,USERID            MOVE IN THE USERID
+         UNPK  WORK(5),FUNCTION(3)        CONVERT TO CHAR
+         TR    WORK(4),HEXTAB-240          FUNCTION
+         MVC   MSG1FUNC,WORK              MOVE IN THE FUNCTION
+         UNPK  WORK(3),GRPAUTH(2)         CONVERT TO CHAR
+         TR    WORK(2),HEXTAB-240          GROUP AUTHORITY
+         MVC   MSG1AUTH,WORK              MOVE IN GROUP AUTHORITY
+         CLI   VOLSERL,X'00'              VOLSER GIVEN?
+         BE    *+10                       NO,
+         MVC   MSG1VOL,VOLSERL+1          MOVE IN THE VOLSER
+         MVC   MSG1RNAM,RESNAME+1         MOVE IN THE RESOURCE NAME
+         MVC   WTOLIST+4(MSG1LGTH),MSG1   MESSAGE TO WTO
+         WTO   MF=(E,WTOLIST)             WRITE IT OUT
+NOWTO01  DS    0H
+         EJECT
+         LA    R1,RESNAME+1        PASS DSNAME ADDRESS
+         BAL   R14,MAPDSN          GO MAP DSNAME INTO NODES
+         SPACE
+         LTR   R15,R15             TEST RETURN CODE
+         BNZ   BADNODE             ERROR, CAN NOT HELP
+         SPACE
+         CLI   FUNCTION,X'07'      IS THIS A PERMIT COMMAND
+         BE    CKPERMIT            YES, DO AUTHORITY CHECK
+         SPACE
+         CLC   VOLSER,=C'999999'   IS RESOURCE A MODEL
+         BE    CKMODEL             YES,
+         B     CKNODES             OTHERWISE,
+         SPACE
+CKMODEL  MVC   WVOLSER,=C'999999'  COPY INTO WORK VOLSER
+         CLI   FUNCTION+1,X'01'    IS FUNCTION "SET"
+         BE    MODERR              YES, MUST USE NOSET ON MODEL
+         TM    FLAG1,X'80'         SPECIAL ATTRIBUTE
+         BO    ALLOWIT             YES,
+         CLI   FUNCTION,X'05'      IS THIS A DELDSD COMMAND
+         BE    CHECKIT             YES, BYPASS GROUP AUTH CHECK
+***********************************************************************
+*        WE HAVE A ADDSD NOSET OF A USER/GROUP MODEL
+***********************************************************************
+         TM    WFLAG1,WFLG1USR     IS THIS A USER DATASET
+         BO    USRMODEL            YES, CHECK THE USER MODEL
+         CLC   WNODE1,GROUP        DO WE HAVE THE GROUP AUTH
+         BE    AUTHCHK             YES, CHECK AUTHORITY WITHIN GROUP
+         B     PREINIT             NO, MUST DO RACINIT
+USRMODEL CLC   WNODE1,USERID       IS THIS THE USER'S MODEL
+         BE    ALLOWIT             YES,
+         B     BADUSER             NO, CAN'T BUILD OTHER'S USER MODEL
+***********************************************************************
+*        WE HAVE A PERMIT FOR A DATASET
+***********************************************************************
+CKPERMIT DS    0H
+         TM    FLAG1,X'80'         SPECIAL ATTRIBUTE
+         BO    ALLOWIT             YES,
+         CLC   WNODE1,USERID       IS THIS THE USER'S PROFILE
+         BE    ALLOWIT             YES,
+         BAL   R14,DOPERMIT        GO EXTRACT OWNER
+         LTR   R15,R15             DID WE GET THE OWNER
+         BNZ   NOOWNER             NO,
+         CLC   OWNER,USERID        IS THE OWNER THIS USER
+         BNE   BADOWNER            NO,
+         B     ALLOWIT             YES,
+         EJECT
+***********************************************************************
+*                                                                     *
+*  THE FOLLOWING ROUTINE PROVIDES FOR ALL DATASET CHECKING.           *
+*                                                                     *
+*   USER DATASETS:   1. 1ST QUAL 7 BYTES & ____OT_                    *
+*                    2. 1ST QUAL 6 BYTES & UNNNNN                     *
+*                                                                     *
+*   GROUP DATASETS:  1. 2ND QUAL = G___$$ IS SPECIAL                  *
+*                    2. 2ND QUAL = G___                               *
+*                    3. 2ND QUAL = G_____                             *
+*                                                                     *
+*  THE DSNAMES ARE CHANGES IN THE FOLLOWING MANNER.                   *
+*                                                                     *
+*   USER DATASETS:   1. 1ST QUAL.MODEL                                *
+*                    2. VOLSER=999999                                 *
+*                                                                     *
+*                                                                     *
+*   GROUP DATASETS                                                    *
+*   (NON-SPECIAL)    1. 2ND QUAL.MODEL                                *
+*                    2. VOLSER=999999                                 *
+*   (SPECIAL-GDG)    1. BLANK OUT THE $$ IN 2ND QUAL                  *
+*                    2. SWAP 1ST & 2ND QUAL                           *
+*                    3. DROP LAST QUAL - G0001V01                     *
+*                    4. VOLSER=999999                                 *
+*   (SPECIAL-NONGDG) 1. BLANK OUT THE $$ IN 2ND QUAL                  *
+*                    2. SWAP 1ST & 2ND QUAL                           *
+*                                                                     *
+***********************************************************************
+CKNODES  LA    R1,NODETAB            POINT TO SPECIAL TABLE
+         CLC   WNODE1,=C'PASSWORD'   CHECK FOR PASSSORD DATASET
+         BNE   CHKNEXT               NO,CONTINUE NORMALLY
+         MVC   WNODE2,=C'PASSWORD'   YES,CHANGE TO PASSWORD.PASSWORD
+         MVI   WNODE2L,8             CHANGE NODE2 LENGTH
+         MVI   W#NODES,2             CHANGE NUMBER OF NODES TO TWO
+CHKNEXT  CLI   0(R1),X'FF'         END OF TABLE?
+         BE    TABEND              YES, NOT IN TABLE
+         CLC   0(9,R1),WNODE1L     NODE IN THE TABLE?
+         BE    SPEC002             YES, TREAT AS SPECIAL
+         LA    R1,9(R1)            INDEX TO NEXT ENTRY
+         B     CHKNEXT             LOOK AGAIN
+TABEND   DS    0H
+         TM    WFLAG1,WFLG1USR     IS THIS A USER DATASET
+         BNO   CKGROUP             NO, CHECK IF A GROUP DATASET
+         MVI   WNODE2L,5           CHANGE NODE LENGTH FOR MODEL
+         MVC   WNODE2,=CL8'MODEL'  ASSIGN MODEL SUFFIX TO USERID.
+         MVI   W#NODES,2           CHANGE # OF NODES FOR REBUILD
+         MVC   WVOLSER,=C'999999'  PROVIDE DUMMY VOLSER
+         BAL   R14,BLDDSN          REBUILD DATASET NAME FOR RACHECK
+         B     CKNAME              GO CHANGE THE DATASET NAME
+         SPACE 2
+CKGROUP  CLI   WNODE2,C'G'         DOES 2ND QUAL START WITH - G
+         BNE   BADNODE             NO, CAN NOT DETERMINE IF USER/GROUP
+***********************************************************************
+*        ON GROUP DATASETS ALWAYS USE THE 2ND QUAL AS GROUP NAME      *
+***********************************************************************
+         MVC   SAVEN(9),WNODE1L    MOVE 1ST NODE TO SAVE  * SWAP      *
+         MVC   WNODE1L(9),WNODE2L  MOVE 2ND NODE TO 1ST   * 1ST & 2ND *
+         MVC   WNODE2L(9),SAVEN    MOVE SAVED NODE TO 2ND * NODES     *
+***********************************************************************
+         SPACE
+         CLC   WNODE1+4(2),=C'$$'  SPECIAL DSNAME
+         BE    SPEC001             YES, GO PROCESS SPECIAL
+         MVI   WNODE2L,5           CHANGE NODE2 LENGTH FOR MODEL
+         MVC   WNODE2,=CL8'MODEL'  ASSIGN MODEL SUFFIX TO GROUPID
+         MVI   W#NODES,2           CHANGE TOTAL # OF NODES
+         MVC   WVOLSER,=C'999999'  PROVIDE DUMMY VOLSER
+         BAL   R14,BLDDSN          REBUILD DATSET NAME
+         B     CKNAME              GO CHANGE THE DATASET NAME
+         SPACE 2
+SPEC001  DS    0H
+         OI    WFLAG1,WFLG1SPC     FLAG AS SPECIAL DATASET
+         MVI   WNODE1L,4           DROP THE - $$
+         MVC   WNODE1+4(4),=CL4' ' DROP THE - $$
+         TM    WFLAG1,WFLG1GDG     IS THIS A GDG DATASET
+         BNO   SPEC002             NO, SPECIAL NON-GDG
+         MVC   WVOLSER,=C'999999'  PROVIDE DUMMY VOLSER
+         SR    R1,R1               CLEAR REG
+         IC    R1,W#NODES          INSERT THE # OF NODES
+         BCTR  R1,0                SUBT ONE
+         STC   R1,W#NODES          STORE THE # OF NODES
+         BAL   R14,BLDDSN          REBUILD DATASET NAME
+         B     CKNAME              GO CHANGE THE DATASET NAME
+SPEC002  DS    0H
+         OI    WFLAG1,WFLG1SPC     FLAG AS SPECIAL DATASET
+         MVC   WVOLSER,VOLSER      USE THE REAL VOLSER
+         BAL   R14,BLDDSN          REBUILD DATSET NAME
+         B     CKNAME              GO CHANGE THE DATASET NAME
+         EJECT
+***********************************************************************
+*        IN THE FUTURE WE MAY ALLOW SOME ACCESS TO PROTECTED          *
+*        DATASETS EVEN IF THE USER IS NOT DEFINED TO RACF.            *
+*        PROTECTED SYS1 DATASETS MAY BE AFFORDED READ ONLY ACCESS     *
+*        FOR EXAMPLE.                                                 *
+***********************************************************************
+CHKFUNC  CLI   FUNCTION,X'03'      IS THIS A ADDSD COMMAND
+         BE    BADUSER             USERID DOES NOT MATCH DATASET
+         B     CHECKIT             IF DELETE CHECK ACCESS LIST
+CKNAME   CLC   WNODE1,USERID       IS THIS THE USER'S DATASET
+         BE    ALLOWIT             YES,
+         TM    FLAG1,X'80'         SPECIAL ATTRIBUTE
+         BO    ALLOWIT             YES,
+         TM    WFLAG1,WFLG1USR     IS USER FLAG ON
+         BO    CHKFUNC             YES, CHECK IF DELETE OR DEFINE
+         CLI   FUNCTION,X'03'      IS THIS A ADDSD COMMAND
+         BNE   CHECKIT             NO, BYPASS GROUP AUTH CHECKS
+         CLC   WNODE1,GROUP        IS THIS THE GROUP'S DATASET
+         BE    AUTHCHK             CHECK AUTHORITY WITHIN GROUP
+PREINIT  MVC   GROUPL,WNODE1L      MOVE IN NEW GROUP
+         SPACE
+         BAL   R14,DOINIT          GO DO THE RACINIT
+         SPACE
+         LTR   R15,R15             TEST RETURN FROM RACINIT
+         BNZ   BADINIT             ERROR IN RACINIT
+AUTHCHK  DS    0H
+         TM    GRPAUTH,X'80'       AUTHORITY = JOIN
+         BO    AUTHOK              YES,
+         TM    GRPAUTH,X'40'       AUTHORITY = CONNECT
+         BO    AUTHOK              YES,
+         TM    GRPAUTH,X'20'       AUTHORITY = CREATE
+         BO    AUTHOK              YES,
+         B     GRPAERR             AUTHORITY = USE OR NOT PROVIDED
+AUTHOK   DS    0H
+         CLI   FUNCTION,X'03'      IS IT A ADDSD COMMAND
+         BNE   CHECKIT             NO,
+         CLC   VOLSER,=C'999999'   IS IT A MODEL
+         BE    ALLOWIT             YES,
+         TM    WFLAG1,WFLG1SPC     IS IT A SPECIAL DATASET
+         BNO   CHECKIT             NO,
+         TM    WFLAG1,WFLG1GDG     IS IT A GDG DATASET
+         BO    CHECKIT             YES,
+         B     ALLOWIT
+         SPACE
+CHECKIT  DS    0H
+         SPACE
+         BAL   R14,DOCHECK         GO DO THE RACHECK
+         SPACE
+         LTR   R15,R15             TEST RETURN FROM RACHECK
+         BZ    ALLOWIT             RACHECK IS OK
+         OI    SMF180F3,SMFFG3CE          RACHECK ERROR
+         LA    R15,4                      FAIL THE REQUEST
+         B     RETURN                     RETURN
+ALLOWIT  DS    0H
+         MVI   SMF180F2,SMFFG2OK          SUCCESSFUL COMMAND
+         L     R1,NX00QUAL                ADDRESS OF QUALIFIER
+         MVC   0(8,R1),USERID             FAKE AS USER'S DATASET
+         L     R1,NX00TYPE                ADDRESS OF DATASET TYPE
+         LTR   R1,R1                      TEST FOR DATASET TYPE
+         BZ    ALLOWIT2                   NONE, THATS ALL
+         MVI   0(R1),X'80'                FAKE AS USER'S DATASET
+ALLOWIT2 LA    R15,0                      ZERO RETURN CODE
+         TM    WFLAG1,WFLG1SPC            SPECIAL?
+         BNO   RETURN                     RETURN
+         TM    WFLAG1,WFLG1GDG            GDG
+         BO    RETURN                     RETURN
+         L     R1,NX00RNAM                DSNAME ADDRESS
+         MVC   0(45,R1),WDSNL             CHANGE DSNAME & LENGTH
+         B     RETURN                     RETURN
+         EJECT
+         MAPDSN
+         EJECT
+         BLDDSN
+         EJECT
+***********************************************************************
+*                                                                     *
+*        THE FOLLOWING CODE WILL PERFORM THE RACHECK.                 *
+*        THE MODEL IS CHECKED TO DETERMINE IF THE USERID              *
+*        HAS CREATE AUTHORITY FOR THIS DATASET.                       *
+*                                                                     *
+*        IF THE DATASET IS A USER OR GROUP DATASET THAT MATCHES       *
+*        THE USER/GROUP FOR THE CURRENT CONNECTION THEN NO RACINIT    *
+*        WAS ISSUED AND SO NO PSEUDO ACEE IS PRESENT, THEREFORE       *
+*        USE THE ACEE CHAINED FROM THE ASCB.                          *
+*                                                                     *
+***********************************************************************
+DOCHECK  DS    0H
+         STM   R0,R15,DSNSAV       SAVE REGS
+         LA    R3,1(,R3)           POINT TO DSNAME
+         LA    R4,1(,R5)           POINT TO VOLSER
+         LA    R5,CLASSD           POINT TO CLASS=DATASET
+         L     R6,ACEEADR          POINT TO PASSED ACEE
+DOCHECK1 MVC   RACHECKD(CCHEKSIZ),CRACHECK
+         RACHECK ENTITY=((3)),VOLSER=(4),CLASS=(5),                    X
+               ATTR=ALTER,DSTYPE=N,ACEE=(6),MF=(E,RACHECKD)
+         ST    R15,RETCHECK               SAVE RETURN CODE
+         L     R1,CVTADR                  GET CVT ADDRESS
+         ICM   R1,7,992+1(R1)             GET CVTRAC ADDRESS
+         TM    RCVTCSTA+3,X'01'           TEST BIT POS 31. OPTA
+         BNO   NOWTO06                    NOT ON, BYPASS WTO
+         MVC   MSG5(MSG5LGTH),MSG5PRTO    CLASS= JOB= FUNCTION= RET=
+         MVC   MSG5CLAS,CLASNAME          MOVE IN THE CLASS NAME
+         MVC   MSG5JOBN,JOBNAME           MOVE IN THE JOBNAME
+         MVC   MSG5FUNC,=C'RACHECK'       MOVE IN THE FUNCTION
+         UNPK  WDWORD(3),RETCHECK+3(2)    CONVERT TO CHAR
+         TR    WDWORD(2),HEXTAB-240       CONVERT TO CHAR
+         MVC   MSG5RETC,WDWORD            MOVE IN RETURN CODE
+         MVC   WTOLIST(WTOLISTL),WTOPROTO INITIALIZE WTO AREA
+         MVC   WTOLIST+4(MSG5LGTH),MSG5   TO WTO LIST
+         WTO   MF=(E,WTOLIST)             WRITE IT OUT
+NOWTO06  DS    0H
+         LM    R0,R14,DSNSAV              RESTORE ALL BUT 15
+         L     R15,RETCHECK        RETURN CODE
+         BR    R14                 RETURN TO CALLER
+         EJECT
+***********************************************************************
+*                                                                     *
+*        THE FOLLOWING CODE WILL PERFORM THE RACINIT.                 *
+*        RACINIT EXIT WILL EXECUTE AN INTERNAL RACF MACRO             *
+*        TO EXTRACT THE USER'S GROUP AUTHORITY AND STORE              *
+*        IT INTO ACEEIEP 1ST BYTE.                                    *
+*                                                                     *
+***********************************************************************
+DOINIT   DS    0H
+         USING IEPDSECT,R14               ADDRESSABILITY
+         USING ACEE,R8                    ADDRESSABILITY
+         STM   R0,R15,DSNSAV       SAVE REGS
+         LA    R2,USERL            POINT TO USER NAME
+         LA    R3,GROUPL           POINT TO GROUP NAME
+         LA    R4,ACEEADR          POINT TO ACEE ADDRESS
+         MVC   RACINITD(CINITSIZ),CRACINIT
+         RACINIT USERID=(2),GROUP=(3),ENVIR=CREATE,SUBPOOL=255,        X
+               ACEE=(4),PASSCHK=NO,MF=(E,RACINITD)
+         ST    R15,RETINIT         SAVE RETURN CODE
+         L     R1,CVTADR                  GET CVT ADDRESS
+         ICM   R1,7,992+1(R1)             GET CVTRAC ADDRESS
+         TM    RCVTCSTA+3,X'01'           TEST BIT POS 31. OPTA
+         BNO   NOWTO05                    NOT ON, BYPASS WTO
+         MVC   MSG5(MSG5LGTH),MSG5PRTO    CLASS= JOB= FUNCTION= RET=
+         MVC   MSG5CLAS,CLASNAME          MOVE IN THE CLASS NAME
+         MVC   MSG5JOBN,JOBNAME           MOVE IN THE JOBNAME
+         MVC   MSG5FUNC,=C'RACINIT'       MOVE IN THE FUNCTION
+         UNPK  WDWORD(3),RETINIT+3(2)     CONVERT TO CHAR
+         TR    WDWORD(2),HEXTAB-240       CONVERT TO CHAR
+         MVC   MSG5RETC,WDWORD            MOVE IN RETURN CODE
+         MVC   MSG5EXTR(8),=C',AUTH=??'   MOVE IN EXTRA INFO
+         LR    R1,R8                      SAVE ACEE REG
+         L     R8,ACEEADR                 POINT TO ACEE
+         LTR   R8,R8                      TEST FOR GOOD ACEE
+         BZ    DOINIT01                   NO ACEE ADDRESS
+         L     R14,ACEEIEP                PARM AREA ADDRESS
+         LTR   R14,R14                    TEST FOR ADDRESS
+         BZ    DOINIT01                   NO ACEE ADDRESS
+         MVC   GRPAUTH,IEPAUTH            SAVE THE AUTHORITY
+         UNPK  WAUTH(3),GRPAUTH(2)        CONVERT HEX TO CHAR - STEP 1.
+         TR    WAUTH(2),HEXTAB-240        CONVERT HEX TO CHAR - STEP 2.
+         MVC   MSG5EXTR+6(2),WAUTH        MOVE IN RETURN CODE
+DOINIT01 LR    R8,R1                      RESTORE ACEE REG
+         MVC   WTOLIST(WTOLISTL),WTOPROTO INITIALIZE WTO AREA
+         MVC   WTOLIST+4(MSG5LGTH),MSG5   TO WTO LIST
+         WTO   MF=(E,WTOLIST)             WRITE IT OUT
+NOWTO05  DS    0H
+         XC    GRPAUTH,GRPAUTH            CLEAR AUTHORITY
+         XC    FLAG1,FLAG1                CLEAR FLAG1
+         LR    R1,R8                      SAVE ACEE REG
+         L     R8,ACEEADR                 POINT TO ACEE
+         LTR   R8,R8                      TEST FOR GOOD ACEE
+         BZ    DOINIT02                   NO ACEE ADDRESS
+         L     R14,ACEEIEP                PARM AREA ADDRESS
+         LTR   R14,R14                    TEST FOR ADDRESS
+         BZ    DOINIT02                   NO AUTH ADDRESS
+         MVC   GRPAUTH,IEPAUTH            SAVE THE AUTHORITY
+         MVC   FLAG1,ACEEFLG1             SAVE THE FLAG1
+DOINIT02 LR    R8,R1                      RESTORE ACEE REG
+         L     R4,ACEEADR          POINT TO ACEE ADDRESS
+         LTR   R4,R4               IS THERE AN ACEE TO DELETE
+         BZ    DOINIT03            NO,
+         LA    R4,ACEEADR          POINT TO ACEE ADDRESS
+         MVC   RACINITD(CINITSIZ),CRACINIT
+         RACINIT ENVIR=DELETE,SUBPOOL=255,                             X
+               ACEE=(4),PASSCHK=NO,MF=(E,RACINITD)
+DOINIT03 DS   0H
+         LM    R0,R14,DSNSAV       RESTORE ALL BUT R15
+         L     R15,RETINIT         RETURN CODE
+         BR    R14                 RETURN TO CALLER
+         DROP  R14,R8
+         EJECT
+***********************************************************************
+*                                                                     *
+*        A LOCATE IS NEEDED IF THE VOLSER IS NOT GIVEN                *
+*        BECAUSE OUR SMF180 RECORD NEEDS THE VOLSER AND               *
+*        VSAM DATASETS NEVER PROVIDE A VOLSER.                        *
+*                                                                     *
+***********************************************************************
+DOLOCATE DS    0H
+         STM   R0,R15,DSNSAV       SAVE REGS
+         XC    DLOCATE(16),DLOCATE CLEAR CAMLST AREA
+         XC    LAREA(256),LAREA    CLEAR WORK AREA FOR LOCATE
+         MVI   DLOCATE,X'44'       SET FOR LOCATE NAME
+         LA    R1,RESNAME+1        ADDRESS OF DATASET NAME
+         ST    R1,DLOCATE+4        STORE IN CAMLST
+         LA    R1,LAREA            ADDRESS OF WORK AREA
+         ST    R1,DLOCATE+12       STORE IN CAMLST
+         LOCATE DLOCATE
+         ST    R15,RETLOC          SAVE RETURN CODE
+         ST    R0,RETLOC0          SAVE REG 0 CODES
+         LTR   R15,R15             ANY ERRORS
+         BNZ   LOCERR              YES,
+         MVC   SMF180VL,LAREA+6    VOLSER TO SMF
+         LM    R0,R14,DSNSAV       RESTORE ALL BUT R15
+         BR    R14                 RETURN TO CALLER
+         EJECT
+***********************************************************************
+*                                                                     *
+*        THIS ROUTINE WILL DO THE FOLLOWING:                          *
+*         1. LOCATE THE DATASET PROFILE AND EXTRACT                   *
+*            (OWNER)                                                  *
+*         2. RETURN CODES TO CALLER.                                  *
+*            (R15=00 OWNER FOUND)                                     *
+*            (R15=04 OWNER NOT FOUND)                                 *
+*                                                                     *
+***********************************************************************
+DOPERMIT EQU   *
+         STM   R0,R15,DSNSAV       SAVE THE REGISTERS
+         MVI   WK1AREA,C' '        CLEAR WORK AREA TO BLANKS
+         MVC   WK1AREA+1(255),WK1AREA
+         MVC   RACLOC1D(LOC1SIZ),RACLOC1C INITIALIZE LOCATE
+         MVC   RACAC1AD(ACT1ASIZ),RACAC1AC INITIALIZE ACTION
+         SPACE
+         ICHEINTY LOCATE,ENTRY=RESNAME,VOLUME=VOLSER,                  X
+               OPTIONS=(FLDEF,TESTC,TESTM,ACTION),                     X
+               WKAREA=WK1AREA,                                         X
+               ACTIONS=(RACAC1AC),                                     X
+               MF=(E,RACLOC1D)
+         SPACE
+         LTR   R15,R15             TEST RETURN CODE
+         BZ    CKOWNER             ZERO, OK
+ACCSR8   LA    R15,8               RETURN CODE 8
+ACCSRET  LM    R0,R14,DSNSAV       RELOAD REGISTERS
+         BR    R14                 RETURN TO CALLER
+         SPACE 2
+CKOWNER  CLC   WK1SIZE1,=X'0008'   OWNER LENGTH FOUND
+         BNE   ACCSR8              NO, SHOW ERROR
+         MVC   OWNER,WK1DATA1      SAVE THE OWNER FIELD
+         B     ACCSRET             GOOD RETURN
+         EJECT
+***********************************************************************
+*        THE ROUTINE TO MESSAGE ERRORS IN THE RACINIT                 *
+***********************************************************************
+BADINIT  DS    0H
+         OI    SMF180F3,SMFFG3IE          RACINIT ERROR
+         LA    R15,4                      FAIL THE REQUEST
+         B     RETURN                     RETURN
+***********************************************************************
+*        THE ROUTINE TO MESSAGE ERRORS IN THE USER'S GROUP AUTHORITY  *
+***********************************************************************
+GRPAERR  DS    0H
+         OI    SMF180F3,SMFFG3GA          GROUP AUTH ERROR
+         MVC   MSG3(MSG3LGTH),MSG3PRTO    USERID= & GROUP=
+         MVC   MSG3USER,USERID            MOVE IN THE USERID
+         MVC   MSG3GROP,GROUP             MOVE IN THE JOBNAME
+         MVC   WTOLIST(WTOLISTL),WTOPROTO INITIALIZE WTO AREA
+         MVC   WTOLIST+4(MSG3LGTH),MSG3   TO WTO LIST
+         WTO   MF=(E,WTOLIST)             WRITE IT OUT
+         MVC   MSG6(MSG6LGTH),MSG6PRTO    FUNCTION AND ERROR
+         MVC   MSG6FUNC,=C'ADDSD '        MOVE IN THE FUNCTION
+         CLI   GRPAUTH,X'10'              READ AUTHORITY
+         BE    GRPAERR1                   YES,
+         MVC   MSG6ERR,=C'USER NOT MEMBER OF GROUP    '
+         B     GRPAERR2
+GRPAERR1 DS    0H
+         MVC   MSG6ERR,=C'INSUFFICIENT GROUP AUTHORITY'
+GRPAERR2 DS    0H
+         MVC   WTOLIST(WTOLISTL),WTOPROTO INITIALIZE WTO AREA
+         MVC   WTOLIST+4(MSG6LGTH),MSG6   TO WTO LIST
+         WTO   MF=(E,WTOLIST)             WRITE IT OUT
+         LA    R15,4                      FAIL THE REQUEST
+         B     RETURN                     RETURN
+         EJECT
+***********************************************************************
+*        THE ROUTINE TO MESSAGE ERRORS IN THE ACEEIEP AREA            *
+***********************************************************************
+NOIEP    DS    0H
+         OI    SMF180F3,SMFFG3IE          RACINIT ERROR
+         WTO   '*** WARNING*** RACINIT DID NOT RETURN USER GROUP AUTHORX
+               ITY - CREATE REQUEST FAILED',                           X
+               ROUTCDE=(9,11)
+         LA    R15,4                      FAIL THE REQUEST
+         B     RETURN                     RETURN
+***********************************************************************
+*        THE ROUTINE TO MESSAGE THAT NO ACEE FOUND                    *
+***********************************************************************
+NOACEE   DS    0H
+         OI    SMF180F3,SMFFG3NA          NO ACEE
+         WTO   '*** WARNING*** NO ACEE FOUND - REQUEST FAILED',        X
+               ROUTCDE=(9,11)
+         LA    R15,4                      FAIL THE REQUEST
+         B     RETURN                     RETURN
+***********************************************************************
+*        ADDSD NOSET OF USER MODEL BUT NOT BY THE USER.               *
+*        DELDSD OF USER PROFILE BUT NOT BY THE USER.                  *
+***********************************************************************
+BADUSER  DS    0H
+         OI    SMF180F3,SMFFG3RE          RESOURCE NAME ERROR
+         WTO   '*** WARNING ***  REQUEST FAILED ****** USER DATASET DOEX
+               S NOT MATCH USERID  ****',ROUTCDE=(9,11)
+         LA    R15,4
+         B     RETURN
+***********************************************************************
+*        LOCATE OF OWNER FAILED ON PERMIT COMMAND CHECKING            *
+***********************************************************************
+NOOWNER  DS    0H
+         OI    SMF180F3,SMFFG3CA          PERMIT AUTHORITY ERROR
+         WTO   '*** WARNING ***  PERMIT FAILED ****** OWNER NOT FOUND. X
+                ****',ROUTCDE=(9,11)
+         LA    R15,4
+         B     RETURN
+***********************************************************************
+*        ADDSD NOSET OF USER MODEL BUT NOT BY THE USER.               *
+*        DELDSD OF USER PROFILE BUT NOT BY THE USER.                  *
+***********************************************************************
+BADOWNER DS    0H
+         OI    SMF180F3,SMFFG3CA          PERMIT AUTHORITY ERROR
+         WTO   '*** WARNING ***  PERMIT FAILED ****** USER MUST BE OWNEX
+               R ****',ROUTCDE=(9,11)
+         LA    R15,4
+         B     RETURN
+***********************************************************************
+*        THE ROUTINE TO BREAK DOWN THE DSNAME OR THE DSNAME           *
+*        IS IN ERROR.                                                 *
+***********************************************************************
+BADNODE  DS    0H
+         OI    SMF180F3,SMFFG3RE          RESOURCE NAME ERROR
+         WTO   '*** WARNING*** DSNAME INVALID - MODELING BYPASSED  ',  X
+               ROUTCDE=(9,11)
+         LA    R15,4                      FAIL THE REQUEST
+         B     RETURN                     RETURN
+         EJECT
+***********************************************************************
+*        THE ROUTINE TO MSG THAT THE LOCATE SVC FAILED                *
+***********************************************************************
+LOCERR   DS    0H
+         OI    SMF180F3,SMFFG3RE   RESOURCE NAME NOT CATALOGED
+         WTO   '*** WARNING*** LOCATE ERROR - REQUEST FAILED',         X
+               ROUTCDE=(9,11)
+         LA    R15,4                      FAIL THE REQUEST
+         B     RETURN                     RETURN
+***********************************************************************
+*        THE ROUTINE TO MSG THAT "NOSET" MUST BE USED TO BUILD        *
+*        A MODEL WITH VOLSER(999999)                                  *
+***********************************************************************
+MODERR   DS    0H
+         OI    SMF180F3,SMFFG3RE          RESOURCE NAME ERROR
+         WTO   '*** WARNING*** MODELS MUST BE DEFINED WITH - NOSET ',  X
+               ROUTCDE=(9,11)
+         LA    R15,4                      FAIL THE REQUEST
+         B     RETURN                     RETURN
+         EJECT
+***********************************************************************
+*        THE ROUTINE TO MSG A WARNING THAT A COMMAND WAS ISSUED       *
+*        BUT RACF IN NOT ACTIVE.                                      *
+***********************************************************************
+NORACF   DS    0H
+         OI    SMF180F3,SMFFG3NR          RACF IS NOT ACTIVE
+         WTO   'ICHCNX00  *** WARNING ***   RACF NOT ACTIVE     ',     X
+               ROUTCDE=(9,11)
+         LA    R15,4                      RACF IS NOT ACTIVE
+         B     RETURN                     RACF IS NOT ACTIVE
+         EJECT
+RETURN   DS    0H
+         ST    R15,WRETURN
+SMFWRT   SMFWTM SMFRD180
+         LTR   R15,R15              TEST FOR GOOD SMF WRITE
+         BZ    SMFOK                OK
+SMFMSG   LA    R2,REPLY             POINT TO REPLY AREA
+         LA    R3,WTORECB           POINT TO ECB
+         XC    REPLY,REPLY          CLEAR REPLY AREA
+         XC    WTORECB,WTORECB      CLEAR ECB
+         WTOR  '*** WARNING *** RACF COULD NOT WRITE TO SMF, REPLY C (TX
+               O CANCEL) OR U (TO RETRY)',(2),L'REPLY,(3),             X
+               ROUTCDE=(9,11)
+         WAIT  ECB=WTORECB          WAIT FOR A REPLY
+         CLI   REPLY,C'U'           REPLY = RETRY
+         BE    SMFWRT               YES,
+         CLI   REPLY,C'C'           REPLY = CANCEL
+         BE    NOSMF                YES,
+         B     SMFMSG               ASK AGAIN
+SMFOK    L     R15,WRETURN
+         EJECT
+RETURN2  LR    R1,R13               SAVE NEW SAVEAREA ADR FOR FREEMAIN
+         L     R13,SAVEOLD                OLD SAVEAREA
+         ST    R15,SAVER15          PLUG (R15) FOR RESTORE (R14-12)
+         FREEMAIN R,A=(1),LV=WORKSIZE,SP=0 FREE UP NEW SAVEAREA
+         XC    SAVENEW,SAVENEW            BREAK CHAIN
+         LM    R14,R12,SAVER14            RESTORE REGS
+         BR    R14                        BACK TO MOTHER
+NOSMF    DS    0H
+         WTO   '*** WARNING*** SMF IS NOT RECORDING REQ TERMINATED ',  X
+               ROUTCDE=(9,11)
+         LA    R15,4                      FAIL THE REQUEST
+         B     RETURN2                    RETURN
+         DROP  ,                          DROP EVERYTHING
+         EJECT
+         NODETAB
+SAVETIME DC    2F'0'
+HEXTAB   DC    X'F0F1F2F3F4F5F6F7F8F9C1C2C3C4C5C6'
+CLASSD   DC    AL1(7),CL7'DATASET'
+CRACINIT RACINIT MF=L
+CINITSIZ EQU   *-CRACINIT
+CRACHECK RACHECK MF=L
+CCHEKSIZ EQU   *-CRACHECK
+RACLOC1C ICHEINTY LOCATE,TYPE='DS',ACTIONS=(),MF=L,                    X
+               ENTRY=0,WKAREA=0
+LOC1SIZ  EQU   *-RACLOC1C
+RACAC1AC ICHEACTN FIELD=OWNER,MF=L
+ACT1ASIZ  EQU   *-RACAC1AC
+         LTORG
+         EJECT
+***********************************************************************
+*        PARAMETER LISTS ECT.
+***********************************************************************
+GTFPROTO GTRACE LNG=256,ID=1,MF=L
+GTFLISTL EQU   *-GTFPROTO              LENGTH OF PROTOTYPE GTRACE LIST
+WTOPROTO WTO   '                                                       X
+                                                                       X
+                         ',                                            X
+               MF=L,ROUTCDE=(9,11)
+WTOLISTL EQU   *-WTOPROTO              LENGTH OF PROTOTYPE WTO LIST
+MSG1PRTO EQU   *
+         DC    C'ICHCNX00 JOB='
+         DC    CL8' '
+         DC    C',GROUP='
+         DC    CL8' '
+         DC    C',USERID='
+         DC    CL8' '
+         DC    C',AUTH='
+         DC    CL2' '
+         DC    C',FUNC='
+         DC    CL4' '
+         DC    C',VOL='
+         DC    CL6' '
+         DC    C',NAME='
+         DC    CL44' '
+MSG1LGTH EQU   *-MSG1PRTO
+MSG3PRTO EQU   *
+         DC    C'ICH408I USER('
+         DC    CL8' '
+         DC    C') GROUP('
+         DC    CL8' '
+         DC    C')'
+MSG3LGTH EQU   *-MSG3PRTO
+MSG4PRTO EQU   *
+         DC    C'                 '
+         DC    C'CL(DATASET) VOL(999999)'
+MSG4LGTH EQU   *-MSG4PRTO
+MSG5PRTO EQU   *
+         DC    C'ICHCNX00 CLASS='
+         DC    CL7' '
+         DC    C',JOB='
+         DC    CL8' '
+         DC    C',FUNCTION='
+         DC    CL7' '
+         DC    C',RETURN='
+         DC    CL2' '
+         DC    CL11' '
+MSG5LGTH EQU   *-MSG5PRTO
+MSG6PRTO EQU   *
+         DC    C'  '
+         DC    C'DEFINE'
+         DC    C' - '
+         DC    C'USER NOT MEMBER OF GROUP    '
+MSG6LGTH EQU   *-MSG6PRTO
+         EJECT
+NX00PARM DSECT
+NX00WORD DS    F                   ADDRESS OF PARM COUNT IN LIST
+NX00FUNC DS    F                   ADDRESS OF  2 BYTE FUNCTION CODE
+NX00REQA DS    F                   ADDRESS OF  1 BYTE REQUESTED AUTH
+NX00RNAM DS    F                   ADDRESS OF 45 BYTE RESOURCE NAME
+NX00ONAM DS    F                   ADDRESS OF 45 BYTE OLD RESOURCE
+NX00VOLS DS    F                   ADDRESS OF  ? BYTE LGTH & VOLSERS
+NX00OVOL DS    F                   ADDRESS OF  6 BYTE OLD VOLSER
+NX00CLAS DS    F                   ADDRESS OF  8 BYTE CLASS NAME
+NX00QUAL DS    F                   ADDRESS OF  8 BYTE QUALIFIER
+NX00TYPE DS    F                   ADDRESS OF  1 BYTE TYPE
+NX00AUTH DS    F                   ADDRESS OF  1 BYTE GRANTED AUTH
+NX00CPPL DS    F                   ADDRESS OF  ? BYTE PARAM LIST
+         EJECT
+SAVEAREA DSECT
+SAVEPLI  DS    F
+SAVEOLD  DS    F
+SAVENEW  DS    F
+SAVER14  DS    F
+SAVER15  DS    F
+SAVER0   DS    F
+SAVER1   DS    F
+SAVER2   DS    F
+SAVER3   DS    F
+SAVER4   DS    F
+SAVER5   DS    F
+SAVER6   DS    F
+SAVER7   DS    F
+SAVER8   DS    F
+SAVER9   DS    F
+SAVER10  DS    F
+SAVER11  DS    F
+SAVER12  DS    F
+SAVESIZE EQU   *-SAVEAREA
+         EJECT
+WORKAREA EQU   *                          START OF WORKAREA
+CVTADR   DS    F                   ADDRESS OF CVT
+GTFLIST  GTRACE LNG=256,ID=1,MF=L
+WTOLIST  WTO   '                                                       X
+                                                                       X
+                         ',                                            X
+               MF=L,ROUTCDE=(9,11)
+DLOCATE  DS    0D
+*        CAMLST NAME,RESNAME+1,,LAREA
+         DS    CL1
+         DS    CL1
+         DS    CL1
+         DS    CL1
+         DS    F
+         DS    F
+         DS    F
+LAREA    DS    0D
+         DS    CL265
+RACINITD RACINIT MF=L
+RACHECKD RACHECK MF=L
+RACLOC1D ICHEINTY LOCATE,TYPE='DS',ACTIONS=(),MF=L,                    X
+               ENTRY=0,WKAREA=0
+RACAC1AD ICHEACTN FIELD=OWNER,MF=L
+         SPACE 2
+WK1AREA  DS    0C                  START OF 512 BYTE WORK AREA
+         DS    CL26
+         DS    CL2                 LENGTH OF ALL EXTRACTED DATA
+WK1SIZE1 DS    CL2                 SIZE OF OWNER
+WK1DATA1 DS    CL8                 OWNER
+OWNER    DS    CL8                 RESOURCE OWNER
+         DS    CL184               PADDING
+         EJECT
+MSG1     EQU   *
+         DC    C'ICHCNX00 JOB='
+MSG1JOBN DC    CL8' '
+         DC    C',GROUP='
+MSG1GRPN DC    CL8' '
+         DC    C',USERID='
+MSG1USRN DC    CL8' '
+         DC    C',AUTH='
+MSG1AUTH DC    CL2' '
+         DC    C',FUNC='
+MSG1FUNC DC    CL4' '
+         DC    C',VOL='
+MSG1VOL  DC    CL6' '
+         DC    C',NAME='
+MSG1RNAM DC    CL44' '
+MSG3     EQU   *
+         DC    C'ICH408I USER('
+MSG3USER DC    CL8' '
+         DC    C') GROUP('
+MSG3GROP DC    CL8' '
+         DC    C')'
+MSG4     EQU   *
+MSG4MNM  DC    C'                 '
+         DC    C'CL(DATASET) VOL(999999)'
+MSG5     EQU   *
+         DC    C'ICHCNX00 CLASS='
+MSG5CLAS DC    CL7' '
+         DC    C',JOB='
+MSG5JOBN DC    CL8' '
+         DC    C',FUNCTION='
+MSG5FUNC DC    CL7' '
+         DC    C',RETURN='
+MSG5RETC DC    CL2' '
+MSG5EXTR DC    CL11' '
+MSG6     EQU   *
+         DC    C'  '
+MSG6FUNC DC    C'      '
+         DC    C' - '
+MSG6ERR  DC    C'                            '
+GTFREC01 DS    XL256                      GTF USER RECORD TYPE 1
+         ORG   GTFREC01                   OVERLAY THE DIFFERENT FIELDS
+GTFJOBNM DS    CL8                        JOBNAME
+GTFFLAG1 DS    X                          FLAG BYTE 1
+GTFUSRID DS    CL9                        LENGTH & USERID
+GTFGROUP DS    CL9                        LENGTH & GROUP
+GTFGAUTH DS    CL1                        GROUP AUTHORITY
+GTFFUNC  DS    CL2                        COMMAND FUNCTION
+GTFRNAM  DS    CL45                       LENGTH & RESOURCE NAME
+GTFQUAL  DS    CL8                        QUALIFIER
+         ORG
+WORK     DS    CL8                 HEX TO CHAR WORK AREA
+GROUPL   DS    0CL9                USERID & LENGTH
+         DS    CL1                 USERID LENGTH
+GROUP    DS    CL8                 GROUP NAME & LENGTH
+USERL    DS    0CL9                USERID & LENGTH
+         DS    CL1                 USERID LENGTH
+USERID   DS    CL8                 USERID
+JOBNAME  DS    CL8                 JOBNAME
+FLAG1    DS    CL1                 ACEE FLAG1
+TERMID   DS    CL8                 ACEE TERMINAL ID
+GRPAUTH  DS    CL1                 ACEE GROUP AUTHORITY
+FUNCTION DS    CL2                 COMMAND FUNCTION
+REQAUTH  DS    CL1                 REQUESTED AUTHORITY
+RESNAME  DS    CL45                RESOURCE NAME & LENGTH
+OLDNAME  DS    CL45                OLD NAME & LENGTH
+VOLSERL  DS    0CL7                VOLSER & LENGTH
+         DS    CL1                 LENGTH
+VOLSER   DS    CL6                 VOLSER
+OVOLSER  DS    CL6                 OLD VOLSER
+CLASNAME DS    CL8                 CLASS NAME
+QUALFIER DS    CL8                 DATASET QUALIFIER
+TYPE     DS    CL1                 DATASET TYPE
+WAUTH    DS    CL3                 WORK AREA FOR CHAR AUTH
+SAVEN    DS    CL9                 SAVE AREA FOR NODE SWAP
+WRETURN  DS    F                   RETURN CODE WORK AREA
+RETINIT  DS    F                   RACINIT RETURN CODE
+RETCHECK DS    F                   RACHECK RETURN CODE
+RETLOC   DS    F                   LOCATE RETURN CODE
+RETLOC0  DS    F                   LOCATE REG 0 CODES
+ACEEADR  DS    F                   ACEE ADDRESS
+WDWORD   DS    D                   DOUBLE WORD WORK AREA
+WTORECB  DS    F                   WTOR ECB
+REPLY    DS    CL1                 WTOR REPLY AREA
+         SPACE 2
+BLANKS   DC    CL44' '
+         WRKDSN
+         SMF180
+WORKSIZE EQU   *-SAVEAREA
+         EJECT
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+         ICHPRCVT
+         IHAACEE
+         EJECT
+         IEPMACRO
+         END

@@ -1,0 +1,1680 @@
+*          DATA SET COPYDISK   AT LEVEL 051 AS OF 25/01/83
+         TITLE 'COPYDISK - COPY AND COMPRESS A DISK PACK'
+COPYDISK CSECT
+         SPACE 3
+**********************************************************************
+*     COPYDISK   COPIES THE DATA FROM ONE DISK TO ANOTHER            *
+*                AND REORGANISES THE DATA SET TO USE THE             *
+*                MINIMUM DISK SPACE                                  *
+*                NORMALLY THIS IS DONE USING THE ORDER OF THE VTOC   *
+*                ENTRIES.  (SEE FILE 4 - START CARD)                 *
+*                                                                    *
+*                ANOTHER OPTION, SUITABLE FOR ORGANISING SYSTEM      *
+*                DISKS, (FILE 4 - ORDER TYPE CARDS + FILE 6), USES   *
+*                A PREFERRED ORDER, PROBABLY IN CONJUNCTION WITH     *
+*                SOME ELEMENT OF PRE-ALLOCATION ON THE TARGET DISK.  *
+*                                                                    *
+*                                                                    *
+*      IT WILL   1) COPY THE CATALOGUE IF REQUESTED USING IEHMOVE    *
+*                       N.B. THE TARGET SYSCTLG SHOULD BE PREALLOCATED*
+*                            IDEALLY USING ABSTR TO BE NEXT TO VTOC   *
+*                                                                    *
+*                2) COPY PDS USING IEBCOPY                           *
+*                   N.B. THE NO OF DIRECTORY BLOCKS IS REDUCED TO    *
+*                   THE TRACK LIMIT ABOVE THE MINIMUM REQUIRED.      *
+*                                                                    *
+*                3) COPY SEQUENTIAL DATA SETS USING IEBGENER         *
+*                   IF THIS FAILS IT WILL RETRY USING RECFM=U        *
+*                                                                    *
+*                4) COPY D-A FILES AS SEQUENTIAL USING IEBGENER      *
+*                   RESETTING DSORG ON COMPLETION                    *
+*                                                                    *
+*                5) COPY A SINGLE DATASET USING PARM=CASTRATE        *
+*                   AND THE SPECIAL INPUT CARD (FILE 4)              *
+*                                                                    *
+*   IT ALLOWS DATA SETS TO BE PREALLOCATED ON THE NEW DISK IN        *
+*   WHICH CASE UNUSED SPACE IS NOT RELEASED                          *
+*                                                                    *
+*                                                                    *
+*  IN THE CASE OF TRANSFER BETWEEN UNLIKE DEVICES, A REPORT FILE IS  *
+*  PRODUCED. WHICH LISTS INEFFECIENT ALLOCATIONS.  THE CRITERIA ARE  *
+*        -                                                           *
+*          A) PRIMARY ALLOCATION > SPACE USED + 10%                  *
+*          B)  BLOCKSIZE/3  < SPACE LEFT ON NEW TRACK                *
+*          C)  NEW PRIMARY > OLD X 2/3                               *
+*    THE FILE IS NOT USED ON A SINGLE DATA SET COPY (PARM=CASTRATE). *
+*    THE INFORMATION CAN BE IGNORED IF THE DATA SET IS PRE-ALLOCATED *
+*    AS THE CALCSP ROUTINE IS ENTERED BEFORE ATTEMPTING ALLOCATION.  *
+*      THIS REPORT CANNOT TAKE ACCOUNT OF  -                         *
+*        A)  EVENTUAL SPACE USED ON A PDS COPY.                      *
+*        B)  EVENTUAL SPACE USED IF THE RLSE OPTION IS IN EFFECT.    *
+*                                                                    *
+*                                                                    *
+*   THE PROGRAM CAN BE RESTARTED AT ANY SPECIFIED DATA SET ON        *
+*   THE OLD DISK.  (FILE 4 - RESTART DSN FEATURE)                    *
+*                                                                    *
+*                                                                    *
+*     INPUT    THERE ARE SIX INPUT FILES                             *
+*                                                                    *
+*     FILE 1.  DDNAME = SYSIN                                        *
+*              MUST BE DD DUMMY BECAUSE IT IS USED BY                *
+*              IEBGENER TO COPY ENTIRE DATA SETS                     *
+*                                                                    *
+*     FILE 2.  DDNAME = MOVEIN                                       *
+*              ONE CARD THE CONTROL CARD FOR IEHMOVE                 *
+*         E.G.  COPY CATALOG,TO=3330=NEW001,CVOL=3330=OLD001         *
+*                                                                    *
+*     FILE 3.  DDNAME = PROGMIN                                      *
+*              THIS FILE IS ONLY USED ON RESTART. IT CONTAINS        *
+*              IEHPROGM CONTROL CARDS AND PROVIDES THE FACILITY TO   *
+*              SCRATCH THE DATA SET ON THE NEW DISK AT WHICH THE     *
+*              JOB HAD PREVIOUSLY FAILED                             *
+*                                                                    *
+*     FILE 4.  DDNAME=START                                          *
+*              NORMAL VERSION                                        *
+*              THIS FILE CONTAINS THE CONTROL INPUT TO COPYDISK      *
+*     CARD 1. START     IN COL 1 (FOR NORMAL START)                  *
+*                                                                    *
+*        OR   CATALOG IN COL 1 (FOR NORMAL START AND CATALOG COPY)   *
+*               N.B. NO CATALOG COPY AVAILABLE ON RESTART            *
+*                                                                    *
+*        OR    DSN OF RESTART DATA SET (FOR RESTART)                 *
+*        OR   ORDER IN COLS U-5 (EQUIV. OF START BUT USES FILE 6)    *
+*                                                                    *
+*        OR   ORDCAT IN COLS1-6  (EQUIV. TO CATALOG PLUS FILE 6)     *
+*                                                                    *
+*        OR   ORDRES IN COLS 1-6  (EQUIV. TO DSN-RESTART PLUS FILE 6)*
+*                                                                    *
+*     CARD 2.  RLSE   IN COL 1 TO RLSE ALL DATA SETS EXCEPT          *
+*                     PREALLOCATED ONES                              *
+*        OR    BLANK  IF NO RLSE REQUIRED                            *
+*                                                                    *
+*              CATAL IN CC5 -> TO PERFORM RECATALOGING               *
+*        OR    LEAVE BLANK IF NOT DESIRED                            *
+*                                                                    *
+*              (N.B. BLDGS BE A PRE-REQUISITE ON TARGET SYSCTLG)     *
+*                                                                    *
+*     FILE 4.  DDNAME=START(CASTRATED VERSION)                       *
+*                                                                    *
+*              1 CARD OF INPUT:                                      *
+*               CC 1-4   RLSE, CATL OR RLCA (RLSE + CATAL) OR BLANKS *
+*               CC 5-42  DSN OF DATASET TO BE COPIED.                *
+*                  NEW WORLD STANDARD OF 38 CHAR MAX DSN             *
+*               CC 43-80 NEWNAME OR BLANKS                           *
+*                                                                    *
+*                                                                    *
+*     FILE 5.  DDNAME=EXCLUDE                                        *
+*                                                                    *
+*               THIS FILE CONTAINS A MAXIMUM OF 50 CARDS DEFINING    *
+*               DATASET NAMES OR GENERIC IDENTIFIERS TO BE EXCLUDED  *
+*               FROM ANY COPY OPERATION.                             *
+*                                                                    *
+*               FREE FORMAT CODED, CONTAINING -                      *
+*                DSN  MY.DATASET.NAME   (GDGS IN FULL)               *
+*             OR DSG GENERIC.ID                                      *
+*                                                                    *
+*               IN ANY SEQUENCE. MINIMUM 1 BLANK BETWEEN DSN/DSG AND *
+*               THE FOLLOWING NAME.                                  *
+*               INVALID OR EXCESS CARDS ARE BYPASSED.                *
+*                                                                    *
+*                                                                    *
+*     FILE 6.  DDNAME=ORDER                                          *
+*               USED IN CONJUNCTION WITH THE ORDER TYPE CARD (FILE 4)*
+*               SPECIFY IN COLS 1 ON, THE DSNAMES (1 PER CARD) OF    *
+*               FILES TO BE COPIED IN THE ORDER GIVEN.               *
+*               PASS #2 IS FORCED. THUS NO ABSTR ALLOCATED FILES     *
+*               BE COPIED.                                           *
+*                                                                    *
+*                                                                    *
+         EJECT
+*        ERROR EXITS                                                 *
+*                                                                    *
+*        ABEND                                                       *
+*                                                                    *
+*              U002   ERROR WHILE OBTAINING OLD FORMAT1 DSCB         *
+*                                                                    *
+*              U003   ERROR READING VTOC OF OLD DISK FOR RESTART     *
+*                     DATA SET                                       *
+*                                                                    *
+*              U004   ERROR ALLOCATING NEW DATA SET                  *
+*                                                                    *
+*              U005   ERROR OBTAINING FORMAT4 DSCB (EITHER DISK)     *
+*                                                                    *
+*              U006   BAD JFCB FOR VTOC (DSN NOT FORMAT4.DSCB)       *
+*                                                                    *
+*                                                                    *
+*              U044   RENAME FAILED IN CASTRATED VERSION.            *
+*                                                                    *
+         EJECT
+*                                                                    *
+*        DD CARDS                                                    *
+*                                                                    *
+*        //SYSPRINT  DD  SYSOUT=A                                    *
+*        //SYSUT1    DD  OLD VOLUME,DISP=OLD                         *
+*        //SYSUT2    DD  NEW VOLUME,DISP=OLD                         *
+*        //SYSUT3    DD  WORK DATASET                                *
+*        //SYSUT4    DD  WORK DATASET                                *
+*        //OLDMOVE   DD  WORK DATASET                                *
+*        //NEWMOVE   DD  WORK DATASET                                *
+*        //OLDDISK   DD  DSN=TEMP1,DISP=OLD,OLDVOLUME                *
+*        //NEWDISK   DD  DSN=TEMP2,DISP=OLD,NEWVOLUME                *
+*        //ZAP2DA    DD  DSN=FORMAT4,DSCB,DISP=OLD,NEWVOLUME         *
+*        //CNTRL     DD &&SEQFILE CONTROL CARDS WRITTEN FOR SUBTASKS *
+*        //SYSIN     DD DUMMY FOR IEBGENER                           *
+*        //PROGMIN   DD * SCRATCH LAST COPIED DS ON RESTART          *
+*        //START     DD * ONE OR TWO CONTROL CARDS                   *
+*        //MOVEIN    DD * IEHMOVE CONTROL CARD FOR COPY CATALOGUE    *
+*        //EXCLUDE   DD * DSG AND DSN CARDS TO EXCLUDE FROM COPY     *
+*        //ORDER     DD * SEQUENCED DSNAMES FOR SYSVOL COPY.         *
+*        //REPORT    DD  SYSOUT=A    INEFFICIENT SPACE USE REPORT    *
+*        //SNAPDUMP  DD  SYSOUT=A                                    *
+*        //SYSABEND  DD  SYSOUT=A                                    *
+*                                                                    *
+*                                                                    *
+*           ---------- POINTS WORTH MENTIONING -----------           *
+*                                                                    *
+*    1)   THIS PROGRAM BYPASSES ISAM DATASETS, VSAM DATA SPACES,     *
+*         SYSTEM TEMPORARY DATA SETS, S.A.S. OR MPSX DATA SETS,      *
+*         PANVALET LIBRARIES AND MARKIV DICTIONARIES.                *
+*         (S.A.S. AND PAN ONLY IF UNLIKE DEVICES)                    *
+*                                                                    *
+*    2)   DATE LAST USED BY BATCH AND TSO IS STORED BY US IN THE     *
+*         11 BYTES OF THE DS1SYSCD FIELD OF F1 DSCB. THIS IS ZAPPED  *
+*         ACROSS AFTER THE COPY. NOTHING WILL BE DAMAGED IF DLU IS   *
+*         NOT USED.                                                  *
+*                                                                    *
+*    3)   ABSTR ALLOCATED DATASETS WILL NOT BE COPIED IF THE SOURCE  *
+*         AND TARGET DEVICES ARE UNLIKE.                             *
+*                                                                    *
+*    4)   TWO PASSES OF THE PROGRAM OCCUR IF THE DEVICES ARE ALIKE.  *
+*         PASS 1 COPIES ONLY ABSTR FILES.  PASS 2 PROCESSES THE REST.*
+*          IF AN ORDERED COPY IS CHOSEN, THEN ONLY PASS#2 IS DONE.   *
+*                                                                    *
+*                                                                    *
+**********************************************************************
+         PRINT NOGEN
+        EJECT
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4             CURRENT 'R' IN VTOC OBTAIN MAINLOOP
+R5       EQU   5             CURRENT 'HH'
+R6       EQU   6          SPARE REG
+R7       EQU   7             LIMIT 'R' VALUE  (DSCB'S / TRK)
+R8       EQU   8          BASE REG #1
+R9       EQU   9             LIMIT FOR 'HH' VALUE  (TRKS/CYL)
+R10      EQU   10                 INTERNAL RETURN REGISTER
+R11      EQU   11         BASE REG #2
+R12      EQU   12         BASE REG #3
+R13      EQU   13                 SAVE AREA
+R14      EQU   14
+R15      EQU   15
+         EJECT
+*          SET UP ADDRESSABILITY
+         SAVE  (14,12),,*
+         BALR  R8,0
+         USING *,8,11,12
+BEGIN    LM    R11,R12,BASEADDS
+         B     CHAINSA
+BASEADDS DC    A(BEGIN+4096)
+         DC    A(BEGIN+8192)
+CHAINSA  EQU   *
+         LR    R15,R13
+         ST    R13,SAVE+4
+         LA    R13,SAVE
+         ST    R13,8(R15)
+         L     R2,0(R1)      ADDRESS OF PARAMETERS
+         CLC   2(8,R2),=C'CASTRATE'    REQUEST FOR A SINGLE D/S COPY
+         BNE   NOCAST         VERY STRANGE. CASTRATE SPELT WRONG?
+         MVI   CODE,C'X'           SINGLE COPY ONLY
+NOCAST   EQU   *
+         SPACE 3
+*              FORCE SYSPRINT DCB PARAMETERS
+         SPACE
+         RDJFCB SYSPRINT           READ SYSPRINT JFCB
+         OI    JFCBNEW+76,X'80'    SET WRITE BACK FLAG
+         OPEN  (SYSPRINT,OUTPUT),TYPE=J
+         CLOSE SYSPRINT            WRITE JFCB BACK TO JOB Q
+*        SET UP DSN OF VTOC FOR DA ZAPS
+         SPACE  2
+         RDJFCB ZAPDCB                  READ JFCB FOR VTOC
+         CLC   ZAPJFCB(12),=C'FORMAT4.DSCB' CHECK DSN
+         BNE   BADJFCB                  NO-ERROR BRANCH
+         MVI   ZAPJFCB,X'04'
+         MVC   ZAPJFCB+1(43),ZAPJFCB     SET FMT4 DSNAME
+         MVC   ZAPJFCB+102(2),=H'144'  SET BLKSIZE IN JFCB
+         OI    ZAPJFCB+76,X'80'    SET WRITE BACK FLAG
+         OPEN  (ZAPDCB,INPUT),TYPE=J
+         L     R2,ZAPDCB+44        -> DEB
+         L     R2,32(,R2)          -> UCB
+         ST    R2,UCBADDR          WHILE DCB IS OPEN
+         CLOSE ZAPDCB
+         EJECT
+         SPACE
+*     SET UP SYSIN DATA SET FOR IEBCOPY
+         OPEN  (CNTRL,OUTPUT)
+         PUT   CNTRL,COPYCARD     COPY INDD=SYSUT1,OUTDD=SYSUT2
+         CLOSE CNTRL
+         BAL   R10,EXCLUDCD       READ EXCLUSIONS IF ANY
+         BAL   R10,CTLIN
+         CLI   CODE,C'C'          CATALOG TO BE MOVED ?
+         BNE   NOCATLG                                 NO
+         SPACE 2
+*            COPY CATALOGUE
+         SPACE 1
+         LINK  EP=IEHMOVE,PARAM=(OPTMOVE,DDMOVE),VL=1   COPY CATLG
+         STH   R15,RETCODE          SAVE FOR INSPECTION
+         LTR   15,15               TEST RETURN CODE OK
+         BE    NOCATLG             YES
+         MVC   MSGID,=C'77'
+         MVC   MESSAGE+20(20),=C'COPY CATALOG FAILED.'
+         CVD   R15,DWORK
+         MVC   MESSAGE+45(4),=X'40202020'
+         ED    MESSAGE+45(4),DWORK+6
+         MVC   MESSAGE+41(4),=C'R15='
+         BAL   R14,PRINT
+NOCATLG  EQU   *
+         LA    R1,ALOLDDIS
+         BAL   R10,DEVDETLS       GET DETAILS OF OLD DEVICE
+         LA    R1,ALNEWDIS
+         BAL   R10,DEVDETLS             AND OF NEW ONE
+         MVI   WRK,X'00'
+         MVC   WRK+1(147),WRK
+         MVC   OLDVOL,JFCBOLD+118
+         MVC   NEWVOL,JFCBNEW+118
+         MVC   OLDVOLST+2(4),OLDTYPE
+         MVC   NEWVOLST+2(4),NEWTYPE
+         CLC   OLDTYPE,NEWTYPE     SAME TYPE ?
+         BE    PASSTART            YES - DEFAULT PASS 1
+         MVC   MSGID,=C'98'
+         MVC   MESSAGE+40(36),=C'***   UNLIKE DEVICES - PASS#2 FORCED'
+         MVC   MESSAGE+80(18),=C'COPYDISK        TO'
+         MVC   MESSAGE+89(6),OLDVOL
+         MVC   MESSAGE+99(6),NEWVOL
+         BAL   R14,PRINT
+         CLI   CODE,C'X'
+         BE    SETP2
+         MVI   REPTFLAG,C'Y'
+         OPEN  (REPFIL,OUTPUT)
+         MVI   REPAR,C'1'
+         MVC   REPAR+10(41),=C'DATA SET SPACE INEFFICIENCY REPORT - DISK
+               K'
+         MVC   REPAR+62(6),NEWVOL
+         PUT   REPFIL,REPAR
+         MVI   REPAR,X'40'
+         MVI   REPAR+10,X'60'
+         MVC   REPAR+11(57),REPAR+10
+         PUT   REPFIL,REPAR
+         MVC   REPAR(121),REPAR-1
+SETP2    MVI   PASS,C'2'
+         B     CHECKX
+         SPACE 2
+PASSTART EQU   *
+         CLI   ORDFLAG,C'Y'
+         BNE   CHECKX
+         MVC   MSGID,=C'97'
+         MVC   MESSAGE+30(26),=C'ORDERED COPY - PASS#2 ONLY'
+         BAL   R14,PRINT
+         MVI   PASS,C'2'
+CHECKX   EQU   *
+         CLI   CODE,C'X'           SINGLE COPY ?
+         BE    SINGLEDS
+         MVC   CC(4),OLDCCHH       OLD VTOC ADDRESS
+         LA    R4,1
+         STC   R4,CC+4             START AT RECORD ONE
+         LH    R5,CC+2             HEAD NUMBER
+         LA    R5,1(R5)            SET READY FOR COMPARE
+         SR    R7,R7
+         IC    R7,OLDDSCBT         DSCBS PER TRACK
+         SR    R9,R9
+         LH    R9,OLDTPERC
+         BCTR  9,0        TRKS/CYL - 1 FOR MAX HH CHECK
+         CLI   CODE,C'R'
+         BNE   ISORDON
+         LA    R10,MAINLOOP
+         B     RESTART
+ISORDON  EQU   *
+         CLI   ORDFLAG,C'Y'        ORDERED COPY ?
+         BNE   MAINLOOP            NO
+         BAL   R10,RESTART         YES - 1ST NAME AVAIL. LOCATE DSCB
+         EJECT
+MAINLOOP EQU   *
+         SPACE 1
+*                   GET VTOC ENTRY FROM OLD DISK
+         SPACE 1
+         OBTAIN CAM2               READ VTOC ENTRY
+         STH   R15,RETCODE          SAVE FOR INSPECTION
+         LTR   15,15               OK ?
+         BNE   ABEND2
+         CLI   WRK+44,C'1'         FORMAT 1 DSCB
+         BNE   SPECIAL
+         BAL   R10,F1RTN           HANDLE F1 DSCB
+SPECIAL  B     UPADDR        NOP IF ORDERED COPY
+         GET   ORDFIL,COPYCARD
+         MVC   RDSN(44),COPYCARD
+         BAL   R10,RESTART2      AVOID IEHPROGM AFTER 1ST CARD
+         B     MAINLOOP
+         SPACE 2
+*                   UPDATE CCHHR
+         SPACE 1
+UPADDR   CR    R4,R7               TEST FOR LAST RECORD ON TRACK
+         BNH   UPREC               NO - BRANCH
+         MVI   CC+4,X'01'          SET RECNO. =1
+         LA    R4,2                R4=RECNO 2  (UPREC AVOIDED)
+         CR    R5,R9               TEST FOR LAST TRACK IN CYL
+         BNH   UPHEAD              NO - BRANCH
+         LA    5,0                 R5=HEADNO=1
+         LH    2,CC                R2 =CYL NO.
+         AH    2,=H'1'             UP CYL NO. IN R2
+         STH   2,CC                UPDATE CYLNO
+         B     UPHEAD              SET HEAD ZERO & CHECK HWM
+UPREC    EQU   *
+         STC   4,CC+4              UPDATE RECORD NO.
+         LA    R4,1(R4)            UPDATE RECNO. REG.
+         B     ISHI                GO CHECK HIWATER MARK
+UPHEAD   EQU   *
+         STC   5,CC+3              UPDATE HEAD NO
+         LA    R5,1(R5)            UPDATE TRACK. REG.
+ISHI     CLC   CC(5),OLDHWM        COMPARE WITH HI WATER MARK
+         BNH   MAINLOOP
+ENDPASS  CLI   PASS,C'1'          WAS THIS PASS1 ?
+         BNE   WRAPUP                              NO
+         MVC   MSGID,=C'99'
+         MVC   MESSAGE+60(18),=C'*** - END OF PASS1'
+         BAL   R14,PRINT
+         OI    REJABSTR+1,X'F0'    AT END OF PASS 1
+         B     SETP2                        BY PASS 1
+         SPACE 3
+WRAPUP   EQU   *
+         MVC   MSGID-1(3),=C'999'
+         MVC   MESSAGE+60(22),=C'***  COPYDISK COMPLETE'
+         BAL   R14,PRINT
+         CLI   CODE,C'X'            SINGLE D/S COPY ?
+         BE    FINITO               YES
+         MVC   MESSAGE+20(17),=C'DATA SETS IGNORED'
+         BAL   R14,PRINT
+         LA    R4,10
+         LA    R5,MKIVCT
+FINLOOP  MVC   MESSAGE+20(4),=X'40202120'
+         ED    MESSAGE+20(4),0(R5)
+         MVC   MESSAGE+25(9),2(R5)
+         BAL   R14,PRINT
+         LA    R5,11(R5)      NEXT ARRAY ELEMENT
+         BCT   R4,FINLOOP
+         CLI   REPTFLAG,C'Y'
+         BNE   TESTORD
+         CLOSE REPFIL
+TESTORD  CLI   ORDFLAG,C'Y'
+         BNE   FINITO
+         CLOSE ORDFIL
+FINITO   EQU   *
+         MVC   MESSAGE+20(19),=C'UNSUCCESSFUL - RC ='
+         LH    R15,RETCODE
+         LTR   R15,R15
+         BNZ   *+10
+         MVC   MESSAGE+20(2),MESSAGE+19  CLEAR UN
+         CVD   R15,DWORK
+         MVC   DWORK(4),=X'40202120'
+         ED    DWORK(4),DWORK+6
+         MVC   MESSAGE+40(2),DWORK+2
+         BAL   R14,PRINT
+         CLOSE SNAPDCB
+         L     R13,4(R13)          RESET R13
+         LH    R15,RETCODE         LOAD HIGHEST RC
+         RETURN (14,12),RC=(15)
+         TITLE 'READ EXCLUDE CARDS, IF ANY'
+EXCLUDCD EQU   *
+         OPEN  (EXCLUDE,INPUT)
+         TM    EXCLUDE+48,X'10'    OPEN OK ?
+         MVI   EXCLIST,X'FF'        TABLE END INDICATOR
+         BZ    ENDEX             OPEN FAILED
+         LA    R9,EXCLIST
+         USING EXCLIST,R9
+         LA    R4,ENDEXCL
+         DROP  R9
+READEX   GET   EXCLUDE
+         LA    R2,79(,R1)          END OF CARD
+         LR    R5,R1
+EXLOOP1  CLI   0(R1),C' '          LOOK FOR NON-BLANK
+         BNE   FNBEX
+         LA    R1,1(,R1)           NEXT CHARACTER
+         CR    R1,R2               REACHED END ?
+         BNH   EXLOOP1                           NO
+         B     EXCERTN             YES, BLANK CARD IGNORED
+         SPACE
+FNBEX    CLC   0(4,R1),=CL4'DSG'
+         BE    DODSG
+         CLC   0(4,R1),=CL4'DSN'
+         BE    DODSN
+         B     EXCERTN             IGNORE INVALID CARD
+DODSG    MVI   0(R9),C'G'
+         B     *+8
+DODSN    MVI   0(R9),C'N'
+         LA    R1,4(,R1)           SKIP OVER 'DSG ' OR 'DSN '
+EXLOOP2  CLI   0(R1),C' '          LOOK FOR NAME
+         BNE   REACHN
+         LA    R1,1(,R1)
+         CR    R1,R2
+         BNH   EXLOOP2
+         B     EXCERTN             IGNORE CARD WITH NO NAME
+         SPACE
+REACHN   LR    R3,R1               SAVE START OF NAME
+EXLOOP3  LA    R1,1(,R1)
+         CR    R1,R2               CHECK FOR END OF CARD
+         BH    ENDNM               - WHICH IS VALID DELIMITER
+         CLI   0(R1),C' '          AND FOR BLANK
+         BNE   EXLOOP3
+ENDNM    EQU   *
+         SR    R1,R3               FIND LENGTH OF NAME
+         BCTR  R1,0                FOR DIRECT USE
+         STC   R1,1(R9)
+         EX    R1,STNAME           MVC   2(0,R9),0(R3)
+         LA    R9,46(,R9)          NEXT ENTRY
+         CR    R9,R4             TABLE FULL ?
+         BL    READEX            NO - NEXT CARD
+         MVC   MSGID,=C'89'
+         MVC   MESSAGE+40(27),=C'** MAX. EXCLUDE CARDS INPUT'
+         BAL   R14,PRINT
+         MVC   MESSAGE(80),0(R5)       CARD IMAGE
+         MVC   MESSAGE+85(22),=C'WAS LAST CARD ACCEPTED'
+         BAL   R14,PRINT
+         B     EOFEX
+         SPACE 1
+EXCERTN  MVC   MSGID,=C'88'
+         MVC   MESSAGE(80),0(R5)       CARD IMAGE
+         MVC   MESSAGE+85(23),=C'** INVALID EXCLUDE CARD'
+         BAL   R14,PRINT
+         B     READEX
+         SPACE
+EOFEX    MVI   0(R9),X'FF'         MARK END OF LIST
+         CLOSE EXCLUDE
+ENDEX    BR    R10
+         TITLE 'READ && PROCESS FILE 4 (START DD) CARD(S)'
+CTLIN    EQU   *
+         OPEN  (CARDDCB,INPUT)
+         TM    CARDDCB+48,X'10'    DD CARD PRESENT ?
+         BZ    ENDCTLIN
+         GET   CARDDCB             READ CARD
+         BAL   R4,STRTPRT
+ISITANX  EQU   *
+         CLI   CODE,C'X'           SINGLE COPY ?
+         BE    SINGLCRD
+         CLC   0(7,R1),=C'CATALOG' CATALOG REQUIRED ?
+         MVI   CODE,C'C'
+         BE    GETCARD2            YES - READ NEXT CARD
+         MVI   CODE,C'S'
+         CLC   0(5,R1),=C'START'   START ?
+         BE    GETCARD2            YES
+         CLC   0(5,R1),=C'ORDER'
+         BE    ORDOPEN       NO COPY SYSCTLG
+         CLC   0(6,R1),=C'ORDCAT'
+         BNE   SETCODER
+         MVI   CODE,C'C'       PERFORM COPY CATALOG
+         B     ORDOPEN
+SETCODER MVI   CODE,C'R'     SET RESTART CODE
+         CLC   0(6,R1),=C'ORDRES'
+         BNE   RESTDSN
+ORDOPEN  OPEN  (ORDFIL,INPUT)
+         TM    ORDFIL+48,X'10'       OPEN OK ?
+         BO    SETORD        YES
+         MVC   MSGID,=C'90'
+         MVC   MESSAGE(18),=C'ORDER FILE MISSING'
+         BAL   R14,PRINT
+         B     WRAPUP
+SETORD   MVI   ORDFLAG,C'Y'      SIGNAL ORDERED COPY
+         NI    SPECIAL+1,X'0F'   ALLOW ENTRY TO RTN & BYPASS UPADDR
+         GET   ORDFIL,COPYCARD
+         MVC   RDSN(44),COPYCARD
+         B     GETCARD2
+RESTDSN  EQU   *
+         MVC   RDSN(44),0(R1)      SAVE RESTART DSNAME
+GETCARD2 GET   CARDDCB             READ SECOND CARD, IF ANY
+         BAL   R4,STRTPRT
+         CLC   0(4,R1),=C'RLSE'       IS RLSE REQUESTED
+         BNE   *+8               NO
+         MVI   RLSEOPT,C'Y'         YES, SET TO C'Y'
+         CLC   4(5,R1),=C'CATAL'
+         BNE   ENDCTLIN
+         MVI   CATFLAG,C'Y'      ALLOW AUTOMATIC RECATALOGING
+SETCATF  EQU   *
+         B     ENDCTLIN
+         SPACE
+SINGLCRD MVC   RDSN(38),4(R1)     EXTRACT DSNN
+         MVC   NEWNAME(38),42(R1)   EXTRACT RENAME
+         CLC   0(4,R1),=C'RLSE'  IS RELEASE ASKED FOR
+         BNE   TRLCA
+         MVI   RLSEOPT,C'Y'       SWITCH ON RELEASE OPTIC'Y'
+         B     ENDCTLIN
+TRLCA    CLC   0(4,R1),=C'RLCA'
+         BNE   TRYCATL
+         MVI   RLSEOPT,C'Y'
+         B     SETCATF
+TRYCATL  CLC   0(4,R1),=C'CATL'
+         BE    SETCATF
+         SPACE
+ENDCTLIN CLOSE CARDDCB
+         BR    R10
+         SPACE 3
+STRTPRT  EQU   *
+         STM   R0,R1,R0R1SAVE
+         MVC   MSGID,=C'96'
+         MVC   MESSAGE(80),0(R1)          CARD IMAGE
+         MVC   MESSAGE+85(16),=C'START FILE INPUT'
+         BAL   R14,PRINT
+         LM    R0,R1,R0R1SAVE
+         BR    R4
+         TITLE 'GET AND STORE DEVICE DETAILS'
+DEVDETLS EQU   *
+         LM    R2,R3,0(R1)
+         RDJFCB ((R2))
+         L     R4,36(,R2)          ADDRESS OF EXLST
+         L     R4,0(,R4)           ADDRESS OF JFCB - ONLY ENTRY IN LIST
+         MVC   CAMVOL,118(R4)
+         LA    R2,40(,R2)          DD NAME FROM DCB
+         DEVTYPE (R2),(R3),DEVTAB
+         MVI   DSN,X'04'
+         MVC   DSN+1(43),DSN
+         OBTAIN CAM1              FORMAT4 DSCB
+         STH   R15,RETCODE          SAVE FOR INSPECTION
+         LTR   R15,R15
+         BNZ   ABEND5
+         MVC   20(1,R3),WRK+31    PDS DIRECTORY BLOCKS PER TRACK
+         MVC   21(1,R3),WRK+30    DSCBS PER TRACK
+         MVC   22(4,R3),WRK+63    VTOC CCHH
+         MVC   26(5,R3),WRK+1     HIGH WATER MARK
+         BR    R10
+         TITLE 'RESTART PROCESSING'
+RESTART  EQU   *
+         LINK  EP=IEHPROGM,PARAM=(OPT,DDPROGM),VL=1
+*
+RESTART2 EQU   *        ALTERNATIVE ENTRY FOR ORDERED COPY FUNCTION
+         MVC   DSN,RDSN
+         MVC   CAMVOL,OLDVOL    ENSURE SEARCH ON OLD VOLUME
+         OBTAIN CAM1               GET RESTART DSCB
+         LTR   15,15               OK ?
+         BZ    FOUNDOK
+         CH    R15,=H'8'
+         BNE   ABEND3              NO BRANCH
+         STH   R15,RETCODE          SAVE FOR INSPECTION
+         MVC   MSGID,=C'11'
+         MVC   MESSAGE(44),DSN
+         MVC   MESSAGE+50(16),=C'DSN NOT FOUND ON'
+         MVC   MESSAGE+67(6),OLDVOL
+         MVC   MESSAGE+75(15),=C'R15=8 EX-OBTAIN'
+         BAL   R14,PRINT
+         CLI   CODE,C'X'       SINGLE D/S COPY ?
+         BE    WRAPUP
+         CLI   ORDFLAG,C'Y'      ORDERED COPY ?
+         BNE   WRAPUP            NO
+         B     SPECIAL
+FOUNDOK  EQU   *
+         MVC   CC(5),WRK+96        SET CCHHR OF DSCB
+         MVC   OLDCCHH(4),WRK+96   SAVE RESTART ADDRESS
+         IC    R4,CC+4       SET CORRECT COMPARISON BASE FOR UPADDR RTN
+         LA    R4,1(R4)
+         LH    R5,CC+2       SET CORRECT TRACK BASE ALSO...
+         LA    R5,1(R5)
+         CLI   PASS,C'2'      UNLIKE DEVICES FOUND ?
+         BE    ENDRSTRT       YES - DON'T TRY ABSTR ALLOCNS
+         SPACE 2
+*   * N.B. OFFSETS ON WRK ARE 44 LESS AFTER CAMLST SEARCH V SEEK !
+         TM    WRK+38,X'01'      UNMOVEABLE ?
+         BO    REPASS1
+        CLC   WRK+38(3),=X'2000C0'   DSORG=DA / RECFM=U  ?
+         BNE   QABST
+         CLC   WRK+42(2),=H'12288'   MARKIV BLKSZ ON 3330
+         BNE   REPASS2
+         BE    REPASS1
+QABST    TM    WRK+50,X'C0'       ABSTR ALLOCN ?
+         BNZ   REPASS2       NO
+         SPACE
+REPASS1  MVI   PASS,C'1'
+         B     ENDRSTRT
+REPASS2  MVI   PASS,C'2'
+ENDRSTRT BR    R10
+         TITLE 'HANDLE DATASETS'
+F1RTN    EQU   *
+         ST    R10,F1RTNR10
+         LA    R1,EXCLIST
+F1EXLOOP CLI   0(R1),X'FF'
+         BE    WANTF1
+         IC    R2,1(R1)
+         CLI   0(R1),C'N'         DSN ?
+         BNE   *+8
+         LA    R2,43     ENSURE FULLNAME COMPARE TO AVOID EQUIV OF DSG
+         EX    R2,CLCNM           CLC   2(0,R1),WRK
+         BE    LOGEXCL              NAME MATCHED - EXCLUDE
+         LA    R1,46(,R1)         NEXT ENTRY IN LIST
+         B     F1EXLOOP
+LOGEXCL  MVC   MSGID,=C'66'
+         MVC   MESSAGE+20(44),WRK      DSN
+         MVC   MESSAGE+70(19),=C'EXCLUDED BY REQUEST'
+         BAL   R14,PRINT
+         AP    EXCLCT,=P'1'
+         B     ENDF1
+         SPACE
+WANTF1    EQU   *
+         CLC   WRK(8),=CL8'SYSCTLG'
+         BE    ENDF1
+TESTEMP  MVC   TESTDSN,WRK         DATA SET NAME
+         NC    TESTDSN,OFFMASK     SWITCH OFF VARIABLE BITS
+         CLC   TESTDSN,TESTMASK    COMPARE REMAINDER
+         BE    ENDF1                                TEMP
+         MVC   DLUBS,WRK+62        SAVE DATE LAST USED
+         MVI   DAFLAG,C'N'       CLEAR D-A FLAG TO NO
+         TM    WRK+82,X'20'      DA DSORG ?
+         BNO    QPASS1        NO
+         MVI   DAFLAG,C'Y'
+         MVI   WRK+82,X'40'    SET DSORG = PS   TEMPORARILY !
+QPASS1   EQU   *
+         CLI   PASS,C'1'
+         BNE   DOPASS2
+         CLC   WRK+82(2),=H'8'       VSAM ?
+         BE    ENDF1
+         TM    WRK+82,X'80'       ISAM ?
+         BO    ENDF1
+         TM    WRK+82,X'01'        UNMOVEABLE ?
+         BO    TRYABSTR            YES
+        CLC   WRK+82(3),=X'4000C0'   DSORG=DA / RECFM= U  ?
+         BNE   TRYABSTR
+         CLC   WRK+86(2),=H'12288' BLKSIZE=12288 ? -IE, IS IT MARKIV ?
+         BE    WASMKIV            YES
+         CLC   WRK+86(2),=H'18432'       3350 MARKIV ?
+         BNE   TRYABSTR            NO
+WASMKIV  EQU   *
+         MVI   DAFLAG,C'N'         YES - RESET FLAG TO OFF
+         B     ENDF1               SKIP MESSAGE UNTIL PASS2
+         SPACE 1
+TRYABSTR TM    WRK+94,X'C0'        IS IT ABSTR ?
+         BNZ   ENDF1                             NO
+DOPASS1  EQU   *             UNMOVEABLE, AND OR ABSTR
+         BAL   R10,BLDJFCB
+         BAL   R10,CALCSP
+         BAL   R10,ABSALLOC
+         BAL   R10,COPYDS
+         B     COMMON
+         SPACE 2
+DOPASS2  EQU   *
+         CLI   DAFLAG,C'Y'           ESTABLISHED D-A ?
+         BNE   ISITVSAM              NO
+         MVI   DAFLAG,C'N'           RESET TO ALLOW -
+         MVI   WRK+82,X'20'             TESTS OF PAN/MARKIV OK
+         B     QYABST
+ISITVSAM EQU   *
+         CLC   WRK+82(2),=H'8'    IS IT VSAM ?
+         BE    REJVSAM                         YES
+         TM    WRK+82,X'80'
+         BO    INDEXED
+QYABST   EQU   *
+         TM    WRK+94,X'C0'       IS IT ABSTR ?
+         BZ    REJABSTR            YES - MSG ONLY IF NO PASS 1 DONE
+         TM    WRK+82,X'01'        UNMOVEABLE ?
+         BO    UNMOVE              YES
+        CLC   WRK+82(3),=X'2000C0'  DSORG=DA  / RECFM=U  ?
+         BNE   TRYDA
+         CLC   WRK+86(2),=H'12288'  IS IT MARK 4 ON 3330 ?
+         BE    MRK4DICT                          YES
+         CLC   WRK+86(2),=H'18432'       3350 MARKIV ?
+         BE    MRK4DICT
+TRYSAS   EQU   *
+         CLI   REPTFLAG,C'Y'        UNLIKE DEVICES ?
+         BNE   TRYDA                NO
+         CLC   WRK+86(4),=X'32E632E2'        3330 SAS DATA SET ?
+         BE    REJSAS                  YES
+         CLC   WRK+86(4),=X'4A7D4A79'       3350 SAS ?
+         BE    REJSAS
+TRYDA    CLI   WRK+82,X'20'        DSORG=DA ?
+         BNE   TSTMPSX
+         CLC   WRK+86(2),=H'1510'  IS IT A PANLIB ?
+         BE    GOTOPAN            YES
+         CLC   WRK+86(2),=H'1419'          3350 PANLIB ?
+         BNE   NOTPAN                       NO
+GOTOPAN  EQU   *
+         BAL   R10,PAN
+         B     ENDF1
+         SPACE 1
+TSTMPSX  EQU   *
+         CLC   WRK+82(3),=X'4000C0'    DSORG=PS  RECFM=U ?
+         BNE   CREATION
+         CLC   WRK+86(4),ZERO
+         BNE   CREATION
+         B     REJMPSX
+         SPACE
+NOTPAN   EQU   *
+         MVI   DAFLAG,C'Y'
+         MVI   WRK+82,X'40'         DSORG PS FOR COPY
+CREATION EQU   *
+         CLI   WRK+59,X'00'        NO OF EXTENTS = ZERO ?
+         BE    DUMALLOC            YES - ALLOC DUMMY DSCB
+         BAL   R10,BLDJFCB
+         BAL   R10,CALCSP
+         BAL   R10,ALLOC
+         BAL   R10,COPYDS
+COMMON   LH    R10,THISRET         GET RETURN CODE, THIS DS
+         CH    R10,=H'4'           WAS IT OK ?
+         BH    ENDF1                           NO, SKIP CAT
+         BAL   R10,CATOPS          CATALOGUE IF REQUIRED
+         B     ENDF1
+         SPACE 2
+DUMALLOC EQU   *
+         BAL   R10,ALLOCDMY
+         B     ENDF1
+         SPACE 3
+*
+*        DATA SETS REJECTED FROM COPY
+*
+*        MARKIV DICTIONARY
+MRK4DICT EQU   *
+         MVC   MSGID,=C'20'
+         MVC   MESSAGE(44),WRK
+         MVC   MESSAGE+50(28),=C'MARKIV DICTIONARY - BYPASSED'
+         BAL   R14,PRINT
+         AP    MKIVCT,=P'1'
+         B     ENDF1
+*        INDEXED SEQUENTIAL DATA SETS
+INDEXED  EQU   *
+         MVC   MSGID,=C'15'
+         MVC   MESSAGE(44),WRK
+         MVC   MESSAGE+50(20),=C'ISAM FILE - BYPASSED'
+         BAL   R14,PRINT
+         AP    ISAMCT,=P'1'
+         B     ENDF1
+*        VSAM DATA SETS
+REJVSAM  EQU   *
+         MVC   MSGID,=C'17'
+         MVC   MESSAGE(44),WRK
+         MVC   MESSAGE+50(26),=C'IS A VSAM OBJECT - USE AMS'
+         BAL   R14,PRINT
+         AP    VSAMCT,=P'1'
+         B     ENDF1
+*        UNMOVEABLE DATA SETS
+REJABSTR EQU   *
+         NOP   ENDF1               BYPASS MSG IF PASS 1 DONE
+         MVC   MSGID,=C'16'        '
+         MVC   MESSAGE(44),WRK
+         MVC  MESSAGE+50(38),=C'ABSTR CANNOT BE MOVED TO UNLIKE DEVICE'
+         BAL   R14,PRINT
+         AP    ABSTRCT,=P'1'
+         B     ENDF1
+UNMOVE   EQU   *
+         MVC   MSGID,=C'19'
+         MVC   MESSAGE(44),WRK     DSN
+         MVC   MESSAGE+50(37),=C'UNMOVEABLE NON-ABSTR D/SET - BYPASSED'
+         BAL   R14,PRINT
+         AP    UNMOVCT,=P'1'
+         B     ENDF1
+REJMPSX  EQU   *
+         MVC   MSGID,=C'21'
+         MVC   MESSAGE(44),WRK     DSN
+         MVC   MESSAGE+50(32),=C'MPSX DATA SET - USE MPSX TO COPY'
+         BAL   R14,PRINT
+         AP    MPSXCT,=P'1'
+         B     ENDF1
+REJSAS   EQU   *
+         MVC   MSGID,=C'22'
+         MVC   MESSAGE(44),WRK     DSN
+         MVC   MESSAGE+50(36),=C'S.A.S. DATA SET - USE S.A.S. TO COPY'
+         BAL   R14,PRINT
+         AP    SASCT,=P'1'
+         SPACE 2
+ENDF1    L     R10,F1RTNR10
+         BR    R10
+         TITLE 'BUILD JFCB'
+BLDJFCB  EQU   *
+         MVC   JFCBNEW(44),WRK     DSN
+         MVC   JFCBNEW+80(6),WRK+53 CREDATE,EXPDATE
+         OI    JFCBNEW+87,X'C0'    DISP=NEW
+         MVC   JFCBNEW+93(1),WRK+90 KEYLEN
+         MVC   JFCBNEW+98(8),WRK+82 DSORG, ETC.
+         MVC   JFCBNEW+108(2),WRK+91   KEYPOSN
+         NI    JFCBNEW+87,X'CF'     CLEAR PROT'N BITS
+         TM    WRK+93,X'04'          READ ONLY PROT'N ?
+         BNO   PROT1                 NO
+         OI    JFCBNEW+87,X'30'      SET READ ONLY PROT'N
+         B     PROTDONE
+PROT1    TM    WRK+93,X'10'          FULL PROT'N ?
+         BNO   PROTDONE              NO
+         OI    JFCBNEW+87,X'10'      SET FULL PROT'N
+PROTDONE EQU   *
+         MVC   JFCBOLD(44),WRK     DSN ALSO REQUIRED IN OLD
+         MVC   JFCBOLD+98(8),WRK+82  DSORG/RECFM/OPTCD/BLKSZ/LRECL
+         MVC   JFCBOLD+93(1),WRK+90   KEYLEN
+         OPEN  (OLDDCB,INPUT),TYPE=J
+         CLOSE OLDDCB
+         BR    R10
+         TITLE 'ALLOCATE BY ABSTR'
+ABSALLOC EQU   *
+         MVI   JFCBNEW+155,X'00'   SET ALLOCN UNIT
+         MVC   WORK(4),WRK+107
+         LH    R0,WORK             CC
+         MH    R0,OLDTPERC           *TPERC
+         AH    R0,WORK+2           + HH
+         STH   R0,JFCBNEW+166      SET REL TRK ADDR
+         LA    1,UCBADDR           R1 -> UCB ADDRESS
+         LA    0,JFCBNEW           R0 -> JFCBNEW
+         SVC   32                  ALLOCATE DATA SET
+         STH   R15,RETCODE          SAVE FOR INSPECTION
+         LTR   15,15               OK ?
+         BE    CONT1               YES BRANCH
+         LA    1,4                 R1 SET TO TEST RC=4
+         CR    15,1      I.E. WAS DATA SET ALREADY ALLOCATED
+         BNE   ABEND4              NO BRANCH
+         B     PREALLOC
+         TITLE 'ALLOCATE - GENERAL CASE'
+ALLOC    EQU   *
+         LA    1,UCBADDR           R1 -> UCB ADDRESS
+         LA    0,JFCBNEW           R0 -> JFCBNEW
+         SVC   32                  ALLOCATE DATA SET
+         STH   R15,RETCODE          SAVE FOR INSPECTION
+         LTR   15,15               OK ?
+         BE    CONT1               YES BRANCH
+         LA    1,4                 R1 SET TO TEST RC=4
+         CR    15,1      I.E. WAS DATA SET ALREADY ALOCATED
+         BNE   ABEND4              NO BRANCH
+PREALLOC EQU   *
+         MVC   MSGID,=C'09'
+         MVC   MESSAGE(44),JFCBNEW  DSN
+         MVC   MESSAGE+45(21),=C' - PREALLOCATION USED'
+         BAL   R14,PRINT           BRANCH TO PRINT
+         MVI   RLSEFLAG,C'N'       SET NO RLSE FOR PREALLOCD DATA SET
+         SPACE 2
+CONT1    EQU   *
+         OPEN (NEWDCB,OUTPUT),TYPE=J
+         CLOSE NEWDCB
+         BR    R10
+         TITLE 'ALLOCATE DUMMY - MODEL DSCB'
+ALLOCDMY EQU   *
+         MVC   MSGID,=C'01'
+         MVC   MESSAGE(44),WRK     DSN
+         MVC   MESSAGE+45(33),=C' WAS ALLOCATED USING A DUMMY DSCB'
+         MVI   PRLINE,C'1'         SPACE TO HEAD OF FORM
+         BAL   R14,PRINT+4         PRESERVE PRLINE CTLCHR
+         LA    R1,UCBADDR          R1 -> UCBADDR
+         L     R0,INDIC32          R0 -> DUMMY DSCB
+         SVC   32                  ISSUE ALLOCATE SVC
+         BAL   R14,PRINT     SPACE TO AVOID CHAN#1 STATIC
+         BR    R10
+INDIC32  DS    0F
+         DC    X'80'               INDICATE DSCB
+         DC    AL3(WRK)            DSCB ADDRESS
+         TITLE 'CALCULATE SPACE REQUIRED'
+CALCSP   EQU   *     CALCULATE NEW PRIMARY & SECONDARY SPACES
+         ST    R10,CALCR10
+         CLC   WRK+98(5),=XL5'0'   LAST TRACK DEFINED ?
+         BE    ENDCALC                                  NO
+         MVC   WORK+2(2),WRK+98    RELATIVE TRACK
+         LH    R1,WORK+2
+         TM    WRK+82,X'02'        PDS ?
+         BNO   PLUS1T              NO
+         TM    WRK+94,X'C0'        CYL ALLOC ?
+         BO    PLUS1T              YES
+         LA    R1,1(R1)       ALLOW FOR 1ST TRK ALL DIR'Y BLKS !
+PLUS1T   EQU   *
+         LA    R1,1(,R1)
+         LR    R0,R1               PRIME REQUIREMENT, OLD TRACKS
+         MVC   WORK(8),WRK+107     GET PRIMARY
+         SR    R1,R1          CLEAR REG.
+         LH    R1,WORK+4      UPPER CC
+         SH    R1,WORK        SUBTRACT LOWER CC
+         MH    R1,OLDTPERC    CONVERT TO TRKS
+         AH    R1,WORK+6      PLUS UPPER TT
+         SH    R1,WORK+2      SUBTRACT LOWER TT
+         AH    R1,=H'1'        PLUS ONE
+         CR    R1,R0          PRIMARY > USED
+         BNH   CNVTRK         NO - OK
+         CLI   REPTFLAG,C'N'
+         BE   USEPRIM
+         LR    R2,R0         R2 = USED
+         SRDL  R2,32
+         M     R2,=F'110'
+         D     R2,=F'100'
+         CR   R1,R3      PRIMARY V USED+10%
+         BNH   USEPRIM
+         MVC   REPAR(22),=C'0  HIGH PRIMARY V USED'
+         MVC   REPAR+30(44),JFCBNEW    DSN
+         MVI   NEWREP,C'Y'       SIGNAL NEW DSNAME GROUP FOR REPORT
+         BAL   R14,REPORTN
+USEPRIM  EQU   *
+         LR    R0,R1          YES - USE PRIMARY
+CNVTRK   BAL   R10,TRKTOTRK    CONV TO NEW TRKS
+         TM    WRK+94,X'80'        CYL OR TRK ALLOC'N ?
+         BO    TFORCYL             YES
+         CLI   WRK+94,X'00'          ABSTR ?
+         BE    STORPRIM              YES
+         L    R0,WORK+4            PICK UP BLOCKS USED EX - TRKTOTRK
+         MVC   JFCBNEW+172(2),WRK+86      SET AVGE BLKLEN = BLKSIZE
+         B     STORPRIM            USE IT
+TFORCYL  EQU   *
+         TM    WRK+94,X'C0'        CYLS ?
+         BNO   STORPRIM                   NO
+         BAL   R10,TTONEWC         CONVERT TO NEW CYLINDERS
+STORPRIM ST    R0,WORK
+         MVC   JFCBNEW+152(3),WORK+1
+         SPACE
+*     SECONDARY
+         MVC   WORK(4),WRK+94
+         MVI   WORK,X'00'
+         L     R0,WORK             SECONDARY ALLOCATION, OLD
+         LTR   R0,R0                NO SEC'Y ?
+         BZ    STORSEC              TRUE
+         TM    WRK+94,X'C0'        CYLS ?
+         BO    CTOT
+         TM    WRK+94,X'40'        BLKS ?
+         BO    STORSEC
+         B     TTOBLK
+CTOT     EQU   *
+         MH    R0,OLDTPERC
+TTOBLK   EQU   *
+         MVI   SECIND,C'Y'   INDICATE SEC'Y ALLOC ENTRY
+         BAL   R10,TRKTOTRK
+         TM    WRK+94,X'C0'
+         BNO   STORSEC
+         BAL   R10,TTONEWC
+STORSEC  EQU   *
+         ST    R0,WORK
+         MVI   NEWREP,C'N'
+         MVC   JFCBNEW+156(3),WORK+1
+         MVC   JFCBNEW+155(1),WRK+94         ALLOCATION UNIT
+         TM    WRK+82,X'02'        PDS ?
+         BNO   SEQDS
+*                   CALCULATE NO OF DIRECTORY BLOCKS
+         SPACE 1
+         OPEN  (OLDDCB2,INPUT),TYPE=J  OPEN DATA SET ON OLD DISK
+         SR    R3,R3
+READB    READ  DECB,SF,OLDDCB2,DIRAREA
+         CHECK DECB
+         LA    R3,1(R3)
+         CLI   DIRAREA,X'FF'       END OF DIRECTORY ?
+         BNE   READB                                  NO
+         ST    R3,BLOCKNO          YES, STORE BLOCK COUNT
+         B     READB
+         SPACE
+DIREOF   CLOSE (OLDDCB2)
+         SR    R0,R0
+         LR    R1,R3               NUMBER OF DIRECTORY BLOCKS
+         SR    R3,R3
+         IC    R3,NEWPDSB          DIRECTORY BLOCKS PER TRACK
+         DR    R0,R3               R1 IS WHOLE TRACKS USED
+         LTR   R0,R0               ANY REMAINDER ?
+         BZ    *+8                                 NO
+         LA    R1,1(,R1)           ADD ANOTHER TRACK
+         MR    R0,R3               NUMBER OF DIRECTORY BLOCKS
+         BCTR  R1,0                LESS 1 FOR SHORT 1ST TRK
+         ST    1,BLOCKNO           SAVE NO OF DIRECTRY BLKS
+         MVC   JFCBNEW+160(3),BLOCKNO+1  SET DIRECTRY BLKS FOR NEW DS
+         SR    R0,R0              MAKE SURE THERE IS SPACE FOR DIRECT.
+         SR    R10,10
+         IC    R10,NEWPDSB        PDS DIRECT. BLOCKS/TRACK
+         DR    R0,R10             BLOCKS/(BLOCKS/TRACK) = TRACKS
+         LTR   R0,R0              ANY REMAINDER ?
+         BZ    *+6                                NO
+         LA    R1,1(,R1)          ADD ONE FOR PART TRACK
+         TM    WRK+94,X'C0'       CYLINDER ALLOCATION ?
+         BNO   ADDNUMBR                                 NO
+         SR    R0,R0
+         LH    R10,NEWTPERC       TRACKS PER CYLINDER
+         DR    R0,R10             CYLINDERS REQUIRED (FOR POSSIBLE
+ADDNUMBR L     R10,JFCBNEW+152    PRIME ALLOC        (LARGE PDS
+         SRL   R10,8              SHIFT OUT
+         AR    R10,R1             ADD ALLOC FOR DIRECTORY
+         ST    R10,WORK
+         MVC   JFCBNEW+152(3),WORK+1   UPDATE PRIMARY ALLOC REQUEST
+         B     PDS                 BRANCH
+SEQDS    EQU   *
+         MVC   JFCBNEW+160(3),ZERO  SET NO DIRECTORY BLOCKS
+PDS      EQU   *
+         MVC   NEWDCB+26(1),JFCBNEW+98   SET DSORG ETC
+         NI    JFCBNEW+86,X'3F'    SET JFCBIND1
+         OI    JFCBNEW+76,X'80'    SET WRITE BACK FLAG
+         MVI   RLSEFLAG,C'Y'       SET RLSE PERMITTED
+ENDCALC  L     R10,CALCR10
+         BR    R10
+         TITLE 'CONVERT OLD TRACKS TO NEW TRACKS'
+TRKTOTRK EQU   *
+         ST    R0,WORK             SAVE OLD TRACKS
+         ST    R0,OLDSPACE
+         LH    R0,WRK+86           BLKSIZE
+         MVC   RKDD+1(1),WRK+90   KEY LENGTH
+         MVC   RKDD+2(2),WRK+86   BLKSIZE
+         PRINT GEN
+         TRKCALC FUNCTN=TRKCAP,RKDD=RKDD,TYPE=OLDTYPE+3,REGSAVE=YES
+         LTR   R15,R15
+         BNZ   TRKERR1
+*   R0 CONTAINS BLOCKS/TRACK
+         SR    R2,R2
+         LR    R3,R0
+MBYTRKS  EQU   *
+         M     R2,WORK             *TRKS
+         STM   R2,R3,DWORK         BLOCKS IN DATASET
+         TRKCALC FUNCTN=TRKCAP,RKDD=RKDD,TYPE=NEWTYPE+3,BALANCE=(R2),  *
+               REGSAVE=YES
+         PRINT NOGEN
+         LTR   R15,R15
+         BNZ   TRKERR2
+*   R0 CONTAINS BLOCKS/TRACK, R2 CONTAINS LEFTOVER AT END OF TRACK
+         LR    R3,R0
+         LH    R0,WRK+86           BLKSIZE
+         CLI   REPTFLAG,C'Y'
+         BNE   CALCTRKS
+         CLI   SECIND,C'Y'
+         BE    CALCTRKS
+         MH    R2,=H'3'      REMAINDER X 3
+         CR    R2,R0               V BLKSIZE
+         BL    CALCTRKS
+         MVC   REPAR(19),=C'0  BLKSIZE WASTEFUL'
+         MVC   REPAR+30(44),JFCBNEW    DSN
+         CLI   NEWREP,C'Y'
+         BNE   BKNEWRP
+         MVI   REPAR,X'40'
+         B     REPBKW
+BKNEWRP  MVI   NEWREP,C'Y'
+REPBKW   EQU   *
+         BAL   R14,REPORTN
+CALCTRKS EQU   *
+         SR    R2,R2               R3 CONTAINS NEW BLOCKS PER TRACK
+         LM    R0,R1,DWORK         BLOCKS
+         DR    R0,R3                      / BLOCKS PER TRACK
+         LTR   R0,R0         ANY REMAINDER ?
+         BZ    ACCEPTR       NO - OK
+         LA    R1,1(R1)      YES - ADD ANOTHER TRACK !
+ACCEPTR  EQU   *
+         LR    R0,R1               = TRACKS REQUIRED
+         CLI   SECIND,C'Y'
+         MVI   SECIND,C'N'
+         BCR   8,R10
+         CLI   REPTFLAG,C'N'
+         BCR   8,R10
+         LR    R3,R0
+         MH    R3,=H'3'      X 3
+         SLL   R3,1
+         C     R3,OLDSPACE
+         BCR   13,R10        NOT HIGH
+         MVC   REPAR(22),=C'0  NEW SPACE > 2/3 OLD'
+         MVC   REPAR+30(44),JFCBNEW    DSN
+         CLI   NEWREP,C'Y'
+         BNE   SPCNEWRP
+         MVI   REPAR,X'40'
+         B     REPSPCH
+SPCNEWRP MVI   NEWREP,C'Y'
+REPSPCH  EQU   *
+         BAL   R14,REPORTN
+         BR    R10
+         SPACE 3
+*                  CONVERT TRACKS TO NEW CYLS
+TTONEWC  EQU   *
+         LH    R1,NEWTPERC
+         ST    R1,WORK
+         SRDL  R0,32
+         D     R0,WORK
+         LTR   R0,R0               ANY REMAINDER ?
+         BZ    *+8
+         LA    R1,1(,R1)
+         LR    R0,R1               NEW CYLS
+         BR    R10
+         TITLE 'COPY DATASET'
+COPYDS   EQU   *
+         ST    R10,COPYR10
+         MVI   RETRY,C'N'          SET NOT RETRY
+         XC    ECBADDR,ECBADDR     CLEAR ECB
+         RDJFCB OLDDCB
+         MVC   JFCBOLD+93(1),JFCBNEW+93      KEYLEN
+         MVC   JFCBOLD+98(8),JFCBNEW+98      DSORG/RECFM/BLKSZ/LRECL
+         MVC   JFCBOLD+108(2),JFCBNEW+108    KEY POSITION
+         OI   JFCBOLD+76,X'80'             WRITE BACK FLAG
+         OPEN  (OLDDCB,INPUT),TYPE=J
+         CLOSE (OLDDCB)
+         TM    WRK+82,X'02'        DSORG=PO ?
+         BNO   GENER                          NO, USE IEBGENER
+         SPACE 3
+*                   USE IEBCOPY TO COPY PDS
+         SPACE 1
+         ATTACH EP=IEBCOPY,ECB=ECBADDR,PARAM=(OPT,COPYINDD),VL=1,      A
+               SZERO=NO
+         ST   1,TCBADDR            SAVE TCB ADDR
+         WAIT  ECB=ECBADDR         WAIT FOR COMPLETION
+         DETACH  TCBADDR           DETACH SUBTASK
+*        PRINT NOGEN
+         MVC   MESSAGE(16),=C'COPY OF DATA SET'
+         MVC   MESSAGE+18(44),JFCBNEW   DSN
+         L     R10,ECBADDR         R10 = RETURN CODE
+         LA    R10,0(R10)          CLEAR FIRST BYTE
+         SRL   R10,12              MOVE OUT USER COMPLETION CODE
+         LTR   R10,R10             TEST SYSTEM COMPLETION CODE
+         BNZ   SYSABEND
+         SR    R10,R10             CLEAR R10
+         IC    R10,ECBADDR+3       R10 = USER COMPLETION CODE
+         CH    R10,RETCODE         IF RET CODE IS HIGHER THAN A
+         BNH   *+8                 PREVIOUS RC THEN SAVE
+         STH   R10,RETCODE         IN RETCODE
+         STH   R10,THISRET
+         B     COPYRET(R10)
+COPYRET  B     COPY0               NORMAL RETURN
+         B     COPY4               ERROR - RECOVERY POSSIBLE
+         B     COPY8               ERROR - NO RECOVERY
+COPY0    MVC   MSGID,=C'02'
+         MVC   MESSAGE+61(11),=C' SUCCESSFUL'
+         B     SETDLUB
+COPY4    MVC   MSGID,=C'03'
+         MVC   MESSAGE+61(39),=C' POSSIBLY UNSUCCESSFUL - WARNING ISSUE*
+               D'
+         BAL   R14,PRINT
+         B     GENEREND
+COPY8    MVC   MSGID,=C'04'
+         MVC   MESSAGE+61(37),=C' UNSUCCESSFUL - RECOVERY NOT POSSIBLE'
+         AP    FAILEDCT,=P'1'
+         BAL   R14,PRINT
+         B     GENEREND
+         SPACE 2
+GENER   EQU    *
+         SPACE 2
+*                   USE IEBGENER TO COPY SEQUENTIAL DATA SETS
+        SPACE   1
+         ATTACH EP=IEBGENER,ECB=ECBADDR,PARAM=(OPT),VL=1,SZERO=NO
+         ST    1,TCBADDR           SAVE TCB ADDR
+         WAIT  ECB=ECBADDR         WAIT FOR COMPLETION
+         DETACH TCBADDR            DETACH SUBTASK
+         MVC   MESSAGE(16),=C'COPY OF DATA SET'
+         MVC   MESSAGE+18(44),JFCBNEW   DSN
+         L     R10,ECBADDR         R10 = RETURN CODE
+         LA    R10,0(R10)          CLEAR TOP BYTE
+         SRL   R10,12              MOVE OUT USER COMPLETION CODE
+         LTR   R10,R10             TES SYSTEM COMPLETION CODE
+         BNZ   SYSABEND
+         SR    R10,R10             CLEAR R10
+         IC    R10,ECBADDR+3       R10 = USER COMPLETION CODE
+         CH    R10,RETCODE         IT RET CODE IS HIGHER THAN A
+         BNH   *+8                 PREVIOUS RET CODE THEN SAVE
+         STH   R10,RETCODE         IN RETCODE
+         STH   R10,THISRET
+         B     GENERET(R10)
+GENERET  B     GENER0              NORMAL END
+         B     GENER4              WARNING ISSUED
+         B     GENER8
+         B     GENER12             UNRECOVERABLE ERROR
+GENER0   MVC   MSGID,=C'01'
+         MVC   MESSAGE+61(11),=C' SUCCESSFUL'
+         B     SETDLUB
+GENER4   MVC   MSGID,=C'05'
+         MVC   MESSAGE+61(28),=C' SUCCESSFUL - WARNING ISSUED'
+         BAL   R14,PRINT           BRANCH TO PRINT
+         B     GENEREND
+GENER8   MVC   MSGID,=C'06'
+         MVC   MESSAGE+61(31),=C' ENDED AFTER USER HEADER LABELS'
+         BAL   R14,PRINT           BRANCH TO PRINT
+         B     GENEREND
+GENER12  CLI   RETRY,C'Y'          HAVE WE TRIED RECFM=U ?
+         BE    MSG2                YES - GIVE UP
+         MVI   RETRY,C'Y'          SET RETRY FLAG
+         MVC   MSGID,=C'07'
+         MVC   MESSAGE+61(50),=C' FAILED - A RETRY HAS BEEN ATTEMPTED U*
+               SING RECFM=U'
+         BAL   R14,PRINT           BRANCH TO PRINT
+*        RETRY USING IEBGENER AND RECFM=U
+         SPACE   1
+         MVI   JFCBNEW+100,X'C0'   SET RECFM=UIN NEW JFCB
+         OPEN  (NEWDCB,OUTPUT),TYPE=J  WRITE JFCB BACK TO JOBQ
+         CLOSE NEWDCB
+         MVI   JFCBOLD+100,X'C0'   SET RECFM=U IN OLD JFCB
+         MVC   JFCBOLD+89(3),ZERO     CLEAR
+         MVC   JFCBOLD+96(2),ZERO      UNWANTED FIELDS
+         MVI   JFCBOLD+101,X'00'            IN   OLD   JFCB
+        MVC   JFCBOLD+155(1),JFCBNEW+155   SET SPACE PARAMETER
+         OPEN   (OLDDCB,INPUT),TYPE=J       WRITE JFCB TO JOBQ
+         CLOSE OLDDCB
+         XC    ECBADDR,ECBADDR     CLEAR ECB
+         B     GENER
+         SPACE 3
+SETDLUB  EQU   *
+         BAL   R14,PRINT
+         BAL   R14,RLSE
+         OPEN  (ZAPDCB,INPUT)
+         MVC   F1DSCB(44),JFCBNEW       SET DSN
+         MVI   ZAPIOB,X'42'        SET IOB FLAGS
+         LA    R1,ZAPECB           SET ECB ADDR
+         ST    R1,ZAPIOB+4           IN IOB
+         LA    R1,CCW1             SET CHANNEL PROG ADDR
+         ST    R1,ZAPIOB+16          IN IOB
+         LA    R1,ZAPDCB           SET DCB ADDR
+         ST    R1,ZAPIOB+20          IN IOB
+         XC    ZAPIOB+32(8),ZAPIOB+32   CLEAR SEEK ADDR
+         MVC   ZAPIOB+35(5),NEWCCHH  SET SEEK ADDR IN IOB
+         XC    ZAPECB,ZAPECB       CLEAR ECB
+         EXCP  ZAPIOB              READ F1 DSCB FROM NEW DISK
+         WAIT  ECB=ZAPECB
+         CLOSE ZAPDCB
+         TM    ZAPECB,X'7F'             READ 0K
+         BNO   ZAPERR                  NO GIVE SNAP DUMP
+         MVC   F1DSCB+62(13),DLUBS
+         CLI   DAFLAG,C'N'        DA ORG
+         BE    NOTUNMUV       NO-NOT FOR CHANGE
+         TM    F1DSCB+82,X'20'       ALREADY D-A ?
+         BO    NOTUNMUV      YES - SKIP IF SET BY PREALLOCATION USE
+         XI    F1DSCB+82,X'60'      SET TO DA
+         CLI   PASS,C'1'
+         BNE   NOTUNMUV            NO SKIP SETTING UNMOVEABLE
+         XI    F1DSCB+82,X'01'     SET UNMOVEABLE BIT
+NOTUNMUV EQU   *
+         LA    R1,CCW2             SET CHANNEL PROG ADDR
+         ST    R1,ZAPIOB+16          IN IOB
+         MVC   ZAPIOB+35(5),COUNT       SET TRACK ADDR FOR WRITE
+         OPEN  (ZAPDCB,UPDAT)
+         XC    ZAPECB,ZAPECB       CLEAR ECB
+         EXCP  ZAPIOB              WRITE F1 DSCB TO NEW DISK
+         WAIT  ECB=ZAPECB
+         CLOSE ZAPDCB
+         TM    ZAPECB,X'7F'        SUCCESSFUL COMPLETION
+         BNO   ZAPERR              NO BRANCH
+         CLI   DAFLAG,C'N'
+         BE    GENEREND
+         MVC   MSGID,=C'13'             SET MESSAGE ID
+         MVC   MESSAGE(44),F1DSCB       SET DSN
+         MVC   MESSAGE+60(38),=C'SUCCESSFULLY CHANGED TO DA ON NEW DISK*
+               '
+         BAL   R14,PRINT
+         MVI   DAFLAG,C'N'
+         B     GENEREND
+        SPACE   3
+MSG2     EQU   *
+         MVC   MSGID,=C'08'
+         MVC   MESSAGE(24),=C'RETRY COPY OF DATA SET  '
+         MVC   MESSAGE+24(44),JFCBNEW   DSN
+         MVC   MESSAGE+61(32),=C' UNSUCCESSFUL - NO FURTHER RETRY'
+         BAL   R14,PRINT           BR TO PRINT
+         AP    FAILEDCT,=P'1'
+         B     GENEREND
+         SPACE 3
+         SPACE
+ZAPERR   EQU   *
+         MVC   MSGID,=C'14'         SET MESSAGE ID
+         MVC   MESSAGE(44),F1DSCB  SET DSN
+         MVC   MESSAGE+72(29),=C'NOT CHANGED TO DA ON NEW DISK'
+         BAL   R14,PRINT
+         SNAP  DCB=SNAPDCB,ID=99,SDATA=CB,PDATA=ALL
+         AP    FAILEDCT,=P'1'
+         LA    R2,4
+         CH    R2,RETCODE
+         BNH   GENEREND
+         STH   R2,RETCODE
+         STH   R2,THISRET
+         SPACE 3
+GENEREND EQU   *
+         L     R10,COPYR10
+         BR    R10
+         SPACE   2
+         SPACE 3
+*        RLSE UNUSED SPACE IN DATA SET
+         SPACE   1
+RLSE     EQU   *
+         CLI   RLSEOPT,C'Y'        IS RLSE REQUIRED ?
+         BNE   ANDBACK                                NO
+         CLI   RLSEFLAG,C'N'       IS RLSE ALLOWED ?
+         BE    ANDBACK                               NO
+         OI    JFCBNEW+86,X'C0'   SET RLSE
+         OI    JFCBNEW+87,X'80'    DISP=MOD
+         OPEN   (NEWDCB,OUTPUT),TYPE=J   WRITE JFCB TO JOBQ
+         CLOSE   NEWDCB            CLOSE PERFORMS THE RLSE
+         MVI   RLSEFLAG,C'N'       RESET FLAG OFF
+ANDBACK  BR    R14
+         TITLE 'PAN LIBRARY'
+PAN      EQU   *
+* NEW ROUTINE TO DUMP, REDEFINE, AND RESTORE, PANLIBS
+*        READ FIRST BLOCK
+*        IS IT PAN LIBRARY ?
+*        IF NOT, EXIT TO NOTPAN
+*        OPEN CNTRL
+*        IS THERE LIBRARY SECURITY ?
+*        IF NOT, GO TO PUTDUMP
+*        BUILD ++CONTROL .... CARD
+*         PUT   ++CONTROL
+*PUTDUMP PUT ++DUMP CARD
+*        CLOSE CNTRL
+*        ATTACH PAN#2
+*        BAL   R10,BLDJFCB
+*        BAL   R10,CALCSP
+*        BAL   R10,ALLOC
+*        WAIT
+*        OPEN CNTRL
+*        PUT   ++CLEAR
+*        ANY SECURITY ?
+*        IF NOT, GOTO CLOSECLEAR
+*        PUT A ++SUPRESS CARD FOR EACH AFFECTED COMMAND
+*CLOSECLEAR CLOSE CNTRL
+*        ATTACH PAN#4
+*        WAIT
+*        OPEN CNTRL
+*        ANY SECURITY ?
+*        IF NOT, GO TO PUTREP
+*        PUT ++CONTROL 0,....
+*PUTREP  PUT   ++REPLACE
+*        CLOSE CNTRL
+*        ATTACH PAN#2
+*        WAIT
+         CLI   REPTFLAG,C'N'       ALIKE DEVICES ?
+         BE    ACCEPTPN            YES
+         MVC   MSGID,=C'18'
+         MVC   MESSAGE(44),WRK
+         MVC   MESSAGE+50(17),=C'PANLIB - BYPASSED'
+         BAL   R14,PRINT
+         AP    PANVCT,=P'1'
+         BR    R10
+         SPACE 1
+ACCEPTPN EQU   *
+         LA    R10,NOTPAN
+         BR    R10
+         TITLE 'CATALOGUE OPERATIONS'
+CATOPS   EQU   *
+*        *************************************************************
+*        *     WARNING.    THIS ROUTINE DOES NOT PERFORM BLDG'S      *
+*        *     THEY MUST BE DONE BEFORE THE COPY IF THE CATAL OPTION *
+*        *     IS IN EFFECT.                                         *
+*        *************************************************************
+         CLI   CATFLAG,C'Y'
+         BNE   ENDCAT
+         CATALOG UOLDCVOL
+         LTR   R15,R15
+         BZ    RECVOL              WAS CAT WITH CVOL=OLDVOL
+         CATALOG UNEWCVOL          TRY WITH CVOL=NEWVOL
+         LTR   R15,R15
+         BZ    RECVOL              RECATALOG WOTH CVOL=NEWVOL
+         CATALOG UNOCVOL           TRY WITH NO CVOL
+         LTR   R15,R15
+         BZ    RECNOCVL
+*      DSN NOT PREVIOUSLY CATAL, CVOL NOT AVAILABLE OR MASTCAT ENTRY
+         MVC   MSGID,=C'33'
+         MVC   MESSAGE(2),=C'UN'
+         B     CWARN
+RECNOCVL EQU   *
+         CATALOG CNOCVOL           CATAL OG JFCBNEW,,NEWVOLST
+         LTR   R15,R15
+         BNZ   PUTWARN
+         B     PUTCATOK
+         SPACE
+RECVOL   CATALOG CNEWCVOL          CAT,JFCBNEW,NEWVOL,NEWVOLST
+         LTR   R15,R15
+         BNZ   PUTWARN
+PUTCATOK MVC   MSGID,=C'44'
+         MVC   MESSAGE+20(44),JFCBNEW
+         MVC   MESSAGE+70(18),=C'RECATALOGUED AS ON'
+         MVC   MESSAGE+90(6),NEWVOL
+         BAL   R14,PRINT
+         B     ENDCAT
+PUTWARN  EQU   *
+         MVC   MSGID,=C'12'
+CWARN    MVC   MESSAGE+2(19),=C'CATALOG OF DATA SET'
+         MVC   MESSAGE+25(44),JFCBNEW            DSN
+         MVC   MESSAGE+75(19),=C'UNSUCCESSFUL - RC ='
+         CVD   R15,DWORK
+         MVC   DWORK(4),=X'40202020'
+         ED    DWORK(4),DWORK+6
+         MVC   MESSAGE+94(2),DWORK+2
+         BAL   R14,PRINT
+ENDCAT   BR    R10
+         TITLE 'SINGLE DATASET COPY'
+SINGLEDS EQU   *
+         BAL   10,RESTART    LOCATE BY NAME & GET CCHHR FOR -
+         OBTAIN CAM2         LOCATE AGAIN TO REALIGN WRK AREA DATA
+         LTR   15,15               OK ?
+         BNE   ABEND3              NO BRANCH
+         BAL   R10,F1RTN
+         CLC   NEWNAME(8),=CL8' '        RENAME?
+         BE    WRAPUP                     NO
+         SR    R0,R0               CLEAR UCB REG.
+        RENAME DSETA
+        LTR   R15,R15       TEST FOR RENAME OK
+        BZ    RENOK
+         ABEND 44,DUMP
+RENOK    MVC   CNOCVOL+4(4),=A(NEWNAME)
+         BAL   R10,CATOPS
+         B     WRAPUP
+         SPACE
+ABEND1    ABEND 1,DUMP             ERROR COPYING CATLG
+ABEND2   ABEND 2,DUMP              ERROR READING OLD VTOC
+ABEND3   ABEND  3,DUMP             ERROR READING OLD VTOC (RESTART)
+ABEND4   ABEND 4,DUMP              ERROR ALLOCATING NEW DS
+ABEND5   ABEND 5,DUMP         ERROR OBTAINING FORMAT4 DSCB
+BADJFCB  ABEND 6,DUMP         BAD VTOC JFCB
+         TITLE 'SYSABEND'
+SYSABEND EQU   *
+         MVC   MSGID,=C'10'
+         MVC   MESSAGE(16),=C'COPY OF DATA SET'
+         MVC   MESSAGE+18(44),JFCBNEW   DSN
+         MVC   MESSAGE+63(14),=C'- SYSTEM ABEND'
+         SLL   R10,12              RE-ALIGN COMPLETION CODE
+         ST    R10,R10STORE
+         UNPK  TRFIELD,R10STORE
+         TR    TRFIELD,TRABLE-240  TR TO PRINTABLE CHARACTERS
+         MVC   MESSAGE+78(3),TRFIELD+1
+*    SCRATCH OF NEW DATA SET REMOVED TO ENABLE DIAGNOSTIC ACTION
+*    VIA  IEHLIST - LISTVTOC DUMP,VOL= ETC.,DSNAME=FAILURE
+*     EVENTUAL SCRATCH ON RESTART VIA PROGMIN DD *
+         BAL   R14,PRINT           BR TO PRINT
+         B     ENDF1               BR TO READ NEXT DSCB
+R10STORE DS    F
+TRFIELD  DS    CL6
+TRABLE   DC    C'0123456789ABCDEF'
+         TITLE 'PRINT SUBROUTINE'
+         SPACE 3
+TRKERR1  EQU   *
+         PRINT GEN
+         MVC   ERR1WTO+45(44),WRK
+ERR1WTO  WTO   'TRACK CAPACITY ERROR, OLD DISK, DSN=1234567890123456789*
+               0123456789012345678901234'
+         ABEND 41
+         SPACE
+TRKERR2  EQU   *
+         MVC   ERR2WTO+44(44),WRK
+ERR2WTO  WTO   'BLKSIZE .GT. TRKCAP, NEW DISK, DSN=12345678901234567890*
+               123456789012345678901234'
+         ABEND 42
+         PRINT NOGEN
+PRINT    MVI   PRLINE,C'-'         SPACE 3 LINES
+         ST    R14,R14SAVE         SAVE R14
+         OPEN  (SYSPRINT,OUTPUT)
+         PUT   SYSPRINT,PRLINE     PUT PRINT LINE
+         CLOSE SYSPRINT           SYSPRINT IS ALSO BY SUB TASKS
+         MVC   MESSAGE,MESSAGE-1   CLEAR AREA TO BLANKS
+         L     R14,R14SAVE         RESTORE R14
+         BR    R14                 EXIT
+R14SAVE  DS    F
+R0R1SAVE DS    2F
+         SPACE 3
+*            REPORT FILE PRINT ROUTINE
+REPORTN  ST    R14,R14SAVE
+         STM   R0,R1,R0R1SAVE
+         PUT   REPFIL,REPAR
+         MVC   REPAR(121),REPAR-1
+         L     R14,R14SAVE
+         LM    R0,R1,R0R1SAVE
+         BR    R14
+NEWREP   DC    C'N'
+         TITLE 'DATA AREAS'
+CCW1     CCW   X'16',RECZERO,X'70',5    READ REC 0
+         CCW   X'92',COUNT,X'40',8      READ COUNT
+         CCW   X'29',F1DSCB,X'40',44    SEARCH KEY =
+         CCW   X'08',CCW1+8,X'40',0     TIC TO SEARCH
+         CCW   X'06',F1DSCB+44,X'00',96 READ DATA
+CCW2     CCW   X'16',RECZERO,X'70',5    READ REC 0
+         CCW   X'31',COUNT,X'40',5      SEARCH COUNT =
+         CCW   X'08',CCW2+8,X'40',0    TIC TO SEARCH
+         CCW   X'05',F1DSCB+44,X'00',96 WRITE F1 DSCB
+ZAPIOB   DC    10F'0'
+ZAPECB   DC    F'0'
+JFCB3    DC   X'87'
+         DC    AL3(ZAPJFCB)
+ZAPJFCB  DS    CL176
+RECZERO  DC    XL5'00'
+COUNT    DS    0XL148
+         DC    XL8'00'
+F1DSCB   DC    XL140'00'
+         SPACE
+OFFMASK  DC    3X'FF',5X'F0',2X'FF',6X'F0',X'FF',2X'00',3X'F0',22X'00'
+TESTMASK DC    C'SYS00000.T000000.',X'0000',C'000',22X'00'
+TESTDSN  DS    CL44
+         SPACE   3
+DWORK    DC    D'0'
+WORK     EQU   DWORK
+SAVE     DC    18F'0'              SAVE AREA
+F1RTNR10 DC    A(0)               SAVE REGISTER 10 IN F1 RTN
+COPYR10  DC    F'0'
+CALCR10  DC    F'0'
+UCBADDR  DS    F
+ZERO     DC    F'0'                ZEROS
+RKDD     DC    X'01000000'   RECORD COUNT=1,KEYLEN,BLKSIZE(2)
+DAFLAG   DC    C'N'
+RETRY    DC    C'N'
+RLSEOPT  DC    C'N'
+RLSEFLAG DC    C'Y'
+CODE     DC    C'S'               DEFAULT TO START
+PASS     DC    C'1'               PASS 1 COMES FIRST
+CATFLAG  DC    C'N'
+ORDFLAG  DC    C'N'      Y - SEQUENCED VTOC SEARCH/COPY
+REPTFLAG DC    C'N'      Y - REPORT FILE OPEN - UNLIKE DEVICES
+DLUBS    DC    CL13' '
+         DS    0H
+STNAME   MVC   2(0,R9),0(R3)
+CLCNM    CLC   2(0,R1),WRK
+         TITLE 'CAMLISTS ETC.'
+CAM2     CAMLST SEEK,CC,OLDVOL,WRK           SEEK
+CAM1     CAMLST SEARCH,DSN,CAMVOL,WRK        SEARCH
+UOLDCVOL CAMLST UNCAT,JFCBNEW,OLDVOLST       UNCAT
+UNEWCVOL CAMLST UNCAT,JFCBNEW,NEWVOLST       UNCAT
+UNOCVOL  CAMLST UNCAT,JFCBNEW                UNCAT
+CNOCVOL  CAMLST CAT,JFCBNEW,,NEWVOLST        CAT
+CNEWCVOL CAMLST CAT,JFCBNEW,NEWVOL,NEWVOLST  CAT
+DSETA    CAMLST RENAME,DSN,NEWNAME,NEWVOLST  RENAME
+         SPACE
+WRK      DS    0D
+         DC    XL148'00'
+OLDVOLST DC    H'1'
+         DC    XL4'0'
+OLDVOL   DC    CL6' '
+         DC    H'0'
+NEWVOLST DC    H'1'
+         DC    XL4'0'
+NEWVOL   DC    CL6' '
+         DC    H'0'
+NEWNAME  DC    CL44' '        CASTRATE DATA SET RENAME
+DSN      DC    CL44' '
+RDSN     DC    CL44' '
+CAMVOL   DC    CL6' '
+         DS    0F
+JFCB1    DC    X'87'
+         DC    AL3(JFCBOLD)
+JFCBOLD  DS    CL176
+         DS    0F
+JFCB2    DC    X'87'
+         DC    AL3(JFCBNEW)
+JFCBNEW  DS    CL176
+         DS    0F
+CC       DS    CL5
+         TITLE 'DDNAMES AND PARMS FOR SUB TASKS'
+         CNOP  6,8           DDNAMES FOR IEBCOPY
+COPYINDD DC    H'40'
+         DC    4D'0'
+         DC    CL8'CNTRL'         SYSIN
+         CNOP  6,8           DDNAMES FOR IEHMOVE
+DDMOVE   DC    H'64'
+         DC    4DL8'0'
+         DC    CL8'MOVEIN'
+         DC    2D'0'
+         DC    CL8'SYSUT3'         ALTERNATIVE NAME FOR SYSUT1
+         CNOP  6,8           DDNAMES FOR IEHPROGM
+DDPROGM  DC    H'40'
+         DC    4DL8'0'
+         DC    CL8'PROGMIN'        ALTERNATIVE NAME FOR SYSIN
+         CNOP  2,4            PARAMS FOR IEBCOPY, IEBGENER, IEHPROGM
+OPT      DC    H'0'
+         CNOP  2,4            PARAMS FOR IEHMOVE
+OPTMOVE  DC    H'08'
+         DC    CL8'POWER=20'
+RETCODE  DC    H'0'                HIGHEST RETURN CODE
+THISRET  DC    H'0'
+ECBADDR  DS    F
+TCBADDR   DS  F
+COPYCARD DC    CL80' COPY INDD=SYSUT1,OUTDD=SYSUT2'
+*            COPYCARD AREA OVERWRITTEN BY ORDER FILE INPUT CARDS
+*            IF ORDFLAG ON
+         TITLE 'DEVICE DETAILS'
+         DS    0F
+ALOLDDIS DC    A(OLDDCB)
+         DC    A(OLDAREA)
+ALNEWDIS DC    A(NEWDCB)
+         DC    A(NEWAREA)
+OLDAREA  DS    0XL31
+OLDTYPE  DS    XL4                DEVTYPE
+OLDMAXBL DS    XL4                MAX BLOCK LENGTH
+OLDNCYLS DS    XL2                CYLINDERS ON VOLUME
+OLDTPERC DS    XL2                TRACKS PER CYLINDER
+OLDTRKL  DS    XL2                 TRACK LENGTH
+OLDBOHK  DS    XL1                BLOCK OVERHEAD, KEYED
+OLDBOHKL DS    XL1                   DITTO, LAST BLOCK
+OLDNOKEY DS    XL1                SUBTRACT IF NO KEY
+OLDFLAGS DS    XL1
+OLDTOL   DS    XL2                TOLERANCE
+OLDPDSB  DS    XL1                PDS DIRECTORY BLOCKS PER TRACK
+OLDDSCBT DS    XL1                DSCBS PER TRACK
+OLDCCHH  DS    XL4                CCHH OF VTOC
+OLDHWM   DS    XL5                HIGH WATER MARK
+         DS    0F
+NEWAREA  DS    0XL31
+NEWTYPE  DS    XL4
+NEWMAXBL DS    XL4
+NEWNCYLS DS    XL2
+NEWTPERC DS    XL2
+NEWTRKL  DS    XL2                 TRACK LENGTH
+NEWBOHK  DS    XL1
+NEWBOHKL DS    XL1
+NEWNOKEY DS    XL1
+NEWFLAGS DS    XL1
+NEWTOL   DS    XL2
+NEWPDSB  DS    XL1
+NEWDSCBT DS    XL1
+NEWCCHH  DS    XL4
+NEWHWM   DS    XL5
+BLOCKNO  DC    F'0'                NO DIRECTRY BLOCKS
+OLDSPACE DS    F
+SECIND   DC    C'N'
+         SPACE
+PRLINE   DS    0CL121
+         DC    X'01',C'DMV0'
+MSGID    DC    C'XX'
+         DC    C'I '
+MESSAGE  DC    CL112' '
+         DC    CL9' '
+REPAR    EQU   MESSAGE
+MKIVCT   DC    PL2'0',CL9'MARK IV'
+ISAMCT   DC    PL2'0',CL9'ISAM'
+VSAMCT   DC    PL2'0',CL9'VSAM'
+ABSTRCT  DC    PL2'0',CL9'ABSTR'
+UNMOVCT  DC    PL2'0',CL9'UNMOVABLE'
+PANVCT   DC    PL2'0',CL9'PANVALET'
+MPSXCT   DC    PL2'0',CL9'MPSX'
+SASCT    DC    PL2'0',CL9'S.A.S.'
+EXCLCT   DC    PL2'0',CL9'EXCLUDED'
+FAILEDCT DC    PL2'0',CL9'COPY FAIL'
+         EJECT
+         LTORG
+         EJECT
+CNTRL    DCB   DSORG=PS,LRECL=80,BLKSIZE=80,MACRF=PM,DDNAME=CNTRL
+OLDDCB   DCB   DSORG=PO,MACRF=R,DDNAME=SYSUT1,EODAD=ENDPASS,EXLST=JFCB1
+NEWDCB   DCB   DSORG=PO,MACRF=W,DDNAME=SYSUT2,EXLST=JFCB2
+CARDDCB  DCB   DDNAME=START,DSORG=PS,MACRF=GL,EODAD=ENDCTLIN
+OLDDCB2  DCB   DDNAME=SYSUT1,MACRF=(R),DSORG=PS,BLKSIZE=256,           $
+               EODAD=DIREOF,RECFM=F,EXLST=JFCB1
+SYSPRINT DCB   DSORG=PS,RECFM=FBA,MACRF=PM,BLKSIZE=121,LRECL=121,      *
+               DDNAME=SYSPRINT,EXLST=JFCB2
+ZAPDCB   DCB   DDNAME=ZAP2DA,DSORG=PS,MACRF=E,EODAD=ZAPERR,KEYLEN=44,  *
+               EXLST=JFCB3
+SNAPDCB  DCB   DSORG=PS,RECFM=VBA,MACRF=W,BLKSIZE=1632,LRECL=125,      *
+               DDNAME=SNAPDUMP
+EXCLUDE  DCB   DSORG=PS,DDNAME=EXCLUDE,RECFM=FB,BLKSIZE=80,            *
+               LRECL=80,EODAD=EOFEX,MACRF=GL,EXLST=JFCB1
+ORDFIL   DCB   DSORG=PS,DDNAME=ORDER,MACRF=GM,EODAD=WRAPUP,            *
+               RECFM=F,BLKSIZE=80
+REPFIL   DCB   DSORG=PS,DDNAME=REPORT,MACRF=PM,RECFM=FA,BLKSIZE=121
+         SPACE 2
+DIRAREA  DC    64F'0'
+EXCLIST  DC    50CL46' '      EXCLUDED DSN/DSG TABLE
+ENDEXCL  DC    X'FF'
+         END

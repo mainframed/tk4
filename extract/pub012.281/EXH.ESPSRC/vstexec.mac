@@ -1,0 +1,1028 @@
+VSTX     TITLE 'V S T E X E C  ***  VISTA COMMAND/PRINT SUPPORT'
+***********************************************************************
+***********************************************************************
+* VSTEXEC
+***********************************************************************
+***********************************************************************
+*
+* Functions
+* ---------
+*
+*   This program provides a way for the host to pass macro instructions
+*   to the Vista tn3270 emulator, which are then executed on the PC.
+*
+*   A separate entry point (VSTPRINT) passes data to be printed
+*   instead of executed.
+*
+*
+* Parameters
+* ----------
+*
+*   VSTEXEC DSNAME(dataset.name)
+*
+*      DSNAME indicates the specified dataset should be opened,
+*      and each line passed to vista for macro execution.
+*
+*   VSTEXEC DDNAME(ddname)
+*
+*      DDNAME indicates the specified pre-allocated ddname should
+*      be opened, and each line passed to vista for macro execution.
+*
+*   VSTEXEC any-other-parms
+*
+*      If any other parms are typed besides DSNAME and DDNAME, this
+*      program passes the entire parm to the emulator for macro
+*      execution.  No syntax checking is done by this program.
+*
+*      For example, to set the window title to the current system id,
+*      you might run something like the following at TSO logon time:
+*
+*         VSTEXEC SetOption("General","WindowTitle","System A")
+*
+*      The entire parm is passed and executed.  Of course you can
+*      run VSTEXEC from a clist, or another program, to create the
+*      parm and include your own variables, or whatever.
+*
+*   VSTPRINT DSNAME(dataset.name)
+*   VSTPRINT DSN(dataset.name)                                  GP14268
+*   VSTPRINT DDNAME(ddname)
+*   VSTPRINT DDN(ddname)                                        GP14268
+*   VSTPRINT DD(ddname)                                         GP14268
+*   VSTPRINT dataset.name  (most of these failed by TSO)
+*
+*      Download the specified file and then print to the local
+*      PC printer.  For example:
+*
+*         VSTPRINT tom.data(member4)
+*
+*
+* Calling Conventions
+* -------------------
+*
+*   VSTEXEC can be called as a TSO command, as shown above.  But it
+*   can also be called from another program using standard calling
+*   conventions to point to a parameter string up to 4000 bytes long.
+*
+*   A typical call from an assembler program might be:
+*
+*              LA    R1,PARM                  point to parm
+*              LINK  EP=VSTEXEC               call program
+*              LTR   R15,R15                  ok call ?
+*              BNZ   ERROR                    no - error
+*     *
+*     PARM     DC    A(PARMLEN+X'80000000')   must have left bit on
+*     PARMLEN  DC    Y(L'PARMDATA)            halfword length
+*     PARMDATA DC    C'Debug(TimeDate("%c"))' here is the command
+*
+*
+* Usage Notes
+* -----------
+*
+*   Vista version 1.22 or above is required.
+*
+*   Obviously this program will only work correctly when called from
+*   a TSO environment with a Vista terminal session active.  Other
+*   emulators will typically just ignore the OEM codes sent to them.
+*
+*   Additionally, the current logon session must support WSF
+*   (write structured field) codes.  This is often referred to as
+*   "extended attributes".  As your VTAM person for support on this.
+*
+*   For all emulators, the screen will clear momentarily while
+*   the data is being sent.  This may cause some disruption in your
+*   current screen processing, although your current application
+*   should recover properly in most cases.
+*
+*   The macro commands sent might also cause some additional
+*   restrictions.  For example, if you are using VSTEXEC to initiate
+*   a file transfer from the host, such as:
+*
+*     VSTEXEC ReceiveFile("host.text","c:\temp.txt","tso","text")
+*
+*   ... the file transfer function will issue a IND$FILE command,
+*   which typically must be done in TSO READY mode or from ISPF
+*   option 6.
+*
+*   Also note that the macro above is executing on the PC, so the
+*   "Receive" function causes transfer from host to PC (which might
+*   be a bit confusing at first since the process is host initiated).
+*
+*
+* Error Codes
+* -----------
+*
+*   Since VSTEXEC was designed to be called from another program
+*   in addition to being a TSO command, no error messages are issued
+*   from the program (other than those that might be generated from
+*   system function errors such as OPEN failures).
+*
+*   Instead, errors are returned in R15 and R0, as follows:
+*
+*   R15    Description                                  R0 Contains
+*   ---  -------------------------------------------  -----------------
+*   1    Getmain for storage space failed             RC from GETMAIN
+*   2    Parameter passed is greater than 4000 bytes  -
+*   3    Can't set full screen mode                   RC from STFSMODE
+*   4    Terminal Query failed                        RC from TPUT
+*   5    Terminal Query failed on reply               RC from TGET
+*   6    Vista terminal support does not exist        -
+*   7    Terminal error while sending data            RC from TPUT
+*   8    Terminal error while receiving response      RC from TGET
+*   9    Dataset name not supplied                    -
+*   10   Word in parm longer than expected            -
+*   11   Program is not running under TSO             -
+*   12   Error allocating specified dataset           Code from SVC 99
+*   13   Error opening specified dataset or ddname    RC from OPEN
+*   14   No parm was supplied                         -
+*   15   DD name not supplied                         -
+*
+*   Note: For a description of the contents of R0 after a failure,
+*         take a look at the appropriate IBM Macro manual.
+*
+* Copyright (none)
+* ----------------
+*
+*   This program is free and in the public domain.  Please
+*   take it and use it for whatever purpose you need.  If you do
+*   find some bugs (likely) or make some updates, please let me know.
+*
+*   Thanks,
+*
+*      Tom Brennan
+*      tom@tombrennansoftware.com
+*      09/26/2000
+*
+*
+* Program Logic and Notes
+* -----------------------
+*
+*   On entry, we check to make sure we are running TSO.  I believe
+*   the PSCB control block is only available in TSO, so that is
+*   checked.
+*
+*   Then we get some buffer storage, and split it up into 2
+*   4096 buffers for input and output.
+*
+*   The input parm is checked to see if it is from a program call,
+*   or from a tso command - and is handled appropriately.
+*
+*   If a dsname was indicated, the dataset is allocated as disp=shr,
+*   and then opened for input.
+*
+*   If a ddname was indicated, the ddname is placed in the dcb
+*   and then operned for input.
+*
+*   If neither a dsname or ddname was specified, the entire parm
+*   is simply passed to Vista as a string.
+*
+*   To send data to the emulator, we have to go to full screen
+*   mode via the STFSMODE macro.  I haven't been able to figure
+*   out a way around this.
+*   N.B.:STFSMODE OFF under MVS 3.8 generates invalid screen addresses;
+*      works just fine (?) in NOEDIT mode.                      GP14268
+*
+*   Revised code has NOT been tested under TCAM. Due to x'02' in the
+*   data stream, it will probably fail (so no MVT support).     GP14268
+*
+*   Once in full screen mode, this program issues a Query to ask the
+*   emulator if it can handle the VSTEXEC parm string.  A response is
+*   returned and examined.  If it looks like it came from Vista,
+*   processing continues.
+*
+*   The single parm string (or the first line of the DSNAME or DDNAME
+*   data) is sent to Vista.  Vista does not execute the macro lines
+*   immediately as they arrive.  Instead, they are stored in a file
+*   named VST$EXEC.MAC on the PC, and executed once the transfer is
+*   complete.
+*
+*   If there are multiple lines in the opened DSNAME or DDNAME, each
+*   of these is sent as a separate item.  You can also send multiple
+*   macro statements by separating them with a semi-colon.
+*
+*   When finished, we close the file, free the dataset, and release
+*   the storage we used.
+*
+*   Return codes are passed back in R15 and R0.
+*
+***********************************************************************
+* CHANGES:
+*----------------------------------------------------------------------
+* 05/30/00 - T.BRENNAN - CREATED
+* 09/25/14 - G.POSTPISCHIL - CHANGED TO ASSEMBLE WITH ASM/XF (NAMES,..)
+*                 USING R10 FOR GLOBAL DCB ADDRESS OF VST$EXEC.
+*                 USING R9 FOR GLOBAL LINE COUNT.
+*                 THE STFSMODE CALLS PRODUCE SCREEN ADDRESSING ERRORS.
+*                 FIXED LRECL COMPARE (INCORRECT FOR RECFM=V).
+*                 USE RECORD INTERFACE FOR VS AND VBS.
+*                 CHANGED INPUT TO LOCATE MODE, AND DECREASED GETMAIN.
+*----------------------------------------------------------------------
+***********************************************************************
+*
+***********************************************************************
+* EQUATES
+***********************************************************************
+VSTEXEC  START 0             HATE BLANK CSECTS (EQU PRIOR)      GP14268
+         YREGS ,
+END      EQU   X'FF'                   TO MARK END OF STRINGS
+CR       EQU   X'0D'                   TO MARK END OF STRINGS
+NOT      EQU   X'FF'                   FOR CLEARING BITMAP FLAGS
+LAST     EQU   X'80000000'             MARKS LAST ENTRY IN PARMLISTS
+GMSIZE   EQU   4096                  GETMAIN SIZE               GP14268
+BUFMAX   EQU   4000                  LEAVE ROOM FOR PRTSTAT1
+*
+***********************************************************************
+* ENTRY POINTS
+***********************************************************************
+*
+*------- VSTEXEC ------------------------------------------------------
+*
+VSTEXEC  CSECT ,
+         USING VSTEXEC,R15
+         SAVE  (14,12),,'VSTEXEC &SYSDATE'
+         L     R12,=A(VSTEXEC)         POINT TO PROGRAM START
+         LA    R0,ENTEXEC              INDICATE ENTRY POINT
+         B     COMMON
+         DROP  R15
+
+*------- VSTPRINT -----------------------------------------------------
+*
+VSTPRINT DS    0H
+         ENTRY VSTPRINT
+         SAVE  (14,12),,'VSTPRINT &SYSDATE'
+         USING VSTPRINT,R15
+         L     R12,=A(VSTEXEC)
+         LA    R0,ENTPRINT             INDICATE ENTRY POINT
+         DROP  R15
+*
+*------- COMMON ROUTINE FOR ENTRY POINTS ------------------------------
+*
+         USING VSTEXEC,R12
+COMMON   STC   R0,ENTMODE              SAVE ENTRY POINT INDICATOR
+         LR    R2,R1                   SAVE PARM ADDRESS
+         ST    R13,SAVE+4              AND SETUP SAVE AREA
+         LA    R11,SAVE
+         ST    R11,8(,R13)
+         LR    R13,R11
+*
+***********************************************************************
+* MAKE SURE WE ARE RUNNING UNDER TSO, AND GET PROFILE PREFIX
+***********************************************************************
+*
+         SLR   R9,R9                   ZERO LINES PRINTED       GP14268
+         MVI   ERRCODE,ERCNOTSO                                 GP14268
+         USING PSA,R0                  (DUMMY USING)
+         L     R1,PSATOLD              GET CURRENT TCB
+         USING TCB,R1                  AND USE
+         L     R1,TCBJSCB              POINT TO JSCB
+         USING IEZJSCB,R1              AND USE
+         ICM   R1,15,JSCBPSCB          POINT TO PSCB
+         USING PSCB,R1                 AND USE
+         BZ    ERROR1                  NOT THERE - ERROR
+         ICM   R1,15,PSCBUPT           POINT TO UPT
+         USING UPT,R1                  AND USE
+         BZ    ERROR1                  NOT THERE - ERROR
+         MVC   PREFIX,UPTPREFX         GET PREFIX
+         SLR   R15,R15                 CLEAR FOR IC
+         IC    R15,UPTPREFL            GET LENGTH OF PREFIX
+         STH   R15,PREFIXL             AND SAVE FOR LATER
+         DROP  R1
+*
+***********************************************************************
+* GET STORAGE FOR BUFFERS AND INIT OUTBUF
+***********************************************************************
+*
+         MVI   ERRCODE,ERCNOSTO                                 GP14268
+         GETMAIN RC,LV=GMSIZE          GET ROOM FOR BUFFERS
+         LTR   R15,R15                 OK ?
+         BNZ   ERROR2                  NO
+         ST    R1,OUTBUF               AND SAVE AS OUTPUT BUFFER
+         MVC   0(OEMAUXL,R1),OEMAUX    INIT OUTBUF HEADER AREA
+         MVI   7(R1),X'98'             ASSUME VSTEXEC PROCESSING
+         CLI   ENTMODE,ENTEXEC         EXEC MODE ?
+         BE    GOTMODE                 YES - CONTINUE
+         MVI   7(R1),X'99'             NO  - SET TO PRINT MODE
+GOTMODE  LA    R1,OEMAUXL(R1)          POINT PAST HEADER
+         ST    R1,OUTBUFD              AND SAVE OUTBUF DATA AREA
+         OI    FLAGS,FGETMAIN          INDICATE GETMAIN WAS OK
+*
+***********************************************************************
+* OBTAIN PARM FROM EITHER CALL STYLE OR COMMAND PROCESSOR STYLE
+***********************************************************************
+*
+         TM    0(R2),X'80'             CALL STYLE PARMS ?
+         BO    CALLPARM                YES - POINT TO CALL-STYLE PARM
+*
+*------- TSO STYLE PARMS ----------------------------------------------
+*
+TSOPARM  OI    FLAGS,FLCP              INVOKED AS CP            GP14268
+         L     R2,0(,R2)               POINT TO PARM
+         LH    R3,0(,R2)               GET LENGTH OF PARM
+         MVI   ERRCODE,ERCPRM2B                                 GP14268
+         CH    R3,=AL2(BUFMAX)         TOO BIG ?                GP14268
+         BH    ERROR1                  YES - ERROR
+         LH    R4,2(,R2)               GET PARM OFFSET
+         LA    R2,4(R2,R4)             POINT TO PARM
+         SR    R3,R4                   SUBTRACT COMMAND FROM LENGTH
+         SH    R3,=H'4'                SUB HEADER FROM LENGTH
+         B     SETUPPRM                AND GO SETUP PARM
+*
+*------- CALL STYLE PARMS ---------------------------------------------
+*
+CALLPARM DS    0H
+         L     R2,0(,R2)               POINT TO PARM LENGTH
+         LH    R3,0(,R2)               AND GET IT
+         LA    R2,2(,R2)               POINT TO PARM DATA
+*
+*------- SETUP PARM FOR OUTPUT TO EMULATOR ----------------------------
+
+SETUPPRM LR    R1,R3                   SAVE LENGTH FOR LATER
+         L     R4,OUTBUFD              POINT TO OUTBUF AREA
+         LR    R5,R3                   GET LENGTH FOR MVCL
+         MVCL  R4,R2                   MOVE DATA TO OUTBUF
+         A     R1,OUTBUFD              POINT PAST DATA IN OUTBUF
+         MVC   0(2,R1),CRLF            MOVE CRLF AFTER DATA
+         LA    R1,2(,R1)               POINT PAST CRLF
+         MVI   0(R1),X'0C'             SEND FORM FEED           GP14268
+         LA    R1,1(,R1)
+         ST    R1,OUTBUFP              AND SAVE OUTBUF END POINTER
+*
+***********************************************************************
+* SEE IF PARM INDICATES A DATASET NAME OR DDNAME FOR INPUT
+***********************************************************************
+*
+         L     R2,OUTBUFD              POINT TO PARM STRING
+         BAL   R11,NONSPACE            SKIP SPACES              GP14268
+         MVI   ERRCODE,ERC0PARM                                 GP14268
+         CLI   0(R2),CR                END OF STRING ?
+         BE    ERROR1                  YES - NO PARM SUPPLIED
+         MVC   WORD(10),0(R2)          GET WORD FOR COMPARISON
+         OC    WORD(10),SPACES         MAKE SURE WORD IS UPPERCASE
+         LA    R0,7                    SET SKIP LENGTH          GP14268
+         CLC   =C'DSNAME(',WORD        DSNAME PARM ?
+         BE    PARMDSN                 YES
+         CLC   =C'DDNAME(',WORD        DDNAME PARM ?
+         BE    PARMDDN                 YES
+         LA    R0,4                    SET SKIP LENGTH SHORTER  GP14268
+         CLC   =C'DSN(',WORD           DSNAME PARM ?            GP14268
+         BE    PARMDSN                 YES                      GP14268
+         LA    R0,3                    SET SKIP LENGTH SHORTER  GP14268
+         CLC   =C'DS(',WORD            DSNAME PARM ?            GP14268
+         BE    PARMDSN                 YES                      GP14268
+         CLC   =C'DD(',WORD            DDNAME PARM ?            GP14268
+         BE    PARMDDN                 YES                      GP14268
+         CLI   ENTMODE,ENTPRINT        VSTPRINT ENTRY POINT ?
+         BE    PARMDSN0                YES - THEN ASSUME DSNAME
+*
+         B     SEND                    NO  - JUST SEND ENTIRE STRING
+*
+***********************************************************************
+* PARMDSN - OBTAIN DSN, CALL SVC 99 TO ALLOCATE, THEN OPEN DD
+***********************************************************************
+*
+PARMDSN  DS    0H
+*
+         OI    FLAGS,FDSNAME           INDICATE DSNAME TYPED
+*
+*------- GET DSNAME FROM PARM -----------------------------------------
+*
+         AR    R2,R0                   BUMP PAST KEYWORD        GP14268
+PARMDSN0 BAL   R11,GETWORD             GET A WORD               GP14268
+         MVI   ERRCODE,ERCDSNER                                 GP14268
+         CLI   WORD,C' '               ANY WORD THERE ?
+         BE    ERROR1                  NO  - ERROR
+*
+*------- ADD PREFIX IF NEEDED -----------------------------------------
+*
+         LA    R3,S99DSN+6             POINT TO TARGET DSNAME AREA
+         CLI   WORD,C''''              TICKED DATASET NAME ?
+         BE    PARMDSN1                YES - REMOVE TICKS
+         MVC   S99DSN+6(7),PREFIX      GET PREFIX TO DSNAME AREA
+         AH    R3,PREFIXL              POINT PAST PREFIX
+         MVI   0(R3),C'.'              ADD A DOT
+         MVC   1(50,R3),WORD           GET REST OF DSNAME
+         B     PARMDSN3                AND CONTINUE
+*
+*------- REMOVE SURROUNDING TICKS IF THERE ----------------------------
+*
+PARMDSN1 LA    R1,54                   SET DATASET NAME MAX SIZE
+         LA    R4,WORD+1               SKIP PAST TICK
+PARMDSN2 CLI   0(R4),C''''             TRAILING TICK ?
+         BE    PARMDSN3                OK  - WE HAVE DSN
+         CLI   0(R4),C' '              FORGOT TRAILING TICK ?
+         BE    PARMDSN3                THAT'S OK
+         MVC   0(1,R3),0(R4)           MOVE A CHARACTER
+         LA    R3,1(,R3)               BUMP POINTERS
+         LA    R4,1(,R4)
+         BCT   R1,PARMDSN2             AND LOOP IF NOT TOO BIG
+         B     ERROR1                  OOPS
+PARMDSN3 DS    0H
+*
+*------- REMOVE MEMBER NAME IF THERE ----------------------------------
+*   UNDER MVS, ENQ REQUIRES CORRECT DSN LENGTH                  GP14268
+*
+         LA    R3,S99DSN+6             POINT TO DSNAME
+PARMDSN4 LA    R3,1(,R3)               POINT TO NEXT CHAR
+         CLI   0(R3),C' '              END OF DSNAME ?
+         BE    PARMDSN5                YES - NO MEMBER NAME HERE
+         CLI   0(R3),C'('              MEMBER NAME HERE ?
+         BNE   PARMDSN4                NO  - KEEP LOOKING
+PARMDSNP LA    R2,1(,R3)               POINT TO MEMBER START
+         BAL   R11,GETWORD             GET MEMBER NAME          GP14268
+         MVC   S99MEM+6(8),WORD        TO S99 PARMLIST
+         NI    S99STATT,NOT-X'80'      STAT IS NOT LAST ANYMORE
+         MVC   0(10,R3),SPACES         CLEAR MEMBER NAME
+PARMDSN5 LA    R0,S99DSN+6             GET START                GP14268
+         SLR   R3,R0                   LENGTH OF DSN            GP14268
+         STH   R3,S99DSN+4             UPDATE LENGTH            GP14268
+         LA    R10,VST$EXEC            POINT TO DCB             GP14268
+*
+*------- LET'S ALLOCATE NOW, AS DISP=SHR ------------------------------
+*
+         MVI   ERRCODE,ERCBDALL                                 GP14268
+         OC    S99DSN+6(44),SPACES     MAKE SURE DSN IS UPPERCASE
+         OC    S99MEM+6(8),SPACES      MAKE SURE MEM IS UPPERCASE
+         LA    R1,S99ALLO              POINT TO SVC99 PARMS
+         SVC   99                      AND ALLOCATE DATASET
+         LTR   R15,R15                 OK ?
+         L     R15,S99ALLOE            GET ERROR CODE
+         BNZ   ERROR2                  NO  - ERROR
+         OI    FLAGS,FALLOC            INDICATE ALLOCATION DONE
+*
+         B     OPENDD                  AND GO OPEN THE DD
+*
+***********************************************************************
+* PARMDDN - OBTAIN THE DDNAME AND OPEN IT
+***********************************************************************
+*
+PARMDDN  DS    0H
+*
+         OI    FLAGS,FDDNAME           INDICATE DDNAME TYPED
+*
+*------- GET DDNAME FROM PARM, AND PUT INTO DCB -----------------------
+*
+         AR    R2,R0                   BUMP PAST KEYWORD        GP14268
+         BAL   R11,GETWORD             GET A WORD               GP14268
+         MVI   ERRCODE,ERCNODDN                                 GP14268
+         CLI   WORD,C' '               ANY WORD THERE ?
+         BE    ERROR1                  NO  - ERROR
+         USING IHADCB,R10              AND USE                  GP14268
+         MVC   DCBDDNAM,WORD           MOVE DDNAME TO DCB
+*
+*------- NOW OPEN DATASET FOR INPUT -----------------------------------
+*
+OPENDD   DS    0H
+         MVI   ERRCODE,ERCINUSE                                 GP14268
+         OPEN  ,MF=(E,OCLIST)          OPEN DATASET FOR INPUT   GP14268
+*^MVS*   LTR   R15,R15                 OK ?
+*^MVS*   BNZ   ERROR2                  NO  - ERROR
+         TM    DCBOFLGS,DCBOFOPN       OK?                      GP14268
+         BZ    ERROR2                    NO - ERROR             GP14268
+         OI    FLAGS,FOPEN             INDICATE DATASET OPEN
+         SR    R1,R1                   CONVERT                  GP14268
+         IC    R1,DCBRECFM             CHANGE RECFM             GP14268
+         SRL   R1,5                      TO                     GP14268
+         STC   R1,RECIX                   BRANCH                GP14268
+*                                      0 1 2 3 4 5 6 7
+*                                      U D V V F F U U
+         TR    RECIX+L'RECIX-1(1),=AL1(0,8,8,8,4,4,0,0)         GP14268
+         MVI   ERRCODE,ERCLN2BG                                 GP14268
+         SR    R1,R1                                            GP14268
+         ICM   R1,3,DCBLRECL           GET RECORD LENGTH        GP14268
+         CLI   RECIX,8                 RECFM=V?                 GP14268
+         BNE   *+8                                              GP14268
+         SH    R1,=H'4'                ALLOW FOR RDW/SDW        GP14268
+         CH    R1,=AL2(BUFMAX)         TOO LARGE FOR BUFFER?    GP14268
+*FAILS*  CLC   DCBLRECL,=AL2(BUFMAX)   LRECL TOO BIG ?          GP14268
+         BH    ERROR1                  YES - ERROR
+*
+*------- POINT TO START OF OUTPUT BUFFER ------------------------------
+*
+         L     R1,OUTBUFD              POINT TO OUTBUF DATA AREA
+         ST    R1,OUTBUFP              AND RESET POINTER TO START
+*
+***********************************************************************
+* PREPARE TO SEND DATA TO EMULATOR
+***********************************************************************
+*
+SEND     DS    0H
+*
+*------- SET FULL SCREEN MODE -----------------------------------------
+*
+         MVI   ERRCODE,ERCNOCRT                                 GP14268
+         STFSMODE ON,INITIAL=YES   ,NOEDIT=YES                  GP14268
+         LTR   R15,R15                 OK CALL ?
+         BNZ   ERROR2                  NO  - ERROR
+*
+*------- QUERY TERMINAL CAPABILITIES ----------------------------------
+*
+         MVI   ERRCODE,ERCBTPUT                                 GP14268
+*OLD*    TPUT  QUERY,LQUERY,NOEDIT
+         TPG   QUERY,LQUERY,NOEDIT,WAIT,HOLD                    GP14268
+         LTR   R15,R15                 OK CALL ?
+         BNZ   ERROR2                  NO  - ERROR
+*
+         LA    R2,WORD                 POINT TO INPUT BUFFER
+         MVI   ERRCODE,ERCBTGET                                 GP14268
+         TGET  (R2),1024,ASIS          GET BUFFER               GP14268
+         LTR   R15,R15                 GOOD INPUT ?             GP14268
+*OLD*    CH    R15,=H'24'              NOEDIT BUFFER RETURNED OK ?
+         BNE   ERROR2                  NO  - ERROR
+         LA    R3,0(R2,R1)             POINT TO END OF BUFFER
+         MVC   0(2,R3),=X'0000'        MARK END OF BUF (ZERO LEN)
+*
+*------- MAKE SURE TERMINAL SUPPORTS VSTEXEC --------------------------
+*
+         SLR   R3,R3                   CLEAR FOR IC
+         MVI   ERRCODE,ERCNOVIS                                 GP14268
+         CLI   0(R2),X'88'             SHOULD BE WSF CODE
+         BNE   ERROR1                  NO  - ERROR
+         LA    R2,1(,R2)               POINT TO FIRST FIELD
+CHKTERM  ICM   R3,B'0011',0(R2)        GET LENGTH
+         BZ    ERROR1                  NO MORE FIELDS - ERROR
+         CLI   2(R2),X'81'             QUERY REPLY ?
+         BNE   ERROR1                  NO  - ERROR
+         CLI   3(R2),X'8F'             OEM AUX DEVICE CODE ?
+         BE    CHKTERM1                YES - WE FOUND IT
+         AR    R2,R3                   NO  - POINT TO NEXT RESPONSE
+         B     CHKTERM                 AND CONTINUE
+CHKTERM1 CLC   =CL8'TCP3270',6(R2)     TCP3270 OEM CODE ?
+         BNE   ERROR1                  NO  - ERROR
+         CLC   =CL8'VISTA',14(R2)      VISTA EMULATOR ?
+         BNE   ERROR1                  NO  - ERROR
+*
+*------- SEND PRINT STATUS SCREEN IF PRINTING -------------------------
+*
+         CLI   ENTMODE,ENTPRINT        PRINT COMMAND ?
+         BNE   NOPRINT1                NO  - CONTINUE
+         TPUT  PRTSTAT1,PRTSTA1L,NOEDIT
+NOPRINT1 DS    0H
+*
+*------- SEE IF DATA IS FROM INPUT FILE -------------------------------
+*
+         TM    FLAGS,FOPEN             DATASET OPEN ?
+         BNO   SENDDATA                NO  - SEND PARM AS STRING
+*
+***********************************************************************
+* PREPARE A BLOCK OF DATA FROM INPUT FILE
+***********************************************************************
+*
+READREC  GET   VST$EXEC                LOCATE A RECORD
+         LR    R2,R1                   PRESERVE ADDRESS         GP14268
+*
+         LA    R9,1(,R9)               INCREMENT LINE COUNT     GP14268
+*
+*------- GET LOC AND LENGTH OF INPUT DATA -----------------------------
+*
+         LH    R3,DCBLRECL             ASSUME LENGTH IS LRECL   GP14268
+         CLI   RECIX,8                 RECFM=V?                 GP14268
+         BL    GOTSIZE                   OTHER                  GP14268
+DORECV   LH    R3,0(,R2)               GET LENGTH OF VAR RECORD
+         SH    R3,=H'4'                MINUS 4 FOR RDW
+         BM    READREC                   SHOULD NEVER HAPPEN?   GP14268
+         LA    R2,4(,R2)               POINT PAST RDW
+GOTSIZE  DS    0H
+*
+*------- IGNORE LINE NUMBERS IN EXEC MODE -----------------------------
+*
+         CLI   ENTMODE,ENTEXEC         VSTEXEC ?
+         BNE   LEAVENUM                NO  - CONTINUE
+         SH    R3,=H'8'                MINUS 8 FOR LINE NUMBERS
+LEAVENUM DS    0H
+*
+*------- TRIM TRAILING SPACES -----------------------------------------
+*
+         LR    R1,R2                   POINT TO START OF DATA
+         AR    R1,R3                   POINT PAST END OF DATA
+TRIMEND  BCTR  R1,0                    BUMP BACK 1 CHARACTER
+         CR    R1,R2                   AT START OF DATA ?
+         BE    TRIMEND9                YES - TRIM TO 1 CHARACTER
+         CLI   0(R1),C' '              SPACE ?
+         BE    TRIMEND                 YES - CONTINUE LOOKING
+TRIMEND9 LA    R3,1(,R1)               POINT PAST NON-SPACE DATA
+         SR    R3,R2                   GET NEW DATA LENGTH
+*
+*------- SEND CURRENT BUFFER IF FULL ----------------------------------
+*
+         L     R1,OUTBUFP              GET OUTBUF POINTER
+         S     R1,OUTBUF               GET LENGTH SO FAR
+         AR    R1,R3                   ADD LENGTH OF NEW DATA
+         CH    R1,=AL2(BUFMAX)         TOO BIG TO FIT IN BUFFER ?
+         BNH   NOTFULL                 NO  - NOT FULL YET
+         BAL   R14,SENDBUF             YES - SEND CURRENT BUFF  GP14268
+NOTFULL  DS    0H
+*
+*------- MOVE INPUT RECORD TO OUTPUT BUFFER ---------------------------
+*
+         LR    R1,R3                   SAVE LENGTH FOR LATER
+         L     R4,OUTBUFP              POINT TO OUTBUF AREA
+         LR    R5,R3                   GET LENGTH FOR MVCL
+         MVCL  R4,R2                   MOVE DATA TO OUTBUF
+         A     R1,OUTBUFP              POINT PAST DATA IN OUTBUF
+         MVC   0(2,R1),CRLF            MOVE CRLF AFTER DATA
+         LA    R1,2(,R1)               POINT PAST CRLF
+*
+*------- SAVE OUTBUF POINTER AND GO BACK FOR MORE ---------------------
+*
+         ST    R1,OUTBUFP              AND SAVE OUTBUF END POINTER
+         B     READREC                 GO GET MORE DATA
+*
+***********************************************************************
+* SEND A BLOCK OF DATA TO THE EMULATOR AND LOOP
+**********************************************************************
+*
+SENDDATA BAL   R14,SENDBUF             SEND OUTPUT BUFFER       GP14268
+*
+*------- IF DD IS OPEN, GO BACK FOR MORE DATA -------------------------
+*
+         TM    FLAGS,FOPEN             DATASET OPEN ?
+         BNO   RETURN0                 NO  - ALL DONE HERE
+         B     READREC                 YES - GO BACK AND READ MORE
+*
+***********************************************************************
+* END OF FILE ON INPUT
+***********************************************************************
+*
+EOFINPUT OI    FLAGS,FINEOD            SIGNAL LAST WRITE        GP14268
+         CLOSE MF=(E,OCLIST)           YES - THEN CLOSE IT      GP14268
+         NI    FLAGS,NOT-FOPEN         INDICATE DATASET CLOSED
+         B     SENDDATA                AND GO SEND LAST BUFFER
+*
+***********************************************************************
+***********************************************************************
+* RETURNS
+***********************************************************************
+***********************************************************************
+*
+*------- RETURN ZERO --------------------------------------------------
+*
+RETURN0  SLR   R15,R15                 SET RC TO ZERO
+         SLR   R0,R0                   SET RS TO ZERO
+         STM   R15,R0,RETURNS          SAVE RETURN CODES
+*
+*------- DISPLAY PRINT RESULTS ----------------------------------------
+*
+         CLI   ENTMODE,ENTPRINT        PRINT MODE ?
+         BNE   RETURNA                 NO  - CONTINUE
+         TPUT  PRTSTAT3,PRTSTA3L,NOEDIT SEND COMPLETION BOX
+*FAILS*  STFSMODE OFF                  TURN SCREEN BACK TO NORMAL
+         MVC   PRTSTAT4+36(4),PRTSTAT  GET LAST NUMBER OF LINES
+         TPUT  PRTSTAT4,PRTSTA4L       AND SHOW THE RESULTS
+RETURNA  DS    0H
+*
+*------- CLEAN UP -----------------------------------------------------
+*
+RETURN   DS    0H
+         STM   R15,R0,RETURNS          SAVE RETURN CODES
+*FAILS*  STFSMODE OFF                  TURN SCREEN BACK TO NORMAL
+         TM    FLAGS,FOPEN             DATASET OPEN ?
+         BNO   RETURN2                 NO  - CONTINUE
+         CLOSE MF=(E,OCLIST)           YES - THEN CLOSE IT      GP14268
+RETURN2  TM    FLAGS,FALLOC            DATASET ALLOCATED ?
+         BNO   RETURN3                 NO  - CONTINUE
+         LA    R1,S99FREE              YES - THEN FREE IT
+         SVC   99
+RETURN3  TM    FLAGS,FGETMAIN          STORAGE OBTAINED ?
+         BNO   RETURN4                 NO  - CONTINUE
+         L     R2,OUTBUF               POINT TO BUFFER AREA     GP14268
+         FREEMAIN RC,LV=GMSIZE,A=(R2)  FREE MEMORY
+RETURN4  DS    0H
+*
+*------- RETURN WITH CODES --------------------------------------------
+*
+         ICM   R15,15,RETURNS          CHECK MAJOR RETURN CODE  GP14268
+         BZ    RETURNC                 OK                       GP14268
+         TM    FLAGS,FLCP              INVOKED AS COMMAND ?     GP14268
+         BZ    RETURNC                   NO                     GP14268
+         CVD   R15,PACKED              CONVERT TO DECIMAL       GP14268
+         MVC   RETSTAC,=X'40202120'    MAKE MASK                GP14268
+         ED    RETSTAC,PACKED+6        MAKE PRINTABLE RET CODE  GP14268
+         UNPK  RETSTAS(L'RETSTAS+1),RETURNS+4(5)                GP14268
+         TR    RETSTAS,HEXTRTAB        MAKE PRINTABLE HEX       GP14268
+         MVI   RETSTAS+L'RETSTAS,C'.'  CLEAN LAST BYTE          GP14268
+*OLD     UNPK  RETSTAC(4),PACKED+5(3)  UNPACK INTO OUTPUT AREA  GP14268
+*OLD     OI    RETSTAC+3,C'0'          FIX UP LAST DIGIT        GP14268
+         TPUT  RETSTAT,RETSTATL        AND DISPLAY              GP14268
+RETURNC  LM    R15,R0,RETURNS          RESTORE RETURN CODES
+         L     R13,SAVE+4              POINT TO PREV SAVE AREA
+         ST    R0,20(,R13)             SAVE REASON CODE
+         RETURN (14,12),RC=(15)
+*
+RETURNS  DS    2F                      SAVE AREA
+         DROP  R10                     DONE WITH DCB            GP14268
+*
+***********************************************************************
+***********************************************************************
+* SENDBUF
+***********************************************************************
+***********************************************************************
+*
+SENDBUF  STM   R14,R3,SENDBUFS         SAVE REGISTERS
+         MVI   ERRCODE,ERCETPUT                                 GP14268
+         L     R2,OUTBUF               POINT TO OUTBUF BUFFER
+         L     R3,OUTBUFP              POINT PAST END OF BUFFER
+         SR    R3,R2                   GET LENGTH OF BUFFER
+         LR    R1,R3                   GET LENGTH TO R1
+         BCTR  R1,0                    BUMP DOWN ONE FOR WSF LENGTH
+         STCM  R1,B'0011',1(R2)        SAVE WSF LENGTH IN STRING
+         TPUT  (R2),(R3),NOEDIT        AND TPUT TO EMULATOR
+         LTR   R15,R15                 OK ?
+         BNZ   ERROR2                  NO  - ERROR
+*
+         TM    FLAGS,FINEOD            NO MORE INPUT?           GP14268
+         BNZ   SENDBUFW                  YES; DO WRITE ONLY     GP14268
+         MVI   ERRCODE,ERCETGET                                 GP14268
+         LA    R2,WORD                 POINT TO INPUT BUFFER
+         TGET  (R2),1024,ASIS                                   GP14268
+*^MVS*   CH    R15,=H'24'              NOEDIT BUFFER RETURNED OK ?
+         LTR   R15,R15                                          GP14268
+         BNZ   ERROR2                  NO  - ERROR
+*
+SENDBUFW DS    0H                                               GP14268
+         L     R1,OUTBUFD              POINT TO OUTBUF DATA AREA
+         ST    R1,OUTBUFP              AND RESET POINTER TO START
+*
+*------- IF WE ARE SENDING TO PRINT FILE, SHOW STATUS -----------------
+*
+         CLI   ENTMODE,ENTPRINT        PRINT MODE ?
+         BNE   SENDBUF1                NO  - CONTINUE
+         CVD   R9,PACKED               CONVERT LINE COUNT       GP14268
+         UNPK  PRTSTAT(4),PACKED+5(3)  UNPACK INTO OUTPUT AREA
+         OI    PRTSTAT+3,C'0'          FIX UP LAST DIGIT
+         TPUT  PRTSTAT2,PRTSTA2L,NOEDIT AND DISPLAY
+SENDBUF1 DS    0H
+*
+         LM    R14,R3,SENDBUFS         RESTORE REGISTERS
+         BR    R14                     AND RETURN
+*
+SENDBUFS DS    6F
+*
+***********************************************************************
+***********************************************************************
+* ERRORS
+***********************************************************************
+***********************************************************************
+*
+*------- RETURN ERROR CODE IN R15, ZERO IN R0 -------------------------
+*
+ERROR1   DS    0H                      CODE ONLY R0 ALWAYS ZERO
+         SLR   R15,R15                 CLEAR RC
+         SLR   R0,R0                   CLEAR RS
+         IC    R15,ERRCODE             GET ERROR CODE           GP14268
+         B     RETURN
+*
+*------- RETURN PASSED R15 IN REASON CODE (R0), ERROR CODE IN R15 -----
+*
+ERROR2   DS    0H                      ORIGINAL R15 RETURNED IN R0
+         LR    R0,R15                  SAVE R15 AS REASON CODE
+         SLR   R15,R15                 CLEAR RC
+         IC    R15,ERRCODE             GET ERROR CODE
+         B     RETURN
+*
+*------- ERROR CODES --------------------------------------------------
+*
+ERCNOSTO EQU   1             ERR_GETMAINFAILED                  GP14268
+ERCPRM2B EQU   2             ERR_PARMTOOBIG                     GP14268
+ERCNOCRT EQU   3             ERR_CANNOTSETFULLSCREENMODE        GP14268
+ERCBTPUT EQU   4             ERR_TPUTQUERYERROR                 GP14268
+ERCBTGET EQU   5             ERR_TGETQUERYERROR                 GP14268
+ERCNOVIS EQU   6             ERR_NOVSTEXECSUPPORT               GP14268
+ERCETPUT EQU   7             ERR_TPUTERROR                      GP14268
+ERCETGET EQU   8             ERR_TGETERROR                      GP14268
+ERCDSNER EQU   9             ERR_DATASETNAMEERROR               GP14268
+ERCWD2LG EQU   10            ERR_WORDTOOLONG                    GP14268
+ERCNOTSO EQU   11            ERR_NOTRUNNINGTSO                  GP14268
+ERCBDALL EQU   12            ERR_ALLOCATION                     GP14268
+ERCINUSE EQU   13            ERR_DATASETOPEN                    GP14268
+ERC0PARM EQU   14            ERR_NOPARMSUPPLIED                 GP14268
+ERCNODDN EQU   15            ERR_DDNAMEERROR                    GP14268
+ERCLN2BG EQU   16            ERR_LRECLTOOBIG                    GP14268
+ERCBDRFM EQU   17            ERR_RECFMNOTSUPPORTED              GP14268
+*
+***********************************************************************
+***********************************************************************
+* NONSPACE - SUBROUTINE TO MOVE POINTER TO NEXT NONSPACE CHARACTER
+***********************************************************************
+***********************************************************************
+*
+* IN:  R2 POINTS WITHIN A STRING
+*
+* OUT: R2 POINTS TO NEXT NON-SPACE CHARACTER IN THE STRING
+*
+*----------------------------------------------------------------------
+*
+NONSPACE CLI   0(R2),C' '              SPACE ?
+         BNER  R11                     NO  - RETURN
+         LA    R2,1(,R2)               YES - SKIP IT
+         B     NONSPACE                AND CONTINUE LOOKING
+*
+***********************************************************************
+***********************************************************************
+* GETWORD - SUBROUTINE TO OBTAIN A WORD FROM THE INPUT STRING
+***********************************************************************
+***********************************************************************
+*
+* IN:  R2 POINTS WITHIN A STRING
+*
+* OUT: WORD CONTAINS THE WORD AT R2.
+*      R2 POINTS PAST THE WORD IN INPUT STRING
+*
+* NOTE: ROUTINE HANDLES NESTED PARENTHESIS (FOR MEMBER NAMES), BUT
+*       ASSUMES END OF WORD IF A CLOSE PAREN IS SEEN WITHOUT A
+*       CLOSE PAREN.
+*
+*----------------------------------------------------------------------
+*
+GETWORD  ST    R11,GETWORDS            SAVE RETURN ADDRESS
+         SLR   R15,R15                 INIT PAREN COUNT TO ZERO
+         BAL   R11,NONSPACE            SKIP SPACES              GP14268
+         MVC   WORD(100),SPACES        CLEAR WORD
+         LA    R14,WORD                POINT TO WORD AREA
+         LA    R1,100                  MAX LENGTH OF WORD AREA
+GETWORD1 CLI   0(R2),C' '              END OF WORD ?
+         BE    GETWORD2                YES
+         CLI   0(R2),CR                END OF WORD ?
+         BE    GETWORD2                YES
+         CLI   0(R2),C'('              OPEN PAREN ?
+         BNE   GETWORD3                NO  - CONTINUE
+         LA    R15,1(,R15)             ADD 1 TO PAREN COUNT
+         B     GETWORD4                AND GO MOVE CHARACTER
+GETWORD3 CLI   0(R2),C')'              END OF WORD ?
+         BNE   GETWORD4                NO  - CONTINUE
+         BCTR  R15,0                   SUB 1 FROM PAREN COUNT
+         LTR   R15,R15                 STILL WITHIN NESTED PARENS ?
+         BM    GETWORD2                NO  - DONE WITH WORD
+GETWORD4 MVC   0(1,R14),0(R2)          MOVE A BYTE
+         LA    R14,1(,R14)             BUMP POINTERS
+         LA    R2,1(,R2)
+         BCT   R1,GETWORD1             AND CONTINUE IF NOT TOO LONG
+         MVI   ERRCODE,ERCWD2LG
+         B     ERROR1                  AND QUIT
+GETWORD2 L     R11,GETWORDS            GET RETURN ADDRESS
+         BR    R11                     AND RETURN
+*
+GETWORDS DS    F                       SAVE AREA
+*
+***********************************************************************
+***********************************************************************
+* LITERALS AND DATA AREAS
+***********************************************************************
+***********************************************************************
+*
+         LTORG
+         SPACE 1
+OCLIST   OPEN  (VST$EXEC,INPUT),MF=L                            GP14268
+         SPACE 1
+SPACES   DC  CL100' '                  SPACES AS A CONSTANT
+CRLF     DC  X'0D25'                   CRLF TRANSLATED TO EBCDIC
+*
+*------- QUERY AND WSF STRINGS ----------------------------------------
+*
+QUERY    DC  X'F3000501FF02'           QUERY THE TERMINAL
+LQUERY   EQU *-QUERY
+*
+OEMAUX   DC  X'F300000F1F010000'       WSF WITH VSTEXEC IDENTIFIER
+OEMAUXL  EQU *-OEMAUX                  LENGTH OF HEADER
+*
+*------- PRINT STATUS SCREEN ------------------------------------------
+*
+PRTSTAT1 DS 0F
+         DC    X'F5C1'                      ERASE/WRITE - RESET/MDT
+         DC    X'110055'                    SBA LINE
+         DC    X'2902C0E842F6'              SET FIELD AND COLOR
+         DC    X'08C5,08A2,08A2,08A2'       LEFT TOP OF BOX
+         DC    C' VISTA PC PRINT '          TITLE TEXT
+         DC    X'3C007C08A2,08D5'           RIGHT TOP OF BOX
+         DC    X'1100A6,0885,1100CC,0885'   BLANK BOX LINE
+         DC    X'1100F6,0885,2902C0E842F0'  MESSAGE LINE
+         DC    C'  Downloading file for printing...'
+         DC    X'11011B,2902C0E842F6,0885'
+         DC    X'110146,0885,11016C,0885'   BLANK BOX LINE
+         DC    X'110196,0885,2902C0E842F0'  MESSAGE LINE
+         DC    C'      Number of lines = 0000'
+         DC    X'1101BB,2902C0E842F6,0885'
+         DC    X'1101E6,0885,11020C,0885'   BLANK BOX LINE
+         DC    X'110235,2902C0E842F6,08C4,3C025C08A2,08D4'
+PRTSTA1L EQU *-PRTSTAT1
+*
+PRTSTAT2 DS 0F
+         DC    X'F1C0'                 WRITE - RESET
+         DC    X'1101B0'               MESSAGE LINE
+PRTSTAT  DC    CL4' '                  NUMBER OF LINES
+PRTSTA2L EQU *-PRTSTAT2
+*
+PRTSTAT3 DS 0F
+         DC    X'F5C3'                 ERASE/WRITE - RESET/MDT/UNLOCK
+PRTSTA3L EQU *-PRTSTAT3
+*
+PRTSTAT4 DC    C'Print completed - number of lines = XXXX'
+PRTSTA4L EQU *-PRTSTAT4
+*
+RETSTAT  DC    C'Request in error; code nnn, subcode xxxxxxxx.' GP14268
+RETSTATL EQU   *-RETSTAT                                        GP14268
+RETSTAC  EQU   RETSTAT+22,4,C'C'                                GP14268
+RETSTAS  EQU   RETSTAT+36,8,C'C'                                GP14268
+*
+TCAMFSM  DC    X'27F5,115D7F' SPECIAL CODE TO GET TCAM FULLSCR  GP14268
+TCAMFSML EQU   *-TCAMFSM                                        GP14268
+*
+TRTABHEX DC    C'0123456789ABCDEF'                              GP14268
+HEXTRTAB EQU   TRTABHEX-C'0'                                    GP14268
+*
+***********************************************************************
+***********************************************************************
+* STORAGE AREAS
+***********************************************************************
+***********************************************************************
+*
+*------- GENERAL STUFF ------------------------------------------------
+*
+SAVE     DC  18A(0)
+OUTBUF   DC  A(0)                      OUTPUT BUFFER POINTER
+OUTBUFD  DC  A(0)                      OUTPUT BUFFER DATA AREA POINTER
+OUTBUFP  DC  A(0)                      OUTPUT BUFFER MOVING POINTER
+PREFIXL  DC  H'0'                      PREFIX LENGTH
+PREFIX   DC  CL7' '                    PROFILE PREFIX
+ERRCODE  DC  X'0'                      ERROR CODE RETURNED IN R15
+FLAGS    DC  X'0'                      FLAGS
+FGETMAIN EQU X'80'                      STORAGE IS OBTAINED
+FALLOC   EQU X'40'                      DATASET IS ALLOCATED
+FOPEN    EQU X'20'                      DATASET IS OPEN
+FDSNAME  EQU X'10'                      DSNAME PARM GIVEN
+FDDNAME  EQU X'08'                      DDNAME PARM GIVEN
+FINEOD   EQU X'02'                      EOF ON INPUT; SKIP GET  GP14268
+FLCP     EQU X'01'                      INVOKED AS COMMAND PROC GP14268
+ENTMODE  DC  X'0'                      ENTRY POINT ID
+ENTEXEC  EQU 0                          ENTRY AT VSTEXEC
+ENTPRINT EQU 1                          ENTRY AT VSTPRINT
+RECIX    DC  X'0'                      RECFM INDEX              GP14268
+PACKED   DC  D'0'                      PACKED WORK AREA
+*
+*------- SVC99 ALLOCATION ---------------------------------------------
+*
+S99ALLO  DC    A(S99ALLOP+LAST)
+S99ALLOP DC    X'14010000'
+S99ALLOE DC    X'00000000'
+         DC    A(S99ALLOT)
+         DC    X'0000000000000000'
+*
+S99ALLOT DC    A(S99DDN)
+         DC    A(S99DSN)
+S99STATT DC    A(S99STAT+LAST)
+         DC    A(S99MEM+LAST)
+*
+S99DDN   DC    X'000100010008',CL8'VST$EXEC'  DDNAME
+S99DSN   DC    X'00020001002C',CL60' '        DSNAME (WITH WORK SPACE)
+S99MEM   DC    X'000300010008',CL8' '         MEMBER (IF ANY)
+S99STAT  DC    X'00040001000108'              DISP=SHR
+*
+S99FREE  DC    A(S99FREEP+LAST)
+S99FREEP DC    X'14020000'
+S99FREEE DC    X'00000000'
+         DC    A(S99FREET)
+         DC    X'0000000000000000'
+S99FREET DC    A(S99DDN+LAST)
+*
+*------- DCB ----------------------------------------------------------
+*
+VST$EXEC DCB   DDNAME=VST$EXEC,MACRF=GL,DSORG=PS,EODAD=EOFINPUT,       *
+               EXLST=EXLIST                                     GP14268
+EXLIST   DC    0A(0),X'85',AL3(EXDCB)                           GP14268
+*---------------------------------------------------------------------*
+*                                                                     *
+*   FOR RECFM=VS OR VBS, REQUEST THE RECORD INTERFACE, TO GET         *
+*   COMPLETE RECORDS (OTHER REASON FOR GOING TO LOCATE MODE)          *
+*                                                                     *
+*---------------------------------------------------------------------*
+         PUSH  USING                                            GP14268
+         DROP  ,                                                GP14268
+         USING EXDCB,R15                                        GP14268
+EXDCB    SLL   R1,8                                             GP14268
+         SRL   R1,8          CLEAN DCB ADDRESS                  GP14268
+         USING IHADCB,R1                                        GP14268
+         TM    DCBRECFM,DCBRECF   F OR U?                       GP14268
+         BNZ   EXDCBEX              YES; RETURN                 GP14268
+         TM    DCBRECFM,DCBRECV+DCBRECSB    VS OR VBS?          GP14268
+         BNO   EXDCBEX                                          GP14268
+         OI    DCBBFTEK,DCBBFTA        TURN ON BFTEK=A          GP14268
+EXDCBEX  BR    R14                                              GP14268
+         POP   USING                                            GP14268
+*
+*------- WORD FOR VARIOUS STORAGE -------------------------------------
+*
+WORD     DS  CL1024                    WORD FOR VARIOUS USAGE
+*
+***********************************************************************
+***********************************************************************
+* DSECTS
+***********************************************************************
+***********************************************************************
+*
+         PRINT NOGEN         SAVE A TREE                        GP14268
+         IHAPSA ,
+         IKJTCB ,
+         IEZJSCB ,
+         IKJPSCB ,
+         IKJUPT ,
+         DCBD  DSORG=PS
+*
+         END

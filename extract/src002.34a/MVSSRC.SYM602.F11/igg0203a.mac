@@ -1,0 +1,788 @@
+         TITLE 'IGG0203A - BDAM CLOSE EXECUTOR'
+IGG0203A CSECT
+***********************************************************************
+*                                                                     *
+*  MODULE NAME = IGG0203A                                             *
+*                                                                     *
+*  DESCRIPTIVE NAME = BDAM CLOSE EXECUTOR                             *
+*                                                                     *
+*  COPYRIGHT = NONE                                                   *
+*                                                                     *
+*  STATUS RELEASE VS2-2 LEVEL 0                                       *
+*                                                                     *
+*                                                                     *
+*  FUNCTION/OPERATION = THIS MODULE RECEIVES CONTROL DURING THE CLOSE *
+*   OF A BDAM DATA SET AND WILL PURGE ALL I/O REQUESTS WHICH WERE IN  *
+*   PROCESS AT THE TIME CLOSE WAS EXECUTED, FREE ANY IOBS THAT WERE   *
+*   OBTAINED DURING PROCESSING, AND FREE BUFFERS IF THE DYNAMIC       *
+*   BUFFER OPTION WAS USED. IT WILL FREE THE SEGMENT WORK AREA POOL IF*
+*   VARIABLE SPANNED WAS SPECIFIED WITHOUT DYNAMIC BUFFERING. IT WILL *
+*   DEQ ALL ENTRIES IN THE READX LIST AND FREE THE SEGMENTS.          *
+*   AS EACH OPERATION IS COMPLETED AUDIT TRAIL BITS ARE SET TO INDI-  *
+*   CATE THAT EITHER THE OPERATION COMPLETED SUCCESSFULLY OR THAT IT  *
+*   WAS NOT NECESSARY. THESE BITS SERVE ONLY TO INFORM THE USER OF THE*
+*   STATUS OF HIS DATA SET AND THE DISPOSITION OF RESOURCES USED BY IT*
+*   BEFORE RETURNING TO COMMON CLOSE, A BRANCH IS MADE TO THE O/C/E   *
+*   RESIDENT ROUTINE TO COPY THE DCB FROM THE CLOSE WORKAREA INTO     *
+*   THE USER'S DCB CORE.                                              *
+*                                                                     *
+*  NOTES = THE MODULE IS ENTERED IN DATA MANAGEMENT KEY. ALL DEQS,    *
+*   PURGE PROCESSING AND XCTL ARE IN DATA MANAGEMENT KEY.  IOBS       *
+*   AND BUFFERS ARE FREED IN USER KEY.                                *
+*                                                                     *
+*   THIS MODULE WILL BE ENTERED BY THE FORCE CLOSE EXECUTOR DURING    *
+*   ABEND PROCESSING, SHOULD THE ABEND OCCUR DURING OPEN, AFTER THE   *
+*   DCB HAS BEEN COPIED BACK. PROCESSING IS THE SAME UNDER BOTH       *
+*   NORMAL AND ABEND CONDITIONS.                                      *
+*                                                                     *
+*     DEPENDENCIES = NONE                                             *
+*                                                                     *
+*     DATA AREAS = NONE                                               *
+*                                                                     *
+*     RESTRICTIONS = NONE                                             *
+*                                                                     *
+*     REGISTER CONVENTIONS = SEE REGISTER EQUATES BELOW               *
+*                                                                     *
+*     PATCH LABEL = NONE                                              *
+*                                                                     *
+*                                                                     *
+*  MODULE TYPE = CLOSE EXECUTOR                                       *
+*                                                                     *
+*     PROCESSOR = ASSEMBLER XF                                        *
+*                                                                     *
+*     MODULE SIZE = 920 DECIMAL BYTES                                 *
+*                                                                     *
+*     ATTRIBUTES = REENTRANT,ENABLED,PRIVILEGED, ENTERED IN DATA      *
+*       MANAGEMENT KEY. MODESET IS ISSUED TO DO SOME PROCESSING IN    *
+*       USER KEY.                                                     *
+*                                                                     *
+*                                                                     *
+*  ENTRY POINT = 'START'                                              *
+*                                                                     *
+*     PURPOSE = SEE FUNCTION                                          *
+*                                                                     *
+*     LINKAGE = THIS MODULE RECEIVES CONTROL EITHER FROM COMMON CLOSE *
+*       OR ANOTHER EXECUTOR WHEN ITS ID APPEARS AS THE NEXT NON-ZERO  *
+*       ENTRY IN THE WTG TABLE. IT MAY ALSO RECEIVE CONTROL FROM      *
+*       THE FORCE CLOSE EXECUTOR IF AN ABEND OCCURRED DURING OPEN.    *
+*                                                                     *
+*     INPUT - INPUTS TO THIS ROUTINE ARE                              *
+*        REGISTER 5 - BEGINNING OF THE DCB PARAMETER LIST             *
+*        REGISTER 6 - BEGINNING OF THE WHERE-TO-GO TABLE (WTG)        *
+*        REGISTER 7 - BEGINNING OF THE CURRENT ENTRY IN THE DCB       *
+*                     PARAMETER LIST                                  *
+*        REGISTER 8 - ADDRESS OF THE CURRENT ENTRY IN THE WTG         *
+*                                                                     *
+*        OPEN WORKAREA - CONTAINS DCB COPY, PARM LIST, WORKAREA,      *
+*          USER DCB ADDRESS AND KEY, FORCE CLOSE EXEC ADDRESS,        *
+*          WTG TABLE AND AUDIT CONTROL BYTES.                         *
+*                                                                     *
+*                                                                     *
+*     OUTPUT = THIS ROUTINE XCTLS TO COMMON CLOSE. REGISTERS 5 AND 6  *
+*        ARE LEFT UNCHANGED. REGISTERS 7 AND 8 ARE POSITIONED TO      *
+*        THE NEXT UNCOMPLETED ENTRY IN THE PARM LIST AND WTG TABLE.   *
+*                                                                     *
+*           CONTROL BLOCKS/DATA AREAS FREED:                          *
+*                          USL/BCB INCLUDING BUFFERS                  *
+*                          SWA INCLUDING BUFFERS                      *
+*                          READ EXCLUSIVE LIST                        *
+*                          ALL IOBS IN IOB POOL AND UNPOSTED QUEUE    *
+*                                                                     *
+*           ALL ENTRIES IN THE READX LIST WILL HAVE BEEN DEQUEUED;    *
+*           DCB WILL HAVE BEEN RETURNED TO PREOPEN STATE              *
+*                                                                     *
+*     EXIT-NORMAL = XCTL BACK TO COMMON CLOSE IF SCAN OF THE WTG TABLE*
+*        DOES NOT FIND A NON-ZERO ENTRY. OTHERWISE AN XCTL IS MADE    *
+*        TO THE FIRST NON-ZERO ENTRY IN THE TABLE.                    *
+*                                                                     *
+*     EXIT-ABNORMAL = NONE                                            *
+*                                                                     *
+*                                                                     *
+*  EXTERNAL REFERENCES = NONE                                         *
+*                                                                     *
+*     ROUTINES:  PURGE(SVC 16) TO PURGE OUTSTANDING I/0               *
+*                FREEMAIN(SVC 10) IS CALLED TO FREE IOBS, READX LIST, *
+*                          SWAS AND BUFFERS                           *
+*                DEQ(SVC 48) IS CALLED TO DEQ ALL BLOCKS ON READX LIST*
+*                XCTL(SVC 7) IS CALLED TO PASS CONTROL                *
+*                IECRES - O/C/EOV RESIDENT RTN FOR DCB COPYBACK       *
+*                                                                     *
+*                                                                     *
+*  TABLES/WORK AREAS- 1.DCB PARAMETER LIST IS THE ADDRESS OF EACH DCB *
+*   SPECIFIED IN THE CLOSE MACRO INSTRUCTION. THE HI-ORDER BYTE       *
+*   CONTAINS A CODE INDICATING THE MODE .                             *
+*   2.WHERE-TO-GO TABLE CONTAINS THE ID AND TTR OF THE ROUTINE WHICH  *
+*   IS TO PROCESS THE CORRESPONDING DCB AND THE ADDRESS OF A WORK AREA*
+*   ASSIGNED TO THAT DCB.                                             *
+*   3.WORK AREA IS A TEMPORARY AREA IN SP230 USED BY THIS ROUTINE     *
+*   AS A WORKAREA FOR THE PURGE PARAMETER LIST. THE COPY OF THE DCB   *
+*   IN THIS WORKAREA IS REFERENCED THROUGHOUT. INFORMATION CONCERNING *
+*   USER KEY AND DCB LENGTHS ARE ALSO KEPT IN THE WORKAREA.           *
+*                                                                     *
+*                                                                     *
+*  MACROS = FREEMAIN, MODESET, XCTL, DEQ, PURGE, WAIT, IECRES         *
+*                                                                     *
+*                                                                     *
+*                                                                     *
+*  CHANGE ACTIVITY = AS FOLLOWS:                                      *
+*                                                                     *
+*                    OS 21 DELETIONS/CHANGES                          *
+*2964053800-054550                                               A40558
+*2964037300,043600-043800                                        M0045
+*2964036400-037200                                               A35821
+*2964009800,036600,041600,085400-091000,091200                   A35339
+*                    VS1-1 DELETIONS/CHANGES                          *
+*                    VS1-2 DELETIONS/CHANGES                          *
+*                    VS1-3 DELETIONS/CHANGES                          *
+*                    VS2-1 DELETIONS/CHANGES                          *
+*                    VS2-2 DELETIONS/CHANGES                          *
+*000300-000350,017100,017300-017360,020735-020737,023120-026900,024600,
+*032800,033552,036420,036520-036580,038200,039400-039900,044000,051300,
+*053000,056000-062120,064800-065200,067644-067648,074900         Y02072
+*                                                                YM1103
+*                                                                YM1190
+*                                                                YM3242
+*                    UPDATES SUBSEQUENT TO VS2-3                      *
+*C043807                                                        ZA09624
+*C049361                                                        ZA09656
+*C033383,033390,A073510                                        @ZA12264
+*D055200-055220,A055054-055184,055240,063404-063406            @ZA11614
+*                    UPDATES SINCE VS2-3.7                            *
+*A027904-027924,A027944                                        @ZA21099
+*C055120-055124,C055128-055130,C055134,C055153,A055132,        @ZA28352
+*A055141-055148,A063405                                        @ZA28352
+***********************************************************************
+         EJECT
+***********************************************************************
+*                         REGISTER USAGE                              *
+***********************************************************************
+RPARM0   EQU   0         PARM PASSED TO FREEMAIN WITH LENGTH
+R0       EQU   0         PARM REG TO SAVE ALL REGS               YM1190
+RBUF     EQU   1         BASE REGISTER FOR BUFFER CNTRL BLK
+RPARM1   EQU   1         PARM PASSED TO FREEMAIN, PURGE AND WAIT
+RDEQWORK EQU   1         WORK REG FOR DEQ PROCESSING
+RDCB     EQU   2         USER'S DCB ADDRESS
+RBASE    EQU   3         BASE REGISTER
+RCORE    EQU   4         WORK AREA ADDRESS
+RPAR     EQU   5         PARAMETER LIST ADDRESS
+RCVT     EQU   5         CVT ADDRESS                           @ZA28352
+RES      EQU   5         ADDRESS OF O/C/EOV RES RTN            @ZA28352
+RWTG     EQU   6         BEGINNING OF WTG
+RDXWORK  EQU   6         BASE REG FOR RDXENTRY AND RDX WORK REG
+RPARC    EQU   7         CURRENT ENTRY IN PARAMETER LIST
+RWORKK   EQU   7         WORK REG-SAVES RDXLIST ADDR BET RTNS    Y02072
+RWTGC    EQU   8         CURRENT ENTRY IN WTG
+RWORKC   EQU   9         WORK REGISTER
+RDXLST1  EQU   9         POINTER TO NEXT READX LIST
+RUSL     EQU   10        PTR TO UNSCHEDULED LIST
+RDXLST   EQU   10        BASE FOR READX LIST
+RIOB     EQU   11        BASE FOR IOB DSECT
+RDEB     EQU   11        BASE FOR DEB DSECT
+RWORKA   EQU   11        WORK REGISTER, ALSO WORKREG FOR MODESET Y02072
+RWORKB   EQU   11        WORK REGISTER                         @ZA11614
+RDEQ     EQU   11        BASE REGISTER FOR DEQ PARM LIST
+RWORKD   EQU   12        WORK REGISTER                         @ZA11614
+RWORKE   EQU   12        WORK REG -EVEN REG IN ARITH OPERATIONS
+RNUMENT  EQU   12        CTR FOR NUMBER OF READX ENTRIES
+RIOB2    EQU   13        NEXT IOB POINTER
+RWORKO   EQU   13        WORK REG -ODD REG IN ARITH OPERATIONS
+RUSLSLOT EQU   13        BASE REGISTER FOR USLSLOT
+RWORKF   EQU   14        WORK REGISTER
+RETURN   EQU   14        RETURN REGISTER FROM SUBROUTINES
+RWORKJ   EQU   15        WORK REGISTER
+RTCB     EQU   15        BASE REG FOR TCB
+R15      EQU   15        PARM REG FOR XCTL AND SAVE
+***********************************************************************
+         EJECT
+***********************************************************************
+*                   INITIALIZATION OF REGISTERS                       *
+***********************************************************************
+START    EQU   *                        PRIMARY ENTRY POINT
+         BALR  RBASE,0                  SET BASE REGISTER
+         USING *,RBASE                  ESTABLISH BASE FOR THIS MOD
+         USING WTG,RWTG                 ESTABLISH BASE FOR WHERE-TO-GO
+         USING WTGENTRY,RWTGC           ESTABLISH BASE FOR CURRENT ENT
+         USING PARML,RPARC              ESTABLISH BASE FOR PARM LIST
+         L     RDCB,PARDCBAD            LOAD DCB ADDRESS
+         USING IHADCB,RDCB              ESTABLISH BASE FOR DCB
+         DROP  RPARC
+         L     RCORE,WTGDCBWA           LOAD WORK AREA ADDRESS
+         USING FORCORE,RCORE            ESTABLISH BASE FOR CLOSE WKAREA
+         DROP  RWTG
+         SPACE 2
+***********************************************************************
+*  THE FOLLOWING ROUTINE BUILDS THE PURGE LIST IN THE CLOSE WORKAREA  *
+*  AND PURGES ALL OUTSTANDING I/O REQUESTS ASSOCIATED WITH THE DEB.   *
+***********************************************************************
+         LA    RPARM1,DXCCW6            LOAD ADDR OF PURGE LIST  Y02072
+         USING PPL,RPARM1               EST BASE FOR PARM LIST   Y02072
+         L     RDEB,DCBDEBAD            LOAD ADDRESS OF DEB
+         USING DEBBASIC,RDEB            ESTABLISH BASE FOR DEB
+         ST    RDEB,PPLDSID             STORE INTO PURGE LIST    Y02072
+         MVI   PPLOPT1,PPLDS+PPLHIO     SET PURGE CODE           Y02072
+         LA    RWORKJ,DEBUSRPG          LOAD ADDR OF PURGE CHAIN FIELD
+         ST    RWORKJ,PPLPIRL           AND STORE INTO PURGE BLK Y02072
+         SR    RWORKJ,RWORKJ            STORE ZEROS IN THE ECB PORTION
+         ST    RWORKJ,PPLCC             OF THE PURGE BLOCK       Y02072
+         DROP  RPARM1                   PURGE DESTROYS R1        Y02072
+*
+         PURGE (1)                      PURGE ANY OUTSTANDING I/O
+*
+         LA    RPARM1,DXCCW6            LOAD ADDR OF PURGE LIST  Y02072
+         USING PPL,RPARM1               EST BASE FOR PARM LIST   Y02072
+         LA    RPARM1,PPLCC             LOAD WAIT PARAMETER ADDR Y02072
+         DROP  RPARM1                                            Y02072
+         WAIT  ECB=(1)                  WAIT FOR PURGE TO COMPLETE
+         OI    DXATEXC2+1,FCACPURG      SET AUDIT TRAIL INDICA-  Y02072
+*                                       TING PURGED I/O          Y02072
+         DROP  RDEB
+         SPACE 2
+***********************************************************************
+*  THE FOLLOWING ROUTINE BUILDS A DEQ LIST, USING THE AVT AS A WORK   *
+*  AREA, AND DEQUEUES EACH ENTRY IN THE READX LIST SEGMENTS,IF THE DCB*
+*  SPECIFIED EXCLUSIVE CONTROL.THE READX LIST PTR IS DEBXXARG IN THE  *
+*  DEB EXTENSION. THE NEXT SEGMENT POINTER IS IN FIELD RDXNEXT IN THE *
+*  READX LIST. THIS ROUTINE EXECUTES IN DATA MANAGEMENT KEY.          *
+***********************************************************************
+DEQRDX   TM    DCBOPTCD,DCBOPTRE        IS THERE AN EXCLUSIVE CONTROL
+         BZ    IOBPOOL                  LIST? BRANCH IF NO.      Y02072
+         L     RDEB,DCBDEBAD            ADDRESS OF DEB
+         USING DEBBASIC,RDEB            ESTABLISH BASE FOR DEB
+         L     RDEQ,DEBAPPAD            ADDR OF APPENDAGE VECTOR LIST
+*                                       WHICH WILL BE USED FOR DEQ PARM
+         DROP  RDEB                                              A35821
+*
+*   GET ADDRESS OF READ EXCLUSIVE LIST, FOUND IN DEB EXTENSION
+*
+         USING DEBAVT,RDEQ              ESTABLISH BASE FOR AVT   Y02072
+         L     RDXLST1,DEBXTNP          GET ADDR OF DEB EXT      Y02072
+         DROP  RDEQ                                              Y02072
+         USING DEBXTN,RDXLST1           ESTABLISH BASE FOR EXT   Y02072
+         L     RDXLST1,DEBXXARG         GET ADDR OF READX LIST   Y02072
+         DROP  RDXLST1                                           Y02072
+         USING DEQAREA,RDEQ             ESTABLISH BASE FOR DEQ PARM LST
+         STM   RWTG,RPARC,DEQREGSV      SAVE REGS IN DEQ WORKAREA
+         LR    RWORKK,RDXLST1           SAVE PTR TO RDXLIST FOR  Y02072
+*                                       NEXT ROUTINE (FREEQIOB)  Y02072
+         MVC   DEQFLAG,LISTDEQ          MOVE DEQ LIST TO DEBAVT  Y02072
+*
+*        POSITION TO NEXT ENTRY IN READ EXCLUSIVE LIST
+*
+FIXPTR   LA    RDXLST,0(RDXLST1)        CLEAR HI-ORDER BYTE      Y02072
+         LTR   RDXLST,RDXLST            LOAD AND TST SEGMENT PTR Y02072
+         USING RDXLIST,RDXLST           ESTABLISH BASE FOR RDXLIST
+         BZ    IOBPOOL                  BRANCH IF NO SEGMENTS    Y02072
+         L     RDXLST1,RDXNEXT          GET NEXT SEGMENT POINTER
+         LA    RNUMENT,RDXMAXCT         NUMBER OF READX LIST SLOTS
+         LA    RDXWORK,RDXENT           STEP POINTER TO FIRST SLOT
+         USING RDXENTRY,RDXWORK         ESTABLISH BASE FOR RDXENTRY
+DLOOP    EQU   *                        DEQ EACH ENTRY IN READX LIST
+         CLC   RDXNQARG,ZEROS           IS THIS SLOT EMPTY       Y02072
+         BE    STPIDX                   BRANCH IF YES
+*
+*        DEQ THE CURRENT ENTRY IN THE READ EXCLUSIVE LIST
+*
+DEQENTRY EQU   *                        DEQ CURRENT READX ENTRY  Y02072
+*
+         DEQ   (SYSNM,(RDXWORK)),MF=(E,(RDEQ)) DEQ READX ENTRY   Y02072
+*
+         XC    RDXNQARG,RDXNQARG        CLEAR OUT THIS SLOT      Y02072
+*
+STPIDX   EQU   *                        POSITION TO NEXT ENTRY   Y02072
+         LA    RDXWORK,RDXENTLN(RDXWORK) UP POINTER TO NEXT SLOT Y02072
+         BCT   RNUMENT,DLOOP            BRANCH IF MORE SLOTS
+         B     FIXPTR                   BR BACK TO PROCESS NEXT SEGMENT
+*
+         DROP  RDXLST,RDEQ,RDXWORK
+         SPACE 2
+***********************************************************************
+*  THE FOLLOWING ROUTINE FREES IOBS ON THE AVAILABLE POOL.   STARTING *
+*  WITH THE IOB POINTED TO BY DCBIOBAD, THE IOB CHAIN IS SEARCHED FOR *
+*  ALL IOBS FLAGGED AS AVAILABLE. EACH IOB IS CHAINED TO THE NEXT     *
+*  THROUGH THE IOBDPLAD FIELD. IT IS ENTERED IN DATA MANAGEMENT KEY.  *
+*  EXIT FROM THIS ROUTINE IS IN USER KEY.                             *
+***********************************************************************
+IOBPOOL  EQU   *                        FREE IOBS IN IOB POOL    Y02072
+         OI    DXATEXC2+1,FCACDEQ       SET AUDIT TRAIL INDICA-  Y02072
+*                                       TING ALL ENTRIES ON      Y02072
+*                                       READX LIST ARE DEQUEUED  Y02072
+         L     RIOB2,DCBIOBAD           LOAD IOB POOL POINTER FROM DCB
+*
+         MODESET  KEYADDR=DXUKEY,WORKREG=11  CHANGE TO USER KEY  Y02072
+*
+ZEROCHK  LA    RIOB,0(RIOB2)            CLEAR HI-ORDER BYTE - MAKE NEXT
+*                                       IOB THE CURRENT IOB
+         USING IOBSTDRD,RIOB            ESTABLISH BASE FOR IOB DSECT
+         LTR   RIOB,RIOB                IS IOB POOL POINTER ZERO
+         BZ    FREEQIOB                 YES, GO CHECK READX LIST Y02072
+         L     RIOB2,IOBDPLAD           LOAD ADDRESS OF NEXT IOB
+         CLI   IOBDAYLI,AVAIL           IS CURRENT IOB AVAILABLE
+         BE    CHKNEXT                  NO, GO CHECK NEXT IOB
+         BAL   RETURN,FREEIOB           YES, GO FREE CURRENT IOB
+         DROP  RIOB
+CHKNEXT  EQU   *                        GO TO CHECK NEXT IOB     Y02072
+         B     ZEROCHK                  GO TO CHECK NEXT IOB
+         SPACE 2
+***********************************************************************
+*  IOBS WAITING ON THE UNPOSTED QUEUES ASSOCIATED WITH EACH ENTRY IN  *
+*  THE READ EXCLUSIVE LIST ARE FREED. WHEN ALL IOBS HAVE BEEN FREED   *
+*  FOR THAT SEGMENT, THAT SEGMENT IS FREED AND THE NEXT, IF THERE IS  *
+*  ONE, IS PROCESSED. THE READX LIST PTR IS AT DEBXXARG IN THE DEB    *
+*  EXTENSION. THE NEXT SEGMENT POINTER IS IN FIELD RDXNEXT IN THE     *
+*  READX LIST. THIS ROUTINE IS ENTERED IN USER KEY. IOBS ARE FREED    *
+*  AND EXIT FROM THIS ROUTINE IS IN USER KEY.                         *
+***********************************************************************
+FREEQIOB EQU   *                        FREE IOBS ON UNPOSTED Q  Y02072
+*
+         MODESET  EXTKEY=DATAMGT        CHANGE TO DATA MGT KEY   Y02072
+*
+         OI    DXATEXC2+1,FCACIOBP      SET AUDIT TRAIL INDICA-  Y02072
+*                                       TING ALL AVAILABLE IOBS  Y02072
+*                                       IN IOB POOL ARE FREED    Y02072
+*
+         MODESET  KEYADDR=DXUKEY,WORKREG=9  RETURN TO USER KEY   Y02072
+*
+         TM    DCBOPTCD,DCBOPTRE        IS EXCL CONTROL OPTION   Y02072
+         BZ    BUFCHK                   NO, GO CHECK BUFFERS     Y02072
+         LR    RDXLST1,RWORKK           RDXLST PTR SAVED BY DEQ  Y02072
+*
+*        POSITION TO NEXT ENTRY IN READ EXCLUSIVE LIST
+*
+LISTPTR  LA    RDXLST,0(RDXLST1)        CLEAR HI-ORDER BYTE
+         LTR   RDXLST,RDXLST            LOAD AND TEST SEGMENT POINTER
+         USING RDXLIST,RDXLST           ESTABLISH BASE FOR RDXLIST
+         BZ    RESTREGS                 BRANCH IF NO SEGMENTS    Y02072
+         L     RDXLST1,RDXNEXT          GET NEXT SEGMENT POINTER
+         LA    RNUMENT,RDXMAXCT         NUMBER OF READX LIST SLOTS
+         LA    RDXWORK,RDXENT           STEP POINTER TO FIRST SLOT
+         USING RDXENTRY,RDXWORK         ESTABLISH BASE FOR RDXENTRY
+*
+*  THE FOLLOWING ROUTINE FREES IOBS ON THE UNPOSTED QUEUE. THESE IOBS *
+*  ARE WAITING FOR EXCLUSIVE CONTROL OF THE CURRENT ENTRY IN THE      *
+*  READ EXCLUSIVE LIST.                                               *
+*
+*
+UNPCHK   L     RIOB2,RDXIOBUQ           GET 1ST IOB WAITING      Y02072
+*                                       FOR THIS ENTRY IN LIST   Y02072
+TZERO4   LA    RIOB,0(RIOB2)            MAKE NEXT IOB CURRENT IOB
+         LTR   RIOB,RIOB                ANY IOBS ON QUEUE
+         BZ    GOTONEXT                 NO, GO TO NEXT ENTRY     Y02072
+         USING IOBSTDRD,RIOB            ESTABLISH IOB BASE       Y02072
+         L     RIOB2,IOBDQPTR           LOAD NEXT IOB ADDRESS
+         DROP  RIOB                                              Y02072
+         MODESET  EXTKEY=DATAMGT        CHG TO DATA MGT KEY    @ZA21099
+         ST    RNUMENT,RDXRSV01         SAVE REGISTER          @ZA21099
+         MODESET  KEYADDR=DXUKEY,WORKREG=11  BACK TO USER KEY  @ZA21099
+         BAL   RETURN,FREEIOB           GO TO FREE THIS IOB
+         L     RNUMENT,RDXRSV01         RESTORE REGISTER       @ZA21099
+         B     TZERO4                   GO TEST FOR END OF QUEUE
+*
+*     WHEN 9 SLOTS HAVE BEEN INVESTIGATED, FREE THIS SEGMENT
+*
+GOTONEXT EQU   *                        POSITION TO NEXT ENTRY   Y02072
+         LA    RDXWORK,RDXENTLN(RDXWORK) UP POINTER TO NEXT SLOT Y02072
+         BCT   RNUMENT,UNPCHK           BRANCH IF MORE SLOTS     Y02072
+*
+         MODESET  EXTKEY=DATAMGT        CHANGE TO DATA MGT KEY   Y02072
+*
+         LA    RPARM0,SP230             PICK UP SUBPOOL NUMBER   Y02072
+         SLL   RPARM0,24                MV SP NUMBER TO TOP BYTE
+         LA    RWORKF,RDXLSTLG          PICK UP LIST SIZE
+         OR    RPARM0,RWORKF            MERGE SIZE WITH SUBPOOL
+         FREEMAIN R,LV=(0),A=(RDXLST)   FREE THE READ EXCLUSIVE LIST
+*
+         MODESET  KEYADDR=DXUKEY,WORKREG=11   CHANGE TO USER KEY Y02072
+*
+         B     LISTPTR                  BR BACK TO PROCESS NEXT SEGMENT
+*
+RESTREGS EQU   *                        RESTORE REGISTERS IN AVT Y02072
+         L     RDEB,DCBDEBAD            GET ADDRESS OF DEB       Y02072
+         USING DEBBASIC,RDEB            ESTABLISH BASE FOR DEB   Y02072
+         L     RDEQ,DEBAPPAD            GET ADDR OF AVT          Y02072
+         DROP  RDEB                                              Y02072
+         USING DEQAREA,RDEQ             ESTAB BASE,DEQ WORKAREA  Y02072
+         LM    RWTG,RPARC,DEQREGSV      RESTORE REGISTERS         M0045
+         DROP  RDEQ
+         DROP  RDXLST
+         DROP  RDXWORK
+         SPACE 2
+***********************************************************************
+*  THE FOLLOWING ROUTINES FREE IOBS ON THE BUFFER QUEUE AND BUFFERS.  *
+*  THE LOCATION OF THE IOBS WAITING FOR A BUFFER IS DETERMINED BY     *
+*  WHETHER ADDRSPACE IS VIRTUAL OR REAL.  A TEST OF THE TCB IS MADE.  *
+*  ENTRY AND EXIT IS IN USER KEY.                                     *
+***********************************************************************
+BUFCHK   EQU   *                        CHK FOR DYNAMIC BUFFER   Y02072
+*
+         MODESET  EXTKEY=DATAMGT        CHANGE TO DATA MGT KEY   Y02072
+*
+         OI    DXATEXC2+1,FCACIOBX      SET AUDIT TRAIL INDICA-  Y02072
+*                                       TING ALL IOBS ON UNPOST  Y02072
+*                                       QUEUE ARE FREED AND THE  Y02072
+*                                       READX LIST IS FREED,IF   Y02072
+*                                       EXCLUSIVE CONTROL        Y02072
+*
+         MODESET  KEYADDR=DXUKEY,WORKREG=11  RETURN TO USER KEY  Y02072
+*
+         TM    DCBOPTCD,DCBOPTDB        WAS THE DYNAMIC BUFFER OPTION
+*                                       SPECIFIED
+         BZ    VRETST                   NO GO TEST FOR VAR SPANNED
+         L     RDEB,DCBDEBAD            GET DEB ADDRESS          Y02072
+         USING DEBBASIC,RDEB            ESTABLISH BASE FOR DEB
+         L     RTCB,DEBTCBAD            GET TCB ADDRESS
+         USING TCB,RTCB                 ESTABLISH BASE FOR TCB
+         TM    TCBFLGS6,TCBRV           DETERMINE TYPE OF ADDRSPCE
+         BO    BCBQ                     BRANCH IF REAL, NO USL
+         DROP  RTCB
+         DROP  RDEB
+***********************************************************************
+*  FOR TASKS IN VIRTUAL ADDRESS SPACES, THE ADDRESSES OF IOBS WAITING *
+*  FOR BUFFERS ARE PLACED ON THE UNSCHEDULED LIST (USL).  THESE IOBS  *
+*  AND THE USL COPIES (CHAINED TOGETHER), INCLUDING THE BUFFER CONTROL*
+*  BLOCK ADJACENT TO THE FIRST USL, WILL ALL BE FREED.                *
+***********************************************************************
+         L     RUSL,DCBDYNB             GET ADDR OF CURRENT USL
+         USING USL,RUSL                 ESTABLISH BASE FOR USL
+         SR    RUSLSLOT,RUSLSLOT        CLEAR REGISTER
+         ICM   RUSLSLOT,ADDR,USLIOB1    GET TOP SLOT ON QUEUE.
+         BZ    FREEUSL                  BRANCH IF NO IOBS ON QUEUE
+         USING USLSLOT,RUSLSLOT         ESTABLISH BASE FOR USLSLOT
+GETIOB   L     RIOB,USLIOBA             GET IOB ADDRESS
+         LA    RIOB,0(RIOB)             CLEAR HI-ORDER BYTE
+         BAL   RETURN,FREEIOB           FREE IOB'S CORE
+         C     RUSLSLOT,USLBFRQB        WAS THAT THE LAST IOB ON LIST?
+         BE    FREEUSL                  BRANCH IF YES TO FREE THIS USL
+         TM    USLSLTFL,USLENDL         IS THIS THE BOTTOM OF THE LIST
+         BZ    BUMPLIST                 BRANCH IF NO TO GO TO NEXT IOB
+         LA    RUSLSLOT,USLSLOT1-L'USLSLOT1   GO BACK TO TOP OF LIST
+BUMPLIST LA    RUSLSLOT,USLNXT          BUMP TO NEXT SLOT ON LIST
+         B     GETIOB
+         DROP  RUSLSLOT
+*                                                                     *
+*  FREE ALL BUT THE ORIGINAL COPY OF THE USL. THAT ONE IS CONTIGUOUS  *
+*  WITH THE BUFFER CONTROL BLOCK AND WILL BE FREED WITH IT.           *
+*                                                                     *
+FREEUSL  EQU   *                        FREE THE USL
+         L     RWORKC,USLCHAIN          SAVE ADDR TO PRIOR USL
+         LR    RPARM1,RUSL              LOAD USL ADDR IN R1 TO   YM1103
+*                                       FREEMAIN                 YM1103
+         LTR   RWORKC,RWORKC            IS THIS THE ORIGINAL COPY
+         BNZ   NEXTUSL                  NO, BRANCH TO FREE THIS LIST
+         L     RPARM0,USLSZFST+BCBTBFRS(RPARM1) GET LGTH OF    @ZA12264
+*                                       USL+BCB+BFR FOR F'MAIN @ZA12264
+         MODESET  EXTKEY=DATAMGT        CHANGE TO DATA MGT KEY   Y02072
+*
+         OI    DXATEXC2+1,FCACIOBU      SET AUDIT TRAIL INDICA-  Y02072
+*                                       TING ALL IOBS ON USL ARE Y02072
+*                                       FREED, INCLUDING USL     Y02072
+*
+         MODESET  KEYADDR=DXUKEY,WORKREG=14  RETURN TO USER KEY  Y02072
+*
+         B     FREEBCB                  BRANCH TO FREE BUFFER CTL BLOCK
+NEXTUSL  EQU   *                        FREE THE USL
+         LH    RPARM0,USLSIZE           LOAD SIZE OF THIS USL COPY
+         BAL   RETURN,FREEAREA          FREE THE USL CORE
+         LR    RUSL,RWORKC              MAKE NEXT USL (SAVED ACROSS
+*                                       FREEMAIN) THE CURRENT USL
+         B     FREEUSL                  GO CHECK NEXT USL
+         DROP  RUSL
+***********************************************************************
+*  FOR TASKS IN REAL ADDRESS SPACES, THE ADDRESSES OF IOBS WAITING FOR*
+*  BUFFERS ARE CHAINED FROM THE BCBFRQT FIELD IN THE BUFFER CONTROL   *
+*  BLOCK.  THIS ROUTINES FREES EACH IOB ON THIS QUEUE.                *
+***********************************************************************
+BCBQ     L     RBUF,DCBBUFCB            LOAD BUFFER CONTROL BLOCK ADDR
+         USING BCBDEFR,RBUF             ESTABLISH BASE FOR BCB
+         L     RIOB2,BCBFRQT            LOAD ADDR OF 1ST IOB WAITING
+*                                       FOR A BUFFER
+         DROP  RBUF
+TZERO5   LA    RIOB,0(RIOB2)            CLEAR HI-ORDER BYTE, MAKE NEXT
+*                                       IOB CURRENT IOB
+         USING IOBSTDRD,RIOB            ESTABLISH BASE FOR IOB
+         LTR   RIOB,RIOB                ANY IOBS ON QUEUE
+         BZ    BUFREL                   NO, GO FREE BUFFERS
+         L     RIOB2,IOBDQPTR           SAVE NEXT IOB ADDRESS
+         BAL   RETURN,FREEIOB           YES, GO FREE THIS IOB
+         DROP  RIOB
+         B     TZERO5                   AND GO TEST FOR END OF QUEUE
+***********************************************************************
+*  THE FOLLOWING ROUTINE FREES THE BUFFER CONTROL BLOCK AND CONTIG-   *
+*  UOUS BUFFERS FOR REAL AND VIRTUAL ADDRESS SPACE.                   *
+***********************************************************************
+BUFREL   L     RBUF,DCBBUFCB            LOAD ADDR OF BUFFER AREA
+         USING BCBDEFR,RBUF             ESTABLISH BASE FOR BCB
+         L     RPARM0,BCBTBRS           GET SIZE OF BUFFER AREA + BCB
+         DROP  RBUF
+FREEBCB  EQU   *                        FREE BCB AND BUFFER AREA
+         BAL   RETURN,FREEAREA          GO TO FREE BUFFER AREA
+*
+         MODESET  EXTKEY=DATAMGT        CHANGE TO DATA MGT KEY   Y02072
+*
+         OI    DXATEXC2+1,FCACIOBB      SET AUDIT TRAIL INDICA-  Y02072
+*                                       TING ALL IOBS ON BUFFER  Y02072
+*                                       QUEUE ARE FREED, INCLU-  Y02072
+*                                       DING BUFFERS AND BCB     Y02072
+*
+         MODESET  KEYADDR=DXUKEY,WORKREG=14  RETURN TO USER KEY  Y02072
+*
+         B     CLEANUP                  BRANCH TO CLEANUP DCB    Y02072
+         SPACE 2
+***********************************************************************
+*  THE FOLLOWING ROUTINE FREES THE SEGMENT WORK AREA IF VARIABLE      *
+*  SPANNED RECORDS WERE USED. THE SWA POOL IS POINTED TO BY THE       *
+*  DCBDYNB FIELD IN THE DCB.                                          *
+***********************************************************************
+VRETST   TM    DCBBFTEK,DCBBFTKR        TEST FOR VRE (BUFTEK=R)  S19015
+         BZ    CLEANUP                  NO, BRANCH               Y02072
+         TM    DCBMACF2,DCBMRSWA        DID USER SUPPLY SWA      YM3242
+         BO    CLEANUP                  YES, DO NOT FREE IT      Y02072
+         L     RBUF,DCBDYNB             ADDRESS OF SWA POOL CNTRL BLK
+         USING BCBDEFS,RBUF             ESTABLISH BASE FOR SWA
+         LH    RWORKA,BCBBFNUM          NUMBER OF BUFFERS        S19015
+         LH    RWORKO,BCBBFLG           BUFFER LENGTH            S19015
+         DROP  RBUF
+         MR    RWORKE,RWORKA            CALCULATE SWA POOL LG    S19015
+         LA    RPARM0,BCBLNTHS(RWORKO)  ADD BCB LENGTH,MV TO R0  Y02072
+         BAL   RETURN,FREEAREA          GO FREE SWA POOL FROM SP0
+*
+         MODESET  EXTKEY=DATAMGT        CHANGE TO DATA MGT KEY   Y02072
+*
+         OI    DXATEXC2,FCACSWA         SET AUDIT TRAIL INDICA- ZA09624
+*                                       TING ALL SEGMENT WORK-   Y02072
+*                                       AREAS ARE FREED.         Y02072
+         SPACE 2
+***********************************************************************
+*  THE FOLLOWING ROUTINE RESTORES & INVALIDATES DCB FIELDS SET BY BDAM*
+*  OPEN.IT IS ENTERED IN USER KEY AND PROCESSES IN DATA MANAGEMENT KEY*
+***********************************************************************
+CLEANUP  EQU   *                        CLEAN UP DCB FIELDS
+*
+         MODESET  EXTKEY=DATAMGT        CHANGE TO DATA MGT KEY   Y02072
+*
+         TM    DCBOPTCD,DCBOPTDB        WAS DYN BUFFERING SPECIFIED
+         BZ    NODYNBUF                 NO,GO INVALIDATE DCB ADDRESSES
+         MVI   DCBBUFCB+3,INVALID       YES MAKE BUFFER CONTROL
+*                                       BLOCK POINTER INVALID
+NODYNBUF EQU   *                        CLEAR REST OF FIELDS
+         NI    DCBOPTCD,X'FF'-DCBOPTTO-DCBOPTDB-DCBOPTRE  CLEAR
+*                                       OVERFLO,DYN BUFFERING,AND
+*                                       READ EXCLUSIVE BITS IN THE
+*                                       OPTION FIELD OF THE DCB WHICH
+*                                       MAY HAVE BEEN SET BY BDAM OPEN
+         MVI   DCBCHECK+3,INVALID       INVALIDATE THE CHECK RTN ADDR
+         MVI   DCBDRDX,X'00'            CLEAR NUMBER OF EXTENTS
+         LA    RWORKC,NMSUBVRE          CTR=3 ADDRESSES TO INVALIDATE
+         TM    DCBBFTEK,DCBBFTKR        TEST FOR VS              S19015
+         BZ    INVALIDT                 NO,BRANCH                S19015
+         TM    DCBMACR2,DCBMRSWA        DID USER SUPPLY SWA      S19015
+         BZ    INVALIDT                 NO,BRANCH                S19015
+         LA    RWORKC,NMSUB             INVALIDATE 2 ADDRESSES   S19015
+         DROP  RDCB
+INVALIDT EQU   *                        INVALIDATE SUBRTN ADDRESSES
+         MVI   DCBDFOR-IHADCB+3(RDCB),INVALID  INVALIDATE SUBRTN Y02072
+         LA    RDCB,4(0,RDCB)           INDEX TO NEXT SUBRTN ADDRESS
+         BCT   RWORKC,INVALIDT          TEST IF ALL INVALIDATED,NO GO
+*                                       BACK. YES GO ON.
+         SPACE 4
+***********************************************************************
+*  ROUTINE TO SCAN DCB LIST FOR OTHER DCBS REQUIRING THIS EXECUTOR.   *
+*  IF NONE ARE FOUND, CONTROL IS TRANSFERRED TO THE NEXT EXECUTOR OF  *
+*  FIRST DCB WHICH IS NOT COMPLETED. THIS ROUTINE IS ENTERED AND      *
+*  PROCESSES IN DATA MANAGEMENT KEY.                                  *
+***********************************************************************
+JCONOVER EQU   *                        RELOOP CODE
+         USING WTG,RWTG                 REESTABLISH BASE FOR WTG TABLE
+         MVI   WTGENTRY,X'00'           CLEAR FIRST BYTE IN CURRENT
+*                                       ENTRY OF WHERE-TO-GO TABLE
+*
+*
+*   ISSUE IECRES MACRO WHICH CALLS THE O/C/E RESIDENT ROUTINE TO
+*   COPY THE PROTECTED DCB FROM THE CLOSE WORKAREA INTO THE USER'S
+*   DCB CORE.
+*
+         IECRES  INIT,DCBCOPY=FRWKAR,STM=(R0,R15,WTGPREFX)       YM1190
+*
+*
+*
+* THE FOLLOWING TESTS THE FORCE CLOSE BIT TO DETERMINE IF ENTRY INTO
+* THIS MODULE WAS MADE BY THE FORCE CLOSE EXECUTOR FOR TASK RECOVERY.
+* IF SO, CONTROL IS RETURNED TO FORCE CLOSE WITH A RETURN CODE OF 0
+* PUT IN REG 15 TO INDICATE THAT THIS CLOSE EXECUTOR EXECUTED SUCCESS-
+* FULLY. (IF THIS EXECUTOR ABENDED DURING PROCESSING, A SECOND LEVEL
+* ESTAE WOULD INTERCEPT THE ABEND PROCESSING, SET THE RETURN CODE TO 8,
+* AND RETURN TO THE FORCE CLOSE RECOVERY ROUTINE, ASSOCIATED WITH
+* COMMON CLOSE.)
+*
+FORCLOS  EQU   *                        ENTRY FROM FORCE CLOSE   Y02072
+         TM    DXATEXC2,FCACFORC        IS THIS FORCE CLOSE?     Y02072
+         BNO   SCAN4EQ                  NO, CONTINUE AS USUAL    Y02072
+         L     RETURN,24(RPAR)          YES,GET FRC CLS RET ADDR Z09656
+         SR    R15,R15                  SET RC=0, SUCCESSFUL     Y02072
+         BR    RETURN                   RETURN TO FORCE CLOSE    Y02072
+*
+*
+SCAN4EQ  LA    RWTGC,L'WTGENTRY(RWTGC)  INCREMENT WHERE-TO-GO INDEX
+         LA    RPARC,L'PARDCBAD(RPARC)  INCREMENT DCB PARAMETER INDEX
+         CLC   WTGIDNX,AMIDCNST         IS THIS EXECUTOR NAMED AGAIN
+         BER   RBASE                    YES-RETURN TO START OF ROUTINE
+         CLC   WTGIDNX,CLLDB            IS THIS THE END OF THE TABLE
+         BL    SCAN4EQ                  NO, GO GET NEXT ENTRY
+         CLC   WTGIDNX,CLLDG            IS THIS THE END OF THE TABLE
+         BH    SCAN4EQ                  NO, BRANCH TO GET NEXT ENTRY
+         LR    RPARC,RPAR               RESTORE  BOTH INDEX REGISTERS
+         DROP  RWTGC
+         LA    RWTGC,WTGENTRY           THEIR INITIAL VALUES
+         USING WTGENTRY,RWTGC
+SCAN4ANY CLI   WTGIDTTR,0               IS THIS DCB COMPLETED?
+         BNE   XCTLRTN                  IF NOT, GO TO NAMED EXECUTOR.
+         LA    RWTGC,L'WTGENTRY(RWTGC)  INCREMENT BOTH INDEX REGISTERS
+         LA    RPARC,L'PARDCBAD(RPARC)  TO THE NEXT ENTRIES.
+         B     SCAN4ANY                 LOOP TO CHECK COMPLETION
+*                                                                     *
+*   THE FOLLOWING XCTLS TO THE NEXT EXECUTOR FOUND IN THE WTG TABLE   *
+*                                                                     *
+XCTLRTN  EQU   *                        XCTL TO THE NEXT MODULE
+         MVC   WTGMODID,WTGENTRY        MOVE EXECUTOR ID
+         LA    R15,DXCCW12              SET UP FOR XCTL
+         XCTL  EPLOC=(RWTG),SF=(E,(15)) GO TO NEXT MOD           Y02072
+         DROP  RWTG
+         SPACE 5
+***********************************************************************
+*  THE FOLLOWING SUBROUTINE DETERMINES THE SIZE OF EACH IOB PASSED TO *
+*  IT (IN REGISTER RIOB) TO BE FREED, AND FREES IT FROM SUBPOOL 0.    *
+*  THIS SUBROUTINE IS ENTERED, PROCESSES, AND EXITS IN USER KEY.      *
+***********************************************************************
+         USING IOBSTDRD,RIOB            ESTABLISH BASE FOR IOB
+         USING IHADCB,RDCB              ESTABLISH BASE FOR DCB
+FREEIOB  SR    RPARM0,RPARM0            CLEAR REG                A40558
+         AH    RPARM0,IOBDIOBS          ADD IOB LENGTH INTO REG  A40558
+         BNPR  RETURN                   DON'T FREEMAIN IF 0 OR   A40558
+*                                       MINUS                    A40558
+         LR    RPARM1,RIOB              LOAD ADDRESS OF THIS IOB
+         LA    RPARM1,0(RPARM1)         CLEAR HIGH ORDER BYTE IN
+*                                       ADDRESS REGISTER
+         DROP  RIOB
+***********************************************************************
+*  IF THE USER IS IN SUPERVISOR STATE, SUBPOOL 000 WILL BE     @ZA11614
+*  SPECIFIED FOR THE FREEMAIN. IF THE USER IS IN PROBLEM       @ZA11614
+*  STATE, SUBPOOL 250 WILL BE SPECIFIED TO FORCE SP 000.       @ZA11614
+***********************************************************************
+         L     RDEB,DCBDEBAD            GET DEB ADDR FROM DCB  @ZA11614
+         USING DEBBASIC,RDEB            ESTABLISH BASE FOR DEB @ZA11614
+         L     RTCB,DEBTCBAD            GET TCB ADDR FROM DEB  @ZA11614
+         USING TCB,RTCB                 ESTABLISH BASE FOR TCB @ZA11614
+         DROP  RDEB                                            @ZA11614
+         LA    RTCB,0(RTCB)             CLEAR HI BYTE          @ZA11614
+         L     RWORKB,CVTPTR(,0)        CVT ADDRESS            @ZA28352
+         L     RWORKB,0(,RWORKB)        TCBWORDS ADDRESS       @ZA28352
+         L     RWORKB,4(RWORKB)         CURRENT TCB ADDRESS    @ZA28352
+         LA    RWORKB,0(RWORKB)         CLEAR HI BYTE          @ZA11614
+         CR    RTCB,RWORKB              IS THIS THE TCB FOR    @ZA28352
+*                                       TASK WHICH OPENED DCB? @ZA28352
+         L     RWORKD,0(RWORKB)         CURRENT RB ADDRESS     @ZA28352
+         BE    TESTATE                  YES-GO CHECK STATE     @ZA28352
+**************************************************************
+*  CLOSE WAS NOT ISSUED UNDER THE SAME TCB AS OPEN.          * @ZA28352
+*  GO TO PROBLEM DETERMINATION MODULE TO ABEND 014-04.       * @ZA28352
+**************************************************************
+         MODESET  EXTKEY=DATAMGT        CHANGE TO DATA MGT KEY @ZA28352
+         L     RCVT,CVTPTR(,0)          LOAD ADDR OF CVT       @ZA28352
+         L     RES,CVTDMSR-CVT(,RCVT)    LOAD ADDR OF IFG019RA @ZA28352
+         DMABCOND 1,PDLOAD,RETURN=NONE                         @ZA28352
+TESTATE  TM    17(RWORKD),X'01'         IS RBOPSW PROB STATE?  @ZA28352
+         BNO   OKZERO                   BRANCH IF SUPVR STATE  @ZA11614
+         DROP  RTCB                                            @ZA11614
+         TM    DXUKEY,X'F0'             IF USER KEY IS ZERO    @ZA11614
+         BZ    SET250                   USE SP 250             @ZA11614
+         MODESET  EXTKEY=ZERO           CHANGE TO ZERO KEY     @ZA11614
+SET250   ICM   RPARM0,8,DC250           SUBPOOL IN HI BYTE     @ZA11614
+OKZERO   TM    DCBBFTEK,DCBBFTKR        TEST FOR BFTEK=R       @ZA11614
+         BZ    FREEAREA                 NO, BRANCH               S19015
+         AH    RPARM0,PREFXIOB          ADD 8 TO SIZE OF IOB     S19015
+         SH    RPARM1,PREFXIOB          SUBTRACT 8 FROM IOB ADDR S19015
+FREEAREA FREEMAIN  R,LV=(0),A=(1)       FREE THE IOB OR BUFFER FROM SP0
+         MODESET  KEYADDR=DXUKEY,WORKREG=11                    @ZA11614
+         BR    RETURN                   RETURN TO MAIN ROUTINE
+***********************************************************************
+          EJECT
+***********************************************************************
+*                             CONSTANTS                               *
+***********************************************************************
+AMIDCNST DC    C'3A'                    BDAM IDENTIFIER
+PREFXIOB DC    H'8'                     SIZE OF IOB PREFIX       S19015
+CLLDB    DC    C'0B'                    CLOSE LOAD B
+CLLDG    DC    C'0G'                    CLOSE LOAD G
+         DS    0F
+SYSNM    DC    C'SYSZ'                  MAJOR QUEUE NAME         Y02072
+         DC    C'GGLG'
+ZEROS    DC    X'0000000000000000'      CLEAR COMPARE CONSTANT
+         DS    0F                                              @ZA11614
+PDLOAD   DC    C'6M',VL3(IGG0206M)      PROB DETER MODULE      @ZA28352
+DC250    DC    X'FA000000'              SUBPOOL 250 CONSTANT   @ZA11614
+LISTDEQ  DEQ   (,,L'RDXNQARG,SYSTEM),RET=HAVE,MF=L   DEQ LIST    Y02072
+         ORG   LISTDEQ+4                ONLY NEED 1ST 4 BYTES    Y02072
+MODID    DC    C'IGG0203A'              MODULE ID                Y02072
+FIX      DC    C'OZ28352 '              FIX NUMBER             @ZA11614
+DATE     DC    CL8'&SYSDATE'            DATE OF LATEST FIX      ZA09656
+PATCH    DC    XL((*-START)/20)'0'      5% PATCH AREA            Y02072
+***********************************************************************
+*                             EQUATES                                 *
+***********************************************************************
+AVAIL    EQU   X'FF'                    AVAILABILITY FLAG IN IOB
+INVALID  EQU   X'01'                    MOVE THIS INTO ADDR FIELD TO
+*                                       INVALIDATE AN ADDR IN THE DCB
+SP230    EQU   230                      SUBPOOL OF READX LIST    Y02072
+ADDR     EQU   B'0111'                  MASK FOR INSERTING 24-BIT ADDR
+NMSUBVRE EQU   3                        NUMBER OF ADDRESSES      Y02072
+*                                       INVALIDATED IN DCB IF VS Y02072
+NMSUB    EQU   2                        NUMBER OF ADDR IF NOT VS Y02072
+BCBTBFRS EQU   12                       OFFSET TO BCBTBRS1     @ZA12264
+RESXCTL  EQU   4                        OFFSET FOR XCTL        @ZA28352
+***********************************************************************
+         EJECT
+***********************************************************************
+*                          DSECTS                                     *
+***********************************************************************
+         IGGPARML                                                Y02072
+         IGGBCB                                                  Y02072
+         EJECT
+         IGGSWA                                                  Y02072
+         IGGRDX                                                  Y02072
+         IGGUSL                                                  Y02072
+         EJECT
+         DCBD  DSORG=(DA)
+         EJECT
+         IEZIOB
+         EJECT
+         IEZDEB
+***********************************************************************
+*  THE FOLLOWING DSECT FORMATS THE DEQ PARAMETER LIST, WHICH IS BUILT *
+*  IN THE FIRST 12 BYTES OF THE AVT.                                  *
+***********************************************************************
+DEB      DSECT
+         ORG   DEBAVT
+DEQAREA  DS    0CL28               WORKAREA-DEQ PARMLST AND REG SAVE
+DEQPARM  DS    0CL12               PARAMETER LIST FOR DEQ
+DEQFLAG  DS    XL4                 FLAGS INDICATING DEQ OPTIONS  Y02072
+DEQMAJOR DS    A                   ADDRESS OF MAJOR QNAME
+DEQMINOR DS    A                   ADDR OF MINOR QNAME
+DEQREGSV DS    2F                  REGS 6 AND 7 ARE SAVED HERE
+         EJECT
+         IECDSECS  (MAIN,(IOB,NO)),RRPL,PREFX,WTG,EXPAND=YES     YM1190
+WTGTABLE DSECT                                                   YM1190
+         ORG   WTG+8                                             Y02072
+WRKRETRN DS    A                   ADDR OF FORCE CLOSE EXEC      Y02072
+         ORG   WTGIDTTR
+WTGIDNX  DS    CL2                 ID OF THE NEXT MODULE
+WTGTTRNX DS    CL3                 TTR OF THE NEXT MODULE
+         ORG   WTGIDTTR+4
+WTGDCBWA DS    A                   ADDR OF WORKAREA FOR THE DCB
+FORCORE  DSECT                     WORKAREA DSECT CONTINUED      Y02072
+         IHAFCAUD  ORG=YES                                       Y02072
+         EJECT
+         IECDPPL                                                 Y02072
+         EJECT
+         IKJTCB
+         EJECT
+         CVT   DSECT=YES                                         YM1190
+         END

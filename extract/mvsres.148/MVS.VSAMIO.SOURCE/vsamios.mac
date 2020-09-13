@@ -1,0 +1,670 @@
+         PRINT ON,NOGEN,NODATA
+*---------------------------------------------------------------------*
+*                                                                     *
+* THIS ROUTINE IS DESIGNED TO PROVIDE VSAM DATASET INPUT/OUTPUT       *
+* CAPABILITY TO PROGRAMS WRITTEN WITH THE MVT COBOL COMPILER, AND     *
+* EXECUTED UNDER THE MVS 3.8J OPERATING SYSTEM RUNNING ON EMULATED    *
+* HARDWARE UNDER THE HERCULES EMULATOR.                               *
+*                                                                     *
+* THE ROUTINE IS DESIGNED TO PROVIDE ACCESS TO ONE OR MORE VSAM       *
+* DATASETS (CLUSTERS).  THE REQUIRED ACB AND RPL (VSAM DATASET        *
+* CONTROL BLOCKS) ARE GENERATED AND STORED IN MEMORY ALLOCATED BY     *
+* THE CALLING COBOL PROGRAM.  DURING THE CALLS TO OPEN AND ACCESS A   *
+* PARTICULAR DATASET, THE ACB AND RPL ARE MODIFIED AS REQUIRED TO     *
+* SATISFY THE REQUESTS AGAINST THAT PARTICULAR DATASET.   THERE IS    *
+* NO NECESSITY TO MODIFY THE ALC CODE AND REASSEMBLE PRIOR TO CALLING *
+* THE ROUTINE.                                                        *
+*                                                                     *
+* BECAUSE THE MVT COBOL COMPILER IS UNABLE TO UTILIZE DYNAMIC CALLING *
+* OF SUBROUTINES, IT IS NECESSARY TO LINK THE OBJECT MODULE FOR THIS  *
+* ROUTINE TO EACH CALLING COBOL PROGRAM. AS THIS IS THE CASE, IT IS   *
+* NOT NECESSARY FOR THE ROUTINE TO BE SERIALLY REENTRANT, AND I HAVE  *
+* NOT DEVOTED THE EFFORT TO MAKE IT SO.                               *
+*                                                                     *
+* THIS CODE IS PLACED IN THE PUBLIC DOMAIN AND MAY BE FREELY USED     *
+* AND INCORPORATED INTO DERIVED WORKS AS LONG AS ATTRIBUTION TO THE   *
+* ORIGINAL AUTHORSHIP REMAINS IN ANY DISTRIBUTED COPIES OF THE ALC    *
+* SOURCE.                                                             *
+*                                                                     *
+* WRITTEN NOVEMBER, 2001 BY JAY MOSELEY, CCP                          *
+* HTTP://WWW.JAYMOSELEY.COM/HERCULES/                                 *
+*                                                                     *
+*---------------------------------------------------------------------*
+         EJECT
+*
+         LCLC  &SYSECT
+&SYSECT  SETC  'VSAMIO'            ROUTINE IDENTIFICATION
+*
+&SYSECT  CSECT
+*
+@IDENT01 B     @IDENT04(R15)       BRANCH AROUND IDENT CONSTANTS
+         DC    AL1(@IDENT03-@IDENT02)
+@IDENT02 DC    C'&SYSECT V2'
+         DC    C'&SYSDATE &SYSTIME - '
+         DC    C'VSAM INPUT/OUTPUT ROUTINE FOR MVS 3.8J'
+@IDENT03 DS    0H
+@IDENT04 EQU   *-@IDENT01
+*
+         SAVE  (14,12)
+*
+         BALR  R12,0               BASE REGISTERS ARE 12 AND 11
+         USING *,R12,R11
+         LA    R11,4095(,R12)
+         LA    R11,1(,R11)
+*
+         LR    R5,R13              COPY CALLER'S SAVEAREA ADDR
+         LA    R13,SAVEAREA        ESTABLISH MY SAVEAREA
+         ST    R5,4(,R13)          BACK CHAIN SAVE AREAS
+         ST    R13,8(,R5)          FORWARD CHAIN SAVE AREAS
+*
+*---------------------------------------------------------------------*
+* THREE BLOCKS OF STORAGE ARE PASSED AS PARAMETERS FROM THE CALLER.   *
+* THE FIRST CONTAINS THE COMMAND TO BE PROCESSED AND RETURN CODE/     *
+* FEEDBACK FIELDS.  THE SECOND CONTAINS DATASET SPECIFICATION FIELDS  *
+* AND CONTROL BLOCKS MAINTAINED BY THIS ROUTINE ON SUBSEQUENT CALLS.  *
+* THE THIRD IS THE RECORD AREA USED FOR INPUT/OUTPUT FOR THE DATASET. *
+*---------------------------------------------------------------------*
+         LM    R8,R10,0(R1)        ADDRESS PASSED PARAMETER BLOCKS
+         USING $CCOMM,R8
+         USING $FCOMM,R9
+         USING $RECORD,R10
+*
+*---------------------------------------------------------------------*
+* RESET FIELDS USED TO RETURN STATUS INFORMATION TO THE CALLER        *
+*---------------------------------------------------------------------*
+         XC    $RC,$RC             CLEAR RETURN CODE
+         XC    $VSRC,$VSRC         CLEAR VSAM RETURN CODE
+         XC    $VSFUNC,$VSFUNC     CLEAR VSAM FUNCTION CODE
+         XC    $VSREAS,$VSREAS     CLEAR VSAM REASON CODE
+*
+*---------------------------------------------------------------------*
+* PERFORM REQUESTED FUNCTION                                          *
+*---------------------------------------------------------------------*
+         CLC   $COMMAND,$OPEN
+         BE    @OPEN
+*
+         CLI   $OPENSW,C'O'        IS DATASET OPEN?
+         BE    @COMM02               YES, OTHER COMMANDS ARE VALID
+*
+         MVC   $RC,=H'22'          INDICATE CLOSED DATASET
+         B     GOBACK
+*
+@COMM02  DS    0H
+         CLC   $COMMAND,$CLOSE
+         BE    @CLOSE
+         CLC   $COMMAND,$READ
+         BE    @READ
+         CLC   $COMMAND,$WRITE
+         BE    @WRITE
+         CLC   $COMMAND,$REWRITE
+         BE    @REWRITE
+         CLC   $COMMAND,$DELETE
+         BE    @DELETE
+         CLC   $COMMAND,$STARTEQ
+         BE    @START
+         CLC   $COMMAND,$STARTGE
+         BE    @START
+*
+         MVC   $RC,=H'20'          INDICATE PARAMETER ERROR
+*
+GOBACK   DS    0H
+*---------------------------------------------------------------------*
+* RETURN TO CALLING PROGRAM WITH ZERO RETURN CODE IN R15              *
+*---------------------------------------------------------------------*
+         L     R13,4(,R13)         RETRIEVE CALLER'S SAVE AREA
+         RETURN (14,12),RC=0
+*
+@OPEN    DS    0H
+*---------------------------------------------------------------------*
+* PROCESSING "OPEN" COMMAND FROM CALLER                               *
+*---------------------------------------------------------------------*
+         CLI   $OPENSW,C'C'        IS DATASET CLOSED?
+         BE    @OPEN02               YES, OPEN IS VALID
+*
+         MVC   $RC,=H'21'          ERROR: OPEN DATASET
+         B     GOBACK
+*
+@OPEN02  DS    0H
+         CLC   $DDNAME,$BLANK      IS DDNAME BLANK?
+         BNE   @OPEN03               NO, CONTINUE
+*
+         MVC   $RC,=H'28'          ERROR: NO DDNAME SUPPLIED
+         B     GOBACK
+*
+@OPEN03  DS    0H
+*---------------------------------------------------------------------*
+* BUILD ACCESS CONTROL BLOCK IN CALLER'S STORAGE USING MODEL.         *
+*---------------------------------------------------------------------*
+         MVC   IFGACB($ACBLEN),ACBMODEL
+         LA    R2,IFGACB
+         MODCB ACB=(R2),DDNAME=(*,$DDNAME)
+*
+*---------------------------------------------------------------------*
+* BUILD REQUEST PARAMETER LIST BLOCK IN CALLER'S STORAGE USING MODEL. *
+*---------------------------------------------------------------------*
+         MVC   IFGRPL($RPLLEN),RPLMODEL
+         LA    R2,IFGRPL
+         MODCB RPL=(R2),ACB=(S,IFGACB)
+*
+*---------------------------------------------------------------------*
+* THE COMBINATION OF ORGANIZATION, ACCESS, AND MODE WILL BE USED TO   *
+* DERIVE A NUMERIC VALUE WHICH IS USED TO ENSURE VALID PERMUTATIONS.  *
+*---------------------------------------------------------------------*
+         SR    R7,R7               CLEAR TO COMPUTE MODE KEY VALUE
+*
+*---------------------------------------------------------------------*
+* PARSE ORGANIZATION KEYWORD                                          *
+*---------------------------------------------------------------------*
+         CLC   $ORG,$ESDS
+         BE    @OES
+         CLC   $ORG,$RRDS
+         BE    @ORR
+         CLC   $ORG,$KSDS
+         BE    @OKS
+*
+         MVC   $RC,=H'23'          ERROR: UNKNOWN ORGANIZATION
+*
+         B     GOBACK
+*
+@OES     DS    0H
+*---------------------------------------------------------------------*
+* ORGANIZATION = ESDS                                                 *
+*---------------------------------------------------------------------*
+***>     LA    R7,0
+         LA    R2,IFGACB
+         MODCB ACB=(R2),MACRF=(ADR)
+         LA    R2,IFGRPL
+         MODCB RPL=(R2),OPTCD=(ADR)
+*
+         B     @OPEN10
+*
+@ORR     DS    0H
+*---------------------------------------------------------------------*
+* ORGANIZATION = RRDS                                                 *
+*---------------------------------------------------------------------*
+         LA    R7,9
+         LA    R2,IFGACB
+         MODCB ACB=(R2),MACRF=(KEY)
+         LA    R2,IFGRPL
+         MODCB RPL=(R2),OPTCD=(KEY)
+*
+         B     @OPEN10
+*
+@OKS     DS    0H
+*---------------------------------------------------------------------*
+* ORGANIZATION = KSDS                                                 *
+*---------------------------------------------------------------------*
+         LA    R7,18
+         LA    R2,IFGACB
+         MODCB ACB=(R2),MACRF=(KEY)
+         LA    R2,IFGRPL
+         MODCB RPL=(R2),OPTCD=(KEY)
+*
+@OPEN10  DS    0H
+*---------------------------------------------------------------------*
+* PARSE ACCESS KEYWORD                                                *
+*---------------------------------------------------------------------*
+         CLC   $ACCESS,$SEQ
+         BE    @OSEQ
+         CLC   $ACCESS,$DIR
+         BE    @ODIR
+         CLC   $ACCESS,$DYN
+         BE    @ODYN
+*
+         MVC   $RC,=H'24'          ERROR: UNKNOWN ACCESS
+*
+         B     GOBACK
+*
+@OSEQ    DS    0H
+*---------------------------------------------------------------------*
+* ACCESS = SEQUENTIAL                                                 *
+*---------------------------------------------------------------------*
+***>     LA    R7,0(,R7)
+         LA    R2,IFGACB
+         MODCB ACB=(R2),MACRF=(SEQ)
+         LA    R2,IFGRPL
+         MODCB RPL=(R2),OPTCD=(SEQ)
+*
+         B     @OPEN20
+*
+@ODIR    DS    0H
+*---------------------------------------------------------------------*
+* ACCESS = DIRECT                                                     *
+*---------------------------------------------------------------------*
+         LA    R7,3(,R7)
+*
+         CLC   $ORG,$ESDS
+         BNE   @ODIROK
+*
+         MVC   $RC,=H'25'          ERROR: BAD ACCESS FOR ESDS
+*
+         B     GOBACK
+*
+@ODIROK  DS    0H
+         LA    R2,IFGACB
+         MODCB ACB=(R2),MACRF=(DIR)
+         LA    R2,IFGRPL
+         MODCB RPL=(R2),OPTCD=(DIR)
+*
+         B     @OPEN20
+*
+@ODYN    DS    0H
+*---------------------------------------------------------------------*
+* ACCESS = DYNAMIC                                                    *
+*---------------------------------------------------------------------*
+         LA    R7,6(,R7)
+*
+         CLC   $ORG,$ESDS
+         BNE   @ODYNOK
+*
+         MVC   $RC,=H'25'          ERROR: BAD ACCESS FOR ESDS
+*
+         B     GOBACK
+*
+@ODYNOK  DS    0H
+         LA    R2,IFGACB
+         MODCB ACB=(R2),MACRF=(SEQ,DIR)
+         LA    R2,IFGRPL
+         MODCB RPL=(R2),OPTCD=(SEQ)
+*
+@OPEN20  DS    0H
+*---------------------------------------------------------------------*
+* PARSE MODE KEYWORD                                                  *
+*---------------------------------------------------------------------*
+         CLC   $MODE,$INPUT
+         BE    @OIN
+         CLC   $MODE,$OUTPUT
+         BE    @OOUT
+         CLC   $MODE,$UPDATE
+         BE    @OBOTH
+*
+         MVC   $RC,=H'26'          ERROR: BAD MODE
+*
+         B     GOBACK
+*
+@OIN     DS    0H
+*---------------------------------------------------------------------*
+* MODE = INPUT                                                        *
+*---------------------------------------------------------------------*
+***>     LA    R7,0(,R7)
+         LA    R2,IFGACB
+         MODCB ACB=(R2),MACRF=(IN)
+         LA    R2,IFGRPL
+         MODCB RPL=(R2),OPTCD=(NUP)
+*
+         B     @OPEN30
+*
+@OOUT    DS    0H
+*---------------------------------------------------------------------*
+* MODE = OUTPUT                                                       *
+*---------------------------------------------------------------------*
+         LA    R7,1(,R7)
+*
+         C     R7,=F'16'           ORG = RRDS AND ACCESS = DYNAMIC
+         BE    @OOUTNO               OUTPUT NOT PERMITTED
+         C     R7,=F'22'           ORG = KSDS AND ACCESS = DIRECT
+         BE    @OOUTNO               OUTPUT NOT PERMITTED
+         C     R7,=F'25'           ORG = KSDS AND ACCESS = DYNAMIC
+         BE    @OOUTNO               OUTPUT NOT PERMITTED
+*
+         LA    R2,IFGACB
+         MODCB ACB=(R2),MACRF=(OUT)
+         LA    R2,IFGRPL
+         MODCB RPL=(R2),OPTCD=(NUP)
+*
+         B     @OPEN30
+*
+@OOUTNO  DS    0H
+         MVC   $RC,=H'27'          ERROR: BAD MODE FOR ORG/ACCESS
+*
+         B     GOBACK
+*
+@OBOTH   DS    0H
+*---------------------------------------------------------------------*
+* MODE = INPUT/OUTPUT                                                 *
+*---------------------------------------------------------------------*
+         LA    R7,2(,R7)
+         LA    R2,IFGACB
+         MODCB ACB=(R2),MACRF=(OUT)
+         LA    R2,IFGRPL
+         MODCB RPL=(R2),OPTCD=(UPD)
+*
+@OPEN30  DS    0H
+*---------------------------------------------------------------------*
+* FINISH MODIFICATIONS AND OPEN DATASET                               *
+*---------------------------------------------------------------------*
+         BAL   R14,MODIFY          MODIFY COMMON RPL PARAMETERS
+*
+         LA    R2,IFGACB
+         OPEN  ((R2))
+         MVI   $OPENSW,C'O'
+*
+         B     GOBACK
+*
+@CLOSE   DS    0H
+*---------------------------------------------------------------------*
+* CLOSE THE DATASET.                                                  *
+*---------------------------------------------------------------------*
+*
+         LA    R2,IFGACB
+         CLOSE ((R2))
+         MVI   $OPENSW,C'C'
+*
+         B     GOBACK
+*
+@READ    DS    0H
+*---------------------------------------------------------------------*
+* READ RECORD USING KEY/RRN FROM THE DATASET                          *
+*---------------------------------------------------------------------*
+         BAL   R14,MODIFY          MODIFY COMMON RPL PARAMETERS
+*
+         GET   RPL=(R2)
+*
+         SHOWCB RPL=(R2),FIELDS=RECLEN,AREA=FEEDBACK,LENGTH=4
+         L     R7,FEEDBACK
+         STH   R7,$RECLEN
+*
+         B     GOBACK
+*
+@WRITE   DS    0H
+*---------------------------------------------------------------------*
+* WRITE PASSED RECORD TO THE DATASET (LOAD OR INSERTION)              *
+*---------------------------------------------------------------------*
+         BAL   R14,MODIFY          MODIFY COMMON RPL PARAMETERS
+*
+         SR    R7,R7
+         CLC   $MODE,$UPDATE       IF ACB IS OPEN FOR UPDATE
+         BE    @WRITE20              MUST MODIFY FOR THIS INSERTION
+*
+         B     @WRITE50            NO NEED TO MODIFY
+*
+@WRITE20 DS    0H
+         MODCB RPL=(R2),OPTCD=(NUP)
+         L     R7,=A(@WRITERS)     ADDRESS TO RESTORE DEFAULT
+*
+@WRITE50 DS    0H
+         PUT   RPL=(R2)
+*
+         LTR   R7,R7               WAS RPL MODIFIED FOR THIS WRITE?
+         BZ    GOBACK                NO, JUST RETURN
+*
+@WRITERS DS    0H
+*
+         SR    R7,R7               TO AVOID LOOPING IF ERROR ON MODCB
+         MODCB RPL=(R2),OPTCD=(UPD)
+*
+         B     GOBACK
+*
+@REWRITE DS    0H
+*---------------------------------------------------------------------*
+* REWRITE THE RECORD PREVIOUSLY READ FROM THE DATASET                 *
+*---------------------------------------------------------------------*
+         LA    R2,IFGRPL
+*
+         SR    R3,R3               CLEAR R4 TO LOAD
+         LH    R3,$RECLEN            LENGTH OF RECORD
+*
+         MODCB RPL=(R2),RECLEN=(R3),AREALEN=(R3),AREA=(R10)
+*
+         PUT   RPL=(R2)
+*
+         B     GOBACK
+*
+@DELETE  DS    0H
+*---------------------------------------------------------------------*
+* DELETE THE PREVIOUSLY READ RECORD FROM THE DATASET                  *
+*---------------------------------------------------------------------*
+         LA    R2,IFGRPL
+*
+         SR    R4,R4               CLEAR R4 TO LOAD
+         LH    R4,$RECLEN            LENGTH OF RECORD
+*
+         MODCB RPL=(R2),RECLEN=(R3),AREALEN=(R3),AREA=(R10)
+*
+         ERASE RPL=(R2)
+*
+         B     GOBACK
+*
+@START   DS    0H
+*---------------------------------------------------------------------*
+* POSITION RECORD POINTER BASED UPON PROVIDED ARGUMENT                *
+*---------------------------------------------------------------------*
+         BAL   R14,MODIFY          MODIFY COMMON RPL PARAMETERS
+*
+         CLI   $COMMAND+5,C'E'     KEY 'EQ' REQUESTED
+         BE    @STARTEQ
+*
+         B     @STARTGE
+*
+@STARTEQ DS    0H
+*
+         MODCB RPL=(R2),OPTCD=(KEQ)
+         SR    R7,R7               NO NEED TO RESTORE IF ERROR
+*
+         B     @START50
+*
+@STARTGE DS    0H
+*
+         MODCB RPL=(R2),OPTCD=(KGE)
+         L     R7,=A(@STARTRS)     ADDRESS TO RESTORE DEFAULT
+*
+@START50 DS    0H
+*
+         POINT RPL=(R2)
+*
+@STARTRS DS    0H
+*
+         SR    R7,R7               TO AVOID LOOPING IF ERROR ON MODCB
+         MODCB RPL=(R2),OPTCD=(KEQ)
+*
+         B     GOBACK
+*
+MODIFY   DS    0H
+*---------------------------------------------------------------------*
+* THIS ROUTINE IS PERFORMED FOR EACH COMMAND TO MODIFY THE RPL        *
+* CONTROL BLOCK BASED UPON THE ORGANIZATION, ACCESS, AND OPEN MODE.   *
+*---------------------------------------------------------------------*
+         ST    R14,SAVER14         SAVE RETURN ADDRESS
+*
+         LA    R2,IFGRPL           ADDRESS GENERATED RPL
+*
+         SR    R3,R3               CLEAR R3 TO LOAD
+         LH    R3,$RECLEN            LENGTH OF RECORD
+*
+         SR    R4,R4               CLEAR R4 TO CONTAIN KEY ADDRESS
+         SR    R5,R5               CLEAR R5 TO CONTAIN KEY LENGTH
+*
+         CLC   $ORG,$ESDS          IF ORGANIZATION NOT ESDS
+         BNE   MOD20                 MORE MODCB PARMS TO LOAD
+*
+         MODCB RPL=(R2),RECLEN=(R3),AREALEN=(R3),AREA=(R10)
+*
+         B     MOD80
+*
+MOD20    DS    0H
+         LA    R4,$RRN             ADDRESS RELATIVE RECORD NUMBER
+*
+         CLC   $ORG,$RRDS          IF ORGANIZATION NOT RRDS
+         BNE   MOD40                 MORE MODCB PARMS TO LOAD
+*
+         MODCB RPL=(R2),RECLEN=(R3),AREALEN=(R3),AREA=(R10),ARG=(R4)
+*
+         B     MOD80
+*
+MOD40    DS    0H
+         LH    R4,$RKP             LOAD KEY OFFSET
+         AR    R4,R10              ADD RECORD ADDRESS
+*
+         LH    R5,$KEYLEN          LOAD KEY LENGTH
+*
+         MODCB RPL=(R2),RECLEN=(R3),AREALEN=(R3),AREA=(R10),           C
+               ARG=(R4),KEYLEN=(R5)
+*
+MOD80    DS    0H
+         L     R14,SAVER14         RELOAD RETURN ADDRESS
+         BR    R14
+*
+SAVER14  DS    F                   SAVE LOCAL RETURN ADDRESS
+*
+VSERROR  DS    0H
+*---------------------------------------------------------------------*
+* ERROR OCCURED DURING VSAM PROCESSING AND EXIT LIST BROUGHT US HERE. *
+* RETRIEVE FEEDBACK INFORMATION AND PLACE IN THE PARAMETER BLOCK TO   *
+* RETURN TO CALLER.                                                   *
+*---------------------------------------------------------------------*
+         MVC   $RC,=H'8'           INDICATE LOGICAL OR PHYSICAL ERROR
+*
+         LA    R2,IFGRPL
+         SHOWCB RPL=(R2),FIELDS=FDBK,AREA=FEEDBACK,LENGTH=4
+*
+         ICM   R5,B'1111',FEEDBACK RETRIEVE FEEDBACK CODES
+         STCM  R5,B'0100',$VSRC+1      AND VSAM RETURN CODE
+         STCM  R5,B'0010',$VSFUNC+1    AND VSAM FUNCTION CODE
+         STCM  R5,B'0001',$VSREAS+1    AND VSAM FEEDBACK CODE
+*
+*---------------------------------------------------------------------*
+* STARTGE AND WRITE COMMANDS MODIFY THE RPL, IF AN ERROR OCCURRED     *
+* THOSE MODIFICATIONS NEED TO BE RESET.  IF R7 IS NOT ZERO, A BRANCH  *
+* TO R7 WILL GO TO THE APPROPRIATE RESET CODE.                        *
+*---------------------------------------------------------------------*
+         CLC   $COMMAND,$STARTGE
+         BE    VSERR20
+         CLC   $COMMAND,$WRITE
+         BNE   GOBACK
+*
+VSERR20  DS    0H
+         LTR   R7,R7               IF R7=0 THEN NO RESET NECESSARY
+         BZ    GOBACK
+*
+         BR    R7                  GO TO RESET MODCB
+*
+VSEOF    DS    0H
+*---------------------------------------------------------------------*
+* END OF INPUT OCCURED DURING READ AND THE EXIT LIST BROUGHT US HERE. *
+* PLACE SPECIAL VALUE OF 9999 IN $RC TO INDICATE END OF FILE TO THE   *
+* CALLING PROGRAM.                                                    *
+*---------------------------------------------------------------------*
+         MVC   $RC,=H'9999'
+*
+         B     GOBACK
+*
+*---------------------------------------------------------------------*
+* THE ACCESS CONTROL BLOCK BELOW IS USED AS A MODEL TO BUILD ACB'S    *
+* DYNAMICALLY AS REQUIRED TO OPEN FILES FOR THE CALLER.               *
+*---------------------------------------------------------------------*
+ACBMODEL ACB   DDNAME=VSAMDD,EXLST=EXL001
+*
+*---------------------------------------------------------------------*
+* THE REQUEST PARAMETER BLOCK BELOW IS USED AS A MODEL TO BUILD RPL'S *
+* DYNAMICALLY AS REQUIRED TO PROCESS FILES FOR THE CALLER.            *
+*---------------------------------------------------------------------*
+RPLMODEL RPL   ACB=ACBMODEL
+*
+*---------------------------------------------------------------------*
+* THE EXIT ROUTINE LIST BLOCK PROVIDES THE ADDRESSES FOR ERROR        *
+* HANDLING AND END OF DATASET CONDITIONS.                             *
+*---------------------------------------------------------------------*
+EXL001   EXLST LERAD=VSERROR,SYNAD=VSERROR,EODAD=VSEOF
+*
+*---------------------------------------------------------------------*
+* FEEDBACK AFTER LOGIC OR I/O ERROR WILL BE RETRIEVED IN THE FULLWORD *
+* BELOW TO BE RETURNED TO THE CALLER.                                 *
+*---------------------------------------------------------------------*
+FEEDBACK DS    F
+*
+*---------------------------------------------------------------------*
+* MY REGISTER SAVE AREA                                               *
+*---------------------------------------------------------------------*
+SAVEAREA DS    18F
+*
+*---------------------------------------------------------------------*
+* THE FOLLOWING CONSTANTS ARE USED TO PARSE PARAMETERS PASSED FROM    *
+* THE CALLER.                                                         *
+*---------------------------------------------------------------------*
+$BLANK   DC    CL08'        '
+*
+$ESDS    DC    CL04'ESDS'
+$KSDS    DC    CL04'KSDS'
+$RRDS    DC    CL04'RRDS'
+*
+$DIR     DC    CL10'DIRECT    '
+$SEQ     DC    CL10'SEQUENTIAL'
+$DYN     DC    CL10'DYNAMIC   '
+*
+$INPUT   DC    CL06'INPUT '
+$OUTPUT  DC    CL06'OUTPUT'
+$UPDATE  DC    CL06'UPDATE'
+*
+$OPEN    DC    CL08'OPEN    '
+$CLOSE   DC    CL08'CLOSE   '
+$READ    DC    CL08'READ    '
+$WRITE   DC    CL08'WRITE   '
+$REWRITE DC    CL08'REWRITE '
+$DELETE  DC    CL08'DELETE  '
+$STARTEQ DC    CL08'STARTEQ '
+$STARTGE DC    CL08'STARTGE '
+*
+         LTORG
+*
+$CCOMM   DSECT                     ACCESSED VIA R8
+*---------------------------------------------------------------------*
+* THE DUMMY SECTION BELOW MAPS THE COMMAND COMMUNICATION PARAMETER    *
+* BLOCK PASSED FROM THE CALLING PROGRAM.                              *
+*---------------------------------------------------------------------*
+$COMMAND DS    CL08                COMMAND FUNCTION
+$RC      DS    H                   RETURN CODE
+$VSRC    DS    H                   VSAM RETURN CODE
+$VSFUNC  DS    H                   VSAM FUNCTION CODE
+$VSREAS  DS    H                   VSAM REASON CODE
+*
+$FCOMM   DSECT                     ACCESSED VIA R9
+*---------------------------------------------------------------------*
+* THE DUMMY SECTION BELOW MAPS THE DATASET CONTROL PARAMETER BLOCK    *
+* PASSED FROM THE CALLING PROGRAM.                                    *
+*---------------------------------------------------------------------*
+* THE PARAMETERS BELOW MUST BE SET BEFORE THE DATASET IS OPENED AND   *
+* (GENERALLY) SHOULD NOT BE MODIFIED WHILE THE DATASET IS OPEN.       *
+*---------------------------------------------------------------------*
+$DDNAME  DS    CL08                DD NAME
+$ORG     DS    CL04                ORGANIZATION (KS/ES/RR)
+$ACCESS  DS    CL10                ACCESS MODE (DIR/SEQ/DYNAM)
+$MODE    DS    CL06                MODE (INPUT/OUTPUT/UPDATE)
+$RECLEN  DS    H                   RECORD LENGTH
+$RKP     DS    H                   KEY OFFSET FROM BEGINNING OF RECORD
+$KEYLEN  DS    H                   KEY LENGTH
+$RRN     EQU   $RKP                RELATIVE RECORD NUMBER
+$OPENSW  DS    CL1                 OPEN FLAG (O=OPEN/C=CLOSED)
+         DS    CL1                 FORCE ALIGNMENT
+         IFGACB DSECT=NO           AREA IN WHICH ACB WILL BE BUILT
+$ACBLEN  EQU   (*-IFGACB)
+         IFGRPL DSECT=NO           AREA IN WHICH RPL WILL BE BUILT
+$RPLLEN  EQU   (*-IFGRPL)
+*
+$RECORD  DSECT                     ACCESSED VIA R10
+*---------------------------------------------------------------------*
+* THE FOLLOWING AREA IS MAPPED TO THE CALLER'S STORAGE WHICH CONTAINS *
+* THE DATA RECORD.  THE STORAGE ALLOCATED MUST MATCH THE RECORD       *
+* LENGTH SET IN THE FILE PARAMETER BLOCK ABOVE OR IT MAY RESULT IN    *
+* DESTRUCTIVE OVERLAP OF OTHER STORAGE IN THE CALLING PROGRAM WHICH   *
+* COULD RESULT IN AN ABEND.                                           *
+*---------------------------------------------------------------------*
+$IOAREA  DS    0CL500
+*
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R10      EQU   10
+R11      EQU   11
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+*
+         END
