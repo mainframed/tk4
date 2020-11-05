@@ -1,6 +1,6 @@
 # tk4- extract
 
-using the script export.sh extracted all `FB 80` sequential and PDS datasets ass well and all `VB 255` PDS and all zip files. Zip files were then extracted. 
+using the script export.sh extracted all `FB 80` sequential and PDS datasets as well and all `VB 255` PDS and all zip files. Zip files were then extracted. 
 
 Created using hercules hyperion source.
 
